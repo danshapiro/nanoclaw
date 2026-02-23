@@ -2,7 +2,7 @@
  * Container Runner for NanoClaw
  * Spawns agent execution in containers and handles IPC
  */
-import { ChildProcess, exec, spawn } from 'child_process';
+import { ChildProcess, exec, execSync, spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -178,36 +178,58 @@ function buildVolumeMounts(
 }
 
 /**
- * Read allowed secrets from .env for passing to the container via stdin.
- * Secrets are never written to disk or mounted as files.
+ * Read secrets for passing to the container via stdin.
  *
- * For CLAUDE_CODE_OAUTH_TOKEN, also checks ~/.claude/.credentials.json
- * as a fallback/override. The CLI auto-refreshes that file, so it always
- * has a fresh token — unlike .env which can go stale.
+ * - ANTHROPIC_API_KEY: read from .env (doesn't expire)
+ * - CLAUDE_CODE_OAUTH_TOKEN: always read from ~/.claude/.credentials.json
+ *   (kept fresh by the CLI). If near-expiry, triggers `claude auth status`
+ *   to force a CLI refresh before reading.
  */
 function readSecrets(): Record<string, string> {
-  const secrets = readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY']);
+  const secrets = readEnvFile(['ANTHROPIC_API_KEY']);
 
-  // If using an API key, no need to check credentials.json
+  // API keys don't expire — if configured, use directly
   if (secrets.ANTHROPIC_API_KEY) return secrets;
 
-  // Try to read a fresh OAuth token from the Claude CLI credentials file.
-  // This token is auto-refreshed by the CLI, so it's always current.
-  try {
-    const credsPath = path.join(getHomeDir(), '.claude', '.credentials.json');
-    const creds = JSON.parse(fs.readFileSync(credsPath, 'utf-8'));
-    const token = creds?.claudeAiOauth?.accessToken;
-    const expiresAt = creds?.claudeAiOauth?.expiresAt;
-    if (token && typeof token === 'string' && token.startsWith('sk-ant-oat01-')) {
-      // Only use if not expired (with 5-minute buffer)
-      if (!expiresAt || Date.now() < expiresAt - 5 * 60 * 1000) {
-        secrets.CLAUDE_CODE_OAUTH_TOKEN = token;
-      } else {
-        logger.warn('OAuth token in ~/.claude/.credentials.json is expired');
+  // OAuth: always read from ~/.claude/.credentials.json (kept fresh by CLI)
+  const credsPath = path.join(getHomeDir(), '.claude', '.credentials.json');
+
+  const readOAuthToken = (): { token?: string; expiresAt?: number } => {
+    try {
+      const creds = JSON.parse(fs.readFileSync(credsPath, 'utf-8'));
+      const token = creds?.claudeAiOauth?.accessToken;
+      const expiresAt = creds?.claudeAiOauth?.expiresAt;
+      if (token && typeof token === 'string' && token.startsWith('sk-ant-oat01-')) {
+        return { token, expiresAt };
       }
+    } catch {
+      // credentials.json doesn't exist or isn't readable
     }
-  } catch {
-    // credentials.json doesn't exist or isn't readable — that's fine
+    return {};
+  };
+
+  let { token, expiresAt } = readOAuthToken();
+
+  // If token is near-expiry (< 1 hour), trigger CLI refresh
+  if (token && expiresAt && Date.now() > expiresAt - 60 * 60 * 1000) {
+    logger.info('OAuth token near expiry, triggering CLI refresh');
+    try {
+      execSync('claude auth status', { timeout: 30_000, stdio: 'ignore' });
+      ({ token, expiresAt } = readOAuthToken());
+    } catch (err) {
+      logger.warn({ err }, 'Failed to trigger CLI token refresh');
+    }
+  }
+
+  // Validate token is not expired (5-minute buffer)
+  if (token) {
+    if (!expiresAt || Date.now() < expiresAt - 5 * 60 * 1000) {
+      secrets.CLAUDE_CODE_OAUTH_TOKEN = token;
+    } else {
+      logger.error('OAuth token in ~/.claude/.credentials.json is expired and CLI refresh failed');
+    }
+  } else {
+    logger.error('No valid OAuth token found in ~/.claude/.credentials.json — run `claude auth login`');
   }
 
   return secrets;
