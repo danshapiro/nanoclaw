@@ -29,6 +29,7 @@ describe('task scheduler', () => {
       next_run: new Date(Date.now() - 60_000).toISOString(),
       status: 'active',
       created_at: '2026-02-22T00:00:00.000Z',
+      suppress_pattern: null,
     });
 
     const enqueueTask = vi.fn(

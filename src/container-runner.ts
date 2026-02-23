@@ -4,6 +4,7 @@
  */
 import { ChildProcess, exec, execSync, spawn } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import {
@@ -181,18 +182,22 @@ function buildVolumeMounts(
  * Read secrets for passing to the container via stdin.
  *
  * - ANTHROPIC_API_KEY: read from .env (doesn't expire)
- * - CLAUDE_CODE_OAUTH_TOKEN: always read from ~/.claude/.credentials.json
+ * - CLAUDE_CODE_OAUTH_TOKEN: if explicitly set in .env, use it as-is (for
+ *   pinned service tokens). Otherwise read from ~/.claude/.credentials.json
  *   (kept fresh by the CLI). If near-expiry, triggers `claude auth status`
  *   to force a CLI refresh before reading.
  */
 function readSecrets(): Record<string, string> {
-  const secrets = readEnvFile(['ANTHROPIC_API_KEY']);
+  const secrets = readEnvFile(['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN']);
 
   // API keys don't expire — if configured, use directly
   if (secrets.ANTHROPIC_API_KEY) return secrets;
 
-  // OAuth: always read from ~/.claude/.credentials.json (kept fresh by CLI)
-  const credsPath = path.join(getHomeDir(), '.claude', '.credentials.json');
+  // If .env has an explicit OAuth token, respect it (pinned service token)
+  if (secrets.CLAUDE_CODE_OAUTH_TOKEN) return secrets;
+
+  // Fallback: read from ~/.claude/.credentials.json (kept fresh by CLI)
+  const credsPath = path.join(os.homedir(), '.claude', '.credentials.json');
 
   const readOAuthToken = (): { token?: string; expiresAt?: number } => {
     try {
