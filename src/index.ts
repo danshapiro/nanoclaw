@@ -716,9 +716,10 @@ async function main(): Promise<void> {
     onMessage: (chatJid: string, msg: NewMessage) => {
       // Remote control commands — intercept before storage
       const group = registeredGroups[chatJid];
+      const triggerPattern = getTriggerPattern(group?.trigger);
       const remoteControlCommand = extractInboundRemoteControlCommand(
         msg,
-        TRIGGER_PATTERN,
+        triggerPattern,
         ASSISTANT_NAME,
         group,
       );
