@@ -50,10 +50,8 @@ import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
-import {
-  extractRemoteControlCommand,
-  RemoteControlCommand,
-} from './remote-control-command.js';
+import { RemoteControlCommand } from './remote-control-command.js';
+import { extractInboundRemoteControlCommand } from './remote-control-routing.js';
 import {
   restoreRemoteControl,
   startRemoteControl,
@@ -718,10 +716,11 @@ async function main(): Promise<void> {
     onMessage: (chatJid: string, msg: NewMessage) => {
       // Remote control commands — intercept before storage
       const group = registeredGroups[chatJid];
-      const remoteControlCommand = extractRemoteControlCommand(
-        msg.content,
+      const remoteControlCommand = extractInboundRemoteControlCommand(
+        msg,
         TRIGGER_PATTERN,
-        { allowNaturalLanguage: group?.isMain === true },
+        ASSISTANT_NAME,
+        group,
       );
       if (remoteControlCommand) {
         handleRemoteControl(remoteControlCommand, chatJid, msg).catch((err) =>
