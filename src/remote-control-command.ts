@@ -1,5 +1,18 @@
 export type RemoteControlCommand = '/remote-control' | '/remote-control-end';
 
+interface ExtractRemoteControlCommandOptions {
+  allowNaturalLanguage?: boolean;
+}
+
+const REMOTE_CONTROL_PATTERN = /\bremote[- ]control\b/;
+const START_REMOTE_CONTROL_PATTERN =
+  /\b(?:start|open|enable|launch|begin|create|reopen)\b(?: (?:a|the))?(?: new)?\s+remote[- ]control\b(?: session)?/;
+const REQUEST_REMOTE_CONTROL_LINK_PATTERN =
+  /\b(?:give|send)\s+me\b.*\bremote[- ]control (?:link|url)\b|\bshare\b.*\bremote[- ]control (?:link|url)\b.*\bwith\s+me\b|\b(?:can|could|would)\s+you\s+(?:give|send|share)\b.*\bremote[- ]control (?:link|url)\b|\b(?:can|could|may)\s+(?:i|we)\s+(?:get|have)\b.*\bremote[- ]control (?:link|url)\b|\b(?:need|want)\b(?: (?:the|a))?\s+remote[- ]control (?:link|url)\b|\bplease\s+(?:give|send|share)\b.*\bremote[- ]control (?:link|url)\b/;
+const STOP_VERB_PATTERN = /\b(?:stop|disable|cancel|close)\b/;
+const STOP_REMOTE_CONTROL_PATTERN =
+  /\b(?:stop|disable|cancel|close)\b(?: (?:the))?\s+remote[- ]control\b(?: session)?|\b(?<!-)end\b(?: (?:the))?\s+remote[- ]control\b(?: session)?|\bremote[- ]control\b(?: session)?\s+(?:off|stop|disable|cancel|close|end)\b/;
+
 function normalizeMessage(content: string): string {
   return content
     .toLowerCase()
@@ -11,6 +24,9 @@ function normalizeMessage(content: string): string {
 export function extractRemoteControlCommand(
   content: string,
   triggerPattern: RegExp,
+  options: ExtractRemoteControlCommandOptions = {
+    allowNaturalLanguage: false,
+  },
 ): RemoteControlCommand | null {
   const trimmed = content.trim();
   if (!trimmed) return null;
@@ -25,27 +41,25 @@ export function extractRemoteControlCommand(
     return withoutTrigger;
   }
 
+  if (options.allowNaturalLanguage !== true) return null;
+
   const normalized = normalizeMessage(withoutTrigger);
-  const hasRemoteControl = /\bremote[- ]control\b/.test(normalized);
+  const hasRemoteControl = REMOTE_CONTROL_PATTERN.test(normalized);
   if (!hasRemoteControl) return null;
 
-  const wantsStop = /\b(stop|end|disable|close|cancel)\b/.test(normalized);
-  if (wantsStop) return '/remote-control-end';
+  const wantsStart =
+    START_REMOTE_CONTROL_PATTERN.test(normalized) ||
+    REQUEST_REMOTE_CONTROL_LINK_PATTERN.test(normalized);
+  const hasAmbiguousControlVerbs =
+    STOP_VERB_PATTERN.test(normalized) && wantsStart;
 
-  const wantsStartVerb = /\b(start|open|enable|launch|begin|create)\b/.test(
-    normalized,
-  );
-  const wantsDeliveryVerb = /\b(get|give|send|share)\b/.test(normalized);
-  const wantsLink = /\b(link|url|session)\b/.test(normalized);
-  const namesLinkDirectly =
-    /\bremote[- ]control (link|url|session)\b/.test(normalized) ||
-    /\b(link|url|session) for remote[- ]control\b/.test(normalized);
+  if (hasAmbiguousControlVerbs) return null;
 
-  if (
-    wantsStartVerb ||
-    (wantsDeliveryVerb && wantsLink) ||
-    namesLinkDirectly
-  ) {
+  if (STOP_REMOTE_CONTROL_PATTERN.test(normalized)) {
+    return '/remote-control-end';
+  }
+
+  if (wantsStart) {
     return '/remote-control';
   }
 
