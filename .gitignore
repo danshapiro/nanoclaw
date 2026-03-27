@@ -32,6 +32,9 @@ groups/global/*
 .idea/
 .vscode/
 
+# Local git worktrees
+.worktrees/
+
 # Skills system (local per-installation state)
 .nanoclaw/
 

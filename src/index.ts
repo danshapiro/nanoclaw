@@ -50,6 +50,7 @@ import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
+import { extractRemoteControlCommand } from './remote-control-command.js';
 import {
   restoreRemoteControl,
   startRemoteControl,
@@ -669,17 +670,21 @@ async function main(): Promise<void> {
     chatJid: string,
     msg: NewMessage,
   ): Promise<void> {
+    const channel = findChannel(channels, chatJid);
+    if (!channel) return;
+
     const group = registeredGroups[chatJid];
     if (!group?.isMain) {
       logger.warn(
         { chatJid, sender: msg.sender },
         'Remote control rejected: not main group',
       );
+      await channel.sendMessage(
+        chatJid,
+        'Remote control is only available from the main chat.',
+      );
       return;
     }
-
-    const channel = findChannel(channels, chatJid);
-    if (!channel) return;
 
     if (command === '/remote-control') {
       const result = await startRemoteControl(
@@ -709,9 +714,12 @@ async function main(): Promise<void> {
   const channelOpts = {
     onMessage: (chatJid: string, msg: NewMessage) => {
       // Remote control commands — intercept before storage
-      const trimmed = msg.content.trim();
-      if (trimmed === '/remote-control' || trimmed === '/remote-control-end') {
-        handleRemoteControl(trimmed, chatJid, msg).catch((err) =>
+      const remoteControlCommand = extractRemoteControlCommand(
+        msg.content,
+        TRIGGER_PATTERN,
+      );
+      if (remoteControlCommand) {
+        handleRemoteControl(remoteControlCommand, chatJid, msg).catch((err) =>
           logger.error({ err, chatJid }, 'Remote control command error'),
         );
         return;
