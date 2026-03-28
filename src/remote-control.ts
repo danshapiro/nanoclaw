@@ -1,5 +1,6 @@
 import { spawn } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import { DATA_DIR } from './config.js';
@@ -21,6 +22,65 @@ const URL_POLL_MS = 200;
 const STATE_FILE = path.join(DATA_DIR, 'remote-control.json');
 const STDOUT_FILE = path.join(DATA_DIR, 'remote-control.stdout');
 const STDERR_FILE = path.join(DATA_DIR, 'remote-control.stderr');
+const CLAUDE_CONFIG_FILE = path.join(os.homedir(), '.claude.json');
+
+function ensureWorkspaceTrusted(cwd: string): void {
+  let config: Record<string, unknown> = {};
+
+  try {
+    config = JSON.parse(fs.readFileSync(CLAUDE_CONFIG_FILE, 'utf-8'));
+  } catch (err: any) {
+    if (err?.code !== 'ENOENT') {
+      logger.warn({ err, cwd }, 'Failed to read Claude config for trust seeding');
+      return;
+    }
+  }
+
+  const projects =
+    typeof config.projects === 'object' && config.projects !== null
+      ? (config.projects as Record<string, Record<string, unknown>>)
+      : {};
+  const current =
+    typeof projects[cwd] === 'object' && projects[cwd] !== null
+      ? projects[cwd]
+      : {};
+
+  projects[cwd] = {
+    allowedTools: Array.isArray(current.allowedTools) ? current.allowedTools : [],
+    mcpContextUris: Array.isArray(current.mcpContextUris)
+      ? current.mcpContextUris
+      : [],
+    mcpServers:
+      typeof current.mcpServers === 'object' && current.mcpServers !== null
+        ? current.mcpServers
+        : {},
+    enabledMcpjsonServers: Array.isArray(current.enabledMcpjsonServers)
+      ? current.enabledMcpjsonServers
+      : [],
+    disabledMcpjsonServers: Array.isArray(current.disabledMcpjsonServers)
+      ? current.disabledMcpjsonServers
+      : [],
+    hasTrustDialogAccepted: true,
+    projectOnboardingSeenCount:
+      typeof current.projectOnboardingSeenCount === 'number'
+        ? current.projectOnboardingSeenCount
+        : 0,
+    hasClaudeMdExternalIncludesApproved:
+      current.hasClaudeMdExternalIncludesApproved === true,
+    hasClaudeMdExternalIncludesWarningShown:
+      current.hasClaudeMdExternalIncludesWarningShown === true,
+    exampleFiles: Array.isArray(current.exampleFiles) ? current.exampleFiles : [],
+    hasCompletedProjectOnboarding:
+      current.hasCompletedProjectOnboarding !== false,
+  };
+  config.projects = projects;
+
+  try {
+    fs.writeFileSync(CLAUDE_CONFIG_FILE, `${JSON.stringify(config, null, 2)}\n`);
+  } catch (err) {
+    logger.warn({ err, cwd }, 'Failed to persist Claude trust for remote control');
+  }
+}
 
 function saveState(session: RemoteControlSession): void {
   fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
@@ -109,6 +169,7 @@ export async function startRemoteControl(
 
   let proc;
   try {
+    ensureWorkspaceTrusted(cwd);
     proc = spawn('claude', ['remote-control', '--name', 'NanoClaw Remote'], {
       cwd,
       stdio: ['pipe', stdoutFd, stderrFd],

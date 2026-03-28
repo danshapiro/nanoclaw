@@ -1,9 +1,21 @@
 import fs from 'fs';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
+const mockEnv: Record<string, string> = {};
+
 // Mock config before importing the module under test
 vi.mock('./config.js', () => ({
   DATA_DIR: '/tmp/nanoclaw-rc-test',
+}));
+
+vi.mock('./env.js', () => ({
+  readEnvFile: vi.fn((keys: string[]) => {
+    const result: Record<string, string> = {};
+    for (const key of keys) {
+      if (mockEnv[key]) result[key] = mockEnv[key];
+    }
+    return result;
+  }),
 }));
 
 // Mock child_process
@@ -48,6 +60,7 @@ describe('remote-control', () => {
     _resetForTesting();
     spawnMock.mockReset();
     stdoutFileContent = '';
+    for (const key of Object.keys(mockEnv)) delete mockEnv[key];
 
     // Default fs mocks
     _mkdirSyncSpy = vi
@@ -65,6 +78,9 @@ describe('remote-control', () => {
       p: string,
     ) => {
       if (p.endsWith('remote-control.stdout')) return stdoutFileContent;
+      if (p.endsWith('.claude.json')) {
+        throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+      }
       if (p.endsWith('remote-control.json')) {
         throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
       }
@@ -101,6 +117,52 @@ describe('remote-control', () => {
         expect.objectContaining({ cwd: '/project', detached: true }),
       );
       expect(proc.unref).toHaveBeenCalled();
+    });
+
+    it('passes .env auth through to the claude child process', async () => {
+      const proc = createMockProcess();
+      spawnMock.mockReturnValue(proc);
+      stdoutFileContent = 'https://claude.ai/code?bridge=env_auth\n';
+      mockEnv.CLAUDE_CODE_OAUTH_TOKEN = 'sk-ant-oat01-remote-control';
+      vi.spyOn(process, 'kill').mockImplementation((() => true) as any);
+
+      await startRemoteControl('user1', 'tg:123', '/project');
+
+      expect(spawnMock).toHaveBeenCalledWith(
+        'claude',
+        ['remote-control', '--name', 'NanoClaw Remote'],
+        expect.objectContaining({
+          env: expect.objectContaining({
+            CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-remote-control',
+          }),
+        }),
+      );
+    });
+
+    it('seeds Claude workspace trust for the release directory', async () => {
+      const proc = createMockProcess();
+      spawnMock.mockReturnValue(proc);
+      stdoutFileContent = 'https://claude.ai/code?bridge=env_trust\n';
+      vi.spyOn(process, 'kill').mockImplementation((() => true) as any);
+      readFileSyncSpy.mockImplementation(((p: string) => {
+        if (p.endsWith('remote-control.stdout')) return stdoutFileContent;
+        if (p.endsWith('.claude.json')) return '{"oauthAccount":{"emailAddress":"dan@example.com"}}';
+        if (p.endsWith('remote-control.json')) {
+          throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+        }
+        return '';
+      }) as any);
+
+      await startRemoteControl('user1', 'tg:123', '/project');
+
+      expect(writeFileSyncSpy).toHaveBeenCalledWith(
+        expect.stringMatching(/\.claude\.json$/),
+        expect.stringContaining('"hasTrustDialogAccepted": true'),
+      );
+      expect(writeFileSyncSpy).toHaveBeenCalledWith(
+        expect.stringMatching(/\.claude\.json$/),
+        expect.stringContaining('"/project"'),
+      );
     });
 
     it('uses file descriptors for stdout/stderr (not pipes)', async () => {
