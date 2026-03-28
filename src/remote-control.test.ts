@@ -1,21 +1,9 @@
 import fs from 'fs';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
-const mockEnv: Record<string, string> = {};
-
 // Mock config before importing the module under test
 vi.mock('./config.js', () => ({
   DATA_DIR: '/tmp/nanoclaw-rc-test',
-}));
-
-vi.mock('./env.js', () => ({
-  readEnvFile: vi.fn((keys: string[]) => {
-    const result: Record<string, string> = {};
-    for (const key of keys) {
-      if (mockEnv[key]) result[key] = mockEnv[key];
-    }
-    return result;
-  }),
 }));
 
 // Mock child_process
@@ -60,7 +48,6 @@ describe('remote-control', () => {
     _resetForTesting();
     spawnMock.mockReset();
     stdoutFileContent = '';
-    for (const key of Object.keys(mockEnv)) delete mockEnv[key];
 
     // Default fs mocks
     _mkdirSyncSpy = vi
@@ -119,24 +106,29 @@ describe('remote-control', () => {
       expect(proc.unref).toHaveBeenCalled();
     });
 
-    it('passes .env auth through to the claude child process', async () => {
+    it('strips service auth from the claude child process env', async () => {
       const proc = createMockProcess();
       spawnMock.mockReturnValue(proc);
       stdoutFileContent = 'https://claude.ai/code?bridge=env_auth\n';
-      mockEnv.CLAUDE_CODE_OAUTH_TOKEN = 'sk-ant-oat01-remote-control';
+      const prevOauth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+      const prevApiKey = process.env.ANTHROPIC_API_KEY;
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = 'sk-ant-oat01-remote-control';
+      process.env.ANTHROPIC_API_KEY = 'sk-live-api-key';
       vi.spyOn(process, 'kill').mockImplementation((() => true) as any);
 
-      await startRemoteControl('user1', 'tg:123', '/project');
+      try {
+        await startRemoteControl('user1', 'tg:123', '/project');
 
-      expect(spawnMock).toHaveBeenCalledWith(
-        'claude',
-        ['remote-control', '--name', 'NanoClaw Remote'],
-        expect.objectContaining({
-          env: expect.objectContaining({
-            CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat01-remote-control',
-          }),
-        }),
-      );
+        const env = spawnMock.mock.calls[0][2].env;
+        expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+        expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+      } finally {
+        if (prevOauth === undefined) delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+        else process.env.CLAUDE_CODE_OAUTH_TOKEN = prevOauth;
+
+        if (prevApiKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+        else process.env.ANTHROPIC_API_KEY = prevApiKey;
+      }
     });
 
     it('seeds Claude workspace trust for the release directory', async () => {
@@ -146,7 +138,8 @@ describe('remote-control', () => {
       vi.spyOn(process, 'kill').mockImplementation((() => true) as any);
       readFileSyncSpy.mockImplementation(((p: string) => {
         if (p.endsWith('remote-control.stdout')) return stdoutFileContent;
-        if (p.endsWith('.claude.json')) return '{"oauthAccount":{"emailAddress":"dan@example.com"}}';
+        if (p.endsWith('.claude.json'))
+          return '{"oauthAccount":{"emailAddress":"dan@example.com"}}';
         if (p.endsWith('remote-control.json')) {
           throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
         }

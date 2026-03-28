@@ -31,7 +31,10 @@ function ensureWorkspaceTrusted(cwd: string): void {
     config = JSON.parse(fs.readFileSync(CLAUDE_CONFIG_FILE, 'utf-8'));
   } catch (err: any) {
     if (err?.code !== 'ENOENT') {
-      logger.warn({ err, cwd }, 'Failed to read Claude config for trust seeding');
+      logger.warn(
+        { err, cwd },
+        'Failed to read Claude config for trust seeding',
+      );
       return;
     }
   }
@@ -46,7 +49,9 @@ function ensureWorkspaceTrusted(cwd: string): void {
       : {};
 
   projects[cwd] = {
-    allowedTools: Array.isArray(current.allowedTools) ? current.allowedTools : [],
+    allowedTools: Array.isArray(current.allowedTools)
+      ? current.allowedTools
+      : [],
     mcpContextUris: Array.isArray(current.mcpContextUris)
       ? current.mcpContextUris
       : [],
@@ -69,17 +74,37 @@ function ensureWorkspaceTrusted(cwd: string): void {
       current.hasClaudeMdExternalIncludesApproved === true,
     hasClaudeMdExternalIncludesWarningShown:
       current.hasClaudeMdExternalIncludesWarningShown === true,
-    exampleFiles: Array.isArray(current.exampleFiles) ? current.exampleFiles : [],
+    exampleFiles: Array.isArray(current.exampleFiles)
+      ? current.exampleFiles
+      : [],
     hasCompletedProjectOnboarding:
       current.hasCompletedProjectOnboarding !== false,
   };
   config.projects = projects;
 
   try {
-    fs.writeFileSync(CLAUDE_CONFIG_FILE, `${JSON.stringify(config, null, 2)}\n`);
+    fs.writeFileSync(
+      CLAUDE_CONFIG_FILE,
+      `${JSON.stringify(config, null, 2)}\n`,
+    );
   } catch (err) {
-    logger.warn({ err, cwd }, 'Failed to persist Claude trust for remote control');
+    logger.warn(
+      { err, cwd },
+      'Failed to persist Claude trust for remote control',
+    );
   }
+}
+
+function buildClaudeEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  // Remote Control requires the full Claude CLI login from ~/.claude.
+  // Stripping service auth env avoids forcing the child into inference-only mode.
+  delete env.CLAUDE_CODE_OAUTH_TOKEN;
+  delete env.ANTHROPIC_AUTH_TOKEN;
+  delete env.ANTHROPIC_API_KEY;
+  delete env.ANTHROPIC_BASE_URL;
+
+  return env;
 }
 
 function saveState(session: RemoteControlSession): void {
@@ -172,6 +197,7 @@ export async function startRemoteControl(
     ensureWorkspaceTrusted(cwd);
     proc = spawn('claude', ['remote-control', '--name', 'NanoClaw Remote'], {
       cwd,
+      env: buildClaudeEnv(),
       stdio: ['pipe', stdoutFd, stderrFd],
       detached: true,
     });
