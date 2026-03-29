@@ -39,6 +39,54 @@ describe('extractSessionCommand', () => {
   it('is case-sensitive for the command', () => {
     expect(extractSessionCommand('/Compact', trigger)).toBeNull();
   });
+
+  it('detects bare /new', () => {
+    expect(extractSessionCommand('/new', trigger)).toBe('/new');
+  });
+
+  it('detects bare /clear', () => {
+    expect(extractSessionCommand('/clear', trigger)).toBe('/clear');
+  });
+
+  it('detects /new with trigger prefix', () => {
+    expect(extractSessionCommand('@Andy /new', trigger)).toBe('/new');
+  });
+
+  it('detects /clear with trigger prefix', () => {
+    expect(extractSessionCommand('@Andy /clear', trigger)).toBe('/clear');
+  });
+
+  it('rejects /new with extra text', () => {
+    expect(extractSessionCommand('/new session', trigger)).toBeNull();
+  });
+
+  it('rejects /clear with extra text', () => {
+    expect(extractSessionCommand('/clear history', trigger)).toBeNull();
+  });
+
+  it('rejects /newish', () => {
+    expect(extractSessionCommand('/newish', trigger)).toBeNull();
+  });
+
+  it('rejects /clearing', () => {
+    expect(extractSessionCommand('/clearing', trigger)).toBeNull();
+  });
+
+  it('handles whitespace around /new', () => {
+    expect(extractSessionCommand('  /new  ', trigger)).toBe('/new');
+  });
+
+  it('handles whitespace around /clear', () => {
+    expect(extractSessionCommand('  /clear  ', trigger)).toBe('/clear');
+  });
+
+  it('is case-sensitive for /new', () => {
+    expect(extractSessionCommand('/New', trigger)).toBeNull();
+  });
+
+  it('is case-sensitive for /clear', () => {
+    expect(extractSessionCommand('/Clear', trigger)).toBeNull();
+  });
 });
 
 describe('isSessionCommandAllowed', () => {
@@ -230,6 +278,262 @@ describe('handleSessionCommand', () => {
     const msgs = [
       makeMsg('summarize this', { timestamp: '99' }),
       makeMsg('/compact', { timestamp: '100' }),
+    ];
+    const result = await handleSessionCommand({
+      missedMessages: msgs,
+      isMainGroup: true,
+      groupName: 'test',
+      triggerPattern: trigger,
+      timezone: 'UTC',
+      deps,
+    });
+    expect(result).toEqual({ handled: true, success: false });
+    expect(deps.sendMessage).toHaveBeenCalledWith(
+      expect.stringContaining('Failed to process'),
+    );
+  });
+
+  it('handles authorized /new in main group', async () => {
+    const deps = makeDeps();
+    const result = await handleSessionCommand({
+      missedMessages: [makeMsg('/new')],
+      isMainGroup: true,
+      groupName: 'test',
+      triggerPattern: trigger,
+      timezone: 'UTC',
+      deps,
+    });
+    expect(result).toEqual({ handled: true, success: true });
+    expect(deps.runAgent).toHaveBeenCalledWith('/new', expect.any(Function));
+    expect(deps.advanceCursor).toHaveBeenCalledWith('100');
+  });
+
+  it('handles authorized /clear in main group', async () => {
+    const deps = makeDeps();
+    const result = await handleSessionCommand({
+      missedMessages: [makeMsg('/clear')],
+      isMainGroup: true,
+      groupName: 'test',
+      triggerPattern: trigger,
+      timezone: 'UTC',
+      deps,
+    });
+    expect(result).toEqual({ handled: true, success: true });
+    expect(deps.runAgent).toHaveBeenCalledWith('/clear', expect.any(Function));
+    expect(deps.advanceCursor).toHaveBeenCalledWith('100');
+  });
+
+  it('processes pre-command messages before /new', async () => {
+    const deps = makeDeps();
+    const msgs = [
+      makeMsg('summarize this', { timestamp: '99' }),
+      makeMsg('/new', { timestamp: '100' }),
+    ];
+    const result = await handleSessionCommand({
+      missedMessages: msgs,
+      isMainGroup: true,
+      groupName: 'test',
+      triggerPattern: trigger,
+      timezone: 'UTC',
+      deps,
+    });
+    expect(result).toEqual({ handled: true, success: true });
+    expect(deps.formatMessages).toHaveBeenCalledWith([msgs[0]], 'UTC');
+    expect(deps.runAgent).toHaveBeenCalledTimes(2);
+    expect(deps.runAgent).toHaveBeenCalledWith(
+      '<formatted>',
+      expect.any(Function),
+    );
+    expect(deps.runAgent).toHaveBeenCalledWith('/new', expect.any(Function));
+  });
+
+  it('processes pre-command messages before /clear', async () => {
+    const deps = makeDeps();
+    const msgs = [
+      makeMsg('summarize this', { timestamp: '99' }),
+      makeMsg('/clear', { timestamp: '100' }),
+    ];
+    const result = await handleSessionCommand({
+      missedMessages: msgs,
+      isMainGroup: true,
+      groupName: 'test',
+      triggerPattern: trigger,
+      timezone: 'UTC',
+      deps,
+    });
+    expect(result).toEqual({ handled: true, success: true });
+    expect(deps.formatMessages).toHaveBeenCalledWith([msgs[0]], 'UTC');
+    expect(deps.runAgent).toHaveBeenCalledTimes(2);
+    expect(deps.runAgent).toHaveBeenCalledWith(
+      '<formatted>',
+      expect.any(Function),
+    );
+    expect(deps.runAgent).toHaveBeenCalledWith('/clear', expect.any(Function));
+  });
+
+  it('sends denial for /new from untrusted sender in non-main group', async () => {
+    const deps = makeDeps();
+    const result = await handleSessionCommand({
+      missedMessages: [makeMsg('/new', { is_from_me: false })],
+      isMainGroup: false,
+      groupName: 'test',
+      triggerPattern: trigger,
+      timezone: 'UTC',
+      deps,
+    });
+    expect(result).toEqual({ handled: true, success: true });
+    expect(deps.sendMessage).toHaveBeenCalledWith(
+      'Session commands require admin access.',
+    );
+    expect(deps.runAgent).not.toHaveBeenCalled();
+  });
+
+  it('sends denial for /clear from untrusted sender in non-main group', async () => {
+    const deps = makeDeps();
+    const result = await handleSessionCommand({
+      missedMessages: [makeMsg('/clear', { is_from_me: false })],
+      isMainGroup: false,
+      groupName: 'test',
+      triggerPattern: trigger,
+      timezone: 'UTC',
+      deps,
+    });
+    expect(result).toEqual({ handled: true, success: true });
+    expect(deps.sendMessage).toHaveBeenCalledWith(
+      'Session commands require admin access.',
+    );
+    expect(deps.runAgent).not.toHaveBeenCalled();
+  });
+
+  it('silently consumes denied /new when sender cannot interact', async () => {
+    const deps = makeDeps({
+      canSenderInteract: vi.fn().mockReturnValue(false),
+    });
+    const result = await handleSessionCommand({
+      missedMessages: [makeMsg('/new', { is_from_me: false })],
+      isMainGroup: false,
+      groupName: 'test',
+      triggerPattern: trigger,
+      timezone: 'UTC',
+      deps,
+    });
+    expect(result).toEqual({ handled: true, success: true });
+    expect(deps.sendMessage).not.toHaveBeenCalled();
+    expect(deps.advanceCursor).toHaveBeenCalledWith('100');
+  });
+
+  it('silently consumes denied /clear when sender cannot interact', async () => {
+    const deps = makeDeps({
+      canSenderInteract: vi.fn().mockReturnValue(false),
+    });
+    const result = await handleSessionCommand({
+      missedMessages: [makeMsg('/clear', { is_from_me: false })],
+      isMainGroup: false,
+      groupName: 'test',
+      triggerPattern: trigger,
+      timezone: 'UTC',
+      deps,
+    });
+    expect(result).toEqual({ handled: true, success: true });
+    expect(deps.sendMessage).not.toHaveBeenCalled();
+    expect(deps.advanceCursor).toHaveBeenCalledWith('100');
+  });
+
+  it('allows is_from_me sender for /new in non-main group', async () => {
+    const deps = makeDeps();
+    const result = await handleSessionCommand({
+      missedMessages: [makeMsg('/new', { is_from_me: true })],
+      isMainGroup: false,
+      groupName: 'test',
+      triggerPattern: trigger,
+      timezone: 'UTC',
+      deps,
+    });
+    expect(result).toEqual({ handled: true, success: true });
+    expect(deps.runAgent).toHaveBeenCalledWith('/new', expect.any(Function));
+  });
+
+  it('allows is_from_me sender for /clear in non-main group', async () => {
+    const deps = makeDeps();
+    const result = await handleSessionCommand({
+      missedMessages: [makeMsg('/clear', { is_from_me: true })],
+      isMainGroup: false,
+      groupName: 'test',
+      triggerPattern: trigger,
+      timezone: 'UTC',
+      deps,
+    });
+    expect(result).toEqual({ handled: true, success: true });
+    expect(deps.runAgent).toHaveBeenCalledWith('/clear', expect.any(Function));
+  });
+
+  it('reports failure when /new runAgent returns error without streamed status', async () => {
+    const deps = makeDeps({
+      runAgent: vi.fn().mockImplementation(async (prompt, onOutput) => {
+        await onOutput({ status: 'success', result: null });
+        return 'error';
+      }),
+    });
+    const result = await handleSessionCommand({
+      missedMessages: [makeMsg('/new')],
+      isMainGroup: true,
+      groupName: 'test',
+      triggerPattern: trigger,
+      timezone: 'UTC',
+      deps,
+    });
+    expect(result).toEqual({ handled: true, success: true });
+    expect(deps.sendMessage).toHaveBeenCalledWith(
+      expect.stringContaining('failed'),
+    );
+  });
+
+  it('reports failure when /clear runAgent returns error without streamed status', async () => {
+    const deps = makeDeps({
+      runAgent: vi.fn().mockImplementation(async (prompt, onOutput) => {
+        await onOutput({ status: 'success', result: null });
+        return 'error';
+      }),
+    });
+    const result = await handleSessionCommand({
+      missedMessages: [makeMsg('/clear')],
+      isMainGroup: true,
+      groupName: 'test',
+      triggerPattern: trigger,
+      timezone: 'UTC',
+      deps,
+    });
+    expect(result).toEqual({ handled: true, success: true });
+    expect(deps.sendMessage).toHaveBeenCalledWith(
+      expect.stringContaining('failed'),
+    );
+  });
+
+  it('returns success:false on pre-command failure before /new', async () => {
+    const deps = makeDeps({ runAgent: vi.fn().mockResolvedValue('error') });
+    const msgs = [
+      makeMsg('summarize this', { timestamp: '99' }),
+      makeMsg('/new', { timestamp: '100' }),
+    ];
+    const result = await handleSessionCommand({
+      missedMessages: msgs,
+      isMainGroup: true,
+      groupName: 'test',
+      triggerPattern: trigger,
+      timezone: 'UTC',
+      deps,
+    });
+    expect(result).toEqual({ handled: true, success: false });
+    expect(deps.sendMessage).toHaveBeenCalledWith(
+      expect.stringContaining('Failed to process'),
+    );
+  });
+
+  it('returns success:false on pre-command failure before /clear', async () => {
+    const deps = makeDeps({ runAgent: vi.fn().mockResolvedValue('error') });
+    const msgs = [
+      makeMsg('summarize this', { timestamp: '99' }),
+      makeMsg('/clear', { timestamp: '100' }),
     ];
     const result = await handleSessionCommand({
       missedMessages: msgs,
