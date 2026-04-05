@@ -34,12 +34,16 @@ type Handler = (...args: any[]) => any;
 
 const clientRef = vi.hoisted(() => ({ current: null as any }));
 
+const loginShouldFail = vi.hoisted(() => ({
+  value: false,
+  error: new Error('Invalid bot token'),
+}));
+
 vi.mock('discord.js', () => {
   const Events = {
     MessageCreate: 'messageCreate',
     ClientReady: 'ready',
     Error: 'error',
-    InteractionCreate: 'interactionCreate',
   };
 
   const GatewayIntentBits = {
@@ -70,6 +74,9 @@ vi.mock('discord.js', () => {
     }
 
     async login(_token: string) {
+      if (loginShouldFail.value) {
+        throw loginShouldFail.error;
+      }
       this._ready = true;
       const readyHandlers = this.eventHandlers.get('ready') || [];
       for (const h of readyHandlers) {
@@ -99,39 +106,12 @@ vi.mock('discord.js', () => {
   class TextChannel {}
   class ThreadChannel {}
 
-  class ButtonBuilder {
-    data: any = {};
-    setCustomId(id: string) {
-      this.data.customId = id;
-      return this;
-    }
-    setLabel(label: string) {
-      this.data.label = label;
-      return this;
-    }
-    setStyle(style: any) {
-      this.data.style = style;
-      return this;
-    }
-  }
-  class ActionRowBuilder {
-    components: any[] = [];
-    addComponents(...items: any[]) {
-      this.components.push(...items);
-      return this;
-    }
-  }
-  const ButtonStyle = { Success: 3, Danger: 4 };
-
   return {
     Client: MockClient,
     Events,
     GatewayIntentBits,
     TextChannel,
     ThreadChannel,
-    ButtonBuilder,
-    ActionRowBuilder,
-    ButtonStyle,
   };
 });
 
@@ -375,6 +355,16 @@ describe('DiscordChannel', () => {
 
       expect(channel.isConnected()).toBe(false);
     });
+
+    it('rejects connect() when login fails', async () => {
+      loginShouldFail.value = true;
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('bad-token', opts);
+
+      await expect(channel.connect()).rejects.toThrow('Invalid bot token');
+
+      loginShouldFail.value = false;
+    });
   });
 
   describe('text message handling', () => {
@@ -482,7 +472,7 @@ describe('DiscordChannel', () => {
       );
     });
 
-    it('uses sender name for DM chats (no guild)', async () => {
+    it('passes isGroup=false for DMs (no guild)', async () => {
       const opts = createTestOpts({
         registeredGroups: vi.fn(() => ({
           'dc:1234567890123456': {
@@ -508,7 +498,7 @@ describe('DiscordChannel', () => {
         expect.any(String),
         'Alice',
         'discord',
-        true,
+        false,
       );
     });
 
@@ -778,7 +768,7 @@ describe('DiscordChannel', () => {
       expect(currentClient().channels.fetch).toHaveBeenCalledWith('9876543210');
     });
 
-    it('handles send failure gracefully', async () => {
+    it('throws on send failure so caller can handle it', async () => {
       const opts = createTestOpts();
       const channel = new DiscordChannel('test-token', opts);
       await channel.connect();
@@ -789,7 +779,7 @@ describe('DiscordChannel', () => {
 
       await expect(
         channel.sendMessage('dc:1234567890123456', 'Will fail'),
-      ).resolves.toBeUndefined();
+      ).rejects.toThrow('Channel not found');
     });
 
     it('does nothing when client is not initialized', async () => {
@@ -821,6 +811,89 @@ describe('DiscordChannel', () => {
       expect(mockChannel.send).toHaveBeenCalledTimes(2);
       expect(mockChannel.send).toHaveBeenNthCalledWith(1, 'x'.repeat(2000));
       expect(mockChannel.send).toHaveBeenNthCalledWith(2, 'x'.repeat(1000));
+    });
+
+    it('calls storeMessageDirect for each sent chunk', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      const sentId1 = 'sent-msg-001';
+      const sentId2 = 'sent-msg-002';
+      const sentDate1 = new Date('2026-01-01T00:00:00Z');
+      const sentDate2 = new Date('2026-01-01T00:00:01Z');
+
+      const mockChannel = {
+        send: vi
+          .fn()
+          .mockResolvedValueOnce({
+            id: sentId1,
+            createdAt: sentDate1,
+          })
+          .mockResolvedValueOnce({
+            id: sentId2,
+            createdAt: sentDate2,
+          }),
+        sendTyping: vi.fn(),
+      };
+      currentClient().channels.fetch.mockResolvedValue(mockChannel);
+
+      const longText = 'a'.repeat(2500);
+      await channel.sendMessage('dc:1234567890123456', longText);
+
+      expect(mockStoreMessageDirect).toHaveBeenCalledTimes(2);
+      expect(mockStoreMessageDirect).toHaveBeenCalledWith({
+        id: sentId1,
+        chat_jid: 'dc:1234567890123456',
+        sender: '999888777',
+        sender_name: 'Andy',
+        content: 'a'.repeat(2000),
+        timestamp: sentDate1.toISOString(),
+        is_from_me: true,
+        is_bot_message: true,
+      });
+      expect(mockStoreMessageDirect).toHaveBeenCalledWith({
+        id: sentId2,
+        chat_jid: 'dc:1234567890123456',
+        sender: '999888777',
+        sender_name: 'Andy',
+        content: 'a'.repeat(500),
+        timestamp: sentDate2.toISOString(),
+        is_from_me: true,
+        is_bot_message: true,
+      });
+    });
+
+    it('calls storeMessageDirect for single short message', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      const sentId = 'sent-msg-short';
+      const sentDate = new Date('2026-02-15T12:00:00Z');
+
+      const mockChannel = {
+        send: vi.fn().mockResolvedValue({
+          id: sentId,
+          createdAt: sentDate,
+        }),
+        sendTyping: vi.fn(),
+      };
+      currentClient().channels.fetch.mockResolvedValue(mockChannel);
+
+      await channel.sendMessage('dc:1234567890123456', 'Short message');
+
+      expect(mockStoreMessageDirect).toHaveBeenCalledTimes(1);
+      expect(mockStoreMessageDirect).toHaveBeenCalledWith({
+        id: sentId,
+        chat_jid: 'dc:1234567890123456',
+        sender: '999888777',
+        sender_name: 'Andy',
+        content: 'Short message',
+        timestamp: sentDate.toISOString(),
+        is_from_me: true,
+        is_bot_message: true,
+      });
     });
   });
 
@@ -881,6 +954,33 @@ describe('DiscordChannel', () => {
         channel.setTyping('dc:1234567890123456', true),
       ).resolves.toBeUndefined();
     });
+
+    it('routes typing to active thread', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      const msg = createMessage({
+        channelId: 'thread_typing',
+        threadParentId: '1234567890123456',
+        content: 'Hello from thread',
+        guildName: 'Server',
+      });
+      await triggerMessage(msg);
+
+      const mockThreadChannel = {
+        send: vi.fn(),
+        sendTyping: vi.fn().mockResolvedValue(undefined),
+      };
+      currentClient().channels.fetch.mockResolvedValue(mockThreadChannel);
+
+      await channel.setTyping('dc:1234567890123456', true);
+
+      expect(currentClient().channels.fetch).toHaveBeenCalledWith(
+        'thread_typing',
+      );
+      expect(mockThreadChannel.sendTyping).toHaveBeenCalled();
+    });
   });
 
   describe('thread support', () => {
@@ -907,7 +1007,7 @@ describe('DiscordChannel', () => {
       );
     });
 
-    it('routes replies to active thread', async () => {
+    it('routes replies to latest active thread', async () => {
       const opts = createTestOpts();
       const channel = new DiscordChannel('test-token', opts);
       await channel.connect();
@@ -936,70 +1036,65 @@ describe('DiscordChannel', () => {
         '1234567890123456',
       );
     });
-  });
 
-  describe('approval buttons', () => {
-    it('sends approval request with buttons', async () => {
+    it('tracks latest thread when multiple threads exist on same parent', async () => {
       const opts = createTestOpts();
       const channel = new DiscordChannel('test-token', opts);
       await channel.connect();
 
-      const mockChannel = {
-        send: vi.fn().mockResolvedValue({
-          id: 'mock-msg-id',
-          createdAt: new Date('2026-01-01T00:00:00Z'),
-        }),
-      };
-      currentClient().channels.fetch.mockResolvedValue(mockChannel);
+      const msg1 = createMessage({
+        channelId: 'thread_A',
+        threadParentId: '1234567890123456',
+        content: 'First thread',
+        guildName: 'Server',
+      });
+      await triggerMessage(msg1);
 
-      await channel.sendApprovalRequest(
-        'dc:1234567890123456',
-        'Deploy v1.2.43?',
-        'deploy-123',
-      );
+      const msg2 = createMessage({
+        channelId: 'thread_B',
+        threadParentId: '1234567890123456',
+        content: 'Second thread',
+        guildName: 'Server',
+      });
+      await triggerMessage(msg2);
 
-      expect(currentClient().channels.fetch).toHaveBeenCalledWith(
-        '1234567890123456',
-      );
-      expect(mockChannel.send).toHaveBeenCalledWith(
-        expect.objectContaining({
-          content: 'Deploy v1.2.43?',
-          components: expect.arrayContaining([
-            expect.objectContaining({ components: expect.any(Array) }),
-          ]),
-        }),
-      );
+      await channel.sendMessage('dc:1234567890123456', 'Reply');
+
+      expect(currentClient().channels.fetch).toHaveBeenCalledWith('thread_B');
     });
 
-    it('handles button interaction and calls onApproval', async () => {
-      const onApproval = vi.fn();
-      const opts = createTestOpts({ onApproval });
+    it('still routes to first thread after second thread message', async () => {
+      const opts = createTestOpts();
       const channel = new DiscordChannel('test-token', opts);
       await channel.connect();
 
-      const interaction = {
-        isButton: () => true,
-        customId: 'approve:deploy-123',
-        user: { id: '55512345', tag: 'alice#1234', displayName: 'Alice' },
-        message: { content: 'Deploy v1.2.43?' },
-        update: vi.fn().mockResolvedValue(undefined),
-      };
+      const msg1 = createMessage({
+        channelId: 'thread_A',
+        threadParentId: '1234567890123456',
+        content: 'First thread',
+        guildName: 'Server',
+      });
+      await triggerMessage(msg1);
 
-      const handlers =
-        currentClient().eventHandlers.get('interactionCreate') || [];
-      for (const h of handlers) await h(interaction);
+      const msg2 = createMessage({
+        channelId: 'thread_B',
+        threadParentId: '1234567890123456',
+        content: 'Second thread',
+        guildName: 'Server',
+      });
+      await triggerMessage(msg2);
 
-      expect(onApproval).toHaveBeenCalledWith(
-        'approve',
-        '55512345',
-        'deploy-123',
-      );
-      expect(interaction.update).toHaveBeenCalledWith(
-        expect.objectContaining({
-          content: expect.stringContaining('Approved'),
-          components: [],
-        }),
-      );
+      const msg3 = createMessage({
+        channelId: 'thread_A',
+        threadParentId: '1234567890123456',
+        content: 'Back to first',
+        guildName: 'Server',
+      });
+      await triggerMessage(msg3);
+
+      await channel.sendMessage('dc:1234567890123456', 'Reply');
+
+      expect(currentClient().channels.fetch).toHaveBeenCalledWith('thread_A');
     });
   });
 

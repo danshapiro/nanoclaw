@@ -1,7 +1,4 @@
 import {
-  ActionRowBuilder,
-  ButtonBuilder,
-  ButtonStyle,
   Client,
   Events,
   GatewayIntentBits,
@@ -22,17 +19,12 @@ import {
 } from '../types.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 
-export type ApprovalCallback = (
-  action: string,
-  userId: string,
-  messageId: string,
-) => void;
+const CONNECT_TIMEOUT_MS = 30_000;
 
 export interface DiscordChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
   registeredGroups: () => Record<string, RegisteredGroup>;
-  onApproval?: ApprovalCallback;
 }
 
 export class DiscordChannel implements Channel {
@@ -41,7 +33,7 @@ export class DiscordChannel implements Channel {
   private client: Client | null = null;
   private opts: DiscordChannelOpts;
   private botToken: string;
-  private activeThreads = new Map<string, string>();
+  private latestThread = new Map<string, string>();
 
   constructor(botToken: string, opts: DiscordChannelOpts) {
     this.botToken = botToken;
@@ -68,7 +60,7 @@ export class DiscordChannel implements Channel {
         const thread = message.channel as ThreadChannel;
         const parentId = thread.parentId;
         if (parentId) {
-          this.activeThreads.set(parentId, channelId);
+          this.latestThread.set(parentId, channelId);
           channelId = parentId;
           channelForName = (thread.parent ?? thread) as TextChannel;
         }
@@ -145,7 +137,15 @@ export class DiscordChannel implements Channel {
         }
       }
 
-      this.opts.onChatMetadata(chatJid, timestamp, chatName, 'discord', true);
+      const isGroup = !!message.guild;
+
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        chatName,
+        'discord',
+        isGroup,
+      );
 
       const group = this.opts.registeredGroups()[chatJid];
       if (!group) {
@@ -173,33 +173,17 @@ export class DiscordChannel implements Channel {
       );
     });
 
-    this.client.on(Events.InteractionCreate, async (interaction) => {
-      if (!interaction.isButton()) return;
-
-      const [action, refId] = interaction.customId.split(':');
-      if (!action || !refId) return;
-
-      logger.info(
-        { action, refId, user: interaction.user.tag },
-        'Discord button interaction',
-      );
-
-      if (this.opts.onApproval) {
-        this.opts.onApproval(action, interaction.user.id, refId);
-      }
-
-      await interaction.update({
-        content: `${interaction.message.content}\n\n**${action === 'approve' ? 'Approved' : 'Rejected'}** by ${interaction.user.displayName}`,
-        components: [],
-      });
-    });
-
     this.client.on(Events.Error, (err) => {
       logger.error({ err: err.message }, 'Discord client error');
     });
 
-    return new Promise<void>((resolve) => {
+    return new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error('Discord connect timed out'));
+      }, CONNECT_TIMEOUT_MS);
+
       this.client!.once(Events.ClientReady, (readyClient) => {
+        clearTimeout(timer);
         logger.info(
           { username: readyClient.user.tag, id: readyClient.user.id },
           'Discord bot connected',
@@ -211,7 +195,10 @@ export class DiscordChannel implements Channel {
         resolve();
       });
 
-      this.client!.login(this.botToken);
+      this.client!.login(this.botToken).catch((err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
     });
   }
 
@@ -224,7 +211,7 @@ export class DiscordChannel implements Channel {
     try {
       const channelId = jid.replace(/^dc:/, '');
 
-      const threadId = this.activeThreads.get(channelId);
+      const threadId = this.latestThread.get(channelId);
       const targetId = threadId ?? channelId;
       const channel = await this.client.channels.fetch(targetId);
 
@@ -264,42 +251,7 @@ export class DiscordChannel implements Channel {
       );
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send Discord message');
-    }
-  }
-
-  async sendApprovalRequest(
-    jid: string,
-    text: string,
-    refId: string,
-  ): Promise<void> {
-    if (!this.client) return;
-
-    try {
-      const channelId = jid.replace(/^dc:/, '');
-      const threadId = this.activeThreads.get(channelId);
-      const channel = await this.client.channels.fetch(threadId ?? channelId);
-
-      if (!channel || !('send' in channel)) return;
-
-      const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-        new ButtonBuilder()
-          .setCustomId(`approve:${refId}`)
-          .setLabel('Approve')
-          .setStyle(ButtonStyle.Success),
-        new ButtonBuilder()
-          .setCustomId(`reject:${refId}`)
-          .setLabel('Reject')
-          .setStyle(ButtonStyle.Danger),
-      );
-
-      await (channel as TextChannel).send({
-        content: text,
-        components: [row],
-      });
-
-      logger.info({ jid, refId }, 'Discord approval request sent');
-    } catch (err) {
-      logger.error({ jid, err }, 'Failed to send Discord approval request');
+      throw err;
     }
   }
 
@@ -323,7 +275,9 @@ export class DiscordChannel implements Channel {
     if (!this.client || !isTyping) return;
     try {
       const channelId = jid.replace(/^dc:/, '');
-      const channel = await this.client.channels.fetch(channelId);
+      const threadId = this.latestThread.get(channelId);
+      const targetId = threadId ?? channelId;
+      const channel = await this.client.channels.fetch(targetId);
       if (channel && 'sendTyping' in channel) {
         await (channel as TextChannel).sendTyping();
       }
