@@ -13,6 +13,7 @@ import {
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
+import { storeMessageDirect } from '../db.js';
 import {
   Channel,
   OnChatMetadata,
@@ -235,12 +236,27 @@ export class DiscordChannel implements Channel {
       const textChannel = channel as TextChannel;
 
       const MAX_LENGTH = 2000;
+      const chunks: string[] = [];
       if (text.length <= MAX_LENGTH) {
-        await textChannel.send(text);
+        chunks.push(text);
       } else {
         for (let i = 0; i < text.length; i += MAX_LENGTH) {
-          await textChannel.send(text.slice(i, i + MAX_LENGTH));
+          chunks.push(text.slice(i, i + MAX_LENGTH));
         }
+      }
+
+      for (const chunk of chunks) {
+        const sent = await textChannel.send(chunk);
+        storeMessageDirect({
+          id: sent.id,
+          chat_jid: jid,
+          sender: this.client!.user!.id,
+          sender_name: ASSISTANT_NAME,
+          content: chunk,
+          timestamp: sent.createdAt.toISOString(),
+          is_from_me: true,
+          is_bot_message: true,
+        });
       }
       logger.info(
         { jid, threadId: threadId ?? null, length: text.length },

@@ -24,6 +24,12 @@ vi.mock('../env.js', () => ({
   readEnvFile: mockReadEnvFile,
 }));
 
+const mockStoreMessageDirect = vi.hoisted(() => vi.fn());
+
+vi.mock('../db.js', () => ({
+  storeMessageDirect: mockStoreMessageDirect,
+}));
+
 type Handler = (...args: any[]) => any;
 
 const clientRef = vi.hoisted(() => ({ current: null as any }));
@@ -77,7 +83,10 @@ vi.mock('discord.js', () => {
 
     channels = {
       fetch: vi.fn().mockResolvedValue({
-        send: vi.fn().mockResolvedValue(undefined),
+        send: vi.fn().mockResolvedValue({
+          id: 'mock-msg-id',
+          createdAt: new Date('2026-01-01T00:00:00Z'),
+        }),
         sendTyping: vi.fn().mockResolvedValue(undefined),
       }),
     };
@@ -798,7 +807,10 @@ describe('DiscordChannel', () => {
       await channel.connect();
 
       const mockChannel = {
-        send: vi.fn().mockResolvedValue(undefined),
+        send: vi.fn().mockResolvedValue({
+          id: 'mock-msg-id',
+          createdAt: new Date('2026-01-01T00:00:00Z'),
+        }),
         sendTyping: vi.fn(),
       };
       currentClient().channels.fetch.mockResolvedValue(mockChannel);
@@ -933,7 +945,10 @@ describe('DiscordChannel', () => {
       await channel.connect();
 
       const mockChannel = {
-        send: vi.fn().mockResolvedValue(undefined),
+        send: vi.fn().mockResolvedValue({
+          id: 'mock-msg-id',
+          createdAt: new Date('2026-01-01T00:00:00Z'),
+        }),
       };
       currentClient().channels.fetch.mockResolvedValue(mockChannel);
 
