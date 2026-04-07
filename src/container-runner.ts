@@ -59,6 +59,53 @@ interface VolumeMount {
   readonly: boolean;
 }
 
+const ONECLI_PROXY_CA_PATH = '/tmp/onecli-gateway-ca.pem';
+const ONECLI_COMBINED_CA_PATH = '/tmp/onecli-combined-ca.pem';
+
+function findEnvArgIndex(args: string[], key: string): number {
+  for (let i = 0; i < args.length - 1; i++) {
+    if (args[i] === '-e' && args[i + 1]?.startsWith(`${key}=`)) {
+      return i + 1;
+    }
+  }
+
+  return -1;
+}
+
+function readEnvArg(args: string[], key: string): string | undefined {
+  const index = findEnvArgIndex(args, key);
+  if (index === -1) {
+    return undefined;
+  }
+
+  return args[index]?.slice(key.length + 1);
+}
+
+function setEnvArg(args: string[], key: string, value: string): void {
+  const index = findEnvArgIndex(args, key);
+  if (index === -1) {
+    args.push('-e', `${key}=${value}`);
+    return;
+  }
+
+  args[index] = `${key}=${value}`;
+}
+
+function normalizeOnecliCaEnv(args: string[]): void {
+  const sslCertFile = readEnvArg(args, 'SSL_CERT_FILE');
+  const nodeExtraCaCerts = readEnvArg(args, 'NODE_EXTRA_CA_CERTS');
+
+  // OneCLI mounts both a proxy-only PEM and a combined bundle. WebFetch follows
+  // NODE_EXTRA_CA_CERTS but does not pick up the public roots when that env var
+  // points at the proxy-only file, so move Node to the combined bundle.
+  if (
+    sslCertFile === ONECLI_COMBINED_CA_PATH &&
+    nodeExtraCaCerts === ONECLI_PROXY_CA_PATH
+  ) {
+    setEnvArg(args, 'NODE_EXTRA_CA_CERTS', ONECLI_COMBINED_CA_PATH);
+  }
+}
+
 function buildVolumeMounts(
   group: RegisteredGroup,
   isMain: boolean,
@@ -267,6 +314,7 @@ async function buildContainerArgs(
       'OneCLI gateway not reachable — container will have no credentials',
     );
   }
+  normalizeOnecliCaEnv(args);
 
   // Runtime-specific args for host gateway resolution
   args.push(...hostGatewayArgs());

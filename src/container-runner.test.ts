@@ -5,6 +5,10 @@ import { PassThrough } from 'stream';
 // Sentinel markers must match container-runner.ts
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+const { spawnMock, applyContainerConfigMock } = vi.hoisted(() => ({
+  spawnMock: vi.fn(),
+  applyContainerConfigMock: vi.fn().mockResolvedValue(true),
+}));
 
 // Mock config
 vi.mock('./config.js', () => ({
@@ -60,17 +64,11 @@ vi.mock('./container-runtime.js', () => ({
   stopContainer: vi.fn(),
 }));
 
-// Mock OneCLI SDK
 vi.mock('@onecli-sh/sdk', () => ({
   OneCLI: class {
-    applyContainerConfig = vi.fn().mockResolvedValue(true);
-    createAgent = vi.fn().mockResolvedValue({ id: 'test' });
-    ensureAgent = vi
-      .fn()
-      .mockResolvedValue({ name: 'test', identifier: 'test', created: true });
+    applyContainerConfig = applyContainerConfigMock;
   },
 }));
-
 // Create a controllable fake ChildProcess
 function createFakeProcess() {
   const proc = new EventEmitter() as EventEmitter & {
@@ -96,7 +94,7 @@ vi.mock('child_process', async () => {
     await vi.importActual<typeof import('child_process')>('child_process');
   return {
     ...actual,
-    spawn: vi.fn(() => fakeProc),
+    spawn: spawnMock,
     exec: vi.fn(
       (_cmd: string, _opts: unknown, cb?: (err: Error | null) => void) => {
         if (cb) cb(null);
@@ -135,6 +133,10 @@ describe('container-runner timeout behavior', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     fakeProc = createFakeProcess();
+    spawnMock.mockImplementation(() => fakeProc);
+    spawnMock.mockClear();
+    applyContainerConfigMock.mockClear();
+    applyContainerConfigMock.mockResolvedValue(true);
   });
 
   afterEach(() => {
@@ -226,5 +228,168 @@ describe('container-runner timeout behavior', () => {
     const result = await resultPromise;
     expect(result.status).toBe('success');
     expect(result.newSessionId).toBe('session-456');
+  });
+
+  it('applies OneCLI config and does not inject Anthropic secrets into stdin', async () => {
+    const resultPromise = runContainerAgent(testGroup, testInput, () => {});
+
+    emitOutputMarker(fakeProc, {
+      status: 'success',
+      result: 'Done',
+      newSessionId: 'session-onecli',
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    const result = await resultPromise;
+    expect(result.status).toBe('success');
+
+    const spawnCall = spawnMock.mock.calls[0];
+    expect(spawnCall).toBeTruthy();
+    const containerArgs = (spawnCall?.[1] ?? []) as unknown as string[];
+    expect(containerArgs).not.toContain('ANTHROPIC_API_KEY=placeholder');
+    expect(
+      containerArgs.some((arg) => arg.startsWith('ANTHROPIC_BASE_URL=')),
+    ).toBe(false);
+    expect(applyContainerConfigMock).toHaveBeenCalledWith(expect.any(Array), {
+      addHostMapping: false,
+      agent: 'test-group',
+    });
+
+    const stdinPayload = JSON.parse(fakeProc.stdin.read()!.toString());
+    expect(stdinPayload.secrets).toBeUndefined();
+    expect(stdinPayload.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+    expect(stdinPayload.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+  });
+
+  it('uses the default OneCLI agent for main-group containers', async () => {
+    const resultPromise = runContainerAgent(
+      testGroup,
+      { ...testInput, isMain: true },
+      () => {},
+    );
+
+    emitOutputMarker(fakeProc, {
+      status: 'success',
+      result: 'Done',
+      newSessionId: 'session-main',
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    const result = await resultPromise;
+    expect(result.status).toBe('success');
+    expect(applyContainerConfigMock).toHaveBeenCalledWith(expect.any(Array), {
+      addHostMapping: false,
+      agent: undefined,
+    });
+  });
+
+  it('rewrites NODE_EXTRA_CA_CERTS to the combined OneCLI bundle when available', async () => {
+    applyContainerConfigMock.mockImplementation(async (args: string[]) => {
+      args.push('-e', 'NODE_EXTRA_CA_CERTS=/tmp/onecli-gateway-ca.pem');
+      args.push('-e', 'SSL_CERT_FILE=/tmp/onecli-combined-ca.pem');
+      return true;
+    });
+
+    const resultPromise = runContainerAgent(testGroup, testInput, () => {});
+
+    emitOutputMarker(fakeProc, {
+      status: 'success',
+      result: 'Done',
+      newSessionId: 'session-ca',
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    const result = await resultPromise;
+    expect(result.status).toBe('success');
+
+    const spawnCall = spawnMock.mock.calls[0];
+    expect(spawnCall).toBeTruthy();
+    const containerArgs = (spawnCall?.[1] ?? []) as unknown as string[];
+    expect(containerArgs).toContain(
+      'NODE_EXTRA_CA_CERTS=/tmp/onecli-combined-ca.pem',
+    );
+    expect(containerArgs).not.toContain(
+      'NODE_EXTRA_CA_CERTS=/tmp/onecli-gateway-ca.pem',
+    );
+  });
+});
+
+describe('container-runner GWS proxy env vars', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    fakeProc = createFakeProcess();
+    spawnMock.mockImplementation(() => fakeProc);
+    spawnMock.mockClear();
+    applyContainerConfigMock.mockClear();
+    applyContainerConfigMock.mockResolvedValue(true);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    delete process.env.GWS_PROXY_URL;
+    delete process.env.GWS_PROXY_KEY;
+  });
+
+  it('injects GWS_PROXY_URL and GWS_PROXY_KEY when set', async () => {
+    process.env.GWS_PROXY_URL = 'http://host.docker.internal:8083';
+    process.env.GWS_PROXY_KEY = 'test_key';
+
+    const onOutput = vi.fn(async () => {});
+    const resultPromise = runContainerAgent(
+      testGroup,
+      testInput,
+      () => {},
+      onOutput,
+    );
+
+    emitOutputMarker(fakeProc, { status: 'success', result: 'Done' });
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    const spawnArgs = spawnMock.mock.calls[0][1] as string[];
+
+    expect(spawnArgs).toContain(
+      'GWS_PROXY_URL=http://host.docker.internal:8083',
+    );
+    expect(spawnArgs).toContain('GWS_PROXY_KEY=test_key');
+  });
+
+  it('does NOT inject old gws env vars or mounts', async () => {
+    process.env.GWS_PROXY_URL = 'http://host.docker.internal:8083';
+    process.env.GWS_PROXY_KEY = 'test_key';
+
+    const resultPromise = runContainerAgent(testGroup, testInput, () => {});
+
+    emitOutputMarker(fakeProc, { status: 'success', result: 'Done' });
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    const spawnArgs = spawnMock.mock.calls[0][1] as string[];
+
+    // No old gws env vars
+    const oldGwsArgs = spawnArgs.filter(
+      (arg) =>
+        typeof arg === 'string' &&
+        (arg.includes('GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND') ||
+          arg.includes('GOOGLE_WORKSPACE_CLI_CONFIG_DIR')),
+    );
+    expect(oldGwsArgs).toHaveLength(0);
+
+    // No gws-config volume mount
+    const gwsMountArg = spawnArgs.find(
+      (arg) =>
+        typeof arg === 'string' &&
+        arg.includes('gws-config:') &&
+        arg.includes('/home/node/.config/gws'),
+    );
+    expect(gwsMountArg).toBeUndefined();
   });
 });
