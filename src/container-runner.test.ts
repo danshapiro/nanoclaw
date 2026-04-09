@@ -420,3 +420,69 @@ describe('container-runner GWS proxy env vars', () => {
     expect(gwsMountArg).toBeUndefined();
   });
 });
+
+describe('container-runner proxy env handling', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    fakeProc = createFakeProcess();
+    spawnMock.mockImplementation(() => fakeProc);
+    spawnMock.mockClear();
+    applyContainerConfigMock.mockClear();
+    applyContainerConfigMock.mockResolvedValue(true);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('adds local service exemptions to NO_PROXY when OneCLI proxy env is present', async () => {
+    applyContainerConfigMock.mockImplementation(async (args: string[]) => {
+      args.push('-e', 'HTTP_PROXY=http://host.docker.internal:10255');
+      args.push('-e', 'HTTPS_PROXY=http://host.docker.internal:10255');
+      return true;
+    });
+
+    const resultPromise = runContainerAgent(testGroup, testInput, () => {});
+
+    emitOutputMarker(fakeProc, { status: 'success', result: 'Done' });
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    await resultPromise;
+
+    const spawnArgs = spawnMock.mock.calls[0][1] as string[];
+    expect(spawnArgs).toContain(
+      'NO_PROXY=host.docker.internal,localhost,127.0.0.1,::1,172.17.0.1',
+    );
+    expect(spawnArgs).toContain(
+      'no_proxy=host.docker.internal,localhost,127.0.0.1,::1,172.17.0.1',
+    );
+  });
+
+  it('merges existing NO_PROXY entries with local service exemptions', async () => {
+    applyContainerConfigMock.mockImplementation(async (args: string[]) => {
+      args.push('-e', 'HTTP_PROXY=http://host.docker.internal:10255');
+      args.push('-e', 'NO_PROXY=example.com,localhost');
+      args.push('-e', 'no_proxy=internal.example');
+      return true;
+    });
+
+    const resultPromise = runContainerAgent(testGroup, testInput, () => {});
+
+    emitOutputMarker(fakeProc, { status: 'success', result: 'Done' });
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    await resultPromise;
+
+    const spawnArgs = spawnMock.mock.calls[0][1] as string[];
+    expect(spawnArgs).toContain(
+      'NO_PROXY=example.com,localhost,internal.example,host.docker.internal,127.0.0.1,::1,172.17.0.1',
+    );
+    expect(spawnArgs).toContain(
+      'no_proxy=example.com,localhost,internal.example,host.docker.internal,127.0.0.1,::1,172.17.0.1',
+    );
+  });
+});

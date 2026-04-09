@@ -63,6 +63,13 @@ interface VolumeMount {
 
 const ONECLI_PROXY_CA_PATH = '/tmp/onecli-gateway-ca.pem';
 const ONECLI_COMBINED_CA_PATH = '/tmp/onecli-combined-ca.pem';
+const LOCAL_SERVICE_NO_PROXY_ENTRIES = [
+  'host.docker.internal',
+  'localhost',
+  '127.0.0.1',
+  '::1',
+  '172.17.0.1',
+];
 
 function findEnvArgIndex(args: string[], key: string): number {
   for (let i = 0; i < args.length - 1; i++) {
@@ -93,6 +100,35 @@ function setEnvArg(args: string[], key: string, value: string): void {
   args[index] = `${key}=${value}`;
 }
 
+function splitCsvEnvValue(value?: string): string[] {
+  if (!value) {
+    return [];
+  }
+
+  return value
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+function mergeCsvEnvValues(...values: string[][]): string {
+  const merged: string[] = [];
+  const seen = new Set<string>();
+
+  for (const value of values) {
+    for (const entry of value) {
+      const key = entry.toLowerCase();
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      merged.push(entry);
+    }
+  }
+
+  return merged.join(',');
+}
+
 function normalizeOnecliCaEnv(args: string[]): void {
   const sslCertFile = readEnvArg(args, 'SSL_CERT_FILE');
   const nodeExtraCaCerts = readEnvArg(args, 'NODE_EXTRA_CA_CERTS');
@@ -106,6 +142,27 @@ function normalizeOnecliCaEnv(args: string[]): void {
   ) {
     setEnvArg(args, 'NODE_EXTRA_CA_CERTS', ONECLI_COMBINED_CA_PATH);
   }
+}
+
+function hasProxyEnv(args: string[]): boolean {
+  return [
+    'HTTP_PROXY',
+    'HTTPS_PROXY',
+    'http_proxy',
+    'https_proxy',
+    'ALL_PROXY',
+    'all_proxy',
+  ].some((key) => readEnvArg(args, key));
+}
+
+function normalizeLocalServiceNoProxyEnv(args: string[]): void {
+  const merged = mergeCsvEnvValues(
+    splitCsvEnvValue(readEnvArg(args, 'NO_PROXY')),
+    splitCsvEnvValue(readEnvArg(args, 'no_proxy')),
+    LOCAL_SERVICE_NO_PROXY_ENTRIES,
+  );
+  setEnvArg(args, 'NO_PROXY', merged);
+  setEnvArg(args, 'no_proxy', merged);
 }
 
 function buildVolumeMounts(
@@ -317,6 +374,9 @@ async function buildContainerArgs(
     );
   }
   normalizeOnecliCaEnv(args);
+  if (hasProxyEnv(args)) {
+    normalizeLocalServiceNoProxyEnv(args);
+  }
 
   // Runtime-specific args for host gateway resolution
   args.push(...hostGatewayArgs());
