@@ -14,6 +14,7 @@ import {
   GROUPS_DIR,
   IDLE_TIMEOUT,
   ONECLI_API_KEY,
+  MANAGED_GWS_SKILLS_DIR,
   ONECLI_URL,
   TIMEZONE,
 } from './config.js';
@@ -28,6 +29,7 @@ import {
 import { OneCLI } from '@onecli-sh/sdk';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
+import { syncAgentSkills } from './skill-sync.js';
 
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
 
@@ -215,17 +217,17 @@ function buildVolumeMounts(
     );
   }
 
-  // Sync skills from container/skills/ into each group's .claude/skills/
+  // Sync bundled skills and managed GWS skills into each group's .claude/skills/
   const skillsSrc = path.join(process.cwd(), 'container', 'skills');
   const skillsDst = path.join(groupSessionsDir, 'skills');
-  if (fs.existsSync(skillsSrc)) {
-    for (const skillDir of fs.readdirSync(skillsSrc)) {
-      const srcDir = path.join(skillsSrc, skillDir);
-      if (!fs.statSync(srcDir).isDirectory()) continue;
-      const dstDir = path.join(skillsDst, skillDir);
-      fs.cpSync(srcDir, dstDir, { recursive: true });
-    }
+  if (!MANAGED_GWS_SKILLS_DIR) {
+    throw new Error('NANOCLAW_MANAGED_GWS_SKILLS_DIR is required');
   }
+  syncAgentSkills({
+    bundledSkillsDir: skillsSrc,
+    managedGwsSkillsDir: MANAGED_GWS_SKILLS_DIR,
+    destinationDir: skillsDst,
+  });
   mounts.push({
     hostPath: groupSessionsDir,
     containerPath: '/home/node/.claude',

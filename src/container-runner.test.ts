@@ -5,10 +5,13 @@ import { PassThrough } from 'stream';
 // Sentinel markers must match container-runner.ts
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
-const { spawnMock, applyContainerConfigMock } = vi.hoisted(() => ({
-  spawnMock: vi.fn(),
-  applyContainerConfigMock: vi.fn().mockResolvedValue(true),
-}));
+const { spawnMock, applyContainerConfigMock, syncAgentSkillsMock } = vi.hoisted(
+  () => ({
+    spawnMock: vi.fn(),
+    applyContainerConfigMock: vi.fn().mockResolvedValue(true),
+    syncAgentSkillsMock: vi.fn(),
+  }),
+);
 
 // Mock config
 vi.mock('./config.js', () => ({
@@ -19,6 +22,7 @@ vi.mock('./config.js', () => ({
   GROUPS_DIR: '/tmp/nanoclaw-test-groups',
   IDLE_TIMEOUT: 1800000, // 30min
   ONECLI_API_KEY: '',
+  MANAGED_GWS_SKILLS_DIR: '/tmp/managed-gws-skills',
   ONECLI_URL: 'http://localhost:10254',
   TIMEZONE: 'America/Los_Angeles',
 }));
@@ -68,6 +72,10 @@ vi.mock('@onecli-sh/sdk', () => ({
   OneCLI: class {
     applyContainerConfig = applyContainerConfigMock;
   },
+}));
+
+vi.mock('./skill-sync.js', () => ({
+  syncAgentSkills: syncAgentSkillsMock,
 }));
 // Create a controllable fake ChildProcess
 function createFakeProcess() {
@@ -137,6 +145,7 @@ describe('container-runner timeout behavior', () => {
     spawnMock.mockClear();
     applyContainerConfigMock.mockClear();
     applyContainerConfigMock.mockResolvedValue(true);
+    syncAgentSkillsMock.mockClear();
   });
 
   afterEach(() => {
@@ -359,6 +368,24 @@ describe('container-runner GWS proxy env vars', () => {
       'GWS_PROXY_URL=http://host.docker.internal:8083',
     );
     expect(spawnArgs).toContain('GWS_PROXY_KEY=test_key');
+  });
+
+  it('loads managed GWS skills from the configured shared dir', async () => {
+    const resultPromise = runContainerAgent(testGroup, testInput, () => {});
+
+    emitOutputMarker(fakeProc, { status: 'success', result: 'Done' });
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    await resultPromise;
+
+    expect(syncAgentSkillsMock).toHaveBeenCalledWith({
+      bundledSkillsDir: expect.stringContaining('/container/skills'),
+      managedGwsSkillsDir: '/tmp/managed-gws-skills',
+      destinationDir:
+        '/tmp/nanoclaw-test-data/sessions/test-group/.claude/skills',
+    });
   });
 
   it('does NOT inject old gws env vars or mounts', async () => {
