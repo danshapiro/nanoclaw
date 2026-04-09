@@ -66,6 +66,24 @@ SECRET_KEYS = [
     "OLLAMA_HOST",
 ]
 
+LOCAL_SERVICE_NO_PROXY_ENTRIES = (
+    "host.docker.internal",
+    "localhost",
+    "127.0.0.1",
+    "::1",
+    "172.17.0.1",
+)
+
+PROXY_ENV_KEYS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+    "NODE_USE_ENV_PROXY",
+)
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def detect_runtime(preference: str | None) -> str:
@@ -94,6 +112,40 @@ def read_secrets(env_file: Path) -> dict:
             if key in SECRET_KEYS:
                 secrets[key] = val.strip()
     return secrets
+
+
+def _split_csv_env(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [entry.strip() for entry in value.split(",") if entry.strip()]
+
+
+def _merge_csv_env(*values: list[str]) -> str:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        for entry in value:
+            key = entry.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(entry)
+    return ",".join(merged)
+
+
+def build_container_env() -> dict[str, str]:
+    env = os.environ.copy()
+    if not any(env.get(key) for key in PROXY_ENV_KEYS):
+        return env
+
+    merged_no_proxy = _merge_csv_env(
+        _split_csv_env(env.get("NO_PROXY")),
+        _split_csv_env(env.get("no_proxy")),
+        list(LOCAL_SERVICE_NO_PROXY_ENTRIES),
+    )
+    env["NO_PROXY"] = merged_no_proxy
+    env["no_proxy"] = merged_no_proxy
+    return env
 
 
 def get_groups(db: Path) -> list[dict]:
@@ -164,6 +216,7 @@ def run_container(runtime: str, image: str, payload: dict,
                 cmd += ["-v", f"{host}:{container}"]
     cmd.append(image)
     dbg(f"cmd: {' '.join(cmd)}")
+    container_env = build_container_env()
 
     # Show payload sans secrets
     if VERBOSE:
@@ -176,6 +229,7 @@ def run_container(runtime: str, image: str, payload: dict,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=container_env,
     )
     dbg(f"container pid: {proc.pid}")
 
