@@ -359,6 +359,16 @@ async function buildContainerArgs(
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
 
+  // GWS Policy Proxy: the shim in the container reads these to forward commands
+  const gwsProxyUrl = process.env.GWS_PROXY_URL;
+  const gwsProxyKey = process.env.GWS_PROXY_KEY;
+  if (gwsProxyUrl) {
+    args.push('-e', `GWS_PROXY_URL=${gwsProxyUrl}`);
+  }
+  if (gwsProxyKey) {
+    args.push('-e', `GWS_PROXY_KEY=${gwsProxyKey}`);
+  }
+
   // OneCLI gateway handles credential injection — containers never see real secrets.
   // The gateway intercepts HTTPS traffic and injects API keys or OAuth tokens.
   const onecliApplied = await onecli.applyContainerConfig(args, {
