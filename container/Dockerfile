@@ -34,6 +34,12 @@ ENV NODE_OPTIONS=--use-openssl-ca
 # Install agent-browser and claude-code globally
 RUN npm install -g agent-browser @anthropic-ai/claude-code
 
+# Install gws proxy shim (thin client that forwards to GWS Policy Proxy).
+# The real gws binary and OAuth credentials live in the proxy container;
+# this shim packages CLI arguments as JSON and POSTs to the proxy.
+COPY shim/gws /usr/local/bin/gws
+RUN chmod +x /usr/local/bin/gws
+
 # Create app directory
 WORKDIR /app
 
