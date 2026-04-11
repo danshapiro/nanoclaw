@@ -20,6 +20,7 @@ This repository is deployed to the server `shapiroserver2` only. Before making a
 
 The primary deployment references are:
 - `/home/user/code/shapiroserver2/docs/nanoclaw/Deployment.md`
+- `/home/user/code/shapiroserver2/docs/nanoclaw/Upgrade.md`
 - `/home/user/code/shapiroserver2/AGENTS.md`
 - `/home/user/code/shapiroserver2/README.md`
 
@@ -39,6 +40,7 @@ If you change deployment behavior, auth flow, backups, rollback, recovery, or se
 - The matching long-lived deploy-management branch in `shapiroserver2` is currently `deploy/nanoclaw`. The NanoClaw source pin in `srv/nanoclaw/source.conf` should be updated there, not left only on a scratch branch.
 - Short-lived worktree branches are disposable implementation branches only. Use them to isolate risky work, but before stopping you must cherry-pick or re-express the final deploy-relevant commits onto the long-lived branch for that repo.
 - After a scratch branch's commits have been preserved on the long-lived branch, the scratch branch/worktree should be treated as cleanup work, not as part of the upgrade story.
+- For the end-to-end operator sequence, follow `/home/user/code/shapiroserver2/docs/nanoclaw/Upgrade.md`.
 - When preparing a future upgrade: rebase or replay the NanoClaw overlay branch onto updated `origin/main`, test that branch, then update the `shapiroserver2` source pin to the tested commit. Do not assemble deployments by hunting across multiple topic branches.
 
 ## Skills Model
