@@ -1,4 +1,5 @@
 import {
+  ChatInputCommandInteraction,
   Client,
   Events,
   GatewayIntentBits,
@@ -8,6 +9,10 @@ import {
 } from 'discord.js';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
+import {
+  ControlCommand,
+  DISCORD_CONTROL_COMMANDS,
+} from '../control-commands.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
 import { storeMessageDirect } from '../db.js';
@@ -25,6 +30,14 @@ export interface DiscordChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
   registeredGroups: () => Record<string, RegisteredGroup>;
+  onSlashCommand?: (command: {
+    chatJid: string;
+    chatName: string;
+    command: ControlCommand;
+    sender: string;
+    senderName: string;
+    timestamp: string;
+  }) => Promise<string>;
 }
 
 export class DiscordChannel implements Channel {
@@ -173,6 +186,11 @@ export class DiscordChannel implements Channel {
       );
     });
 
+    this.client.on(Events.InteractionCreate, async (interaction) => {
+      if (!interaction.isChatInputCommand()) return;
+      await this.handleSlashCommand(interaction);
+    });
+
     this.client.on(Events.Error, (err) => {
       logger.error({ err: err.message }, 'Discord client error');
     });
@@ -182,16 +200,15 @@ export class DiscordChannel implements Channel {
         reject(new Error('Discord connect timed out'));
       }, CONNECT_TIMEOUT_MS);
 
-      this.client!.once(Events.ClientReady, (readyClient) => {
+      this.client!.once(Events.ClientReady, async (readyClient) => {
         clearTimeout(timer);
+        await this.syncSlashCommands();
         logger.info(
           { username: readyClient.user.tag, id: readyClient.user.id },
           'Discord bot connected',
         );
         console.log(`\n  Discord bot: ${readyClient.user.tag}`);
-        console.log(
-          `  Use /chatid command or check channel IDs in Discord settings\n`,
-        );
+        console.log(`  Commands: /help /status /new /clear /compact\n`);
         resolve();
       });
 
@@ -285,15 +302,152 @@ export class DiscordChannel implements Channel {
       logger.debug({ jid, err }, 'Failed to send Discord typing indicator');
     }
   }
+
+  private async handleSlashCommand(
+    interaction: ChatInputCommandInteraction,
+  ): Promise<void> {
+    const command = interaction.commandName as ControlCommand;
+    if (!DISCORD_CONTROL_COMMANDS.some((item) => item.name === command)) {
+      return;
+    }
+
+    try {
+      await interaction.deferReply({ ephemeral: true });
+
+      if (!this.opts.onSlashCommand) {
+        await interaction.editReply('Slash commands are not configured.');
+        return;
+      }
+
+      const senderName =
+        interaction.member && 'displayName' in interaction.member
+          ? interaction.member.displayName
+          : interaction.user.globalName || interaction.user.username;
+
+      const routing = await this.resolveRoutingContext({
+        channelId: interaction.channelId,
+        channel: interaction.channel as TextChannel | ThreadChannel | null,
+        guildName: interaction.guild?.name,
+        fallbackChatName: senderName,
+      });
+
+      const reply = await this.opts.onSlashCommand({
+        chatJid: routing.chatJid,
+        chatName: routing.chatName,
+        command,
+        sender: interaction.user.id,
+        senderName,
+        timestamp: new Date(interaction.createdTimestamp).toISOString(),
+      });
+
+      await interaction.editReply(reply);
+    } catch (err) {
+      logger.error({ err, command }, 'Discord slash command failed');
+      if (interaction.deferred || interaction.replied) {
+        await interaction
+          .editReply('Command failed. Check the NanoClaw logs for details.')
+          .catch(() => undefined);
+      } else {
+        await interaction
+          .reply({
+            content: 'Command failed. Check the NanoClaw logs for details.',
+            ephemeral: true,
+          })
+          .catch(() => undefined);
+      }
+    }
+  }
+
+  private async syncSlashCommands(): Promise<void> {
+    if (!this.client?.application || !this.opts.onSlashCommand) return;
+
+    await this.client.application.commands.set([]);
+
+    const guildIds = await this.getRegisteredGuildIds();
+    for (const guildId of guildIds) {
+      try {
+        const guild = await this.client.guilds.fetch(guildId);
+        await guild.commands.set(DISCORD_CONTROL_COMMANDS);
+      } catch (err) {
+        logger.warn({ err, guildId }, 'Failed to sync Discord slash commands');
+      }
+    }
+
+    logger.info(
+      {
+        guildCount: guildIds.length,
+        commands: DISCORD_CONTROL_COMMANDS.map((command) => command.name),
+      },
+      'Discord slash commands synced',
+    );
+  }
+
+  private async getRegisteredGuildIds(): Promise<string[]> {
+    if (!this.client) return [];
+
+    const guildIds = new Set<string>();
+    for (const chatJid of Object.keys(this.opts.registeredGroups())) {
+      if (!chatJid.startsWith('dc:')) continue;
+      const channelId = chatJid.replace(/^dc:/, '');
+
+      try {
+        const channel = await this.client.channels.fetch(channelId);
+        const guildId =
+          channel && 'guildId' in channel
+            ? (channel.guildId as string | null)
+            : null;
+        if (guildId) guildIds.add(guildId);
+      } catch (err) {
+        logger.debug(
+          { err, channelId },
+          'Failed to resolve Discord guild for slash command sync',
+        );
+      }
+    }
+
+    return [...guildIds];
+  }
+
+  private async resolveRoutingContext(opts: {
+    channelId: string;
+    channel: TextChannel | ThreadChannel | null;
+    guildName?: string;
+    fallbackChatName: string;
+  }): Promise<{ chatJid: string; chatName: string }> {
+    let channelId = opts.channelId;
+    let channelName = opts.channel?.name || 'discord';
+
+    if (opts.channel?.isThread()) {
+      const thread = opts.channel as ThreadChannel;
+      if (thread.parentId) {
+        this.latestThread.set(thread.parentId, thread.id);
+        channelId = thread.parentId;
+        channelName = (thread.parent ?? thread).name;
+      }
+    }
+
+    const chatName = opts.guildName
+      ? `${opts.guildName} #${channelName}`
+      : opts.fallbackChatName;
+
+    return {
+      chatJid: `dc:${channelId}`,
+      chatName,
+    };
+  }
 }
 
 registerChannel('discord', (opts: ChannelOpts): DiscordChannel | null => {
   const env = readEnvFile(['DISCORD_BOT_TOKEN']);
   const token = process.env.DISCORD_BOT_TOKEN || env.DISCORD_BOT_TOKEN || '';
   if (!token) return null;
+  const discordOpts = opts as ChannelOpts & {
+    onSlashCommand?: DiscordChannelOpts['onSlashCommand'];
+  };
   return new DiscordChannel(token, {
     onMessage: opts.onMessage,
     onChatMetadata: opts.onChatMetadata,
     registeredGroups: opts.registeredGroups,
+    onSlashCommand: discordOpts.onSlashCommand,
   });
 });

@@ -39,9 +39,13 @@ const loginShouldFail = vi.hoisted(() => ({
   error: new Error('Invalid bot token'),
 }));
 
+const mockGlobalCommandSet = vi.hoisted(() => vi.fn().mockResolvedValue([]));
+const mockGuildCommandSet = vi.hoisted(() => vi.fn().mockResolvedValue([]));
+
 vi.mock('discord.js', () => {
   const Events = {
     MessageCreate: 'messageCreate',
+    InteractionCreate: 'interactionCreate',
     ClientReady: 'ready',
     Error: 'error',
   };
@@ -57,6 +61,18 @@ vi.mock('discord.js', () => {
     eventHandlers = new Map<string, Handler[]>();
     user: any = { id: '999888777', tag: 'Andy#1234' };
     private _ready = false;
+    application = {
+      commands: {
+        set: mockGlobalCommandSet,
+      },
+    };
+    guilds = {
+      fetch: vi.fn().mockResolvedValue({
+        commands: {
+          set: mockGuildCommandSet,
+        },
+      }),
+    };
 
     constructor(_opts: any) {
       clientRef.current = this;
@@ -90,6 +106,9 @@ vi.mock('discord.js', () => {
 
     channels = {
       fetch: vi.fn().mockResolvedValue({
+        guildId: 'guild-123',
+        name: 'general',
+        isThread: () => false,
         send: vi.fn().mockResolvedValue({
           id: 'mock-msg-id',
           createdAt: new Date('2026-01-01T00:00:00Z'),
@@ -218,6 +237,55 @@ async function triggerMessage(message: any) {
   for (const h of handlers) await h(message);
 }
 
+async function triggerInteraction(interaction: any) {
+  const handlers = currentClient().eventHandlers.get('interactionCreate') || [];
+  for (const h of handlers) await h(interaction);
+}
+
+function createInteraction(overrides: {
+  commandName?: string;
+  channelId?: string;
+  channelName?: string;
+  guildName?: string;
+  senderId?: string;
+  senderName?: string;
+  createdTimestamp?: number;
+  threadParentId?: string;
+}) {
+  const isThread = !!overrides.threadParentId;
+  const deferredReply = vi.fn().mockResolvedValue(undefined);
+  const editReply = vi.fn().mockResolvedValue(undefined);
+  const reply = vi.fn().mockResolvedValue(undefined);
+
+  return {
+    commandName: overrides.commandName ?? 'status',
+    channelId: overrides.channelId ?? '1234567890123456',
+    channel: {
+      id: overrides.channelId ?? '1234567890123456',
+      name: overrides.channelName ?? 'general',
+      isThread: () => isThread,
+      parentId: overrides.threadParentId ?? null,
+      parent: overrides.threadParentId
+        ? { name: overrides.channelName ?? 'general' }
+        : null,
+    },
+    guild: overrides.guildName ? { name: overrides.guildName } : null,
+    member: { displayName: overrides.senderName ?? 'Alice' },
+    user: {
+      id: overrides.senderId ?? '55512345',
+      username: overrides.senderName ?? 'Alice',
+    },
+    createdTimestamp:
+      overrides.createdTimestamp ?? Date.parse('2026-04-12T18:00:00.000Z'),
+    deferred: false,
+    replied: false,
+    deferReply: deferredReply,
+    editReply,
+    reply,
+    isChatInputCommand: () => true,
+  };
+}
+
 describe('DiscordChannel', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -334,6 +402,7 @@ describe('DiscordChannel', () => {
       await channel.connect();
 
       expect(currentClient().eventHandlers.has('messageCreate')).toBe(true);
+      expect(currentClient().eventHandlers.has('interactionCreate')).toBe(true);
       expect(currentClient().eventHandlers.has('error')).toBe(true);
       expect(currentClient().eventHandlers.has('ready')).toBe(true);
     });
@@ -520,6 +589,92 @@ describe('DiscordChannel', () => {
         'My Server #bot-chat',
         'discord',
         true,
+      );
+    });
+  });
+
+  describe('slash commands', () => {
+    it('syncs the five Yente slash commands when a handler is configured', async () => {
+      const opts = createTestOpts({
+        onSlashCommand: vi.fn().mockResolvedValue('ok'),
+      });
+      const channel = new DiscordChannel('test-token', opts);
+
+      await channel.connect();
+
+      expect(mockGlobalCommandSet).toHaveBeenCalledWith([]);
+      expect(currentClient().guilds.fetch).toHaveBeenCalledWith('guild-123');
+      expect(mockGuildCommandSet).toHaveBeenCalledWith([
+        {
+          name: 'help',
+          description: 'Show Yente command help and usage',
+        },
+        {
+          name: 'status',
+          description: 'Show model, tokens, uptime, and failing services',
+        },
+        {
+          name: 'new',
+          description: 'Start a fresh Yente session',
+        },
+        {
+          name: 'clear',
+          description: 'Clear the current session (same as /new)',
+        },
+        {
+          name: 'compact',
+          description: 'Compact the current Yente session',
+        },
+      ]);
+    });
+
+    it('routes slash commands through onSlashCommand and edits the deferred reply', async () => {
+      const onSlashCommand = vi.fn().mockResolvedValue('status output');
+      const opts = createTestOpts({ onSlashCommand });
+      const channel = new DiscordChannel('test-token', opts);
+
+      await channel.connect();
+
+      const interaction = createInteraction({
+        commandName: 'status',
+        guildName: 'Test Server',
+        channelName: 'yente',
+      });
+      await triggerInteraction(interaction);
+
+      expect(interaction.deferReply).toHaveBeenCalledWith({ ephemeral: true });
+      expect(onSlashCommand).toHaveBeenCalledWith({
+        chatJid: 'dc:1234567890123456',
+        chatName: 'Test Server #yente',
+        command: 'status',
+        sender: '55512345',
+        senderName: 'Alice',
+        timestamp: '2026-04-12T18:00:00.000Z',
+      });
+      expect(interaction.editReply).toHaveBeenCalledWith('status output');
+    });
+
+    it('maps thread slash commands back to the parent channel', async () => {
+      const onSlashCommand = vi.fn().mockResolvedValue('ok');
+      const opts = createTestOpts({ onSlashCommand });
+      const channel = new DiscordChannel('test-token', opts);
+
+      await channel.connect();
+
+      const interaction = createInteraction({
+        commandName: 'compact',
+        channelId: 'thread_123',
+        channelName: 'yente',
+        guildName: 'Test Server',
+        threadParentId: '1234567890123456',
+      });
+      await triggerInteraction(interaction);
+
+      expect(onSlashCommand).toHaveBeenCalledWith(
+        expect.objectContaining({
+          chatJid: 'dc:1234567890123456',
+          command: 'compact',
+        }),
       );
     });
   });

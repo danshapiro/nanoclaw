@@ -50,6 +50,12 @@ import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
+import {
+  ControlCommand,
+  extractTextControlCommand,
+  getHelpText,
+  toSessionSlashCommand,
+} from './control-commands.js';
 import { RemoteControlCommand } from './remote-control-command.js';
 import { extractInboundRemoteControlCommand } from './remote-control-routing.js';
 import {
@@ -69,6 +75,7 @@ import {
   isSessionCommandAllowed,
 } from './session-commands.js';
 import { startSessionCleanup } from './session-cleanup.js';
+import { buildStatusReport } from './status-report.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
@@ -711,6 +718,133 @@ async function main(): Promise<void> {
     }
   }
 
+  function canSenderUseStoredCommand(
+    chatJid: string,
+    group: RegisteredGroup,
+    msg: NewMessage,
+  ): boolean {
+    const isMainGroup = group.isMain === true;
+    const triggerPattern = getTriggerPattern(group.trigger);
+    const hasTrigger = triggerPattern.test(msg.content.trim());
+    const requiresTrigger = !isMainGroup && group.requiresTrigger !== false;
+
+    return (
+      isMainGroup ||
+      !requiresTrigger ||
+      (hasTrigger &&
+        (msg.is_from_me ||
+          isTriggerAllowed(chatJid, msg.sender, loadSenderAllowlist())))
+    );
+  }
+
+  async function handleControlCommand(
+    command: ControlCommand,
+    chatJid: string,
+    msg: NewMessage,
+    chatName?: string,
+  ): Promise<{ reply: string; shouldSendPublicReply: boolean }> {
+    const group = registeredGroups[chatJid];
+    if (!group) {
+      return {
+        reply: 'This Discord channel is not registered to Yente.',
+        shouldSendPublicReply: true,
+      };
+    }
+
+    const channel = findChannel(channels, chatJid);
+    if (!channel) {
+      return {
+        reply: 'Yente is not connected to this Discord channel right now.',
+        shouldSendPublicReply: true,
+      };
+    }
+
+    if (command === 'help') {
+      return { reply: getHelpText(), shouldSendPublicReply: true };
+    }
+
+    if (command === 'status') {
+      return {
+        reply: await buildStatusReport({
+          chatName: chatName ?? group.name,
+          group,
+          sessionId: sessions[group.folder],
+          isDiscordConnected:
+            channel.name === 'discord' ? channel.isConnected() : true,
+        }),
+        shouldSendPublicReply: true,
+      };
+    }
+
+    const isMainGroup = group.isMain === true;
+    const canUseSessionCommand = isSessionCommandAllowed(
+      isMainGroup,
+      msg.is_from_me === true,
+    );
+    if (!canUseSessionCommand) {
+      if (canSenderUseStoredCommand(chatJid, group, msg)) {
+        await channel.sendMessage(
+          chatJid,
+          'Session commands require admin access.',
+        );
+      }
+      return {
+        reply: 'Session commands require admin access.',
+        shouldSendPublicReply: false,
+      };
+    }
+
+    const pendingMessages = getMessagesSince(
+      chatJid,
+      getOrRecoverCursor(chatJid),
+      ASSISTANT_NAME,
+      MAX_MESSAGES_PER_PROMPT,
+    );
+    const syntheticCommandMessage: NewMessage = {
+      ...msg,
+      id: msg.id || `control-${command}-${Date.now()}`,
+      chat_jid: chatJid,
+      content: toSessionSlashCommand(command),
+    };
+
+    const result = await handleSessionCommand({
+      missedMessages: [...pendingMessages, syntheticCommandMessage],
+      isMainGroup,
+      groupName: group.name,
+      triggerPattern: getTriggerPattern(group.trigger),
+      timezone: TIMEZONE,
+      deps: {
+        sendMessage: (text) => channel.sendMessage(chatJid, text),
+        setTyping: (typing) =>
+          channel.setTyping?.(chatJid, typing) ?? Promise.resolve(),
+        runAgent: (prompt, onOutput) =>
+          runAgent(group, prompt, chatJid, onOutput),
+        closeStdin: () => queue.closeStdin(chatJid),
+        advanceCursor: (ts) => {
+          lastAgentTimestamp[chatJid] = ts;
+          saveState();
+        },
+        formatMessages,
+        canSenderInteract: (candidate) =>
+          canSenderUseStoredCommand(chatJid, group, candidate),
+      },
+    });
+
+    if (!result.handled) {
+      return {
+        reply: `${toSessionSlashCommand(command)} was not handled.`,
+        shouldSendPublicReply: false,
+      };
+    }
+
+    return {
+      reply: result.success
+        ? `${toSessionSlashCommand(command)} finished.`
+        : `${toSessionSlashCommand(command)} failed. The session is unchanged.`,
+      shouldSendPublicReply: false,
+    };
+  }
+
   // Channel callbacks (shared by all channels)
   const channelOpts = {
     onMessage: (chatJid: string, msg: NewMessage) => {
@@ -746,6 +880,23 @@ async function main(): Promise<void> {
           return;
         }
       }
+
+      const textControlCommand = extractTextControlCommand(msg.content);
+      if (textControlCommand) {
+        handleControlCommand(textControlCommand, chatJid, msg).then(
+          async ({ reply, shouldSendPublicReply }) => {
+            if (!shouldSendPublicReply) return;
+            const channel = findChannel(channels, chatJid);
+            if (!channel) return;
+            await channel.sendMessage(chatJid, reply);
+          },
+          (err) => {
+            logger.error({ err, chatJid }, 'Control command error');
+          },
+        );
+        return;
+      }
+
       storeMessage(msg);
     },
     onChatMetadata: (
@@ -756,6 +907,29 @@ async function main(): Promise<void> {
       isGroup?: boolean,
     ) => storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
     registeredGroups: () => registeredGroups,
+    onSlashCommand: (command: {
+      chatJid: string;
+      chatName: string;
+      command: ControlCommand;
+      sender: string;
+      senderName: string;
+      timestamp: string;
+    }) =>
+      handleControlCommand(
+        command.command,
+        command.chatJid,
+        {
+          id: `slash-${command.command}-${command.timestamp}`,
+          chat_jid: command.chatJid,
+          sender: command.sender,
+          sender_name: command.senderName,
+          content: command.command,
+          timestamp: command.timestamp,
+          is_from_me: false,
+          is_bot_message: false,
+        },
+        command.chatName,
+      ).then((result) => result.reply),
   };
 
   // Create and connect all registered channels.
