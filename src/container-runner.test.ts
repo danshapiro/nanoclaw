@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import { EventEmitter } from 'events';
+import fs from 'fs';
 import { PassThrough } from 'stream';
 
 // Sentinel markers must match container-runner.ts
@@ -484,5 +485,125 @@ describe('container-runner proxy env handling', () => {
     expect(spawnArgs).toContain(
       'no_proxy=example.com,localhost,internal.example,host.docker.internal,127.0.0.1,::1,172.17.0.1',
     );
+  });
+});
+
+describe('container-runner settings defaults', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    fakeProc = createFakeProcess();
+    spawnMock.mockImplementation(() => fakeProc);
+    spawnMock.mockClear();
+    applyContainerConfigMock.mockClear();
+    applyContainerConfigMock.mockResolvedValue(true);
+    syncAgentSkillsMock.mockClear();
+    vi.mocked(fs.existsSync).mockImplementation(() => false);
+    vi.mocked(fs.readFileSync).mockImplementation(() => '');
+    vi.mocked(fs.writeFileSync).mockClear();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('creates missing settings.json with the Opus default and env defaults', async () => {
+    const resultPromise = runContainerAgent(testGroup, testInput, () => {});
+
+    emitOutputMarker(fakeProc, { status: 'success', result: 'Done' });
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    await resultPromise;
+
+    const settingsWrite = vi
+      .mocked(fs.writeFileSync)
+      .mock.calls.find(
+        (args) =>
+          typeof args[0] === 'string' && args[0].endsWith('settings.json'),
+      );
+    expect(settingsWrite).toBeTruthy();
+
+    const written = JSON.parse(String(settingsWrite?.[1]));
+    expect(written.model).toBe('opus');
+    expect(written.env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS).toBe('1');
+    expect(written.env.CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD).toBe('1');
+    expect(written.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY).toBe('0');
+  });
+
+  it('merges the Opus default into existing settings.json without overwriting env values', async () => {
+    vi.mocked(fs.existsSync).mockImplementation(
+      (p) => typeof p === 'string' && p.endsWith('settings.json'),
+    );
+    vi.mocked(fs.readFileSync).mockImplementation((p) => {
+      if (typeof p === 'string' && p.endsWith('settings.json')) {
+        return JSON.stringify({
+          env: {
+            CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '0',
+            FAMILIAR_API_URL: 'http://host.docker.internal:8081',
+          },
+        });
+      }
+      return '';
+    });
+
+    const resultPromise = runContainerAgent(testGroup, testInput, () => {});
+
+    emitOutputMarker(fakeProc, { status: 'success', result: 'Done' });
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    await resultPromise;
+
+    const settingsWrite = vi
+      .mocked(fs.writeFileSync)
+      .mock.calls.find(
+        (args) =>
+          typeof args[0] === 'string' && args[0].endsWith('settings.json'),
+      );
+    expect(settingsWrite).toBeTruthy();
+
+    const written = JSON.parse(String(settingsWrite?.[1]));
+    expect(written.model).toBe('opus');
+    expect(written.env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS).toBe('0');
+    expect(written.env.CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD).toBe('1');
+    expect(written.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY).toBe('0');
+    expect(written.env.FAMILIAR_API_URL).toBe('http://host.docker.internal:8081');
+  });
+
+  it('recovers from malformed settings.json and rewrites the defaults', async () => {
+    vi.mocked(fs.existsSync).mockImplementation(
+      (p) => typeof p === 'string' && p.endsWith('settings.json'),
+    );
+    vi.mocked(fs.readFileSync).mockImplementation((p) => {
+      if (typeof p === 'string' && p.endsWith('settings.json')) {
+        return '{not json';
+      }
+      return '';
+    });
+
+    const resultPromise = runContainerAgent(testGroup, testInput, () => {});
+
+    emitOutputMarker(fakeProc, { status: 'success', result: 'Done' });
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    await resultPromise;
+
+    const settingsWrite = vi
+      .mocked(fs.writeFileSync)
+      .mock.calls.find(
+        (args) =>
+          typeof args[0] === 'string' && args[0].endsWith('settings.json'),
+      );
+    expect(settingsWrite).toBeTruthy();
+
+    const written = JSON.parse(String(settingsWrite?.[1]));
+    expect(written.model).toBe('opus');
+    expect(written.env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS).toBe('1');
+    expect(written.env.CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD).toBe('1');
+    expect(written.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY).toBe('0');
   });
 });

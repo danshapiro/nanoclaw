@@ -70,6 +70,18 @@ const LOCAL_SERVICE_NO_PROXY_ENTRIES = [
   '::1',
   '172.17.0.1',
 ];
+const DEFAULT_CLAUDE_MODEL = 'opus';
+const SETTINGS_ENV_DEFAULTS: Record<string, string> = {
+  // Enable agent swarms (subagent orchestration)
+  // https://code.claude.com/docs/en/agent-teams#orchestrate-teams-of-claude-code-sessions
+  CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
+  // Load CLAUDE.md from additional mounted directories
+  // https://code.claude.com/docs/en/memory#load-memory-from-additional-directories
+  CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
+  // Enable Claude's memory feature (persists user preferences between sessions)
+  // https://code.claude.com/docs/en/memory#manage-auto-memory
+  CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
+};
 
 function findEnvArgIndex(args: string[], key: string): number {
   for (let i = 0; i < args.length - 1; i++) {
@@ -251,26 +263,46 @@ function buildVolumeMounts(
   );
   fs.mkdirSync(groupSessionsDir, { recursive: true });
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
-  if (!fs.existsSync(settingsFile)) {
+  let settings: { env: Record<string, string>; model?: unknown; [key: string]: unknown };
+  let settingsFileExists = fs.existsSync(settingsFile);
+  if (settingsFileExists) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
+      const env =
+        parsed?.env &&
+        typeof parsed.env === 'object' &&
+        !Array.isArray(parsed.env)
+          ? parsed.env
+          : {};
+      settings = { ...parsed, env };
+    } catch {
+      settings = { env: {} };
+      settingsFileExists = false;
+    }
+  } else {
+    settings = { env: {} };
+  }
+
+  let settingsChanged = false;
+  if (
+    typeof settings.model !== 'string' ||
+    settings.model.trim().length === 0
+  ) {
+    settings.model = DEFAULT_CLAUDE_MODEL;
+    settingsChanged = true;
+  }
+
+  for (const [key, value] of Object.entries(SETTINGS_ENV_DEFAULTS)) {
+    if (!(key in settings.env)) {
+      settings.env[key] = value;
+      settingsChanged = true;
+    }
+  }
+
+  if (!settingsFileExists || settingsChanged) {
     fs.writeFileSync(
       settingsFile,
-      JSON.stringify(
-        {
-          env: {
-            // Enable agent swarms (subagent orchestration)
-            // https://code.claude.com/docs/en/agent-teams#orchestrate-teams-of-claude-code-sessions
-            CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
-            // Load CLAUDE.md from additional mounted directories
-            // https://code.claude.com/docs/en/memory#load-memory-from-additional-directories
-            CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
-            // Enable Claude's memory feature (persists user preferences between sessions)
-            // https://code.claude.com/docs/en/memory#manage-auto-memory
-            CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
-          },
-        },
-        null,
-        2,
-      ) + '\n',
+      JSON.stringify(settings, null, 2) + '\n',
     );
   }
 
