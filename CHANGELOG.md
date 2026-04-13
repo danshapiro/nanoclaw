@@ -4,6 +4,13 @@ All notable changes to NanoClaw will be documented in this file.
 
 For detailed release notes, see the [full changelog on the documentation site](https://docs.nanoclaw.dev/changelog).
 
+## [1.2.52] - 2026-04-12
+
+- Narrowed the Discord Yente control surface to `/help`, `/status`, `/new`, `/clear`, and `/compact`
+- Added Discord interaction handling that bulk-syncs the live command registry and clears stale global commands
+- Added a host-side status report that reads live transcript model and token usage, reports uptime, and summarizes healthy services as `N services OK` before listing failures
+- Added exact bare-word control aliases in Discord for `help`, `status`, `new`, `clear`, and `compact`
+
 ## [1.2.36] - 2026-03-26
 
 - [BREAKING] Replaced pino logger with built-in logger. WhatsApp users must re-merge the WhatsApp fork to pick up the Baileys logger compatibility fix: `git fetch whatsapp main && git merge whatsapp/main`. If the `whatsapp` remote is not configured: `git remote add whatsapp https://github.com/qwibitai/nanoclaw-whatsapp.git`.
