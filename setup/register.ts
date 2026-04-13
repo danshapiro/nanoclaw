@@ -7,6 +7,7 @@
 import fs from 'fs';
 import path from 'path';
 
+import { personalizeClaudeMd } from '../src/assistant-identity.ts';
 import { STORE_DIR } from '../src/config.ts';
 import { initDatabase, setRegisteredGroup } from '../src/db.ts';
 import { isValidGroupFolder } from '../src/group-folder.ts';
@@ -157,11 +158,7 @@ export async function run(args: string[]): Promise<void> {
     for (const mdFile of mdFiles) {
       if (fs.existsSync(mdFile)) {
         let content = fs.readFileSync(mdFile, 'utf-8');
-        content = content.replace(/^# Andy$/m, `# ${parsed.assistantName}`);
-        content = content.replace(
-          /You are Andy/g,
-          `You are ${parsed.assistantName}`,
-        );
+        content = personalizeClaudeMd(content, parsed.assistantName);
         fs.writeFileSync(mdFile, content);
         logger.info({ file: mdFile }, 'Updated CLAUDE.md');
       }

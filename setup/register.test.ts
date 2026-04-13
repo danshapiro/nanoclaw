@@ -4,6 +4,7 @@ import path from 'path';
 import { afterEach, describe, it, expect, beforeEach } from 'vitest';
 
 import Database from 'better-sqlite3';
+import { personalizeClaudeMd } from '../src/assistant-identity.ts';
 
 /**
  * Tests for the register step.
@@ -217,23 +218,32 @@ describe('parameterized SQL registration', () => {
 
 describe('file templating', () => {
   it('replaces assistant name in CLAUDE.md content', () => {
-    let content = '# Andy\n\nYou are Andy, a personal assistant.';
-
-    content = content.replace(/^# Andy$/m, '# Nova');
-    content = content.replace(/You are Andy/g, 'You are Nova');
+    const content = personalizeClaudeMd(
+      '# Andy\n\nYou are Andy, a personal assistant.',
+      'Nova',
+    );
 
     expect(content).toBe('# Nova\n\nYou are Nova, a personal assistant.');
   });
 
   it('handles names with special regex characters', () => {
-    let content = '# Andy\n\nYou are Andy.';
-
     const newName = 'C.L.A.U.D.E';
-    content = content.replace(/^# Andy$/m, `# ${newName}`);
-    content = content.replace(/You are Andy/g, `You are ${newName}`);
+    const content = personalizeClaudeMd('# Andy\n\nYou are Andy.', newName);
 
     expect(content).toContain('# C.L.A.U.D.E');
     expect(content).toContain('You are C.L.A.U.D.E.');
+  });
+
+  it('rewrites trigger examples in CLAUDE.md content', () => {
+    const content = personalizeClaudeMd(
+      '# Andy\n\nYou are Andy.\n\nTrigger with @Andy.',
+      'Yente',
+    );
+
+    expect(content).toContain('# Yente');
+    expect(content).toContain('You are Yente.');
+    expect(content).toContain('Trigger with @Yente.');
+    expect(content).not.toContain('@Andy');
   });
 
   it('updates .env ASSISTANT_NAME line', () => {
@@ -292,11 +302,7 @@ describe('CLAUDE.md template copy', () => {
 
       for (const mdFile of mdFiles) {
         let content = fs.readFileSync(mdFile, 'utf-8');
-        content = content.replace(/^# Andy$/m, `# ${assistantName}`);
-        content = content.replace(
-          /You are Andy/g,
-          `You are ${assistantName}`,
-        );
+        content = personalizeClaudeMd(content, assistantName);
         fs.writeFileSync(mdFile, content);
       }
     }
@@ -316,11 +322,11 @@ describe('CLAUDE.md template copy', () => {
     fs.mkdirSync(path.join(groupsDir, 'global'), { recursive: true });
     fs.writeFileSync(
       path.join(groupsDir, 'main', 'CLAUDE.md'),
-      '# Andy\n\nYou are Andy, a personal assistant.\n\n## Admin Context\n\nThis is the **main channel**.',
+      '# Andy\n\nYou are Andy, a personal assistant.\n\nUse @Andy to trigger.\n\n## Admin Context\n\nThis is the **main channel**.',
     );
     fs.writeFileSync(
       path.join(groupsDir, 'global', 'CLAUDE.md'),
-      '# Andy\n\nYou are Andy, a personal assistant.',
+      '# Andy\n\nYou are Andy, a personal assistant.\n\nUse @Andy to trigger.',
     );
   });
 
@@ -397,6 +403,7 @@ describe('CLAUDE.md template copy', () => {
       const content = readGroupMd(folder);
       expect(content).toContain('# Luna');
       expect(content).toContain('You are Luna');
+      expect(content).toContain('@Luna');
       expect(content).not.toContain('Andy');
     }
   });
