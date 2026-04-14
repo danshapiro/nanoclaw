@@ -1,16 +1,16 @@
 # Repository Guidelines
 
 ## Quick Context
-NanoClaw is a personal Claude assistant built as a small Node.js/TypeScript system. The core runtime is a single host process with a skill-first channel system: channels self-register at startup, inbound messages are stored in SQLite, and responses are produced by Claude Agent SDK instances running in isolated Linux containers. This repository is a fork, but agents must treat upstream `origin/main` as the source of truth and avoid creating unnecessary divergence. Each group gets its own filesystem and memory boundary.
+NanoClaw is a personal Claude assistant built as a small Node.js/TypeScript system. The core runtime is a single host process with a skill-first channel system: channels self-register at startup, inbound messages are stored in SQLite, and responses are produced by Claude Agent SDK instances running in isolated Linux containers. This repository is a fork: `upstream/main` is the upstream product line, `origin` is the personal fork remote, and `overlay/shapiroserver2` is the long-lived local deploy overlay. Each group gets its own filesystem and memory boundary.
 
 ## Upstream-First Fork Policy
-- Treat `origin/main` as the product, architecture, and workflow source of truth for this fork.
-- Keep local `main` easy to update from `origin/main`. Do not make changes that increase long-term fork drift unless the user explicitly approves that exact divergence in this session.
+- Treat `upstream/main` as the product, architecture, and workflow source of truth for this fork.
+- Keep local `main` easy to update from `upstream/main`. Do not make changes that increase long-term fork drift unless the user explicitly approves that exact divergence in this session.
 - Do not make fork-specific product, architecture, deployment, auth, workflow, or built-in-vs-skill decisions on your own.
-- Before changing core runtime or release-management files, fetch and compare with `origin/main`, then explain how the proposed change preserves updateability.
+- Before changing core runtime or release-management files, fetch and compare with `upstream/main`, then explain how the proposed change preserves updateability.
 - Sensitive files include: `src/index.ts`, `src/container-runner.ts`, `src/container-runtime.ts`, `src/config.ts`, `src/db.ts`, `src/router.ts`, `src/channels/index.ts`, `container/agent-runner/**`, `setup/**`, `groups/main/CLAUDE.md`, `groups/global/CLAUDE.md`, `package.json`, `package-lock.json`, and `CHANGELOG.md`.
 - Explicit user approval is required before changing the auth model, deployment model, container mount model, channel-loading model, built-in-vs-skill boundaries, or dependency choices that replace upstream architecture.
-- If you think divergence from `origin/main` is necessary, stop and ask the user. Do not implement it speculatively, and do not treat existing fork drift as precedent.
+- If you think divergence from `upstream/main` is necessary, stop and ask the user. Do not implement it speculatively, and do not treat existing fork drift as precedent.
 
 ## Project Structure & Key Files
 `src/` contains the main runtime. Important files include `src/index.ts` for orchestration, `src/channels/registry.ts` for channel registration, `src/ipc.ts` for task processing and IPC watching, `src/router.ts` for message formatting and outbound routing, `src/container-runner.ts` for agent container execution, `src/task-scheduler.ts` for recurring work, `src/db.ts` for SQLite operations, and `src/config.ts` for paths and intervals. `setup/` contains guided installation and platform checks. `container/` contains the agent image, runtime assets, and `container/skills/` for skills loaded inside agent containers. Host-side skills live in `.claude/skills/`. Group memory lives under `groups/<name>/CLAUDE.md`. `docs/` holds design and operational notes; `assets/` holds images; `config-examples/` holds example config payloads; `dist/` is generated output.
@@ -35,13 +35,13 @@ Important constraints from that documentation:
 If you change deployment behavior, auth flow, backups, rollback, recovery, or server assumptions in this repo, update the matching docs in `/home/user/code/shapiroserver2` in the same task.
 
 ## Deploy Branch Strategy
-- Keep `main` aligned with `origin/main`. Do not treat temporary fix branches as the deploy path.
-- The long-lived NanoClaw deploy overlay branch is currently `overlay/shapiroserver2`. Deploy-affecting NanoClaw runtime changes must be folded back into that branch before the task is complete.
-- The matching long-lived deploy-management branch in `shapiroserver2` is currently `deploy/nanoclaw`. The NanoClaw source pin in `srv/nanoclaw/source.conf` should be updated there, not left only on a scratch branch.
+- Keep `main` aligned with `upstream/main`, then mirror that clean baseline to the personal fork's `main` branch. Do not treat temporary fix branches as the deploy path.
+- The long-lived NanoClaw deploy overlay branch is `overlay/shapiroserver2`. Deploy-affecting NanoClaw runtime changes must be folded back into that branch before the task is complete.
+- The matching long-lived deploy-management branch in `shapiroserver2` is `deploy/nanoclaw`, and it owns the NanoClaw source pin in `srv/nanoclaw/source.conf`. Do not leave that pin only on a scratch branch.
 - Short-lived worktree branches are disposable implementation branches only. Use them to isolate risky work, but before stopping you must cherry-pick or re-express the final deploy-relevant commits onto the long-lived branch for that repo.
 - After a scratch branch's commits have been preserved on the long-lived branch, the scratch branch/worktree should be treated as cleanup work, not as part of the upgrade story.
-- For the end-to-end operator sequence, follow `/home/user/code/shapiroserver2/docs/nanoclaw/Upgrade.md`.
-- When preparing a future upgrade: rebase or replay the NanoClaw overlay branch onto updated `origin/main`, test that branch, then update the `shapiroserver2` source pin to the tested commit. Do not assemble deployments by hunting across multiple topic branches.
+- For the authoritative end-to-end operator sequence, follow `/home/user/code/shapiroserver2/docs/nanoclaw/Upgrade.md`.
+- When preparing a future upgrade: rebase or replay the NanoClaw overlay branch onto updated `upstream/main`, test that branch, then update the `shapiroserver2` `deploy/nanoclaw` source pin to the tested commit. Do not assemble deployments by hunting across multiple topic branches.
 
 ## Skills Model
 NanoClaw relies on skills more than built-in features. Read `CONTRIBUTING.md` before creating a PR or adding a skill.
