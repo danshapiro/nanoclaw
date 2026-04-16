@@ -4,6 +4,7 @@
  */
 import { ChildProcess, spawn } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import {
@@ -267,6 +268,18 @@ function buildVolumeMounts(
         readonly: true,
       });
     }
+  }
+
+  const hostClaudeConfigFile = path.join(
+    process.env.HOME || os.homedir(),
+    '.claude.json',
+  );
+  if (fs.existsSync(hostClaudeConfigFile)) {
+    mounts.push({
+      hostPath: hostClaudeConfigFile,
+      containerPath: '/home/node/.claude.json',
+      readonly: true,
+    });
   }
 
   // Per-group Claude sessions directory (isolated from other groups)

@@ -452,6 +452,40 @@ describe('container-runner GWS proxy env vars', () => {
     );
   });
 
+  it('mounts the host Claude auth config read-only when available', async () => {
+    const previousHome = process.env.HOME;
+    process.env.HOME = '/var/lib/nanoclaw';
+    vi.mocked(fs.existsSync).mockImplementation(
+      (p) =>
+        typeof p === 'string' &&
+        (p === '/srv/nanoclaw/shared/repos/portable-skills' ||
+          p === '/srv/nanoclaw/shared/repos/portable-skills/.git' ||
+          p === '/var/lib/nanoclaw/.claude.json'),
+    );
+
+    try {
+      const resultPromise = runContainerAgent(testGroup, testInput, () => {});
+
+      emitOutputMarker(fakeProc, { status: 'success', result: 'Done' });
+      await vi.advanceTimersByTimeAsync(10);
+      fakeProc.emit('close', 0);
+      await vi.advanceTimersByTimeAsync(10);
+
+      await resultPromise;
+
+      const spawnArgs = spawnMock.mock.calls[0][1] as string[];
+      expect(spawnArgs).toContain(
+        '/var/lib/nanoclaw/.claude.json:/home/node/.claude.json:ro',
+      );
+    } finally {
+      if (previousHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = previousHome;
+      }
+    }
+  });
+
   it('does NOT inject old gws env vars or mounts', async () => {
     process.env.GWS_PROXY_URL = 'http://host.docker.internal:8083';
     process.env.GWS_PROXY_KEY = 'test_key';
