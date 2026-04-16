@@ -1,0 +1,150 @@
+---
+name: FullQAPass
+description: Only use this skill if requested by name
+---
+
+# FullQAPass
+
+Run a full NanoClaw runtime validation and emit a machine-readable result.
+
+## Output contract
+
+Return exactly one line per completed check:
+
+```text
+CHECK <name> PASS <details>
+CHECK <name> FAIL <details>
+SUMMARY PASS
+SUMMARY FAIL
+```
+
+Do not emit bullets, prose, or markdown outside those lines.
+
+## Required checks
+
+Always emit these checks in this order:
+
+1. `skill_named_invocation`
+2. `allowed_tool_surface`
+3. `portable_repo_visible_on_main`
+4. `portable_repo_writable`
+5. `portable_repo_git_ok`
+6. `settings_json_valid`
+7. `tool_bash_roundtrip`
+8. `tool_read_write_edit`
+9. `tool_glob_grep`
+10. `tool_todowrite`
+11. `tool_notebookedit`
+12. `tool_websearch_https`
+13. `tool_webfetch_https`
+14. `tool_toolsearch`
+15. `tool_skill_nested`
+16. `orchestration_roundtrip`
+17. `managed_skills_visible`
+18. `nanoclaw_mcp_roundtrip`
+19. `gws_auth_status` when `gws` is present in `PATH`
+
+If any check fails, continue running the remaining checks, then end with `SUMMARY FAIL`.
+
+## Scratch paths
+
+- Use `/workspace/group/full-qa-pass/` for temporary files.
+- Use `/workspace/portable-skills/.qa/` for the writable git probe.
+- Clean both paths before finishing, even after failures.
+
+## Procedure
+
+### 1. Named invocation
+
+Confirm you are running because the user requested `FullQAPass` by name.
+
+### 2. Allowed tool surface
+
+Assert that the current environment includes these tool families:
+
+- `Bash`
+- `Read`
+- `Write`
+- `Edit`
+- `Glob`
+- `Grep`
+- `WebSearch`
+- `WebFetch`
+- `Task`
+- `TaskOutput`
+- `TaskStop`
+- `TeamCreate`
+- `TeamDelete`
+- `SendMessage`
+- `TodoWrite`
+- `ToolSearch`
+- `Skill`
+- `NotebookEdit`
+- `mcp__nanoclaw__*`
+
+If any required family is missing, mark this check failed.
+
+### 3. Portable repo checks
+
+- `portable_repo_visible_on_main`: verify `/workspace/portable-skills` exists.
+- `portable_repo_writable`: create and remove a temporary file under `/workspace/portable-skills/.qa/`.
+- `portable_repo_git_ok`: verify `/workspace/portable-skills` is a git working tree and ends clean after the probe.
+
+### 4. Settings validation
+
+Validate `/home/node/.claude/settings.json`:
+
+- the file exists
+- it contains valid JSON
+- `env` is an object when present
+
+### 5. Tool probes
+
+- `tool_bash_roundtrip`: use Bash to create, read, and delete a scratch file.
+- `tool_read_write_edit`: use `Write`, `Read`, and `Edit` on a file under `/workspace/group/full-qa-pass/`.
+- `tool_glob_grep`: use `Glob` and `Grep` against the scratch directory and confirm the created file is found.
+- `tool_todowrite`: create at least one todo item and mark it completed.
+- `tool_notebookedit`: create or update a notebook entry tied to this run.
+- `tool_websearch_https`: perform an HTTPS web search and confirm the result URLs are HTTPS.
+- `tool_webfetch_https`: fetch an HTTPS URL and confirm content was returned.
+- `tool_toolsearch`: use `ToolSearch` and confirm it returns at least one result relevant to this environment.
+- `tool_skill_nested`: invoke the built-in `status` skill by name and confirm it returns a result.
+
+### 6. Orchestration roundtrip
+
+Exercise the orchestration tool family end-to-end:
+
+- create a temporary team
+- start a short-lived task
+- obtain task output
+- send a message if the task interface requires it
+- stop the task if needed
+- delete the temporary team
+
+Mark `orchestration_roundtrip` failed if any step fails.
+
+### 7. Managed skills visibility
+
+Confirm `/home/node/.claude/skills/` contains both built-in container skills and managed synced skills when present.
+At minimum, verify `status` and `FullQAPass` are visible there.
+
+### 8. NanoClaw MCP roundtrip
+
+Create a uniquely named temporary scheduled task with `mcp__nanoclaw__schedule_task`, confirm it appears in `mcp__nanoclaw__list_tasks`, then remove it with `mcp__nanoclaw__cancel_task`.
+
+### 9. Optional GWS check
+
+If `gws` is present in `PATH`, run a lightweight auth/status check and emit `gws_auth_status`.
+If `gws` is not present, omit this check entirely.
+
+## Cleanup
+
+Before returning:
+
+- remove `/workspace/group/full-qa-pass/` contents created by this run
+- remove `/workspace/portable-skills/.qa/` contents created by this run
+- ensure `/workspace/portable-skills` is not left dirty by the probe
+
+## Final line
+
+Emit `SUMMARY PASS` only when every required emitted check passed. Otherwise emit `SUMMARY FAIL`.

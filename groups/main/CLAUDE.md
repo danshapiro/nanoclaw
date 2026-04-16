@@ -77,6 +77,10 @@ Standard Markdown: `**bold**`, `*italic*`, `[links](url)`, `# headings`.
 
 This is the **main channel**, which has elevated privileges.
 
+Portable cross-agent skills live under `/workspace/portable-skills/skills/<name>/`.
+When you author or update a portable skill, make the change there and commit it in `/workspace/portable-skills`.
+Do not treat `/home/node/.claude/skills/` as canonical source. That directory is generated cache only.
+
 ## Authentication
 
 Anthropic credentials must be either an API key from console.anthropic.com (`ANTHROPIC_API_KEY`) or a long-lived OAuth token from `claude setup-token` (`CLAUDE_CODE_OAUTH_TOKEN`). Short-lived tokens from the system keychain or `~/.claude/.credentials.json` expire within hours and can cause recurring container 401s. The `/setup` skill walks through this. OneCLI manages credentials (including Anthropic auth) — run `onecli --help`.

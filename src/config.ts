@@ -55,8 +55,19 @@ export const CONTAINER_MAX_OUTPUT_SIZE = parseInt(
 export const ONECLI_URL = process.env.ONECLI_URL || envConfig.ONECLI_URL;
 export const ONECLI_API_KEY =
   process.env.ONECLI_API_KEY || envConfig.ONECLI_API_KEY;
-export const MANAGED_GWS_SKILLS_DIR =
-  process.env.NANOCLAW_MANAGED_GWS_SKILLS_DIR || '';
+
+function parseColonSeparatedDirs(value?: string): string[] {
+  return (value || '')
+    .split(':')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+export const MANAGED_SKILLS_DIRS = parseColonSeparatedDirs(
+  process.env.NANOCLAW_MANAGED_SKILLS_DIRS,
+);
+export const WRITABLE_SKILLS_DIR =
+  process.env.NANOCLAW_WRITABLE_SKILLS_DIR || '';
 export const MAX_MESSAGES_PER_PROMPT = Math.max(
   1,
   parseInt(process.env.MAX_MESSAGES_PER_PROMPT || '10', 10) || 10,

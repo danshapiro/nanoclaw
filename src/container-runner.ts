@@ -14,9 +14,10 @@ import {
   GROUPS_DIR,
   IDLE_TIMEOUT,
   ONECLI_API_KEY,
-  MANAGED_GWS_SKILLS_DIR,
+  MANAGED_SKILLS_DIRS,
   ONECLI_URL,
   TIMEZONE,
+  WRITABLE_SKILLS_DIR,
 } from './config.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
@@ -184,6 +185,7 @@ function buildVolumeMounts(
   const mounts: VolumeMount[] = [];
   const projectRoot = process.cwd();
   const groupDir = resolveGroupFolderPath(group.folder);
+  const groupSessionRoot = path.join(DATA_DIR, 'sessions', group.folder);
 
   if (isMain) {
     // Main gets the project root read-only. Writable paths the agent needs
@@ -224,6 +226,20 @@ function buildVolumeMounts(
       readonly: false,
     });
 
+    if (WRITABLE_SKILLS_DIR) {
+      const gitDir = path.join(WRITABLE_SKILLS_DIR, '.git');
+      if (!fs.existsSync(WRITABLE_SKILLS_DIR) || !fs.existsSync(gitDir)) {
+        throw new Error(
+          `NANOCLAW_WRITABLE_SKILLS_DIR must be a git working tree: ${WRITABLE_SKILLS_DIR}`,
+        );
+      }
+      mounts.push({
+        hostPath: WRITABLE_SKILLS_DIR,
+        containerPath: '/workspace/portable-skills',
+        readonly: false,
+      });
+    }
+
     // Global memory directory — writable for main so it can update shared context
     const globalDir = path.join(GROUPS_DIR, 'global');
     if (fs.existsSync(globalDir)) {
@@ -255,12 +271,7 @@ function buildVolumeMounts(
 
   // Per-group Claude sessions directory (isolated from other groups)
   // Each group gets their own .claude/ to prevent cross-group session access
-  const groupSessionsDir = path.join(
-    DATA_DIR,
-    'sessions',
-    group.folder,
-    '.claude',
-  );
+  const groupSessionsDir = path.join(groupSessionRoot, '.claude');
   fs.mkdirSync(groupSessionsDir, { recursive: true });
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
   let settings: { env: Record<string, string>; model?: unknown; [key: string]: unknown };
@@ -307,15 +318,12 @@ function buildVolumeMounts(
   }
 
   // Sync bundled skills and managed GWS skills into each group's .claude/skills/
-  const skillsSrc = path.join(process.cwd(), 'container', 'skills');
+  const skillsSrc = path.join(projectRoot, 'container', 'skills');
   const skillsDst = path.join(groupSessionsDir, 'skills');
-  if (!MANAGED_GWS_SKILLS_DIR) {
-    throw new Error('NANOCLAW_MANAGED_GWS_SKILLS_DIR is required');
-  }
   syncAgentSkills({
-    bundledSkillsDir: skillsSrc,
-    managedGwsSkillsDir: MANAGED_GWS_SKILLS_DIR,
+    sourceRoots: [skillsSrc, ...MANAGED_SKILLS_DIRS],
     destinationDir: skillsDst,
+    manifestPath: path.join(groupSessionRoot, '.nanoclaw-managed-skills.json'),
   });
   mounts.push({
     hostPath: groupSessionsDir,

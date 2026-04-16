@@ -135,6 +135,15 @@ const testInput = {
   isMain: false,
 };
 
+function mockRuntimeExistsSync(): void {
+  vi.mocked(fs.existsSync).mockImplementation(
+    (p) =>
+      typeof p === 'string' &&
+      (p === '/srv/nanoclaw/shared/repos/portable-skills' ||
+        p === '/srv/nanoclaw/shared/repos/portable-skills/.git'),
+  );
+}
+
 function emitOutputMarker(
   proc: ReturnType<typeof createFakeProcess>,
   output: ContainerOutput,
@@ -152,6 +161,7 @@ describe('container-runner timeout behavior', () => {
     applyContainerConfigMock.mockClear();
     applyContainerConfigMock.mockResolvedValue(true);
     syncAgentSkillsMock.mockClear();
+    mockRuntimeExistsSync();
   });
 
   afterEach(() => {
@@ -343,6 +353,7 @@ describe('container-runner GWS proxy env vars', () => {
     spawnMock.mockClear();
     applyContainerConfigMock.mockClear();
     applyContainerConfigMock.mockResolvedValue(true);
+    mockRuntimeExistsSync();
   });
 
   afterEach(() => {
@@ -356,7 +367,7 @@ describe('container-runner GWS proxy env vars', () => {
     process.env.GWS_PROXY_KEY = 'test_key';
 
     const onOutput = vi.fn(async () => {});
-    const resultPromise = runContainerAgent(
+    const _resultPromise = runContainerAgent(
       testGroup,
       testInput,
       () => {},
@@ -445,7 +456,7 @@ describe('container-runner GWS proxy env vars', () => {
     process.env.GWS_PROXY_URL = 'http://host.docker.internal:8083';
     process.env.GWS_PROXY_KEY = 'test_key';
 
-    const resultPromise = runContainerAgent(testGroup, testInput, () => {});
+    const _resultPromise = runContainerAgent(testGroup, testInput, () => {});
 
     emitOutputMarker(fakeProc, { status: 'success', result: 'Done' });
     await vi.advanceTimersByTimeAsync(10);
@@ -482,6 +493,7 @@ describe('container-runner proxy env handling', () => {
     spawnMock.mockClear();
     applyContainerConfigMock.mockClear();
     applyContainerConfigMock.mockResolvedValue(true);
+    mockRuntimeExistsSync();
   });
 
   afterEach(() => {
@@ -549,7 +561,7 @@ describe('container-runner settings defaults', () => {
     applyContainerConfigMock.mockClear();
     applyContainerConfigMock.mockResolvedValue(true);
     syncAgentSkillsMock.mockClear();
-    vi.mocked(fs.existsSync).mockImplementation(() => false);
+    mockRuntimeExistsSync();
     vi.mocked(fs.readFileSync).mockImplementation(() => '');
     vi.mocked(fs.writeFileSync).mockClear();
   });

@@ -254,7 +254,7 @@ describe('handleSessionCommand', () => {
   it('reports failure when command-stage runAgent returns error without streamed status', async () => {
     // runAgent resolves 'error' but callback never gets status: 'error'
     const deps = makeDeps({
-      runAgent: vi.fn().mockImplementation(async (prompt, onOutput) => {
+      runAgent: vi.fn().mockImplementation(async (_prompt, onOutput) => {
         await onOutput({ status: 'success', result: null });
         return 'error';
       }),
@@ -469,7 +469,7 @@ describe('handleSessionCommand', () => {
 
   it('reports failure when /new runAgent returns error without streamed status', async () => {
     const deps = makeDeps({
-      runAgent: vi.fn().mockImplementation(async (prompt, onOutput) => {
+      runAgent: vi.fn().mockImplementation(async (_prompt, onOutput) => {
         await onOutput({ status: 'success', result: null });
         return 'error';
       }),
@@ -490,7 +490,7 @@ describe('handleSessionCommand', () => {
 
   it('reports failure when /clear runAgent returns error without streamed status', async () => {
     const deps = makeDeps({
-      runAgent: vi.fn().mockImplementation(async (prompt, onOutput) => {
+      runAgent: vi.fn().mockImplementation(async (_prompt, onOutput) => {
         await onOutput({ status: 'success', result: null });
         return 'error';
       }),
