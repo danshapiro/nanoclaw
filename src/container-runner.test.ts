@@ -312,6 +312,43 @@ describe('container-runner timeout behavior', () => {
     });
   });
 
+  it('falls back to the default OneCLI agent when a named agent is unavailable', async () => {
+    applyContainerConfigMock.mockImplementation(
+      async (_args: string[], options: { agent?: string }) =>
+        options.agent === undefined,
+    );
+
+    const resultPromise = runContainerAgent(testGroup, testInput, () => {});
+
+    emitOutputMarker(fakeProc, {
+      status: 'success',
+      result: 'Done',
+      newSessionId: 'session-fallback',
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    const result = await resultPromise;
+    expect(result.status).toBe('success');
+    expect(applyContainerConfigMock).toHaveBeenNthCalledWith(
+      1,
+      expect.any(Array),
+      {
+        addHostMapping: false,
+        agent: 'test-group',
+      },
+    );
+    expect(applyContainerConfigMock).toHaveBeenNthCalledWith(
+      2,
+      expect.any(Array),
+      {
+        addHostMapping: false,
+        agent: undefined,
+      },
+    );
+  });
+
   it('rewrites NODE_EXTRA_CA_CERTS to the combined OneCLI bundle when available', async () => {
     applyContainerConfigMock.mockImplementation(async (args: string[]) => {
       args.push('-e', 'NODE_EXTRA_CA_CERTS=/tmp/onecli-gateway-ca.pem');
@@ -452,7 +489,7 @@ describe('container-runner GWS proxy env vars', () => {
     );
   });
 
-  it('mounts the host Claude auth config read-only when available', async () => {
+  it('does not mount the host Claude auth config blob into containers', async () => {
     const previousHome = process.env.HOME;
     process.env.HOME = '/var/lib/nanoclaw';
     vi.mocked(fs.existsSync).mockImplementation(
@@ -474,7 +511,7 @@ describe('container-runner GWS proxy env vars', () => {
       await resultPromise;
 
       const spawnArgs = spawnMock.mock.calls[0][1] as string[];
-      expect(spawnArgs).toContain(
+      expect(spawnArgs).not.toContain(
         '/var/lib/nanoclaw/.claude.json:/home/node/.claude.json:ro',
       );
     } finally {

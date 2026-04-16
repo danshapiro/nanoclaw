@@ -4,7 +4,6 @@
  */
 import { ChildProcess, spawn } from 'child_process';
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 
 import {
@@ -270,18 +269,6 @@ function buildVolumeMounts(
     }
   }
 
-  const hostClaudeConfigFile = path.join(
-    process.env.HOME || os.homedir(),
-    '.claude.json',
-  );
-  if (fs.existsSync(hostClaudeConfigFile)) {
-    mounts.push({
-      hostPath: hostClaudeConfigFile,
-      containerPath: '/home/node/.claude.json',
-      readonly: true,
-    });
-  }
-
   // Per-group Claude sessions directory (isolated from other groups)
   // Each group gets their own .claude/ to prevent cross-group session access
   const groupSessionsDir = path.join(groupSessionRoot, '.claude');
@@ -425,15 +412,45 @@ async function buildContainerArgs(
 
   // OneCLI gateway handles credential injection — containers never see real secrets.
   // The gateway intercepts HTTPS traffic and injects API keys or OAuth tokens.
-  const onecliApplied = await onecli.applyContainerConfig(args, {
-    addHostMapping: false, // Nanoclaw already handles host gateway
-    agent: agentIdentifier,
-  });
+  const applyOnecliConfig = async (agent?: string) => {
+    const candidateArgs = [...args];
+    const applied = await onecli.applyContainerConfig(candidateArgs, {
+      addHostMapping: false, // Nanoclaw already handles host gateway
+      agent,
+    });
+    return { applied, candidateArgs };
+  };
+
+  let resolvedAgentIdentifier = agentIdentifier;
+  let {
+    applied: onecliApplied,
+    candidateArgs: configuredArgs,
+  } = await applyOnecliConfig(agentIdentifier);
+
+  if (!onecliApplied && agentIdentifier) {
+    logger.warn(
+      { containerName, agentIdentifier },
+      'Named OneCLI agent unavailable — retrying with the default agent',
+    );
+    const fallbackAttempt = await applyOnecliConfig(undefined);
+    onecliApplied = fallbackAttempt.applied;
+    configuredArgs = fallbackAttempt.candidateArgs;
+    if (onecliApplied) {
+      resolvedAgentIdentifier = undefined;
+    }
+  }
+
   if (onecliApplied) {
-    logger.info({ containerName }, 'OneCLI gateway config applied');
+    args.splice(0, args.length, ...configuredArgs);
+  }
+  if (onecliApplied) {
+    logger.info(
+      { containerName, agentIdentifier: resolvedAgentIdentifier },
+      'OneCLI gateway config applied',
+    );
   } else {
     logger.warn(
-      { containerName },
+      { containerName, agentIdentifier },
       'OneCLI gateway not reachable — container will have no credentials',
     );
   }
