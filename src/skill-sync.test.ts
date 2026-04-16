@@ -69,11 +69,7 @@ describe('syncAgentSkills', () => {
     writeSkill(destinationDir, 'large-outputs', 'stale portable outputs');
 
     syncAgentSkills({
-      sourceRoots: [
-        bundledSkillsDir,
-        managedGwsSkillsDir,
-        portableSkillsDir,
-      ],
+      sourceRoots: [bundledSkillsDir, managedGwsSkillsDir, portableSkillsDir],
       destinationDir,
       manifestPath,
     });
@@ -111,11 +107,7 @@ describe('syncAgentSkills', () => {
     writeSkill(destinationDir, 'large-outputs', 'legacy outputs');
 
     syncAgentSkills({
-      sourceRoots: [
-        bundledSkillsDir,
-        managedGwsSkillsDir,
-        portableSkillsDir,
-      ],
+      sourceRoots: [bundledSkillsDir, managedGwsSkillsDir, portableSkillsDir],
       destinationDir,
       manifestPath,
     });
@@ -145,11 +137,7 @@ describe('syncAgentSkills', () => {
     writeSkill(destinationDir, 'using-familiar', 'service-owned familiar');
 
     syncAgentSkills({
-      sourceRoots: [
-        bundledSkillsDir,
-        managedGwsSkillsDir,
-        portableSkillsDir,
-      ],
+      sourceRoots: [bundledSkillsDir, managedGwsSkillsDir, portableSkillsDir],
       destinationDir,
       manifestPath,
     });
@@ -160,11 +148,7 @@ describe('syncAgentSkills', () => {
     });
 
     syncAgentSkills({
-      sourceRoots: [
-        bundledSkillsDir,
-        managedGwsSkillsDir,
-        portableSkillsDir,
-      ],
+      sourceRoots: [bundledSkillsDir, managedGwsSkillsDir, portableSkillsDir],
       destinationDir,
       manifestPath,
     });

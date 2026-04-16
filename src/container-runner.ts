@@ -274,7 +274,11 @@ function buildVolumeMounts(
   const groupSessionsDir = path.join(groupSessionRoot, '.claude');
   fs.mkdirSync(groupSessionsDir, { recursive: true });
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
-  let settings: { env: Record<string, string>; model?: unknown; [key: string]: unknown };
+  let settings: {
+    env: Record<string, string>;
+    model?: unknown;
+    [key: string]: unknown;
+  };
   let settingsFileExists = fs.existsSync(settingsFile);
   if (settingsFileExists) {
     try {
@@ -311,10 +315,7 @@ function buildVolumeMounts(
   }
 
   if (!settingsFileExists || settingsChanged) {
-    fs.writeFileSync(
-      settingsFile,
-      JSON.stringify(settings, null, 2) + '\n',
-    );
+    fs.writeFileSync(settingsFile, JSON.stringify(settings, null, 2) + '\n');
   }
 
   // Sync bundled skills and managed GWS skills into each group's .claude/skills/

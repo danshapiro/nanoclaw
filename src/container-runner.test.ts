@@ -634,7 +634,9 @@ describe('container-runner settings defaults', () => {
     expect(written.env.CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS).toBe('0');
     expect(written.env.CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD).toBe('1');
     expect(written.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY).toBe('0');
-    expect(written.env.FAMILIAR_API_URL).toBe('http://host.docker.internal:8081');
+    expect(written.env.FAMILIAR_API_URL).toBe(
+      'http://host.docker.internal:8081',
+    );
     expect(written.env.MSGVAULT_API_URL).toBe(
       'http://host.docker.internal:8091',
     );

@@ -48,7 +48,10 @@ function readManifest(manifestPath: string): SkillManifest {
 
   const manifest: SkillManifest = {};
   for (const [rootDir, skillNames] of Object.entries(parsed)) {
-    if (!Array.isArray(skillNames) || skillNames.some((name) => typeof name !== 'string')) {
+    if (
+      !Array.isArray(skillNames) ||
+      skillNames.some((name) => typeof name !== 'string')
+    ) {
       throw new Error(`Managed skills manifest is invalid: ${manifestPath}`);
     }
     manifest[rootDir] = [...skillNames].sort();
@@ -113,7 +116,9 @@ export function syncAgentSkills({
   const previousOwners = buildOwnedDestinations(previousManifest);
   const currentOwners = buildOwnedDestinations(currentManifest);
 
-  for (const [sourceRoot, previousSkillNames] of Object.entries(previousManifest)) {
+  for (const [sourceRoot, previousSkillNames] of Object.entries(
+    previousManifest,
+  )) {
     const currentSkillNames = new Set(currentManifest[sourceRoot] ?? []);
     for (const skillName of previousSkillNames) {
       const destinationDirForSkill = path.join(destinationDir, skillName);
