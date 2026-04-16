@@ -237,4 +237,35 @@ describe('syncAgentSkills', () => {
       `Managed skill "large-outputs" would overwrite unmanaged destination directory: ${path.join(destinationDir, 'large-outputs')}`,
     );
   });
+
+  it('adopts legacy managed skills when a new source root matches the existing SKILL.md', () => {
+    const rootDir = makeTempDir();
+    const bundledSkillsDir = path.join(rootDir, 'bundled');
+    const managedGwsSkillsDir = path.join(rootDir, 'managed-gws');
+    const destinationDir = path.join(rootDir, 'group-skills');
+    const manifestPath = path.join(rootDir, '.nanoclaw-managed-skills.json');
+
+    writeSkill(bundledSkillsDir, 'status', 'bundled status');
+
+    syncAgentSkills({
+      sourceRoots: [bundledSkillsDir],
+      destinationDir,
+      manifestPath,
+    });
+
+    writeSkill(managedGwsSkillsDir, 'gws-calendar', 'managed calendar');
+    writeSkill(destinationDir, 'gws-calendar', 'managed calendar');
+
+    syncAgentSkills({
+      sourceRoots: [bundledSkillsDir, managedGwsSkillsDir],
+      destinationDir,
+      manifestPath,
+    });
+
+    expect(readSkill(destinationDir, 'gws-calendar')).toBe('managed calendar');
+    expect(readManifest(manifestPath)).toEqual({
+      [bundledSkillsDir]: ['status'],
+      [managedGwsSkillsDir]: ['gws-calendar'],
+    });
+  });
 });

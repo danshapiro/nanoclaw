@@ -36,6 +36,22 @@ function copySkillDirectory(
   fs.cpSync(sourceDir, destinationDir, { recursive: true });
 }
 
+function canAdoptLegacyManagedSkill(
+  sourceDir: string,
+  destinationDir: string,
+): boolean {
+  const sourceSkill = path.join(sourceDir, 'SKILL.md');
+  const destinationSkill = path.join(destinationDir, 'SKILL.md');
+  if (!fs.existsSync(sourceSkill) || !fs.existsSync(destinationSkill)) {
+    return false;
+  }
+
+  return (
+    fs.readFileSync(sourceSkill, 'utf8') ===
+    fs.readFileSync(destinationSkill, 'utf8')
+  );
+}
+
 function readManifest(manifestPath: string): SkillManifest {
   if (!fs.existsSync(manifestPath)) {
     return {};
@@ -147,6 +163,13 @@ export function syncAgentSkills({
         fs.existsSync(destinationDirForSkill) &&
         previousOwner !== currentOwner
       ) {
+        if (
+          previousOwner === undefined &&
+          canAdoptLegacyManagedSkill(sourceDir, destinationDirForSkill)
+        ) {
+          copySkillDirectory(sourceDir, destinationDir, skillName);
+          continue;
+        }
         throw new Error(
           `Managed skill "${skillName}" would overwrite unmanaged destination directory: ${destinationDirForSkill}`,
         );
