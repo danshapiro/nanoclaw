@@ -22,6 +22,28 @@ function writeSkill(rootDir: string, skillName: string, body: string): void {
   fs.writeFileSync(path.join(skillDir, 'SKILL.md'), body);
 }
 
+function writeDirectory(
+  rootDir: string,
+  dirName: string,
+  filename: string,
+  contents: string,
+): void {
+  const dirPath = path.join(rootDir, dirName);
+  fs.mkdirSync(dirPath, { recursive: true });
+  fs.writeFileSync(path.join(dirPath, filename), contents);
+}
+
+function readSkill(rootDir: string, skillName: string): string {
+  return fs.readFileSync(path.join(rootDir, skillName, 'SKILL.md'), 'utf8');
+}
+
+function readManifest(manifestPath: string): Record<string, string[]> {
+  return JSON.parse(fs.readFileSync(manifestPath, 'utf8')) as Record<
+    string,
+    string[]
+  >;
+}
+
 afterEach(() => {
   for (const tempRoot of tempRoots.splice(0)) {
     fs.rmSync(tempRoot, { recursive: true, force: true });
@@ -29,90 +51,206 @@ afterEach(() => {
 });
 
 describe('syncAgentSkills', () => {
-  it('copies bundled non-gws skills and managed gws skills', () => {
+  it('copies built-in, gws, and portable skills and records ownership by source root', () => {
     const rootDir = makeTempDir();
     const bundledSkillsDir = path.join(rootDir, 'bundled');
     const managedGwsSkillsDir = path.join(rootDir, 'managed-gws');
+    const portableSkillsDir = path.join(rootDir, 'portable-skills');
     const destinationDir = path.join(rootDir, 'group-skills');
+    const manifestPath = path.join(rootDir, '.nanoclaw-managed-skills.json');
 
     writeSkill(bundledSkillsDir, 'status', 'bundled status');
     writeSkill(bundledSkillsDir, 'agent-browser', 'bundled browser');
-    writeSkill(bundledSkillsDir, 'gws-gmail', 'bundled gws should be ignored');
     writeSkill(managedGwsSkillsDir, 'gws-gmail', 'managed gmail');
-    writeSkill(managedGwsSkillsDir, 'gws-shared', 'managed shared');
-    writeSkill(destinationDir, 'using-familiar', 'keep existing familiar');
-    writeSkill(destinationDir, 'gws-stale', 'remove stale gws');
+    writeSkill(portableSkillsDir, 'large-outputs', 'portable large outputs');
+    writeSkill(destinationDir, 'using-familiar', 'service-owned familiar');
+    writeSkill(destinationDir, 'agent-browser', 'stale bundled browser');
+    writeSkill(destinationDir, 'gws-gmail', 'stale managed gmail');
+    writeSkill(destinationDir, 'large-outputs', 'stale portable outputs');
 
     syncAgentSkills({
-      bundledSkillsDir,
-      managedGwsSkillsDir,
+      sourceRoots: [
+        bundledSkillsDir,
+        managedGwsSkillsDir,
+        portableSkillsDir,
+      ],
       destinationDir,
+      manifestPath,
     });
 
-    expect(
-      fs.readFileSync(path.join(destinationDir, 'status', 'SKILL.md'), 'utf8'),
-    ).toBe('bundled status');
-    expect(
-      fs.readFileSync(
-        path.join(destinationDir, 'agent-browser', 'SKILL.md'),
-        'utf8',
-      ),
-    ).toBe('bundled browser');
-    expect(
-      fs.readFileSync(
-        path.join(destinationDir, 'gws-gmail', 'SKILL.md'),
-        'utf8',
-      ),
-    ).toBe('managed gmail');
-    expect(
-      fs.readFileSync(
-        path.join(destinationDir, 'gws-shared', 'SKILL.md'),
-        'utf8',
-      ),
-    ).toBe('managed shared');
-    expect(
-      fs.readFileSync(
-        path.join(destinationDir, 'using-familiar', 'SKILL.md'),
-        'utf8',
-      ),
-    ).toBe('keep existing familiar');
-    expect(fs.existsSync(path.join(destinationDir, 'gws-stale'))).toBe(false);
-  });
-
-  it('throws when the managed gws skill directory is missing', () => {
-    const rootDir = makeTempDir();
-
-    writeSkill(path.join(rootDir, 'bundled'), 'status', 'bundled status');
-
-    expect(() =>
-      syncAgentSkills({
-        bundledSkillsDir: path.join(rootDir, 'bundled'),
-        managedGwsSkillsDir: path.join(rootDir, 'missing-gws'),
-        destinationDir: path.join(rootDir, 'group-skills'),
-      }),
-    ).toThrowError(
-      `Managed GWS skills directory does not exist: ${path.join(rootDir, 'missing-gws')}`,
+    expect(readSkill(destinationDir, 'status')).toBe('bundled status');
+    expect(readSkill(destinationDir, 'agent-browser')).toBe('bundled browser');
+    expect(readSkill(destinationDir, 'gws-gmail')).toBe('managed gmail');
+    expect(readSkill(destinationDir, 'large-outputs')).toBe(
+      'portable large outputs',
     );
+    expect(readSkill(destinationDir, 'using-familiar')).toBe(
+      'service-owned familiar',
+    );
+    expect(readManifest(manifestPath)).toEqual({
+      [bundledSkillsDir]: ['agent-browser', 'status'],
+      [managedGwsSkillsDir]: ['gws-gmail'],
+      [portableSkillsDir]: ['large-outputs'],
+    });
   });
 
-  it('throws when a managed gws skill is missing its SKILL.md', () => {
+  it('adopts legacy managed-cache directories on first sync when no manifest exists', () => {
     const rootDir = makeTempDir();
     const bundledSkillsDir = path.join(rootDir, 'bundled');
     const managedGwsSkillsDir = path.join(rootDir, 'managed-gws');
+    const portableSkillsDir = path.join(rootDir, 'portable-skills');
+    const destinationDir = path.join(rootDir, 'group-skills');
+    const manifestPath = path.join(rootDir, '.nanoclaw-managed-skills.json');
 
-    writeSkill(bundledSkillsDir, 'status', 'bundled status');
-    fs.mkdirSync(path.join(managedGwsSkillsDir, 'gws-gmail'), {
-      recursive: true,
+    writeSkill(bundledSkillsDir, 'agent-browser', 'bundled browser');
+    writeSkill(managedGwsSkillsDir, 'gws-gmail', 'managed gmail');
+    writeSkill(portableSkillsDir, 'large-outputs', 'portable large outputs');
+    writeSkill(destinationDir, 'using-familiar', 'service-owned familiar');
+    writeSkill(destinationDir, 'agent-browser', 'legacy browser');
+    writeSkill(destinationDir, 'gws-gmail', 'legacy gmail');
+    writeSkill(destinationDir, 'large-outputs', 'legacy outputs');
+
+    syncAgentSkills({
+      sourceRoots: [
+        bundledSkillsDir,
+        managedGwsSkillsDir,
+        portableSkillsDir,
+      ],
+      destinationDir,
+      manifestPath,
     });
+
+    expect(readSkill(destinationDir, 'agent-browser')).toBe('bundled browser');
+    expect(readSkill(destinationDir, 'gws-gmail')).toBe('managed gmail');
+    expect(readSkill(destinationDir, 'large-outputs')).toBe(
+      'portable large outputs',
+    );
+    expect(readSkill(destinationDir, 'using-familiar')).toBe(
+      'service-owned familiar',
+    );
+    expect(fs.existsSync(manifestPath)).toBe(true);
+  });
+
+  it('prunes only the skills previously owned by the same source root', () => {
+    const rootDir = makeTempDir();
+    const bundledSkillsDir = path.join(rootDir, 'bundled');
+    const managedGwsSkillsDir = path.join(rootDir, 'managed-gws');
+    const portableSkillsDir = path.join(rootDir, 'portable-skills');
+    const destinationDir = path.join(rootDir, 'group-skills');
+    const manifestPath = path.join(rootDir, '.nanoclaw-managed-skills.json');
+
+    writeSkill(bundledSkillsDir, 'agent-browser', 'bundled browser');
+    writeSkill(managedGwsSkillsDir, 'gws-gmail', 'managed gmail');
+    writeSkill(portableSkillsDir, 'large-outputs', 'portable large outputs');
+    writeSkill(destinationDir, 'using-familiar', 'service-owned familiar');
+
+    syncAgentSkills({
+      sourceRoots: [
+        bundledSkillsDir,
+        managedGwsSkillsDir,
+        portableSkillsDir,
+      ],
+      destinationDir,
+      manifestPath,
+    });
+
+    fs.rmSync(path.join(portableSkillsDir, 'large-outputs'), {
+      recursive: true,
+      force: true,
+    });
+
+    syncAgentSkills({
+      sourceRoots: [
+        bundledSkillsDir,
+        managedGwsSkillsDir,
+        portableSkillsDir,
+      ],
+      destinationDir,
+      manifestPath,
+    });
+
+    expect(readSkill(destinationDir, 'agent-browser')).toBe('bundled browser');
+    expect(readSkill(destinationDir, 'gws-gmail')).toBe('managed gmail');
+    expect(readSkill(destinationDir, 'using-familiar')).toBe(
+      'service-owned familiar',
+    );
+    expect(fs.existsSync(path.join(destinationDir, 'large-outputs'))).toBe(
+      false,
+    );
+    expect(readManifest(manifestPath)).toEqual({
+      [bundledSkillsDir]: ['agent-browser'],
+      [managedGwsSkillsDir]: ['gws-gmail'],
+      [portableSkillsDir]: [],
+    });
+  });
+
+  it('ignores directories that do not contain SKILL.md', () => {
+    const rootDir = makeTempDir();
+    const bundledSkillsDir = path.join(rootDir, 'bundled');
+    const destinationDir = path.join(rootDir, 'group-skills');
+    const manifestPath = path.join(rootDir, '.nanoclaw-managed-skills.json');
+
+    writeSkill(bundledSkillsDir, 'agent-browser', 'bundled browser');
+    writeDirectory(bundledSkillsDir, 'not-a-skill', 'README.md', 'ignore me');
+
+    syncAgentSkills({
+      sourceRoots: [bundledSkillsDir],
+      destinationDir,
+      manifestPath,
+    });
+
+    expect(readSkill(destinationDir, 'agent-browser')).toBe('bundled browser');
+    expect(fs.existsSync(path.join(destinationDir, 'not-a-skill'))).toBe(false);
+    expect(readManifest(manifestPath)).toEqual({
+      [bundledSkillsDir]: ['agent-browser'],
+    });
+  });
+
+  it('rejects duplicate managed skill names across source roots', () => {
+    const rootDir = makeTempDir();
+    const bundledSkillsDir = path.join(rootDir, 'bundled');
+    const portableSkillsDir = path.join(rootDir, 'portable-skills');
+
+    writeSkill(bundledSkillsDir, 'large-outputs', 'bundled outputs');
+    writeSkill(portableSkillsDir, 'large-outputs', 'portable outputs');
 
     expect(() =>
       syncAgentSkills({
-        bundledSkillsDir,
-        managedGwsSkillsDir,
+        sourceRoots: [bundledSkillsDir, portableSkillsDir],
         destinationDir: path.join(rootDir, 'group-skills'),
+        manifestPath: path.join(rootDir, '.nanoclaw-managed-skills.json'),
       }),
     ).toThrowError(
-      `Managed GWS skill is missing SKILL.md: ${path.join(managedGwsSkillsDir, 'gws-gmail')}`,
+      `Managed skill "large-outputs" is provided by multiple source roots: ${bundledSkillsDir}, ${portableSkillsDir}`,
+    );
+  });
+
+  it('rejects overwriting an unmanaged destination skill after manifest initialization', () => {
+    const rootDir = makeTempDir();
+    const bundledSkillsDir = path.join(rootDir, 'bundled');
+    const portableSkillsDir = path.join(rootDir, 'portable-skills');
+    const destinationDir = path.join(rootDir, 'group-skills');
+    const manifestPath = path.join(rootDir, '.nanoclaw-managed-skills.json');
+
+    writeSkill(bundledSkillsDir, 'agent-browser', 'bundled browser');
+
+    syncAgentSkills({
+      sourceRoots: [bundledSkillsDir],
+      destinationDir,
+      manifestPath,
+    });
+
+    writeSkill(destinationDir, 'large-outputs', 'user-owned large outputs');
+    writeSkill(portableSkillsDir, 'large-outputs', 'portable large outputs');
+
+    expect(() =>
+      syncAgentSkills({
+        sourceRoots: [bundledSkillsDir, portableSkillsDir],
+        destinationDir,
+        manifestPath,
+      }),
+    ).toThrowError(
+      `Managed skill "large-outputs" would overwrite unmanaged destination directory: ${path.join(destinationDir, 'large-outputs')}`,
     );
   });
 });

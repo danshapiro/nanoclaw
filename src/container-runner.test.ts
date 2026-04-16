@@ -24,8 +24,13 @@ vi.mock('./config.js', () => ({
   IDLE_TIMEOUT: 1800000, // 30min
   ONECLI_API_KEY: '',
   MANAGED_GWS_SKILLS_DIR: '/tmp/managed-gws-skills',
+  MANAGED_SKILLS_DIRS: [
+    '/srv/nanoclaw/shared/skills',
+    '/srv/nanoclaw/shared/repos/portable-skills/skills',
+  ],
   ONECLI_URL: 'http://localhost:10254',
   TIMEZONE: 'America/Los_Angeles',
+  WRITABLE_SKILLS_DIR: '/srv/nanoclaw/shared/repos/portable-skills',
 }));
 
 // Mock logger
@@ -371,7 +376,7 @@ describe('container-runner GWS proxy env vars', () => {
     expect(spawnArgs).toContain('GWS_PROXY_KEY=test_key');
   });
 
-  it('loads managed GWS skills from the configured shared dir', async () => {
+  it('loads managed skills from the configured roots and stores the manifest outside .claude', async () => {
     const resultPromise = runContainerAgent(testGroup, testInput, () => {});
 
     emitOutputMarker(fakeProc, { status: 'success', result: 'Done' });
@@ -382,11 +387,58 @@ describe('container-runner GWS proxy env vars', () => {
     await resultPromise;
 
     expect(syncAgentSkillsMock).toHaveBeenCalledWith({
-      bundledSkillsDir: expect.stringContaining('/container/skills'),
-      managedGwsSkillsDir: '/tmp/managed-gws-skills',
+      sourceRoots: [
+        expect.stringContaining('/container/skills'),
+        '/srv/nanoclaw/shared/skills',
+        '/srv/nanoclaw/shared/repos/portable-skills/skills',
+      ],
       destinationDir:
         '/tmp/nanoclaw-test-data/sessions/test-group/.claude/skills',
+      manifestPath:
+        '/tmp/nanoclaw-test-data/sessions/test-group/.nanoclaw-managed-skills.json',
     });
+  });
+
+  it('mounts the writable portable repo for main only', async () => {
+    const resultPromise = runContainerAgent(
+      testGroup,
+      { ...testInput, isMain: true },
+      () => {},
+    );
+
+    emitOutputMarker(fakeProc, { status: 'success', result: 'Done' });
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    await resultPromise;
+
+    const mainArgs = spawnMock.mock.calls[0][1] as string[];
+    expect(mainArgs).toContain(
+      '/srv/nanoclaw/shared/repos/portable-skills:/workspace/portable-skills',
+    );
+
+    spawnMock.mockClear();
+    fakeProc = createFakeProcess();
+    spawnMock.mockImplementation(() => fakeProc);
+
+    const nonMainPromise = runContainerAgent(
+      testGroup,
+      { ...testInput, isMain: false },
+      () => {},
+    );
+
+    emitOutputMarker(fakeProc, { status: 'success', result: 'Done' });
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    await nonMainPromise;
+
+    const nonMainArgs = spawnMock.mock.calls[0][1] as string[];
+    expect(nonMainArgs).not.toContain(
+      '/srv/nanoclaw/shared/repos/portable-skills:/workspace/portable-skills',
+    );
   });
 
   it('does NOT inject old gws env vars or mounts', async () => {
@@ -541,6 +593,7 @@ describe('container-runner settings defaults', () => {
           env: {
             CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '0',
             FAMILIAR_API_URL: 'http://host.docker.internal:8081',
+            MSGVAULT_API_URL: 'http://host.docker.internal:8091',
           },
         });
       }
@@ -570,6 +623,9 @@ describe('container-runner settings defaults', () => {
     expect(written.env.CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD).toBe('1');
     expect(written.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY).toBe('0');
     expect(written.env.FAMILIAR_API_URL).toBe('http://host.docker.internal:8081');
+    expect(written.env.MSGVAULT_API_URL).toBe(
+      'http://host.docker.internal:8091',
+    );
   });
 
   it('recovers from malformed settings.json and rewrites the defaults', async () => {
