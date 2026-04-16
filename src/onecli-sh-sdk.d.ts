@@ -1,5 +1,7 @@
 declare module '@onecli-sh/sdk' {
   export interface OneCLIOptions {
+    apiKey?: string;
+    timeout?: number;
     url?: string;
   }
 
