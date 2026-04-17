@@ -112,14 +112,15 @@ Validate `/home/node/.claude/settings.json`:
 
 ### 6. Orchestration roundtrip
 
-Exercise the orchestration tool family end-to-end:
+Exercise the orchestration tool family end-to-end in a bounded way:
 
-- create a temporary team
-- start a short-lived task
-- obtain task output
-- send a message if the task interface requires it
-- stop the task if needed
-- delete the temporary team
+- create a temporary team named `fullqapass-probe`
+- do **not** use `Agent` or create a long-lived teammate for this check
+- use `Task` to start a short-lived probe that returns exactly `PROBE_OK`
+- use `TaskOutput` to confirm the task result contains `PROBE_OK`
+- if the task is still running after you capture its output, use `TaskStop` to stop it
+- delete the temporary team with `TeamDelete`
+- keep the temporary team memberless so `TeamDelete` can succeed immediately
 
 Mark `orchestration_roundtrip` failed if any step fails.
 
@@ -130,11 +131,13 @@ At minimum, verify `status` and `FullQAPass` are visible there.
 
 ### 8. NanoClaw MCP roundtrip
 
-Create a uniquely named temporary scheduled task with `mcp__nanoclaw__schedule_task`.
+Use `Bash` or `Read` to inspect `/workspace/ipc/available_groups.json`, then select a `jid` from an entry with `"isRegistered": true`.
+If no registered group exists, fail this check immediately with that reason.
+Create a uniquely named temporary scheduled task with `mcp__nanoclaw__schedule_task`, passing the selected `jid` via `target_group_jid`.
 Because task snapshots are written asynchronously, retry `mcp__nanoclaw__list_tasks` up to 5 times with short delays between attempts until the task ID appears.
 Use `Bash` for the short delays when needed.
 Then remove the task with `mcp__nanoclaw__cancel_task`.
-Fail this check only if the task ID never appears before the retry budget is exhausted or cleanup fails.
+Fail this check only if no registered target group can be selected, the task ID never appears before the retry budget is exhausted, or cleanup fails.
 
 ### 9. Optional GWS check
 
