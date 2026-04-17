@@ -130,7 +130,11 @@ At minimum, verify `status` and `FullQAPass` are visible there.
 
 ### 8. NanoClaw MCP roundtrip
 
-Create a uniquely named temporary scheduled task with `mcp__nanoclaw__schedule_task`, confirm it appears in `mcp__nanoclaw__list_tasks`, then remove it with `mcp__nanoclaw__cancel_task`.
+Create a uniquely named temporary scheduled task with `mcp__nanoclaw__schedule_task`.
+Because task snapshots are written asynchronously, retry `mcp__nanoclaw__list_tasks` up to 5 times with short delays between attempts until the task ID appears.
+Use `Bash` for the short delays when needed.
+Then remove the task with `mcp__nanoclaw__cancel_task`.
+Fail this check only if the task ID never appears before the retry budget is exhausted or cleanup fails.
 
 ### 9. Optional GWS check
 
