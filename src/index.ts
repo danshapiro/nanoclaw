@@ -78,6 +78,7 @@ import {
 import { startSessionCleanup } from './session-cleanup.js';
 import { buildStatusReport } from './status-report.js';
 import { startSchedulerLoop } from './task-scheduler.js';
+import { listTaskSnapshotTargets } from './task-snapshot-targets.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
 
@@ -998,8 +999,8 @@ async function main(): Promise<void> {
         status: t.status,
         next_run: t.next_run,
       }));
-      for (const group of Object.values(registeredGroups)) {
-        writeTasksSnapshot(group.folder, group.isMain === true, taskRows);
+      for (const target of listTaskSnapshotTargets(registeredGroups)) {
+        writeTasksSnapshot(target.folder, target.isMain, taskRows);
       }
     },
   });
