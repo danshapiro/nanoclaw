@@ -96,6 +96,55 @@ describe('runQueryRunner', () => {
     expect(harness.dispatchedPrompts).toEqual(['user prompt']);
   });
 
+  it('throws the query-exit error when close-sentinel shutdown ends an unresolved conversational round', async () => {
+    const harness = createHarness();
+
+    await expect(
+      harness.run(
+        createMessageStream(harness.promptQueue, [
+          async (prompt) => {
+            expect(prompt).toBe('user prompt');
+            return [{ type: 'assistant', uuid: 'assistant-1' }];
+          },
+        ]),
+        true,
+      ),
+    ).rejects.toThrow(QUERY_EXIT_ERROR);
+
+    expect(harness.outputs).toEqual([]);
+    expect(harness.dispatchedPrompts).toEqual(['user prompt']);
+  });
+
+  it('throws the query-exit error when a follow-up prompt is accepted but never dispatched before the stream exits', async () => {
+    const harness = createHarness({ followUps: ['follow-up prompt'] });
+
+    await expect(
+      harness.run(
+        createMessageStream(harness.promptQueue, [
+          async (prompt) => {
+            expect(prompt).toBe('user prompt');
+            return [
+              {
+                type: 'result',
+                subtype: 'success',
+                result: 'Visible reply',
+              },
+            ];
+          },
+        ]),
+      ),
+    ).rejects.toThrow(QUERY_EXIT_ERROR);
+
+    expect(harness.outputs).toEqual([
+      {
+        status: 'success',
+        result: 'Visible reply',
+        newSessionId: undefined,
+      },
+    ]);
+    expect(harness.dispatchedPrompts).toEqual(['user prompt']);
+  });
+
   it('inserts NO_REPLY_RECOVERY_PROMPT ahead of already-buffered follow-up prompts after the first silent success result', async () => {
     const harness = createHarness({ followUps: ['follow-up prompt'] });
 
@@ -115,12 +164,23 @@ describe('runQueryRunner', () => {
             },
           ];
         },
+        async (prompt) => {
+          expect(prompt).toBe('follow-up prompt');
+          return [
+            {
+              type: 'result',
+              subtype: 'success',
+              result: 'Follow-up reply',
+            },
+          ];
+        },
       ]),
     );
 
     expect(harness.dispatchedPrompts).toEqual([
       'user prompt',
       NO_REPLY_RECOVERY_PROMPT,
+      'follow-up prompt',
     ]);
   });
 
@@ -146,6 +206,16 @@ describe('runQueryRunner', () => {
             },
           ];
         },
+        async (prompt) => {
+          expect(prompt).toBe('follow-up prompt');
+          return [
+            {
+              type: 'result',
+              subtype: 'success',
+              result: 'Follow-up reply',
+            },
+          ];
+        },
       ]),
     );
 
@@ -155,10 +225,16 @@ describe('runQueryRunner', () => {
         result: 'Recovered reply',
         newSessionId: 'session-123',
       },
+      {
+        status: 'success',
+        result: 'Follow-up reply',
+        newSessionId: 'session-123',
+      },
     ]);
     expect(harness.dispatchedPrompts).toEqual([
       'user prompt',
       NO_REPLY_RECOVERY_PROMPT,
+      'follow-up prompt',
     ]);
   });
 

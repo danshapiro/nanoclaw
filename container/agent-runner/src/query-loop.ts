@@ -127,8 +127,8 @@ export function createQueryLoopGuard(
     onQueryExit(_exit: QueryExit): GuardAction {
       if (
         !options.isScheduledTask &&
-        activeRound !== null &&
-        !activeRound.delivered
+        ((activeRound !== null && !activeRound.delivered) ||
+          queuedPromptCount > 0)
       ) {
         return { type: 'emit-error', error: QUERY_EXIT_ERROR };
       }
