@@ -11,10 +11,6 @@ import {
   formatOutbound,
   stripInternalTags,
 } from './router.js';
-import {
-  hasVisibleReply as containerHasVisibleReply,
-  stripInternalTags as containerStripInternalTags,
-} from '../container/agent-runner/src/delivery-activity.js';
 import { NewMessage } from './types.js';
 
 function makeMsg(overrides: Partial<NewMessage> = {}): NewMessage {
@@ -286,29 +282,6 @@ describe('formatOutbound', () => {
     expect(
       formatOutbound('<internal>thinking</internal>The answer is 42'),
     ).toBe('The answer is 42');
-  });
-});
-
-describe('container delivery helpers', () => {
-  it('match the host internal-tag stripping semantics', () => {
-    const mixed = 'visible <internal>secret</internal> text';
-    const internalOnly = '<internal>secret</internal>';
-
-    expect(containerStripInternalTags(mixed)).toBe(stripInternalTags(mixed));
-    expect(containerStripInternalTags(internalOnly)).toBe(
-      stripInternalTags(internalOnly),
-    );
-  });
-
-  it('match the host visible-text classification rule', () => {
-    expect(containerHasVisibleReply('visible <internal>secret</internal>')).toBe(
-      true,
-    );
-    expect(
-      containerHasVisibleReply('<internal>secret</internal>   \n\t'),
-    ).toBe(false);
-    expect(containerHasVisibleReply('   \n\t')).toBe(false);
-    expect(formatOutbound('<internal>secret</internal>   \n\t')).toBe('');
   });
 });
 

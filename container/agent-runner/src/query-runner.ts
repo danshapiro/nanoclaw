@@ -102,7 +102,8 @@ interface RunQueryRunnerOptions {
   promptQueue: PromptQueue;
   messages: AsyncIterable<QueryRunnerMessage>;
   isScheduledTask: boolean;
-  closedDuringQuery: boolean;
+  closedDuringQuery?: boolean;
+  getClosedDuringQuery?: () => boolean;
   consumeSendMessageCount: () => number;
   onPromptDispatched?: (prompt: string) => void;
   writeOutput: (output: ContainerOutput) => Promise<void> | void;
@@ -143,6 +144,14 @@ function noteBoundaryDelivery(
   consumeSendMessageCount: () => number,
 ): void {
   guard.noteSendMessageDelivery(consumeSendMessageCount() > 0);
+}
+
+function resolveClosedDuringQuery(options: RunQueryRunnerOptions): boolean {
+  if (options.getClosedDuringQuery) {
+    return options.getClosedDuringQuery();
+  }
+
+  return options.closedDuringQuery ?? false;
 }
 
 export async function runQueryRunner(
@@ -198,8 +207,9 @@ export async function runQueryRunner(
   }
 
   noteBoundaryDelivery(guard, options.consumeSendMessageCount);
+  const closedDuringQuery = resolveClosedDuringQuery(options);
   const exitAction = guard.onQueryExit({
-    closedDuringQuery: options.closedDuringQuery,
+    closedDuringQuery,
   });
   await applyGuardAction(
     exitAction,
@@ -211,6 +221,6 @@ export async function runQueryRunner(
   return {
     newSessionId,
     lastAssistantUuid,
-    closedDuringQuery: options.closedDuringQuery,
+    closedDuringQuery,
   };
 }

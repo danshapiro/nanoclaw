@@ -255,6 +255,44 @@ describe('container-runner timeout behavior', () => {
     expect(result.newSessionId).toBe('session-456');
   });
 
+  it('returns explicit streamed error markers and preserves newSessionId', async () => {
+    const onOutput = vi.fn(async () => {});
+    const resultPromise = runContainerAgent(
+      testGroup,
+      testInput,
+      () => {},
+      onOutput,
+    );
+
+    emitOutputMarker(fakeProc, {
+      status: 'error',
+      result: null,
+      error:
+        'Conversational turn ended without a delivered reply before the query exited',
+      newSessionId: 'session-789',
+    });
+
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 1);
+    await vi.advanceTimersByTimeAsync(10);
+
+    const result = await resultPromise;
+    expect(result).toEqual({
+      status: 'error',
+      result: null,
+      error:
+        'Conversational turn ended without a delivered reply before the query exited',
+      newSessionId: 'session-789',
+    });
+    expect(onOutput).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: 'error',
+        error:
+          'Conversational turn ended without a delivered reply before the query exited',
+      }),
+    );
+  });
+
   it('applies OneCLI config and does not inject Anthropic secrets into stdin', async () => {
     const resultPromise = runContainerAgent(testGroup, testInput, () => {});
 
@@ -405,12 +443,6 @@ describe('container-runner GWS proxy env vars', () => {
 
     const onOutput = vi.fn(async () => {});
     const _resultPromise = runContainerAgent(
-      testGroup,
-      testInput,
-      () => {},
-      onOutput,
-    );
-
     emitOutputMarker(fakeProc, { status: 'success', result: 'Done' });
     await vi.advanceTimersByTimeAsync(10);
     fakeProc.emit('close', 0);
