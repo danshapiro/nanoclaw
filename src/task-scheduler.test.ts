@@ -170,7 +170,11 @@ describe('task scheduler', () => {
       }),
       getSessions: () => ({}),
       queue: {
-        enqueueTask: (_groupJid: string, _taskId: string, fn: () => Promise<void>) => {
+        enqueueTask: (
+          _groupJid: string,
+          _taskId: string,
+          fn: () => Promise<void>,
+        ) => {
           void fn();
         },
         notifyIdle,

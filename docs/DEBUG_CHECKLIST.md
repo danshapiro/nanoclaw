@@ -121,6 +121,8 @@ grep -E 'Starting container|Container active|concurrency limit' logs/nanoclaw.lo
 sqlite3 store/messages.db "SELECT chat_jid, MAX(timestamp) as latest FROM messages GROUP BY chat_jid ORDER BY latest DESC LIMIT 5;"
 ```
 
+If the host reports `Conversational turn completed without a delivered reply after one recovery attempt` or `Conversational turn ended without a delivered reply before the query exited`, inspect the session transcript and the matching container log together. The transcript shows whether the SDK emitted only internal or silent results, and the container log shows whether the runner exited on recovery exhaustion or on query exit before any delivered reply.
+
 ## Container Mount Issues
 
 ```bash
