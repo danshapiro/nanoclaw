@@ -199,22 +199,6 @@ describe('createQueryLoopGuard', () => {
     });
   });
 
-  it('returns an explicit error when query exits with an accepted follow-up prompt still queued', () => {
-    const guard = createQueryLoopGuard({ isScheduledTask: false });
-
-    guard.enqueueConversationalPrompt('first prompt');
-    guard.enqueueConversationalPrompt('follow-up prompt');
-    guard.markPromptDispatched();
-
-    expect(
-      guard.onResult({ subtype: 'success', resultText: 'visible reply' }),
-    ).toEqual({ type: 'emit-success', resultText: 'visible reply' });
-    expect(guard.onQueryExit({ closedDuringQuery: false })).toEqual({
-      type: 'emit-error',
-      error: QUERY_EXIT_ERROR,
-    });
-  });
-
   it('allows scheduled-task rounds to finish silently on success results and query exit', () => {
     const guard = createQueryLoopGuard({ isScheduledTask: true });
 

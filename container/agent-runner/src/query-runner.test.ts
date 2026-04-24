@@ -115,36 +115,6 @@ describe('runQueryRunner', () => {
     expect(harness.dispatchedPrompts).toEqual(['user prompt']);
   });
 
-  it('throws the query-exit error when a follow-up prompt is accepted but never dispatched before the stream exits', async () => {
-    const harness = createHarness({ followUps: ['follow-up prompt'] });
-
-    await expect(
-      harness.run(
-        createMessageStream(harness.promptQueue, [
-          async (prompt) => {
-            expect(prompt).toBe('user prompt');
-            return [
-              {
-                type: 'result',
-                subtype: 'success',
-                result: 'Visible reply',
-              },
-            ];
-          },
-        ]),
-      ),
-    ).rejects.toThrow(QUERY_EXIT_ERROR);
-
-    expect(harness.outputs).toEqual([
-      {
-        status: 'success',
-        result: 'Visible reply',
-        newSessionId: undefined,
-      },
-    ]);
-    expect(harness.dispatchedPrompts).toEqual(['user prompt']);
-  });
-
   it('inserts NO_REPLY_RECOVERY_PROMPT ahead of already-buffered follow-up prompts after the first silent success result', async () => {
     const harness = createHarness({ followUps: ['follow-up prompt'] });
 

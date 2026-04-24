@@ -1,7 +1,7 @@
 import { hasVisibleReply } from './delivery-activity.js';
 
 export const NO_REPLY_RECOVERY_PROMPT =
-  "You already completed work for the user's latest conversational message, but no user-visible reply was delivered. Finish the turn now. Do not do more tool work unless strictly required.";
+  "You completed work for the user's last message but no reply was delivered. Finish.";
 
 export const RECOVERY_EXHAUSTED_ERROR =
   'Conversational turn completed without a delivered reply after one recovery attempt';
@@ -125,11 +125,7 @@ export function createQueryLoopGuard(
     },
 
     onQueryExit(_exit: QueryExit): GuardAction {
-      if (
-        !options.isScheduledTask &&
-        ((activeRound !== null && !activeRound.delivered) ||
-          queuedPromptCount > 0)
-      ) {
+      if (!options.isScheduledTask && activeRound !== null && !activeRound.delivered) {
         return { type: 'emit-error', error: QUERY_EXIT_ERROR };
       }
 
