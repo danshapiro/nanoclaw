@@ -443,6 +443,12 @@ describe('container-runner GWS proxy env vars', () => {
 
     const onOutput = vi.fn(async () => {});
     const _resultPromise = runContainerAgent(
+      testGroup,
+      testInput,
+      () => {},
+      onOutput,
+    );
+
     emitOutputMarker(fakeProc, { status: 'success', result: 'Done' });
     await vi.advanceTimersByTimeAsync(10);
     fakeProc.emit('close', 0);
