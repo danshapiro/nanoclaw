@@ -24,6 +24,10 @@ RUN apt-get update && apt-get install -y \
     libxshmfence1 \
     curl \
     git \
+    novnc \
+    websockify \
+    x11vnc \
+    xvfb \
     && rm -rf /var/lib/apt/lists/*
 
 # Set Chromium path for agent-browser
@@ -54,6 +58,10 @@ COPY agent-runner/ ./
 
 # Build TypeScript
 RUN npm run build
+
+# Copy browser-auth sidecar entrypoint
+COPY browser-auth-session.sh /app/browser-auth-session.sh
+RUN chmod +x /app/browser-auth-session.sh
 
 # Create workspace directories
 RUN mkdir -p /workspace/group /workspace/global /workspace/extra /workspace/ipc/messages /workspace/ipc/tasks /workspace/ipc/input
