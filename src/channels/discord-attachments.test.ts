@@ -382,6 +382,31 @@ describe('materializeDiscordAttachments', () => {
     ]);
   });
 
+  it('redacts raw attachment URLs from unexpected fetch failure messages', async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockRejectedValue(
+        new Error('failed to fetch https://cdn.discord.test/private-token'),
+      );
+
+    const lines = await materializeDiscordAttachments({
+      messageId: 'msg_001',
+      group,
+      groupDir,
+      attachments: [
+        attachment({ url: 'https://cdn.discord.test/private-token' }),
+      ],
+      fetchImpl,
+    });
+
+    expect(lines).toEqual([
+      '[Attachment failed: report.txt reason=failed to fetch redacted URL]',
+    ]);
+    expect(lines[0]).not.toContain('https://');
+    expect(lines[0]).not.toContain('cdn.discord.test');
+    expect(lines[0]).not.toContain('private-token');
+  });
+
   it('stops later attachments after the message download budget is exhausted', async () => {
     vi.spyOn(Date, 'now')
       .mockReturnValueOnce(1_000)

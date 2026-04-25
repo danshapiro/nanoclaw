@@ -382,9 +382,13 @@ function formatDownloadError(error: unknown, timeoutMs: number): string {
     return `download timed out after ${formatDuration(timeoutMs)}`;
   }
   if (error instanceof Error && error.message) {
-    return error.message;
+    return redactUrls(error.message);
   }
   return 'unknown attachment download failure';
+}
+
+function redactUrls(message: string): string {
+  return message.replace(/\b(?:https?|file):\/\/[^\s]+/gi, 'redacted URL');
 }
 
 function isTimeoutError(error: unknown): boolean {

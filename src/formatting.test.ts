@@ -109,6 +109,21 @@ describe('formatMessages', () => {
     );
   });
 
+  it('preserves saved Discord attachment paths in message content', () => {
+    const attachmentLine =
+      '[File: report.txt type=text/plain size=10 B path=/workspace/group/attachments/discord/msg_001/att1-report.txt]';
+
+    const result = formatMessages(
+      [makeMsg({ content: `Check\n${attachmentLine}` })],
+      TZ,
+    );
+
+    expect(result).toContain(
+      '/workspace/group/attachments/discord/msg_001/att1-report.txt',
+    );
+    expect(result).toContain(attachmentLine);
+  });
+
   it('handles empty array', () => {
     const result = formatMessages([], TZ);
     expect(result).toContain('<context timezone="UTC" />');
