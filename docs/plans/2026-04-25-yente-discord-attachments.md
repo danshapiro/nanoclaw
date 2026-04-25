@@ -42,6 +42,7 @@ This preserves upstream updateability better than a broad fork-specific architec
 - Modify `src/channels/discord.test.ts`
   - Replace placeholder-only attachment expectations with local-path attachment expectations.
   - Add ingress tests proving unregistered channels do not download, fetch failures are visible in the message, and `onMessage` is not called until materialization finishes.
+  - Mock `resolveGroupFolderPath(...)` to a per-test temp directory so channel tests never write attachment artifacts into the repo's real `groups/` tree.
 
 - Modify `/home/user/code/shapiroserver2/srv/nanoclaw/source.conf` on a `deploy/nanoclaw` worktree
   - Pin the exact tested NanoClaw runtime SHA after the runtime commit is folded onto `overlay/shapiroserver2`.
@@ -261,6 +262,8 @@ Required assertions:
 - A filename like `../../secret.txt` or `..\\secret.txt` never creates or returns a path containing `..`, `/secret.txt` outside the message dir, or a host escape.
 - If an attachment has metadata `size` greater than `maxBytesPerFile`, `fetchImpl` is not called and the returned line is `[Attachment failed: ...]`.
 - If streamed bytes exceed the limit despite small metadata, the temp file is removed and the returned line is `[Attachment failed: ...]`.
+- If cumulative saved bytes would exceed `maxBytesTotal`, the over-budget attachment fails visibly and is not fetched or written.
+- If the fetch aborts on `AbortSignal.timeout(...)`, the returned failure reason is normalized to a user-readable timeout such as `download timed out after 30s`.
 - If the first attachment succeeds and the second fetch returns HTTP 403, the helper returns one success line and one visible failure line.
 - If `attachments` already exists as a symlink to another temp directory, the helper fails the attachment and writes nothing through the symlink.
 - If there are more than 10 attachments, only the first 10 are eligible for fetch and the excess entries get explicit failure lines.
@@ -298,7 +301,7 @@ import { RegisteredGroup } from '../types.js';
 - Directory creation:
   - Build `attachments/discord/<messageSegment>` relative to the resolved group dir.
   - Iterate each path component with `lstat`.
-  - If missing, create it with `fsp.mkdir(componentPath, { mode: 0o700 })`, then `lstat` it.
+  - If missing, create it with `fsp.mkdir(componentPath, { mode: 0o700 })`, then `lstat` it. If a concurrent writer creates the same directory first and `mkdir` returns `EEXIST`, retry `lstat` instead of treating that as a download failure.
   - If existing and `isSymbolicLink()` or not `isDirectory()`, throw `Unsafe attachment storage path: <relative path>`.
   - After the directory exists, compare `await fsp.realpath(dir)` with `await fsp.realpath(groupDir)` and fail if it escapes.
 
@@ -368,6 +371,45 @@ git commit -m "fix: materialize discord attachments"
 - [ ] **Step 1: Write failing Discord channel tests**
 
 In `src/channels/discord.test.ts`, update `createMessage(...)` attachment fixtures so test attachments include `id`, `url`, `name`, `contentType`, and `size`.
+
+Add temp group-folder isolation before importing `DiscordChannel`:
+
+```ts
+import fsp from 'fs/promises';
+import os from 'os';
+import path from 'path';
+
+const mockGroupsRoot = vi.hoisted(() => ({ value: '' }));
+
+vi.mock('../group-folder.js', () => ({
+  resolveGroupFolderPath: vi.fn((folder: string) => {
+    if (!mockGroupsRoot.value) {
+      throw new Error('mock group root was not initialized');
+    }
+    return `${mockGroupsRoot.value}/${folder}`;
+  }),
+}));
+```
+
+In the existing `beforeEach`, create a temp root and assign `mockGroupsRoot.value`. In the existing `afterEach`, remove that temp root and reset the value:
+
+```ts
+let tmpRoot: string;
+
+beforeEach(async () => {
+  vi.clearAllMocks();
+  tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'nanoclaw-discord-channel-'));
+  mockGroupsRoot.value = tmpRoot;
+});
+
+afterEach(async () => {
+  vi.restoreAllMocks();
+  await fsp.rm(tmpRoot, { recursive: true, force: true });
+  mockGroupsRoot.value = '';
+});
+```
+
+If this requires changing the existing `beforeEach`/`afterEach` callbacks to `async`, do that. Use `vi.spyOn(globalThis, 'fetch')` for fetch stubs so `vi.restoreAllMocks()` cleans them up. Do not use the repo's real `groups/` directory in these tests; `git status --short -- groups` must remain empty after the test run.
 
 Add or update tests under `describe('attachments', ...)`:
 
@@ -519,12 +561,14 @@ BASE_RUNTIME_SHA="$(git merge-base overlay/shapiroserver2 HEAD)"
 git diff --stat "$BASE_RUNTIME_SHA"..HEAD
 git diff --name-only "$BASE_RUNTIME_SHA"..HEAD
 git diff "$BASE_RUNTIME_SHA"..HEAD -- package.json package-lock.json src/router.ts src/db.ts src/container-runner.ts src/config.ts
+git status --short -- groups
 ```
 
 Expected:
 
 - Only `docs/plans/2026-04-25-yente-discord-attachments.md`, `src/channels/discord.ts`, `src/channels/discord.test.ts`, `src/channels/discord-attachments.ts`, and `src/channels/discord-attachments.test.ts` changed.
 - No changes to dependencies, DB schema, router, container runner, config, auth, or channel loader.
+- No untracked or modified files under `groups/`; attachment tests must use temp directories only.
 
 - [ ] **Step 4: Commit any formatting-only cleanup**
 
@@ -605,14 +649,23 @@ Run:
 ```bash
 cd /home/user/code/shapiroserver2
 mkdir -p .worktrees
-if [ ! -d .worktrees/yente-discord-attachments-deploy ]; then
-  git worktree add .worktrees/yente-discord-attachments-deploy deploy/nanoclaw
+DEPLOY_WT="$(
+  git worktree list --porcelain |
+    awk '
+      $1 == "worktree" { path=$2 }
+      $1 == "branch" && $2 == "refs/heads/deploy/nanoclaw" { print path }
+    ' |
+    head -n1
+)"
+if [ -z "$DEPLOY_WT" ]; then
+  DEPLOY_WT="/home/user/code/shapiroserver2/.worktrees/yente-discord-attachments-deploy"
+  git worktree add "$DEPLOY_WT" deploy/nanoclaw
 fi
-cd .worktrees/yente-discord-attachments-deploy
+cd "$DEPLOY_WT"
 git status --short --branch
 ```
 
-Expected: worktree is on `deploy/nanoclaw` and clean.
+Expected: worktree is on `deploy/nanoclaw` and clean. In the current workstation state, this should reuse `/home/user/code/shapiroserver2/.worktrees/trycycle-reconcile-deploy-canonical`; do not try to add a second worktree for `deploy/nanoclaw` while that branch is already checked out. Use this selected path as `<DEPLOY_WT>` in later deploy-repo steps. If this worktree is dirty with another agent's changes, inspect before proceeding and do not overwrite or revert them.
 
 - [ ] **Step 2: Capture live truth before editing docs**
 
@@ -665,7 +718,7 @@ git commit -m "deploy: pin nanoclaw discord attachment fix"
 
 - [ ] **Step 1: Deploy through the canonical host path**
 
-From `/home/user/code/shapiroserver2/.worktrees/yente-discord-attachments-deploy`, run:
+From `<DEPLOY_WT>`, run:
 
 ```bash
 bash srv/nanoclaw/deploy-host.sh
@@ -810,7 +863,18 @@ ssh shapiroserver2-lan \
 
 Expected: PASS and the JSON report result contains `YENTE_ATTACHMENT_OK`.
 
-- [ ] **Step 4: Run real Discord acceptance if a human-operated Discord client is available**
+- [ ] **Step 4: Remove the helper-smoke artifact**
+
+Before any optional real Discord acceptance, remove the helper-smoke artifact so the live group does not retain test-only files:
+
+```bash
+ssh shapiroserver2-lan \
+  "sudo -u nanoclaw rm -rf '/srv/nanoclaw/shared/groups/<GROUP_FOLDER>/attachments/discord/live-smoke-discord-attachments'"
+```
+
+Expected: command succeeds. The preceding agent-smoke already proved the file was readable through `/workspace/group`.
+
+- [ ] **Step 5: Run real Discord acceptance if a human-operated Discord client is available**
 
 Do not use a Discord user token or bot-authored message to fake this; bot-authored messages are intentionally ignored by `discord.ts`.
 
@@ -827,7 +891,7 @@ If no safe human-operated client is available, record this as a residual manual 
 
 - [ ] **Step 1: Refresh live proof artifacts**
 
-From `/home/user/code/shapiroserver2/.worktrees/yente-discord-attachments-deploy`, run:
+From `<DEPLOY_WT>`, run:
 
 ```bash
 bash tests/capture-nanoclaw-live-proof.sh
@@ -906,7 +970,7 @@ Expected: clean tree; `overlay/shapiroserver2` points at the deployed runtime SH
 Run:
 
 ```bash
-cd /home/user/code/shapiroserver2/.worktrees/yente-discord-attachments-deploy
+cd "<DEPLOY_WT>"
 git status --short --branch
 git log --oneline -3
 cat srv/nanoclaw/source.conf
