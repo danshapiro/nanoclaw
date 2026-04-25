@@ -542,6 +542,40 @@ describe('materializeDiscordAttachments', () => {
     expect(await readSaved('attachments')).toBe('not a dir');
   });
 
+  it('does not create a temp file outside the group when the message directory is swapped before open', async () => {
+    const fixedNow = 1_234_567_890_000;
+    vi.spyOn(Date, 'now').mockReturnValue(fixedNow);
+    const outside = path.join(tmpRoot, 'outside');
+    await fsp.mkdir(outside);
+    const fetchImpl = vi.fn().mockResolvedValue(response('contents'));
+    let nameReads = 0;
+    const swappingAttachment: DiscordAttachmentInput = {
+      id: 'att1',
+      contentType: 'text/plain',
+      size: 8,
+      url: 'https://cdn.discord.test/report.txt',
+      get name() {
+        nameReads += 1;
+        if (nameReads === 1) return 'report.txt';
+        const messageDir = path.join(groupDir, 'attachments/discord/msg_001');
+        fs.rmSync(messageDir, { recursive: true, force: true });
+        fs.symlinkSync(outside, messageDir);
+        return 'report.txt';
+      },
+    };
+
+    const lines = await materializeDiscordAttachments({
+      messageId: 'msg_001',
+      group,
+      groupDir,
+      attachments: [swappingAttachment],
+      fetchImpl,
+    });
+
+    expect(lines[0]).toContain('[Attachment failed: report.txt reason=');
+    expect(await fsp.readdir(outside)).toEqual([]);
+  });
+
   it('revalidates the message directory before rename to prevent directory swaps', async () => {
     const outside = path.join(tmpRoot, 'outside');
     await fsp.mkdir(outside);

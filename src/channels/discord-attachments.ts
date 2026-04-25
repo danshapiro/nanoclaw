@@ -53,10 +53,13 @@ interface DownloadResult {
   containerPath: string;
 }
 
-interface OpenedTempFile {
+interface OpenedManagedDirectory {
   path: string;
+  fdPath: string;
   dev: number;
   ino: number;
+  handle: fsp.FileHandle;
+  relativeComponents: string[];
 }
 
 const DEFAULT_LIMITS: DiscordAttachmentLimits = {
@@ -188,39 +191,49 @@ async function downloadOneAttachment(
     }
   }
 
-  const messageDir = await ensureManagedDirectory(args.groupDir, [
-    'attachments',
-    'discord',
-    args.messageSegment,
-  ]);
-  const safeAttachmentId = sanitizePathSegment(
-    args.attachment.id,
-    `attachment-${args.index + 1}`,
+  const messageDirComponents = ['attachments', 'discord', args.messageSegment];
+  const messageDir = await ensureManagedDirectory(
+    args.groupDir,
+    messageDirComponents,
   );
-  const safeFilename = sanitizePathFilename(
-    args.attachment.name,
-    `attachment-${args.index + 1}`,
-    args.maxFilenameChars,
-  );
-  const finalFilename = `${safeAttachmentId}-${safeFilename}`;
-  const tempFilename = `.${finalFilename}.${process.pid}.${Date.now()}.tmp`;
-  const finalPath = path.join(messageDir, finalFilename);
-  const tempPath = path.join(messageDir, tempFilename);
+  let openedMessageDir: OpenedManagedDirectory | null = null;
+  let finalFilename = '';
+  let tempFilename = '';
   let fileHandle: fsp.FileHandle | null = null;
-  let tempCleanupFile: OpenedTempFile | null = null;
+  let finalPath = '';
+  let tempPath = '';
   let shouldRemoveTemp = true;
+  let shouldRemoveFinal = false;
 
   try {
+    openedMessageDir = await openManagedDirectory(
+      messageDir,
+      args.groupDir,
+      messageDirComponents,
+    );
+    const safeAttachmentId = sanitizePathSegment(
+      args.attachment.id,
+      `attachment-${args.index + 1}`,
+    );
+    const safeFilename = sanitizePathFilename(
+      args.attachment.name,
+      `attachment-${args.index + 1}`,
+      args.maxFilenameChars,
+    );
+    finalFilename = `${safeAttachmentId}-${safeFilename}`;
+    tempFilename = `.${finalFilename}.${process.pid}.${Date.now()}.tmp`;
+    finalPath = path.join(openedMessageDir.fdPath, finalFilename);
+    tempPath = path.join(openedMessageDir.fdPath, tempFilename);
+    await assertOpenedManagedDirectoryCurrent(openedMessageDir, args.groupDir);
     fileHandle = await fsp.open(
       tempPath,
-      fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY,
+      fs.constants.O_CREAT |
+        fs.constants.O_EXCL |
+        fs.constants.O_WRONLY |
+        fs.constants.O_NOFOLLOW,
       0o600,
     );
-    tempCleanupFile = await assertSafeOpenedTempFile(
-      tempPath,
-      args.groupDir,
-      fileHandle,
-    );
+    await assertSafeOpenedTempFile(fileHandle);
 
     let bytes = 0;
     const stream = Readable.fromWeb(response.body);
@@ -238,13 +251,12 @@ async function downloadOneAttachment(
     await fileHandle.close();
     fileHandle = null;
 
-    await assertSafeManagedDirectory(messageDir, args.groupDir, [
-      'attachments',
-      'discord',
-      args.messageSegment,
-    ]);
+    await assertOpenedManagedDirectoryCurrent(openedMessageDir, args.groupDir);
     await fsp.rename(tempPath, finalPath);
     shouldRemoveTemp = false;
+    shouldRemoveFinal = true;
+    await assertOpenedManagedDirectoryCurrent(openedMessageDir, args.groupDir);
+    shouldRemoveFinal = false;
 
     return {
       displayName: args.displayName,
@@ -257,8 +269,14 @@ async function downloadOneAttachment(
     if (fileHandle) {
       await fileHandle.close().catch(() => undefined);
     }
-    if (shouldRemoveTemp && tempCleanupFile) {
-      await removeOpenedTempFile(tempCleanupFile, args.groupDir);
+    if (openedMessageDir) {
+      if (shouldRemoveTemp && tempFilename) {
+        await removeOpenedDirectoryEntry(openedMessageDir, tempFilename);
+      }
+      if (shouldRemoveFinal && finalFilename) {
+        await removeOpenedDirectoryEntry(openedMessageDir, finalFilename);
+      }
+      await openedMessageDir.handle.close().catch(() => undefined);
     }
   }
 }
@@ -356,43 +374,76 @@ async function assertSafeManagedDirectory(
   }
 }
 
-async function assertSafeOpenedTempFile(
-  tempPath: string,
+async function openManagedDirectory(
+  dir: string,
   groupDir: string,
-  fileHandle: fsp.FileHandle,
-): Promise<OpenedTempFile> {
-  const groupReal = await fsp.realpath(groupDir);
-  const tempReal = await fsp.realpath(tempPath);
-  if (
-    tempReal !== groupReal &&
-    !tempReal.startsWith(`${groupReal}${path.sep}`)
-  ) {
-    throw new Error('Unsafe attachment temp path escaped group folder');
-  }
+  relativeComponents: string[],
+): Promise<OpenedManagedDirectory> {
+  const handle = await fsp.open(
+    dir,
+    fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW,
+  );
+  const fdPath = `/proc/self/fd/${handle.fd}`;
+  try {
+    const stat = await handle.stat();
+    if (!stat.isDirectory()) {
+      throw new Error(
+        `Unsafe attachment storage path: ${relativeComponents.join('/')}`,
+      );
+    }
 
+    const openedDir: OpenedManagedDirectory = {
+      path: dir,
+      fdPath,
+      dev: stat.dev,
+      ino: stat.ino,
+      handle,
+      relativeComponents,
+    };
+    await assertOpenedManagedDirectoryCurrent(openedDir, groupDir);
+    return openedDir;
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    throw error;
+  }
+}
+
+async function assertOpenedManagedDirectoryCurrent(
+  dir: OpenedManagedDirectory,
+  groupDir: string,
+): Promise<void> {
+  await assertSafeManagedDirectory(dir.path, groupDir, dir.relativeComponents);
+  const stat = await fsp.lstat(dir.path);
+  if (stat.dev !== dir.dev || stat.ino !== dir.ino) {
+    throw new Error(
+      `Unsafe attachment storage path: ${dir.relativeComponents.join('/')}`,
+    );
+  }
+  const groupReal = await fsp.realpath(groupDir);
+  const dirReal = await fsp.realpath(dir.fdPath);
+  if (dirReal !== groupReal && !dirReal.startsWith(`${groupReal}${path.sep}`)) {
+    throw new Error(
+      `Unsafe attachment storage path: ${dir.relativeComponents.join('/')}`,
+    );
+  }
+}
+
+async function assertSafeOpenedTempFile(
+  fileHandle: fsp.FileHandle,
+): Promise<void> {
   const tempStat = await fileHandle.stat();
   if (!tempStat.isFile()) {
     throw new Error('Unsafe attachment temp path is not a regular file');
   }
-  return { path: tempReal, dev: tempStat.dev, ino: tempStat.ino };
 }
 
-async function removeOpenedTempFile(
-  tempFile: OpenedTempFile,
-  groupDir: string,
+async function removeOpenedDirectoryEntry(
+  dir: OpenedManagedDirectory,
+  filename: string,
 ): Promise<void> {
-  const directorySafe = await assertSafeManagedDirectory(
-    path.dirname(tempFile.path),
-    groupDir,
-  ).then(
-    () => true,
-    () => false,
-  );
-  if (!directorySafe) return;
-
-  const stat = await fsp.stat(tempFile.path).catch(() => null);
-  if (!stat || stat.dev !== tempFile.dev || stat.ino !== tempFile.ino) return;
-  await fsp.rm(tempFile.path, { force: true }).catch(() => undefined);
+  await fsp.rm(path.join(dir.fdPath, filename), { force: true }).catch(() => {
+    // If the pinned directory was removed, there is no path to chase.
+  });
 }
 
 function componentsFor(groupDir: string, componentPath: string): string[] {
