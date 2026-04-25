@@ -30,8 +30,14 @@ const CONNECT_TIMEOUT_MS = 30_000;
 function sanitizeAttachmentLinePart(value: string): string {
   return (
     value
-      .replace(/[\u0000-\u001f\u007f]+/g, ' ')
-      .replace(/[\[\]]+/g, ' ')
+      .replaceAll('[', ' ')
+      .replaceAll(']', ' ')
+      .split('')
+      .map((char) => {
+        const code = char.charCodeAt(0);
+        return code < 32 || code === 127 ? ' ' : char;
+      })
+      .join('')
       .replace(/\s+/g, ' ')
       .trim() || 'attachment'
   );

@@ -260,8 +260,8 @@ function parseHttpsUrl(rawUrl: string | null | undefined): URL {
   let url: URL;
   try {
     url = new URL(rawUrl);
-  } catch {
-    throw new Error('attachment URL is invalid');
+  } catch (err) {
+    throw new Error('attachment URL is invalid', { cause: err });
   }
 
   if (url.protocol !== 'https:') {
@@ -410,8 +410,16 @@ function sanitizeDisplayName(
 
 function sanitizeOneLine(rawValue: string, fallback: string): string {
   const safe = rawValue
-    .replace(/[\u0000-\u001f\u007f]+/g, ' ')
-    .replace(/[\[\]]+/g, ' ')
+    .replaceAll('[', ' ')
+    .replaceAll(']', ' ')
+    .replaceAll(/[^\S\r\n]+/g, ' ')
+    .replaceAll(/\r|\n/g, ' ')
+    .split('')
+    .map((char) => {
+      const code = char.charCodeAt(0);
+      return code < 32 || code === 127 ? ' ' : char;
+    })
+    .join('')
     .replace(/\s+/g, ' ')
     .trim();
   return safe || fallback;
