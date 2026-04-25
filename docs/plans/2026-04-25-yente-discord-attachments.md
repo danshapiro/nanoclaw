@@ -249,7 +249,7 @@ import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { materializeDiscordAttachments } from './discord-attachments.js';
-import { RegisteredGroup } from '../types.js';
+import type { RegisteredGroup } from '../types.js';
 
 let tmpRoot: string;
 let groupDir: string;
@@ -315,7 +315,7 @@ import { Readable } from 'stream';
 
 import { resolveGroupFolderPath } from '../group-folder.js';
 import { logger } from '../logger.js';
-import { RegisteredGroup } from '../types.js';
+import type { RegisteredGroup } from '../types.js';
 ```
 
 - Directory creation:
@@ -329,9 +329,26 @@ import { RegisteredGroup } from '../types.js';
   - Build final filename as `<safeAttachmentId>-<safeFilename>`.
   - Build temp filename as `.${finalFilename}.${process.pid}.${Date.now()}.tmp`.
   - Use `fsp.open(tempPath, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY, 0o600)`.
+  - After opening `tempPath` and before writing any bytes, run a second containment check against the opened temp file, not only the path string:
+
+```ts
+const groupReal = await fsp.realpath(groupDir);
+const tempReal = await fsp.realpath(tempPath);
+if (tempReal !== groupReal && !tempReal.startsWith(`${groupReal}${path.sep}`)) {
+  throw new Error('Unsafe attachment temp path escaped group folder');
+}
+
+const tempStat = await fileHandle.stat();
+if (!tempStat.isFile()) {
+  throw new Error('Unsafe attachment temp path is not a regular file');
+}
+```
+
   - Stream `response.body` through `Readable.fromWeb(response.body)` and increment bytes before each write.
   - If bytes exceed `maxBytes`, throw a user-friendly size error and remove the temp file.
   - Close the file handle in `finally`.
+  - Immediately before `rename`, run `await assertSafeManagedDirectory(messageDir, groupDir)` again so a directory swapped after the pre-write checks cannot redirect the final path.
+  - On any post-open containment, regular-file, pre-rename revalidation, streaming, or rename failure, close the file handle, remove the temp file when possible, and return a visible `[Attachment failed: ...]` line rather than continuing the write or silently dropping the message.
   - `await fsp.rename(tempPath, finalPath)` only after the stream completes.
 
 - URL and response validation:
