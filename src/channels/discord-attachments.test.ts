@@ -146,6 +146,29 @@ describe('materializeDiscordAttachments', () => {
     expect(fs.existsSync(path.join(tmpRoot, 'secret.txt'))).toBe(false);
   });
 
+  it('does not preserve unsafe dot names in display text', async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(response('a'))
+      .mockResolvedValueOnce(response('b'));
+
+    const lines = await materializeDiscordAttachments({
+      messageId: 'msg',
+      group,
+      groupDir,
+      attachments: [
+        attachment({ id: 'a1', name: '..', size: 1 }),
+        attachment({ id: 'a2', name: '.env', size: 1 }),
+      ],
+      fetchImpl,
+    });
+
+    expect(lines[0]).toContain('[File: attachment-1 ');
+    expect(lines[0]).not.toContain('[File: .. ');
+    expect(lines[1]).toContain('[File: file.env ');
+    expect(lines[1]).not.toContain('[File: .env ');
+  });
+
   it('renders prompt-structural filename characters as one safe line', async () => {
     const fetchImpl = vi.fn().mockResolvedValue(response('contents'));
 
@@ -565,5 +588,61 @@ describe('materializeDiscordAttachments', () => {
       '[Attachment failed: report.txt reason=Unsafe attachment storage path: attachments/discord/msg_001]',
     );
     expect(await fsp.readdir(outside)).toEqual([]);
+  });
+
+  it('does not clean up through a swapped message-directory symlink', async () => {
+    const fixedNow = 1_234_567_890_000;
+    vi.spyOn(Date, 'now').mockReturnValue(fixedNow);
+    const outside = path.join(tmpRoot, 'outside');
+    await fsp.mkdir(outside);
+    const outsideTempName = `.att1-report.txt.${process.pid}.${fixedNow}.tmp`;
+    const outsideTempPath = path.join(outside, outsideTempName);
+    await fsp.writeFile(outsideTempPath, 'do not delete');
+
+    let controller!: ReadableStreamDefaultController<Uint8Array>;
+    const stream = new ReadableStream<Uint8Array>({
+      start(nextController) {
+        controller = nextController;
+        controller.enqueue(Buffer.from('safe'));
+      },
+    });
+    const fetchImpl = vi.fn().mockResolvedValue(
+      new Response(stream, {
+        status: 200,
+        headers: { 'content-length': '4' },
+      }),
+    );
+
+    const materializing = materializeDiscordAttachments({
+      messageId: 'msg_001',
+      group,
+      groupDir,
+      attachments: [attachment({ size: 4 })],
+      fetchImpl,
+    });
+
+    await vi.waitFor(async () => {
+      await expect(
+        fsp.access(path.join(groupDir, 'attachments/discord/msg_001')),
+      ).resolves.toBeUndefined();
+    });
+    await fsp.rm(path.join(groupDir, 'attachments/discord/msg_001'), {
+      recursive: true,
+      force: true,
+    });
+    await fsp.symlink(
+      outside,
+      path.join(groupDir, 'attachments/discord/msg_001'),
+    );
+    controller.close();
+
+    const lines = await materializing;
+
+    expect(lines[0]).toContain(
+      '[Attachment failed: report.txt reason=Unsafe attachment storage path: attachments/discord/msg_001]',
+    );
+    await expect(fsp.readFile(outsideTempPath, 'utf8')).resolves.toBe(
+      'do not delete',
+    );
   });
 });

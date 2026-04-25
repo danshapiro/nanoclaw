@@ -53,6 +53,12 @@ interface DownloadResult {
   containerPath: string;
 }
 
+interface OpenedTempFile {
+  path: string;
+  dev: number;
+  ino: number;
+}
+
 const DEFAULT_LIMITS: DiscordAttachmentLimits = {
   maxCount: 10,
   maxBytesPerFile: 25 * 1024 * 1024,
@@ -201,6 +207,7 @@ async function downloadOneAttachment(
   const finalPath = path.join(messageDir, finalFilename);
   const tempPath = path.join(messageDir, tempFilename);
   let fileHandle: fsp.FileHandle | null = null;
+  let tempCleanupFile: OpenedTempFile | null = null;
   let shouldRemoveTemp = true;
 
   try {
@@ -209,7 +216,11 @@ async function downloadOneAttachment(
       fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY,
       0o600,
     );
-    await assertSafeOpenedTempFile(tempPath, args.groupDir, fileHandle);
+    tempCleanupFile = await assertSafeOpenedTempFile(
+      tempPath,
+      args.groupDir,
+      fileHandle,
+    );
 
     let bytes = 0;
     const stream = Readable.fromWeb(response.body);
@@ -246,8 +257,8 @@ async function downloadOneAttachment(
     if (fileHandle) {
       await fileHandle.close().catch(() => undefined);
     }
-    if (shouldRemoveTemp) {
-      await fsp.rm(tempPath, { force: true }).catch(() => undefined);
+    if (shouldRemoveTemp && tempCleanupFile) {
+      await removeOpenedTempFile(tempCleanupFile, args.groupDir);
     }
   }
 }
@@ -349,7 +360,7 @@ async function assertSafeOpenedTempFile(
   tempPath: string,
   groupDir: string,
   fileHandle: fsp.FileHandle,
-): Promise<void> {
+): Promise<OpenedTempFile> {
   const groupReal = await fsp.realpath(groupDir);
   const tempReal = await fsp.realpath(tempPath);
   if (
@@ -363,6 +374,25 @@ async function assertSafeOpenedTempFile(
   if (!tempStat.isFile()) {
     throw new Error('Unsafe attachment temp path is not a regular file');
   }
+  return { path: tempReal, dev: tempStat.dev, ino: tempStat.ino };
+}
+
+async function removeOpenedTempFile(
+  tempFile: OpenedTempFile,
+  groupDir: string,
+): Promise<void> {
+  const directorySafe = await assertSafeManagedDirectory(
+    path.dirname(tempFile.path),
+    groupDir,
+  ).then(
+    () => true,
+    () => false,
+  );
+  if (!directorySafe) return;
+
+  const stat = await fsp.stat(tempFile.path).catch(() => null);
+  if (!stat || stat.dev !== tempFile.dev || stat.ino !== tempFile.ino) return;
+  await fsp.rm(tempFile.path, { force: true }).catch(() => undefined);
 }
 
 function componentsFor(groupDir: string, componentPath: string): string[] {
@@ -409,7 +439,11 @@ function sanitizeDisplayName(
   maxChars: number,
 ): string {
   const base = path.basename((rawName || '').replaceAll('\\', '/')).trim();
-  return sanitizeOneLine(base, fallback).slice(0, maxChars);
+  if (!base || base === '.' || base === '..') {
+    return fallback.slice(0, maxChars);
+  }
+  const visibleName = base.startsWith('.') ? `file${base}` : base;
+  return sanitizeOneLine(visibleName, fallback).slice(0, maxChars);
 }
 
 function sanitizeOneLine(rawValue: string, fallback: string): string {
