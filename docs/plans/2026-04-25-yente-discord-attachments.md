@@ -92,7 +92,8 @@ Unregistered Discord channels keep the existing metadata-only behavior and must 
   - `maxBytesTotal = 50 * 1024 * 1024`.
   - `downloadTimeoutMs = 30_000` per file.
   - `messageDownloadBudgetMs = 60_000` total for one message.
-- Check `att.size` before download when present, but also enforce streamed bytes because remote metadata is not the authority.
+- Check `att.size` before download when present against both the per-file limit and the remaining message-total byte budget. If the remaining total budget is exhausted, or metadata proves the attachment cannot fit, fail that attachment visibly without calling `fetch`.
+- Treat all display metadata as untrusted prompt text. Display filenames, MIME types, and failure reasons must be normalized to one safe line and must not contain control characters or bracket characters that can break the `[File: ...]` / `[Attachment failed: ...]` contract.
 - Accept only `https:` attachment URLs. Discord CDN attachment URLs should satisfy this. Anything else produces an explicit failure line.
 - Do not expose Discord CDN URLs in stored messages or agent prompts.
 - Do not add package dependencies.
@@ -167,12 +168,22 @@ export async function materializeDiscordAttachments(
       continue;
     }
 
+    let timeoutMs = limits.downloadTimeoutMs;
     try {
       const elapsedMs = Date.now() - startedAt;
       const remainingBudgetMs = limits.messageDownloadBudgetMs - elapsedMs;
       if (remainingBudgetMs <= 0) {
         throw new Error(`message attachment download budget exceeded after ${formatDuration(limits.messageDownloadBudgetMs)}`);
       }
+      const remainingTotalBytes = limits.maxBytesTotal - totalBytes;
+      if (remainingTotalBytes <= 0) {
+        throw new Error(`message attachment byte budget exceeded after ${formatBytes(limits.maxBytesTotal)}`);
+      }
+      const maxBytes = Math.min(limits.maxBytesPerFile, remainingTotalBytes);
+      if (attachment.size !== null && attachment.size !== undefined && attachment.size > maxBytes) {
+        throw new Error(`attachment size ${formatBytes(attachment.size)} exceeds remaining limit ${formatBytes(maxBytes)}`);
+      }
+      timeoutMs = Math.min(limits.downloadTimeoutMs, remainingBudgetMs);
 
       const result = await downloadOneAttachment({
         attachment,
@@ -181,15 +192,15 @@ export async function materializeDiscordAttachments(
         groupDir,
         messageSegment,
         fetchAttachment,
-        timeoutMs: Math.min(limits.downloadTimeoutMs, remainingBudgetMs),
-        maxBytes: Math.min(limits.maxBytesPerFile, limits.maxBytesTotal - totalBytes),
+        timeoutMs,
+        maxBytes,
         maxFilenameChars: limits.maxFilenameChars,
       });
 
       totalBytes += result.bytes;
       lines.push(formatAttachmentSuccess(result));
     } catch (error) {
-      const reason = formatDownloadError(error, limits.downloadTimeoutMs);
+      const reason = formatDownloadError(error, timeoutMs ?? limits.downloadTimeoutMs);
       logger.warn({ err: error, messageId: args.messageId, attachment: displayName }, 'Discord attachment materialization failed');
       lines.push(formatAttachmentFailure(displayName, reason));
     }
@@ -268,6 +279,7 @@ Required assertions:
 - If `attachments` already exists as a symlink to another temp directory, the helper fails the attachment and writes nothing through the symlink.
 - If there are more than 10 attachments, only the first 10 are eligible for fetch and the excess entries get explicit failure lines.
 - If `url` is missing or non-HTTPS, the helper returns an explicit failure line and does not call `fetchImpl`.
+- A filename containing newlines or bracket characters is still rendered as exactly one safe bracketed line and cannot inject a fake attachment line or fake `path=`.
 
 Use `new Response('contents', { status: 200, headers: { 'content-length': '8' } })` for successful fake fetches. Use an HTTPS-looking URL such as `https://cdn.discord.test/report.txt`; the fake fetch prevents network access.
 
@@ -328,7 +340,8 @@ import { RegisteredGroup } from '../types.js';
   - `formatDownloadError(...)` must normalize timeout/abort failures to `download timed out after 30s` when the per-file timeout was 30 seconds.
 
 - Sanitization:
-  - Normalize backslashes to `/`, take `path.basename(...)`, trim, remove control characters, cap display names, and fall back to `attachment-<n>` if empty.
+  - Normalize backslashes to `/`, take `path.basename(...)`, trim, replace control characters and `[`/`]` with safe spacing or punctuation, cap display names, and fall back to `attachment-<n>` if empty.
+  - Normalize MIME values to a conservative single-line token such as `text/plain`; use `unknown` if the value is missing or contains whitespace, control characters, brackets, or other prompt-structural punctuation.
   - Path filenames should be stricter than display names: replace every character outside `[A-Za-z0-9._-]` with `_`, collapse repeated `_`, reject `.`/`..`, prefix names that start with `.`, and cap to `maxFilenameChars` while preserving a short extension when possible.
   - Path segments for message/attachment IDs should allow only `[A-Za-z0-9_-]`; replace other characters with `_`, cap length, and fall back to `message`/`attachment-<n>`.
 
