@@ -23,6 +23,8 @@ This preserves upstream updateability better than a broad fork-specific architec
 - It follows the upstream convention that attachments become local file paths for the agent, but adapts the path to this overlay's actual mount root: `/workspace/group`.
 - It leaves a future upstream rebase free to replace this helper with the upstream session/inbox model when the overlay is intentionally migrated.
 
+One non-obvious requirement is preserving Discord ingest order. The helper waits for downloads before storing the message so agents never see stale placeholder text, but NanoClaw's current polling cursor is timestamp-based. Discord message events must therefore be serialized inside `DiscordChannel`; otherwise a later Discord message can be stored first and advance the cursor past the still-downloading attachment message.
+
 ## File Structure
 
 - Create `src/channels/discord-attachments.ts`
@@ -36,6 +38,7 @@ This preserves upstream updateability better than a broad fork-specific architec
 - Modify `src/channels/discord.ts`
   - Move attachment processing until after `registeredGroups()[chatJid]` succeeds.
   - Call `materializeDiscordAttachments(...)` before `opts.onMessage(...)`.
+  - Serialize Discord `MessageCreate` ingestion through a single bounded promise chain so a later Discord message cannot be stored before an earlier message whose attachments are still downloading.
   - Keep `onChatMetadata(...)` behavior for unregistered Discord chats.
   - Keep mention translation, thread-to-parent mapping, reply context, slash commands, typing, and outbound send behavior unchanged.
 
@@ -80,6 +83,7 @@ Unregistered Discord channels keep the existing metadata-only behavior and must 
 ## Contracts And Invariants
 
 - Attachment downloads happen only after `opts.registeredGroups()[chatJid]` returns a group.
+- Discord `MessageCreate` handling is serialized before `opts.onMessage(...)`. This is required because NanoClaw's current router cursor is timestamp-based: if a later Discord message is stored while an earlier attachment message is still downloading, the later timestamp can advance the global cursor and the earlier message can be skipped. Keep this ordering fix inside `DiscordChannel`; do not change the DB schema, router cursor, or core message loop for this bug.
 - Saved files live under the registered group folder resolved by `resolveGroupFolderPath(group.folder)`.
 - Container paths always use `/workspace/group/attachments/discord/<safe-message-id>/<safe-attachment-id>-<safe-name>`.
 - Host writes must fail closed if any managed attachment directory component already exists as a symlink or non-directory.
@@ -215,6 +219,7 @@ The final code should not copy this blindly if tests reveal a cleaner local expr
 ## Cutover And Regression Risk
 
 - Main behavioral regression risk: delaying `onMessage` while downloads happen. Keep bounded timeouts and a total message budget, and verify `onMessage` waits only until materialization finishes or fails.
+- Ordering regression risk: Discord.js does not wait for async event listeners, so attachment downloads can otherwise reorder stored messages. Serialize Discord message ingestion and test that a later message is not delivered while an earlier attachment download is pending.
 - Security regression risk: the group folder is writable by agents, so pre-existing symlinks under `attachments/` must fail closed instead of letting the host write through them.
 - Operational risk: attachments add durable group state and backup volume. Keep strict limits, store only registered-channel attachments, and document the new storage location.
 - Deployment risk: `shapiroserver2` currently has known pin/doc drift around the latest overlay state. Treat `/srv/nanoclaw/current/deploy-metadata.json` as live truth, then reconcile `source.conf`, `Deployment.md`, and proof artifacts after the new cutover.
@@ -453,6 +458,16 @@ Check this out
   - Resolve fake fetch with `new Response(...)`, then `await trigger`.
   - Assert `opts.onMessage` was called once with a saved path line.
 
+- `serializes Discord message delivery while an attachment download is pending`
+  - Create message A with `messageId: 'msg_001'`, timestamp `2026-04-25T01:00:00.000Z`, content `@Andy read this`, and one attachment whose fake fetch is deferred.
+  - Create message B with `messageId: 'msg_002'`, timestamp `2026-04-25T01:00:01.000Z`, content `@Andy follow-up`, and no attachments.
+  - Start `const first = triggerMessage(messageA)` without awaiting it.
+  - Start `const second = triggerMessage(messageB)` without awaiting it.
+  - Before resolving the attachment fetch, assert `opts.onMessage` has not been called for either message.
+  - Resolve the fetch, then `await first` and `await second`.
+  - Assert `opts.onMessage` was called first with `msg_001` and the saved attachment path, then with `msg_002`.
+  - This test protects the timestamp-cursor invariant without changing `src/index.ts`, `src/db.ts`, or `src/router.ts`.
+
 Existing placeholder tests should be changed to assert the new path-bearing contract. Do not delete coverage for image/video/audio/file labels; update it to check labels plus `path=`.
 
 - [ ] **Step 2: Run Discord channel tests to verify they fail**
@@ -475,6 +490,35 @@ Make these changes:
 import { materializeDiscordAttachments } from './discord-attachments.js';
 ```
 
+- Add a private Discord message ingestion queue:
+
+```ts
+private messageIngestQueue: Promise<void> = Promise.resolve();
+```
+
+- Keep the event listener itself small and return the queued promise so tests that call the registered handler can await the completed work:
+
+```ts
+this.client.on(Events.MessageCreate, (message: Message) =>
+  this.enqueueMessageCreate(message),
+);
+```
+
+- Implement the queue so one failed message logs the error but does not permanently poison the chain:
+
+```ts
+private enqueueMessageCreate(message: Message): Promise<void> {
+  const run = this.messageIngestQueue.then(() =>
+    this.handleMessageCreate(message),
+  );
+  this.messageIngestQueue = run.catch((err) => {
+    logger.error({ err }, 'Discord message handling failed');
+  });
+  return this.messageIngestQueue;
+}
+```
+
+- Move the existing message-create body into `private async handleMessageCreate(message: Message): Promise<void>`.
 - Remove the old block that maps attachments directly to `[Image: name]`, `[Video: name]`, `[Audio: name]`, or `[File: name]`.
 - Keep bot ignore, thread parent mapping, chat identity, mention translation, and chat metadata behavior as-is.
 - Call `this.opts.onChatMetadata(...)` before the registered-group check, preserving group discovery.
