@@ -54,6 +54,9 @@ One non-obvious requirement is preserving Discord ingest order. The helper waits
   - Update the current tested deploy ref and live release state from live metadata.
   - Add a short current-state note that Discord attachments for registered chats are materialized under `shared/groups/<group>/attachments/discord/...` and are covered by the existing shared-state backup scope.
 
+- Modify `/home/user/code/shapiroserver2/services-and-security.md` on the same `deploy/nanoclaw` worktree after the live deploy succeeds
+  - Update the current production ref, release pointers, live verification date/release text, and add the same concise Discord attachment storage contract under the NanoClaw current-state section.
+
 - Modify `/home/user/code/shapiroserver2/changes.md` on the same `deploy/nanoclaw` worktree after the live deploy succeeds
   - Record the user-visible fix and rollout date.
 
@@ -222,7 +225,7 @@ The final code should not copy this blindly if tests reveal a cleaner local expr
 - Ordering regression risk: Discord.js does not wait for async event listeners, so attachment downloads can otherwise reorder stored messages. Serialize Discord message ingestion and test that a later message is not delivered while an earlier attachment download is pending.
 - Security regression risk: the group folder is writable by agents, so pre-existing symlinks under `attachments/` must fail closed instead of letting the host write through them.
 - Operational risk: attachments add durable group state and backup volume. Keep strict limits, store only registered-channel attachments, and document the new storage location.
-- Deployment risk: `shapiroserver2` currently has known pin/doc drift around the latest overlay state. Treat `/srv/nanoclaw/current/deploy-metadata.json` as live truth, then reconcile `source.conf`, `Deployment.md`, and proof artifacts after the new cutover.
+- Deployment risk: `shapiroserver2` currently has known pin/doc drift around the latest overlay state. Treat `/srv/nanoclaw/current/deploy-metadata.json` as live truth, then reconcile `source.conf`, `Deployment.md`, `services-and-security.md`, and proof artifacts after the new cutover.
 - Testing gap: there is no safe automated way to create a real Discord non-bot user message from the bot token. Cover Discord ingress with unit/integration tests, then use live deployed helper/mount smoke plus the standard Yente host smoke. If a human-operated Discord client is already available during execution, run the real attachment acceptance test too, but do not block rollout on unsafe user-token automation.
 
 ---
@@ -725,6 +728,7 @@ Expected: This exact SHA is the value to pin in `shapiroserver2/srv/nanoclaw/sou
 **Files:**
 - Modify: `/home/user/code/shapiroserver2/srv/nanoclaw/source.conf`
 - Later in Task 8, modify: `/home/user/code/shapiroserver2/docs/nanoclaw/Deployment.md`
+- Later in Task 8, modify: `/home/user/code/shapiroserver2/services-and-security.md`
 - Later in Task 8, modify: `/home/user/code/shapiroserver2/changes.md`
 - Later in Task 8, likely modify: `/home/user/code/shapiroserver2/tests/artifacts/nanoclaw-live/current/**`
 
@@ -753,7 +757,28 @@ git status --short --branch
 
 Expected: worktree is on `deploy/nanoclaw` and clean. In the current workstation state, this should reuse `/home/user/code/shapiroserver2/.worktrees/trycycle-reconcile-deploy-canonical`; do not try to add a second worktree for `deploy/nanoclaw` while that branch is already checked out. Use this selected path as `<DEPLOY_WT>` in later deploy-repo steps. If this worktree is dirty with another agent's changes, inspect before proceeding and do not overwrite or revert them.
 
-- [ ] **Step 2: Capture live truth before editing docs**
+- [ ] **Step 2: Reconcile `deploy/nanoclaw` with `main` before editing**
+
+The shapiroserver2 upgrade runbook requires the final deploy-management state to land on both `main` and `deploy/nanoclaw`. Start from a deploy branch that contains current `main` so the final main landing is a fast-forward instead of a surprise integration task after deploy.
+
+Run:
+
+```bash
+git fetch --all --prune
+git status --short --branch
+git rev-list --left-right --count main...deploy/nanoclaw
+```
+
+Expected: worktree is clean. If the branch drift is not `0 0`, rebase `deploy/nanoclaw` onto `main` now and preserve both sides' intended current-state docs and deploy pin:
+
+```bash
+git rebase main
+bash tests/validate.sh
+```
+
+Expected: rebase succeeds and `bash tests/validate.sh` passes before changing `source.conf`. If conflicts involve another agent's unlanded changes, inspect them and preserve them; do not reset or overwrite.
+
+- [ ] **Step 3: Capture live truth before editing docs**
 
 Run:
 
@@ -769,26 +794,33 @@ ssh shapiroserver2-lan '
 
 Expected: command succeeds. Use this output to reconcile any existing drift in `Deployment.md`; do not assume the checked-in source pin is live truth.
 
-- [ ] **Step 3: Update `source.conf`**
+- [ ] **Step 4: Update `source.conf`**
 
-Edit `srv/nanoclaw/source.conf` so it pins the Task 4 `RUNTIME_SHA`:
+Set `RUNTIME_SHA` in this shell to the exact SHA recorded in Task 4, then edit `srv/nanoclaw/source.conf` so it pins that runtime:
 
 ```text
 repo=/home/user/code/nanoclaw
 ref=<RUNTIME_SHA>
 ```
 
-- [ ] **Step 4: Run deploy repo validation before deploy**
+- [ ] **Step 5: Run source-pin sanity checks before deploy**
+
+Do not run the full `bash tests/validate.sh` between changing `source.conf` and refreshing live proof artifacts. That validator intentionally requires `docs/nanoclaw/Deployment.md`, `services-and-security.md`, and `tests/artifacts/nanoclaw-live/current/**` to match the pinned SHA, and those files cannot be truthful for the new release until after deploy and proof capture.
 
 Run:
 
 ```bash
-bash tests/validate.sh
+PINNED_SHA="$(sed -n 's/^ref=//p' srv/nanoclaw/source.conf | head -n1)"
+test "$PINNED_SHA" = "$RUNTIME_SHA"
+git -C /home/user/code/nanoclaw cat-file -e "$PINNED_SHA^{commit}"
+bash -n srv/nanoclaw/deploy-host.sh
+bash -n srv/nanoclaw/deploy-skills.sh
+bash -n tests/capture-nanoclaw-live-proof.sh
 ```
 
-Expected: PASS.
+Expected: all commands succeed. Full deploy-repo validation happens in Task 8 after docs and proof artifacts are refreshed against the live release.
 
-- [ ] **Step 5: Commit deploy-management prep**
+- [ ] **Step 6: Commit deploy-management prep**
 
 Run:
 
@@ -973,6 +1005,7 @@ If no safe human-operated client is available, record this as a residual manual 
 **Files:**
 - Modify: `/home/user/code/shapiroserver2/tests/artifacts/nanoclaw-live/current/**`
 - Modify: `/home/user/code/shapiroserver2/docs/nanoclaw/Deployment.md`
+- Modify: `/home/user/code/shapiroserver2/services-and-security.md`
 - Modify: `/home/user/code/shapiroserver2/changes.md`
 
 - [ ] **Step 1: Refresh live proof artifacts**
@@ -1007,6 +1040,11 @@ In `docs/nanoclaw/Deployment.md`:
 - Discord attachment contract: for registered Discord chats, inbound attachments are downloaded at ingress into `/srv/nanoclaw/shared/groups/<group>/attachments/discord/<message-id>/` and surfaced to agents as `/workspace/group/attachments/discord/<message-id>/<attachment-id>-<safe-name>` paths. Failed downloads are stored as explicit message text failures; raw Discord CDN URLs are not exposed to agents.
 ```
 
+In `services-and-security.md`:
+
+- Update "Current production ref", "Current release pointers", and the live verification date/release text from the live metadata.
+- Add the same one-sentence Discord attachment contract in the NanoClaw section, next to the existing Discord command-surface bullet.
+
 In `changes.md`, add a dated entry for April 25, 2026 stating that Yente now materializes registered Discord attachments into group storage, appends explicit file paths/failures to message text, and was redeployed after validation.
 
 Do not update `docs/nanoclaw/Upgrade.md` unless the implementation actually changes the operator procedure. This plan does not intend to change it.
@@ -1020,18 +1058,18 @@ bash tests/validate.sh
 git status --short
 ```
 
-Expected: validation PASS; only intentional docs/source/proof artifact changes are present.
+Expected: validation PASS; only intentional docs and proof artifact changes are present.
 
 - [ ] **Step 4: Commit deploy proof updates**
 
 Run:
 
 ```bash
-git add docs/nanoclaw/Deployment.md changes.md tests/artifacts/nanoclaw-live/current
+git add docs/nanoclaw/Deployment.md services-and-security.md changes.md tests/artifacts/nanoclaw-live/current
 git commit -m "docs: refresh nanoclaw live proof"
 ```
 
-If Step 1 did not change proof artifacts and Step 2 did not change docs, skip this commit.
+If Step 1 did not change proof artifacts and Step 2 did not change docs or service-state text, skip this commit.
 
 ### Task 9: Final Repository State And Rollback Readiness
 
@@ -1064,7 +1102,36 @@ cat srv/nanoclaw/source.conf
 
 Expected: clean tree; `deploy/nanoclaw` contains the new source pin and docs/proof commits.
 
-- [ ] **Step 3: Verify live rollback pointer**
+- [ ] **Step 3: Land the deploy-management result on `main`**
+
+The upgrade runbook requires the final shapiroserver2 state on both `deploy/nanoclaw` and `main`. Because Task 5 rebased `deploy/nanoclaw` onto `main` before editing, this should be a fast-forward unless another agent moved `main` during the rollout.
+
+Run:
+
+```bash
+cd /home/user/code/shapiroserver2
+MAIN_WT="$(
+  git worktree list --porcelain |
+    awk '
+      $1 == "worktree" { path=$2 }
+      $1 == "branch" && $2 == "refs/heads/main" { print path }
+    ' |
+    head -n1
+)"
+if [ -z "$MAIN_WT" ]; then
+  MAIN_WT="/home/user/code/shapiroserver2/.worktrees/yente-discord-attachments-main"
+  git worktree add "$MAIN_WT" main
+fi
+cd "$MAIN_WT"
+git status --short --branch
+git merge --ff-only deploy/nanoclaw
+bash tests/validate.sh
+git rev-list --left-right --count main...deploy/nanoclaw
+```
+
+Expected: main worktree is clean before the merge, merge fast-forwards, validation passes, and branch drift prints `0 0`. If `main` moved and fast-forward fails, return to `<DEPLOY_WT>`, rebase `deploy/nanoclaw` onto the new `main`, rerun `bash tests/validate.sh`, then repeat this step. Do not overwrite another agent's main-branch changes.
+
+- [ ] **Step 4: Verify live rollback pointer**
 
 Run:
 
@@ -1079,12 +1146,12 @@ ssh shapiroserver2-lan '
 
 Expected: current is the new runtime SHA; previous is the pre-deploy release. If validation failed after cutover, use the rollback section in `/home/user/code/shapiroserver2/docs/nanoclaw/Deployment.md`.
 
-- [ ] **Step 4: Final implementation report**
+- [ ] **Step 5: Final implementation report**
 
 Report:
 
 - Runtime commit SHA deployed.
-- `shapiroserver2` deploy commit SHA.
+- `shapiroserver2` `deploy/nanoclaw` and `main` commit SHA after landing.
 - Focused and full tests run.
 - Standard live checks run.
 - Attachment-specific live smoke result.
