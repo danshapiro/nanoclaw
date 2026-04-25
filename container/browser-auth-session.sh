@@ -35,7 +35,7 @@ cleanup() {
 
   agent-browser --session "$SESSION_NAME" close >/dev/null 2>&1 || true
 
-  for pid_var in AGENT_BROWSER_PID WEBSOCKIFY_PID X11VNC_PID XVFB_PID; do
+  for pid_var in AGENT_BROWSER_PID X11VNC_PID XVFB_PID; do
     local pid="${!pid_var:-}"
     if [[ -n "$pid" ]] && kill -0 "$pid" >/dev/null 2>&1; then
       kill "$pid" >/dev/null 2>&1 || true
@@ -69,13 +69,6 @@ if ! wait_for_tcp 127.0.0.1 5900; then
   fail "x11vnc did not start listening on port 5900"
 fi
 
-websockify --web=/usr/share/novnc 6080 localhost:5900 >/tmp/browser-auth-session-websockify.log 2>&1 &
-WEBSOCKIFY_PID=$!
-
-if ! wait_for_tcp 127.0.0.1 6080; then
-  fail "websockify did not start listening on port 6080"
-fi
-
 agent-browser --session "$SESSION_NAME" --headed --profile "$PROFILE_DIR" open "$URL" &
 AGENT_BROWSER_PID=$!
 
@@ -93,9 +86,6 @@ while true; do
   fi
   if [[ -n "${X11VNC_PID:-}" ]] && ! kill -0 "$X11VNC_PID" >/dev/null 2>&1; then
     fail "x11vnc exited unexpectedly"
-  fi
-  if [[ -n "${WEBSOCKIFY_PID:-}" ]] && ! kill -0 "$WEBSOCKIFY_PID" >/dev/null 2>&1; then
-    fail "websockify exited unexpectedly"
   fi
   sleep 5
 done

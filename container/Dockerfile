@@ -24,8 +24,6 @@ RUN apt-get update && apt-get install -y \
     libxshmfence1 \
     curl \
     git \
-    novnc \
-    websockify \
     x11vnc \
     xvfb \
     && rm -rf /var/lib/apt/lists/*
