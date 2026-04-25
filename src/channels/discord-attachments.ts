@@ -277,7 +277,11 @@ async function ensureManagedDirectory(
   let current = groupDir;
   for (const component of components) {
     current = path.join(current, component);
-    await ensureDirectoryComponent(current, groupDir, componentsFor(groupDir, current));
+    await ensureDirectoryComponent(
+      current,
+      groupDir,
+      componentsFor(groupDir, current),
+    );
   }
   return current;
 }
@@ -348,7 +352,10 @@ async function assertSafeOpenedTempFile(
 ): Promise<void> {
   const groupReal = await fsp.realpath(groupDir);
   const tempReal = await fsp.realpath(tempPath);
-  if (tempReal !== groupReal && !tempReal.startsWith(`${groupReal}${path.sep}`)) {
+  if (
+    tempReal !== groupReal &&
+    !tempReal.startsWith(`${groupReal}${path.sep}`)
+  ) {
     throw new Error('Unsafe attachment temp path escaped group folder');
   }
 
@@ -359,10 +366,7 @@ async function assertSafeOpenedTempFile(
 }
 
 function componentsFor(groupDir: string, componentPath: string): string[] {
-  return path
-    .relative(groupDir, componentPath)
-    .split(path.sep)
-    .filter(Boolean);
+  return path.relative(groupDir, componentPath).split(path.sep).filter(Boolean);
 }
 
 function formatAttachmentSuccess(result: DownloadResult): string {

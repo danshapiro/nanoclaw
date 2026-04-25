@@ -528,7 +528,10 @@ describe('materializeDiscordAttachments', () => {
       recursive: true,
       force: true,
     });
-    await fsp.symlink(outside, path.join(groupDir, 'attachments/discord/msg_001'));
+    await fsp.symlink(
+      outside,
+      path.join(groupDir, 'attachments/discord/msg_001'),
+    );
     controller.close();
 
     const lines = await materializing;

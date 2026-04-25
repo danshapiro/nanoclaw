@@ -1,3 +1,7 @@
+import fsp from 'fs/promises';
+import os from 'os';
+import path from 'path';
+
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 
 vi.mock('../config.js', () => ({
@@ -28,6 +32,17 @@ const mockStoreMessageDirect = vi.hoisted(() => vi.fn());
 
 vi.mock('../db.js', () => ({
   storeMessageDirect: mockStoreMessageDirect,
+}));
+
+const mockGroupsRoot = vi.hoisted(() => ({ value: '' }));
+
+vi.mock('../group-folder.js', () => ({
+  resolveGroupFolderPath: vi.fn((folder: string) => {
+    if (!mockGroupsRoot.value) {
+      throw new Error('mock group root was not initialized');
+    }
+    return `${mockGroupsRoot.value}/${folder}`;
+  }),
 }));
 
 type Handler = (...args: any[]) => any;
@@ -228,6 +243,28 @@ function createMessage(overrides: {
   };
 }
 
+function createAttachment(overrides: Partial<any> = {}) {
+  const name = overrides.name ?? 'report.txt';
+  return {
+    id: overrides.id ?? 'att1',
+    name,
+    contentType: overrides.contentType ?? 'text/plain',
+    size: overrides.size ?? 10,
+    url: overrides.url ?? `https://cdn.discord.test/${name}`,
+    ...overrides,
+  };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 function currentClient() {
   return clientRef.current;
 }
@@ -287,12 +324,21 @@ function createInteraction(overrides: {
 }
 
 describe('DiscordChannel', () => {
-  beforeEach(() => {
+  let tmpRoot: string;
+
+  beforeEach(async () => {
     vi.clearAllMocks();
+    tmpRoot = await fsp.mkdtemp(
+      path.join(os.tmpdir(), 'nanoclaw-discord-channel-'),
+    );
+    mockGroupsRoot.value = tmpRoot;
+    await fsp.mkdir(path.join(tmpRoot, 'test-server'), { recursive: true });
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     vi.restoreAllMocks();
+    await fsp.rm(tmpRoot, { recursive: true, force: true });
+    mockGroupsRoot.value = '';
   });
 
   describe('self-registration', () => {
@@ -761,82 +807,19 @@ describe('DiscordChannel', () => {
   });
 
   describe('attachments', () => {
-    it('stores image attachment with placeholder', async () => {
-      const opts = createTestOpts();
-      const channel = new DiscordChannel('test-token', opts);
-      await channel.connect();
-
-      const attachments = new Map([
-        ['att1', { name: 'photo.png', contentType: 'image/png' }],
-      ]);
-      const msg = createMessage({
-        content: '',
-        attachments,
-        guildName: 'Server',
-      });
-      await triggerMessage(msg);
-
-      expect(opts.onMessage).toHaveBeenCalledWith(
-        'dc:1234567890123456',
-        expect.objectContaining({
-          content: '[Image: photo.png]',
+    it('stores downloaded attachment paths for registered channels', async () => {
+      vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        new Response('hello file', {
+          status: 200,
+          headers: { 'content-length': '10' },
         }),
       );
-    });
-
-    it('stores video attachment with placeholder', async () => {
       const opts = createTestOpts();
       const channel = new DiscordChannel('test-token', opts);
       await channel.connect();
 
       const attachments = new Map([
-        ['att1', { name: 'clip.mp4', contentType: 'video/mp4' }],
-      ]);
-      const msg = createMessage({
-        content: '',
-        attachments,
-        guildName: 'Server',
-      });
-      await triggerMessage(msg);
-
-      expect(opts.onMessage).toHaveBeenCalledWith(
-        'dc:1234567890123456',
-        expect.objectContaining({
-          content: '[Video: clip.mp4]',
-        }),
-      );
-    });
-
-    it('stores file attachment with placeholder', async () => {
-      const opts = createTestOpts();
-      const channel = new DiscordChannel('test-token', opts);
-      await channel.connect();
-
-      const attachments = new Map([
-        ['att1', { name: 'report.pdf', contentType: 'application/pdf' }],
-      ]);
-      const msg = createMessage({
-        content: '',
-        attachments,
-        guildName: 'Server',
-      });
-      await triggerMessage(msg);
-
-      expect(opts.onMessage).toHaveBeenCalledWith(
-        'dc:1234567890123456',
-        expect.objectContaining({
-          content: '[File: report.pdf]',
-        }),
-      );
-    });
-
-    it('includes text content with attachments', async () => {
-      const opts = createTestOpts();
-      const channel = new DiscordChannel('test-token', opts);
-      await channel.connect();
-
-      const attachments = new Map([
-        ['att1', { name: 'photo.jpg', contentType: 'image/jpeg' }],
+        ['att1', createAttachment({ name: 'report.txt' })],
       ]);
       const msg = createMessage({
         content: 'Check this out',
@@ -848,19 +831,71 @@ describe('DiscordChannel', () => {
       expect(opts.onMessage).toHaveBeenCalledWith(
         'dc:1234567890123456',
         expect.objectContaining({
-          content: 'Check this out\n[Image: photo.jpg]',
+          content:
+            'Check this out\n[File: report.txt type=text/plain size=10 B path=/workspace/group/attachments/discord/msg_001/att1-report.txt]',
         }),
       );
+      await expect(
+        fsp.readFile(
+          path.join(
+            tmpRoot,
+            'test-server/attachments/discord/msg_001/att1-report.txt',
+          ),
+          'utf8',
+        ),
+      ).resolves.toBe('hello file');
     });
 
-    it('handles multiple attachments', async () => {
+    it('stores media attachments with labels and saved paths', async () => {
+      vi.spyOn(globalThis, 'fetch').mockImplementation(() =>
+        Promise.resolve(
+          new Response('x', {
+            status: 200,
+            headers: { 'content-length': '1' },
+          }),
+        ),
+      );
       const opts = createTestOpts();
       const channel = new DiscordChannel('test-token', opts);
       await channel.connect();
 
       const attachments = new Map([
-        ['att1', { name: 'a.png', contentType: 'image/png' }],
-        ['att2', { name: 'b.txt', contentType: 'text/plain' }],
+        [
+          'att1',
+          createAttachment({
+            id: 'att1',
+            name: 'photo.png',
+            contentType: 'image/png',
+            size: 1,
+          }),
+        ],
+        [
+          'att2',
+          createAttachment({
+            id: 'att2',
+            name: 'clip.mp4',
+            contentType: 'video/mp4',
+            size: 1,
+          }),
+        ],
+        [
+          'att3',
+          createAttachment({
+            id: 'att3',
+            name: 'sound.mp3',
+            contentType: 'audio/mpeg',
+            size: 1,
+          }),
+        ],
+        [
+          'att4',
+          createAttachment({
+            id: 'att4',
+            name: 'report.pdf',
+            contentType: 'application/pdf',
+            size: 1,
+          }),
+        ],
       ]);
       const msg = createMessage({
         content: '',
@@ -872,9 +907,266 @@ describe('DiscordChannel', () => {
       expect(opts.onMessage).toHaveBeenCalledWith(
         'dc:1234567890123456',
         expect.objectContaining({
-          content: '[Image: a.png]\n[File: b.txt]',
+          content: [
+            '[Image: photo.png type=image/png size=1 B path=/workspace/group/attachments/discord/msg_001/att1-photo.png]',
+            '[Video: clip.mp4 type=video/mp4 size=1 B path=/workspace/group/attachments/discord/msg_001/att2-clip.mp4]',
+            '[Audio: sound.mp3 type=audio/mpeg size=1 B path=/workspace/group/attachments/discord/msg_001/att3-sound.mp3]',
+            '[File: report.pdf type=application/pdf size=1 B path=/workspace/group/attachments/discord/msg_001/att4-report.pdf]',
+          ].join('\n'),
         }),
       );
+      expect(vi.mocked(globalThis.fetch)).toHaveBeenCalledTimes(4);
+    });
+
+    it('does not download attachments for unregistered channels', async () => {
+      const fetchSpy = vi.spyOn(globalThis, 'fetch');
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      const attachments = new Map([['att1', createAttachment()]]);
+      const msg = createMessage({
+        channelId: '9999999999999999',
+        content: 'Unknown channel',
+        attachments,
+        guildName: 'Other Server',
+      });
+      await triggerMessage(msg);
+
+      expect(opts.onChatMetadata).toHaveBeenCalledWith(
+        'dc:9999999999999999',
+        expect.any(String),
+        expect.any(String),
+        'discord',
+        true,
+      );
+      expect(opts.onMessage).not.toHaveBeenCalled();
+      expect(fetchSpy).not.toHaveBeenCalled();
+      await expect(fsp.readdir(tmpRoot)).resolves.toEqual(['test-server']);
+    });
+
+    it('keeps partial success and visible failure lines', async () => {
+      vi.spyOn(globalThis, 'fetch')
+        .mockResolvedValueOnce(
+          new Response('ok', {
+            status: 200,
+            headers: { 'content-length': '2' },
+          }),
+        )
+        .mockResolvedValueOnce(new Response('nope', { status: 403 }));
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      const attachments = new Map([
+        ['att1', createAttachment({ id: 'att1', name: 'good.txt', size: 2 })],
+        [
+          'att2',
+          createAttachment({ id: 'att2', name: 'blocked.txt', size: 4 }),
+        ],
+      ]);
+      const msg = createMessage({
+        content: 'Check',
+        attachments,
+        guildName: 'Server',
+      });
+      await triggerMessage(msg);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'dc:1234567890123456',
+        expect.objectContaining({
+          content: [
+            'Check',
+            '[File: good.txt type=text/plain size=2 B path=/workspace/group/attachments/discord/msg_001/att1-good.txt]',
+            '[Attachment failed: blocked.txt reason=download returned HTTP 403]',
+          ].join('\n'),
+        }),
+      );
+      const content = vi.mocked(opts.onMessage).mock.calls[0][1].content;
+      expect(content).not.toContain('cdn.discord.test');
+    });
+
+    it('waits for materialization before delivering the message', async () => {
+      const pending = deferred<Response>();
+      vi.spyOn(globalThis, 'fetch').mockReturnValue(pending.promise);
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      const attachments = new Map([
+        ['att1', createAttachment({ name: 'report.txt' })],
+      ]);
+      const msg = createMessage({
+        content: 'Wait',
+        attachments,
+        guildName: 'Server',
+      });
+
+      const triggered = triggerMessage(msg);
+      await Promise.resolve();
+      expect(opts.onMessage).not.toHaveBeenCalled();
+
+      pending.resolve(
+        new Response('hello file', {
+          status: 200,
+          headers: { 'content-length': '10' },
+        }),
+      );
+      await triggered;
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'dc:1234567890123456',
+        expect.objectContaining({
+          content: expect.stringContaining(
+            'path=/workspace/group/attachments/discord/msg_001/att1-report.txt',
+          ),
+        }),
+      );
+    });
+
+    it('serializes Discord message delivery while an attachment download is pending', async () => {
+      const pending = deferred<Response>();
+      vi.spyOn(globalThis, 'fetch').mockReturnValue(pending.promise);
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      const messageA = createMessage({
+        messageId: 'msg_001',
+        createdAt: new Date('2026-04-25T01:00:00.000Z'),
+        content: '@Andy read this',
+        attachments: new Map([
+          ['att1', createAttachment({ name: 'report.txt' })],
+        ]),
+        guildName: 'Server',
+      });
+      const messageB = createMessage({
+        messageId: 'msg_002',
+        createdAt: new Date('2026-04-25T01:00:01.000Z'),
+        content: '@Andy follow-up',
+        guildName: 'Server',
+      });
+
+      const first = triggerMessage(messageA);
+      const second = triggerMessage(messageB);
+      await Promise.resolve();
+      expect(opts.onMessage).not.toHaveBeenCalled();
+
+      pending.resolve(
+        new Response('hello file', {
+          status: 200,
+          headers: { 'content-length': '10' },
+        }),
+      );
+      await first;
+      await second;
+
+      expect(opts.onMessage).toHaveBeenNthCalledWith(
+        1,
+        'dc:1234567890123456',
+        expect.objectContaining({
+          id: 'msg_001',
+          content: expect.stringContaining(
+            'path=/workspace/group/attachments/discord/msg_001/att1-report.txt',
+          ),
+        }),
+      );
+      expect(opts.onMessage).toHaveBeenNthCalledWith(
+        2,
+        'dc:1234567890123456',
+        expect.objectContaining({
+          id: 'msg_002',
+          content: '@Andy follow-up',
+        }),
+      );
+    });
+
+    it('translates bot mentions before appending attachment paths', async () => {
+      vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        new Response('hello file', {
+          status: 200,
+          headers: { 'content-length': '10' },
+        }),
+      );
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      const msg = createMessage({
+        content: '<@999888777> read this',
+        mentionsBotId: true,
+        attachments: new Map([['att1', createAttachment()]]),
+        guildName: 'Server',
+      });
+      await triggerMessage(msg);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'dc:1234567890123456',
+        expect.objectContaining({
+          content:
+            '@Andy read this\n[File: report.txt type=text/plain size=10 B path=/workspace/group/attachments/discord/msg_001/att1-report.txt]',
+        }),
+      );
+    });
+
+    it('keeps reply context before attachment paths', async () => {
+      vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        new Response('hello file', {
+          status: 200,
+          headers: { 'content-length': '10' },
+        }),
+      );
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      const msg = createMessage({
+        content: 'I agree',
+        reference: { messageId: 'original_msg_id' },
+        attachments: new Map([['att1', createAttachment()]]),
+        guildName: 'Server',
+      });
+      await triggerMessage(msg);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'dc:1234567890123456',
+        expect.objectContaining({
+          content:
+            '[Reply to Bob] I agree\n[File: report.txt type=text/plain size=10 B path=/workspace/group/attachments/discord/msg_001/att1-report.txt]',
+        }),
+      );
+    });
+
+    it('uses parent registered group for thread attachment messages', async () => {
+      vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        new Response('hello file', {
+          status: 200,
+          headers: { 'content-length': '10' },
+        }),
+      );
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      const msg = createMessage({
+        channelId: 'thread_111',
+        threadParentId: '1234567890123456',
+        content: 'Thread file',
+        attachments: new Map([['att1', createAttachment()]]),
+        guildName: 'Server',
+      });
+      await triggerMessage(msg);
+      await channel.sendMessage('dc:1234567890123456', 'Reply in thread');
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'dc:1234567890123456',
+        expect.objectContaining({
+          content: expect.stringContaining(
+            'path=/workspace/group/attachments/discord/msg_001/att1-report.txt',
+          ),
+        }),
+      );
+      expect(currentClient().channels.fetch).toHaveBeenCalledWith('thread_111');
     });
   });
 

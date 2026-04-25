@@ -22,9 +22,20 @@ import {
   OnInboundMessage,
   RegisteredGroup,
 } from '../types.js';
+import { materializeDiscordAttachments } from './discord-attachments.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 
 const CONNECT_TIMEOUT_MS = 30_000;
+
+function sanitizeAttachmentLinePart(value: string): string {
+  return (
+    value
+      .replace(/[\u0000-\u001f\u007f]+/g, ' ')
+      .replace(/[\[\]]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim() || 'attachment'
+  );
+}
 
 export interface DiscordChannelOpts {
   onMessage: OnInboundMessage;
@@ -47,6 +58,7 @@ export class DiscordChannel implements Channel {
   private opts: DiscordChannelOpts;
   private botToken: string;
   private latestThread = new Map<string, string>();
+  private messageIngestQueue: Promise<void> = Promise.resolve();
 
   constructor(botToken: string, opts: DiscordChannelOpts) {
     this.botToken = botToken;
@@ -63,128 +75,9 @@ export class DiscordChannel implements Channel {
       ],
     });
 
-    this.client.on(Events.MessageCreate, async (message: Message) => {
-      if (message.author.bot) return;
-
-      let channelId = message.channelId;
-      let channelForName: TextChannel | ThreadChannel =
-        message.channel as TextChannel;
-      if (message.channel.isThread()) {
-        const thread = message.channel as ThreadChannel;
-        const parentId = thread.parentId;
-        if (parentId) {
-          this.latestThread.set(parentId, channelId);
-          channelId = parentId;
-          channelForName = (thread.parent ?? thread) as TextChannel;
-        }
-      }
-
-      const chatJid = `dc:${channelId}`;
-      let content = message.content;
-      const timestamp = message.createdAt.toISOString();
-      const senderName =
-        message.member?.displayName ||
-        message.author.displayName ||
-        message.author.username;
-      const sender = message.author.id;
-      const msgId = message.id;
-
-      let chatName: string;
-      if (message.guild) {
-        chatName = `${message.guild.name} #${(channelForName as TextChannel).name}`;
-      } else {
-        chatName = senderName;
-      }
-
-      if (this.client?.user) {
-        const botId = this.client.user.id;
-        const isBotMentioned =
-          message.mentions.users.has(botId) ||
-          content.includes(`<@${botId}>`) ||
-          content.includes(`<@!${botId}>`);
-
-        if (isBotMentioned) {
-          content = content
-            .replace(new RegExp(`<@!?${botId}>`, 'g'), '')
-            .trim();
-          if (!TRIGGER_PATTERN.test(content)) {
-            content = `@${ASSISTANT_NAME} ${content}`;
-          }
-        }
-      }
-
-      if (message.attachments.size > 0) {
-        const attachmentDescriptions = [...message.attachments.values()].map(
-          (att) => {
-            const contentType = att.contentType || '';
-            if (contentType.startsWith('image/')) {
-              return `[Image: ${att.name || 'image'}]`;
-            } else if (contentType.startsWith('video/')) {
-              return `[Video: ${att.name || 'video'}]`;
-            } else if (contentType.startsWith('audio/')) {
-              return `[Audio: ${att.name || 'audio'}]`;
-            } else {
-              return `[File: ${att.name || 'file'}]`;
-            }
-          },
-        );
-        if (content) {
-          content = `${content}\n${attachmentDescriptions.join('\n')}`;
-        } else {
-          content = attachmentDescriptions.join('\n');
-        }
-      }
-
-      if (message.reference?.messageId) {
-        try {
-          const repliedTo = await message.channel.messages.fetch(
-            message.reference.messageId,
-          );
-          const replyAuthor =
-            repliedTo.member?.displayName ||
-            repliedTo.author.displayName ||
-            repliedTo.author.username;
-          content = `[Reply to ${replyAuthor}] ${content}`;
-        } catch {
-          // Referenced message may have been deleted
-        }
-      }
-
-      const isGroup = !!message.guild;
-
-      this.opts.onChatMetadata(
-        chatJid,
-        timestamp,
-        chatName,
-        'discord',
-        isGroup,
-      );
-
-      const group = this.opts.registeredGroups()[chatJid];
-      if (!group) {
-        logger.debug(
-          { chatJid, chatName },
-          'Message from unregistered Discord channel',
-        );
-        return;
-      }
-
-      this.opts.onMessage(chatJid, {
-        id: msgId,
-        chat_jid: chatJid,
-        sender,
-        sender_name: senderName,
-        content,
-        timestamp,
-        is_from_me: false,
-        is_bot_message: false,
-      });
-
-      logger.info(
-        { chatJid, chatName, sender: senderName },
-        'Discord message stored',
-      );
-    });
+    this.client.on(Events.MessageCreate, (message: Message) =>
+      this.enqueueMessageCreate(message),
+    );
 
     this.client.on(Events.InteractionCreate, async (interaction) => {
       if (!interaction.isChatInputCommand()) return;
@@ -217,6 +110,149 @@ export class DiscordChannel implements Channel {
         reject(err);
       });
     });
+  }
+
+  private enqueueMessageCreate(message: Message): Promise<void> {
+    const run = this.messageIngestQueue.then(() =>
+      this.handleMessageCreate(message),
+    );
+    this.messageIngestQueue = run.catch((err) => {
+      logger.error({ err }, 'Discord message handling failed');
+    });
+    return this.messageIngestQueue;
+  }
+
+  private async handleMessageCreate(message: Message): Promise<void> {
+    if (message.author.bot) return;
+
+    let channelId = message.channelId;
+    let channelForName: TextChannel | ThreadChannel =
+      message.channel as TextChannel;
+    if (message.channel.isThread()) {
+      const thread = message.channel as ThreadChannel;
+      const parentId = thread.parentId;
+      if (parentId) {
+        this.latestThread.set(parentId, channelId);
+        channelId = parentId;
+        channelForName = (thread.parent ?? thread) as TextChannel;
+      }
+    }
+
+    const chatJid = `dc:${channelId}`;
+    let content = message.content;
+    const timestamp = message.createdAt.toISOString();
+    const senderName =
+      message.member?.displayName ||
+      message.author.displayName ||
+      message.author.username;
+    const sender = message.author.id;
+    const msgId = message.id;
+    const chatName = message.guild
+      ? `${message.guild.name} #${(channelForName as TextChannel).name}`
+      : senderName;
+
+    if (this.client?.user) {
+      const botId = this.client.user.id;
+      const isBotMentioned =
+        message.mentions.users.has(botId) ||
+        content.includes(`<@${botId}>`) ||
+        content.includes(`<@!${botId}>`);
+
+      if (isBotMentioned) {
+        content = content.replace(new RegExp(`<@!?${botId}>`, 'g'), '').trim();
+        if (!TRIGGER_PATTERN.test(content)) {
+          content = `@${ASSISTANT_NAME} ${content}`;
+        }
+      }
+    }
+
+    const isGroup = !!message.guild;
+    this.opts.onChatMetadata(chatJid, timestamp, chatName, 'discord', isGroup);
+
+    const group = this.opts.registeredGroups()[chatJid];
+    if (!group) {
+      logger.debug(
+        { chatJid, chatName },
+        'Message from unregistered Discord channel',
+      );
+      return;
+    }
+
+    if (message.reference?.messageId) {
+      try {
+        const repliedTo = await message.channel.messages.fetch(
+          message.reference.messageId,
+        );
+        const replyAuthor =
+          repliedTo.member?.displayName ||
+          repliedTo.author.displayName ||
+          repliedTo.author.username;
+        content = `[Reply to ${replyAuthor}] ${content}`;
+      } catch {
+        // Referenced message may have been deleted
+      }
+    }
+
+    const attachments = [...message.attachments.values()];
+    const attachmentLines =
+      attachments.length > 0
+        ? await this.materializeAttachmentsForMessage(msgId, group, attachments)
+        : [];
+
+    if (attachmentLines.length > 0) {
+      content = content
+        ? `${content}\n${attachmentLines.join('\n')}`
+        : attachmentLines.join('\n');
+    }
+
+    this.opts.onMessage(chatJid, {
+      id: msgId,
+      chat_jid: chatJid,
+      sender,
+      sender_name: senderName,
+      content,
+      timestamp,
+      is_from_me: false,
+      is_bot_message: false,
+    });
+
+    logger.info(
+      { chatJid, chatName, sender: senderName },
+      'Discord message stored',
+    );
+  }
+
+  private async materializeAttachmentsForMessage(
+    messageId: string,
+    group: RegisteredGroup,
+    attachments: Array<{
+      id?: string | null;
+      name?: string | null;
+      contentType?: string | null;
+      size?: number | null;
+      url?: string | null;
+    }>,
+  ): Promise<string[]> {
+    try {
+      return await materializeDiscordAttachments({
+        messageId,
+        group,
+        attachments: attachments.map((att) => ({
+          id: att.id,
+          name: att.name,
+          contentType: att.contentType,
+          size: att.size,
+          url: att.url,
+        })),
+      });
+    } catch (err) {
+      logger.error({ err, messageId }, 'Discord attachment helper failed');
+      const reason = err instanceof Error ? err.message : 'unknown error';
+      return attachments.map(
+        (att, index) =>
+          `[Attachment failed: ${sanitizeAttachmentLinePart(att.name || `attachment-${index + 1}`)} reason=${sanitizeAttachmentLinePart(reason)}]`,
+      );
+    }
   }
 
   async sendMessage(jid: string, text: string): Promise<void> {
