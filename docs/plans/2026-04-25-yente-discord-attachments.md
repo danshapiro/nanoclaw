@@ -594,17 +594,46 @@ Run:
 git fetch upstream origin
 git status --short --branch
 git log --oneline --decorate -5
-git diff --stat upstream/main...HEAD -- src/channels/discord.ts src/channels/discord-attachments.ts src/router.ts src/db.ts src/container-runner.ts src/config.ts package.json
+
+BASE_RUNTIME_SHA="$(git merge-base overlay/shapiroserver2 HEAD)"
+git diff --stat "$BASE_RUNTIME_SHA"..HEAD
+git diff --name-only "$BASE_RUNTIME_SHA"..HEAD
+git diff --name-only "$BASE_RUNTIME_SHA"..HEAD -- package.json package-lock.json src/router.ts src/db.ts src/container-runner.ts src/config.ts src/channels/index.ts
+
+# Upstream-policy review only. This overlay already has intentional differences
+# from upstream/main in deployment-sensitive files, so do not use this as the
+# isolation check for the new bug fix.
+git diff --stat upstream/main...HEAD -- src/channels/discord.ts src/channels/discord-attachments.ts src/router.ts src/db.ts src/container-runner.ts src/config.ts package.json package-lock.json
 ```
 
-Expected: working tree clean; the new change remains isolated to Discord-specific files relative to this overlay.
+Expected:
+
+- Working tree clean.
+- The `$BASE_RUNTIME_SHA..HEAD` diff contains only the plan file and Discord attachment implementation/test files.
+- The sensitive-file diff against `$BASE_RUNTIME_SHA` prints nothing except `src/channels/discord.ts` if Task 2 has already landed.
+- The `upstream/main...HEAD` diff may show existing overlay divergence in `package.json`, `src/config.ts`, `src/db.ts`, and `src/container-runner.ts`; use it to confirm this task did not add new core-runtime drift beyond the Discord-specific files already reviewed in the overlay diff.
 
 - [ ] **Step 2: Fast-forward `overlay/shapiroserver2` to the tested runtime**
 
-If the current worktree is still on `trycycle/yente-discord-attachments`, run:
+Use the existing `overlay/shapiroserver2` worktree if another agent has it checked out; otherwise switch this implementation worktree onto the overlay branch and fast-forward it:
 
 ```bash
-git switch overlay/shapiroserver2
+OVERLAY_WT="$(
+  git worktree list --porcelain |
+    awk '
+      $1 == "worktree" { path=$2 }
+      $1 == "branch" && $2 == "refs/heads/overlay/shapiroserver2" { print path }
+    ' |
+    head -n1
+)"
+
+if [ -n "$OVERLAY_WT" ] && [ "$OVERLAY_WT" != "$(pwd)" ]; then
+  cd "$OVERLAY_WT"
+  git status --short --branch
+else
+  git switch overlay/shapiroserver2
+fi
+
 git merge --ff-only trycycle/yente-discord-attachments
 ```
 
