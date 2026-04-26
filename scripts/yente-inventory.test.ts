@@ -128,6 +128,26 @@ describe('yente inventory', () => {
       readFileSyncSpy.mockRestore();
     }
   });
+
+  it('records unreadable credential files without opening their contents', () => {
+    const envPath = path.join(stateRoot, '.env');
+    fs.chmodSync(envPath, 0o000);
+
+    try {
+      const inventory = buildYenteInventory({ stateRoot, configRoot, checkedAt: '2026-04-26T00:00:00.000Z' });
+
+      expect(hashSourceState(stateRoot)).toMatch(/^[a-f0-9]{64}$/);
+      expect(inventory.credentialMaterial).toContainEqual({
+        path: '.env',
+        reason: 'environment file',
+        keys: [],
+        unreadable: true,
+      });
+      expect(JSON.stringify(inventory)).not.toContain('super-secret-token');
+    } finally {
+      fs.chmodSync(envPath, 0o600);
+    }
+  });
 });
 
 function createInventoryFixture(root: string, config: string): void {

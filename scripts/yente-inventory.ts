@@ -68,6 +68,7 @@ export interface CredentialMaterial {
   path: string;
   reason: string;
   keys?: string[];
+  unreadable?: boolean;
 }
 
 export interface ProviderPolicyEvidence {
@@ -199,7 +200,20 @@ export function sha256File(file: string): string {
 }
 
 function updateHashFromFile(hash: crypto.Hash, file: string): void {
-  const fd = fs.openSync(file, 'r');
+  let fd: number;
+  try {
+    fd = fs.openSync(file, 'r');
+  } catch (err) {
+    if (isPermissionDenied(err)) {
+      const stat = fs.statSync(file);
+      hash.update('<unreadable>');
+      hash.update(String(stat.size));
+      hash.update('\0');
+      hash.update(String(stat.mtimeMs));
+      return;
+    }
+    throw err;
+  }
   const buffer = Buffer.allocUnsafe(1024 * 1024);
   try {
     let bytesRead = 0;
@@ -473,7 +487,13 @@ function classifyCredentialMaterial(
 
   for (const rel of files) {
     if (rel === '.env' || rel === 'data/env') {
-      credentials.push({ path: rel, reason: 'environment file', keys: readEnvKeys(path.join(stateRoot, rel)) });
+      const file = path.join(stateRoot, rel);
+      credentials.push({
+        path: rel,
+        reason: 'environment file',
+        keys: readEnvKeys(file),
+        ...(isEnvFileUnreadable(file) ? { unreadable: true } : {}),
+      });
       continue;
     }
     if (rel.startsWith('store/auth/') || rel.includes('/baileys/') || rel.includes('whatsapp')) {
@@ -498,14 +518,37 @@ function classifyCredentialMaterial(
 }
 
 function readEnvKeys(file: string): string[] {
-  return fs
-    .readFileSync(file, 'utf8')
+  const raw = readTextIfReadable(file);
+  if (raw === null) return [];
+  return raw
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter((line) => line && !line.startsWith('#') && line.includes('='))
     .map((line) => line.slice(0, line.indexOf('=')).trim())
     .filter(isSecretKey)
     .sort();
+}
+
+function isEnvFileUnreadable(file: string): boolean {
+  return readTextIfReadable(file) === null;
+}
+
+function readTextIfReadable(file: string): string | null {
+  try {
+    return fs.readFileSync(file, 'utf8');
+  } catch (err) {
+    if (isPermissionDenied(err)) return null;
+    throw err;
+  }
+}
+
+function isPermissionDenied(err: unknown): boolean {
+  return (
+    err instanceof Error &&
+    'code' in err &&
+    (err as NodeJS.ErrnoException).code !== undefined &&
+    ['EACCES', 'EPERM'].includes((err as NodeJS.ErrnoException).code ?? '')
+  );
 }
 
 export function inferChannel(jid: string, channelHint?: string | null): { channelType: string; platformId: string } {
