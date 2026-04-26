@@ -60,8 +60,13 @@ interface FetchResponse {
 
 type FetchLike = (
   url: string,
-  init: { method: 'PUT'; headers: Record<string, string>; body: string },
+  init: { method: 'GET' | 'PUT' | 'POST'; headers: Record<string, string>; body?: string },
 ) => Promise<FetchResponse>;
+
+export interface DiscordApplicationConfig {
+  applicationId: string;
+  publicKey: string;
+}
 
 interface DiscordInteractionUser {
   id?: unknown;
@@ -126,6 +131,112 @@ export async function registerYenteDiscordGuildCommands(args: {
   }
 }
 
+export async function clearYenteDiscordGlobalCommands(args: {
+  applicationId: string;
+  botToken: string;
+  fetchImpl?: FetchLike;
+}): Promise<void> {
+  const fetchImpl = args.fetchImpl ?? fetch;
+  const url = `${DISCORD_API_BASE}/applications/${encodeURIComponent(args.applicationId)}/commands`;
+  const response = await fetchImpl(url, {
+    method: 'PUT',
+    headers: {
+      Authorization: `Bot ${args.botToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: '[]',
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Failed to clear Yente Discord global commands: ${response.status} ${text}`);
+  }
+}
+
+export async function fetchDiscordApplicationConfig(args: {
+  botToken: string;
+  fetchImpl?: FetchLike;
+}): Promise<DiscordApplicationConfig> {
+  const fetchImpl = args.fetchImpl ?? fetch;
+  const response = await fetchImpl(`${DISCORD_API_BASE}/oauth2/applications/@me`, {
+    method: 'GET',
+    headers: {
+      Authorization: `Bot ${args.botToken}`,
+    },
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Failed to discover Discord application config: ${response.status} ${text}`);
+  }
+
+  const body = JSON.parse(await response.text()) as { id?: unknown; verify_key?: unknown };
+  if (typeof body.id !== 'string' || body.id.length === 0) {
+    throw new Error('Failed to discover Discord application config: response missing id');
+  }
+  if (typeof body.verify_key !== 'string' || body.verify_key.length === 0) {
+    throw new Error('Failed to discover Discord application config: response missing verify_key');
+  }
+  return { applicationId: body.id, publicKey: body.verify_key };
+}
+
+export async function resolveDiscordGuildIdsForChannels(args: {
+  botToken: string;
+  channelIds: readonly string[];
+  fetchImpl?: FetchLike;
+}): Promise<string[]> {
+  const fetchImpl = args.fetchImpl ?? fetch;
+  const guildIds = new Set<string>();
+
+  for (const channelId of args.channelIds) {
+    const normalized = channelIdFromPlatformId(channelId);
+    if (!normalized) continue;
+    const response = await fetchImpl(`${DISCORD_API_BASE}/channels/${encodeURIComponent(normalized)}`, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bot ${args.botToken}`,
+      },
+    });
+    if (!response.ok) continue;
+    const body = JSON.parse(await response.text()) as { guild_id?: unknown };
+    if (typeof body.guild_id === 'string' && body.guild_id.length > 0) {
+      guildIds.add(body.guild_id);
+    }
+  }
+
+  return [...guildIds].sort();
+}
+
+export async function syncYenteDiscordApplicationCommands(args: {
+  botToken: string;
+  channelIds: readonly string[];
+  applicationId?: string | null;
+  publicKey?: string | null;
+  fetchImpl?: FetchLike;
+}): Promise<DiscordApplicationConfig & { guildIds: string[] }> {
+  const discovered =
+    args.applicationId && args.publicKey
+      ? { applicationId: args.applicationId, publicKey: args.publicKey }
+      : await fetchDiscordApplicationConfig({ botToken: args.botToken, fetchImpl: args.fetchImpl });
+  const guildIds = await resolveDiscordGuildIdsForChannels({
+    botToken: args.botToken,
+    channelIds: args.channelIds,
+    fetchImpl: args.fetchImpl,
+  });
+
+  await clearYenteDiscordGlobalCommands({
+    applicationId: discovered.applicationId,
+    botToken: args.botToken,
+    fetchImpl: args.fetchImpl,
+  });
+  await registerYenteDiscordGuildCommands({
+    applicationId: discovered.applicationId,
+    botToken: args.botToken,
+    guildIds,
+    fetchImpl: args.fetchImpl,
+  });
+
+  return { ...discovered, guildIds };
+}
+
 export function normalizeDiscordApplicationCommandInteraction(
   interaction: DiscordApplicationCommandInteraction,
 ): NormalizedDiscordCommandInteraction | null {
@@ -142,7 +253,6 @@ export function normalizeDiscordApplicationCommandInteraction(
     userId ||
     'Discord user';
   const channelId = typeof interaction.channel_id === 'string' ? interaction.channel_id : '';
-  const guildId = typeof interaction.guild_id === 'string' ? interaction.guild_id : null;
 
   return {
     commandName: command.name,
@@ -150,7 +260,14 @@ export function normalizeDiscordApplicationCommandInteraction(
     requiresAdmin: command.requiresAdmin,
     userId: `discord:${userId}`,
     senderName,
-    platformId: guildId ? `discord:${guildId}:${channelId}` : `discord:@me:${channelId}`,
+    platformId: channelId,
     threadId: null,
   };
+}
+
+function channelIdFromPlatformId(platformId: string): string | null {
+  if (!platformId) return null;
+  if (!platformId.startsWith('discord:')) return platformId;
+  const parts = platformId.split(':');
+  return parts[2] ?? null;
 }

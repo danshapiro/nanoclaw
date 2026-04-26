@@ -142,7 +142,7 @@ export function buildYenteInventory(options: InventoryOptions): YenteInventory {
       source.groups = readGroups(db);
       source.tasks = readTasks(db);
       source.targetSessions = readSessions(db);
-      source.senders = readSenders(db, source.chats);
+      source.senders = readSenders(db, source.chats, source.groups);
       source.roles = readRoles(db);
       remoteControl = readRemoteControlEvidence(db, stateRoot, remoteControl.stateFile);
     } finally {
@@ -327,9 +327,10 @@ function readSessions(db: Database.Database): SourceSession[] {
   ).map((row) => ({ groupFolder: row.group_folder, sessionId: row.session_id }));
 }
 
-function readSenders(db: Database.Database, chats: SourceChat[]): SourceSender[] {
+function readSenders(db: Database.Database, chats: SourceChat[], groups: SourceGroup[]): SourceSender[] {
   const byKey = new Map<string, SourceSender>();
   const chatChannel = new Map(chats.map((chat) => [chat.jid, inferChannel(chat.jid, chat.channel).channelType]));
+  const chatGroupFolder = new Map(groups.map((group) => [group.jid, group.folder]));
 
   if (hasTable(db, 'messages')) {
     const rows = db
@@ -341,7 +342,7 @@ function readSenders(db: Database.Database, chats: SourceChat[]): SourceSender[]
         senderId: row.sender,
         senderName: row.sender_name,
         channelType,
-        groupFolder: null,
+        groupFolder: chatGroupFolder.get(row.chat_jid) ?? null,
       });
     }
   }

@@ -241,8 +241,10 @@ function applyReport(report: YenteMigrationReport, options: ApplyOptions): void 
   central.transaction(() => {
     for (const group of report.inventory.source.groups) insertAgentGroup(central, group);
     for (const mapping of report.messagingGroupMappings) insertMessagingGroup(central, mapping, report.inventory);
-    for (const mapping of report.sessionMappings)
+    for (const mapping of report.sessionMappings) {
       insertMessagingGroupAgent(central, mapping, groupsByFolder.get(mapping.groupFolder)!);
+      insertAgentDestination(central, mapping);
+    }
     insertUsersAndRoles(central, report);
     for (const mapping of report.sessionMappings) insertSession(central, mapping);
   })();
@@ -341,6 +343,42 @@ function insertMessagingGroupAgent(db: Database.Database, mapping: SessionMappin
     group.isMain ? 100 : 0,
     groupCreatedAt(),
   );
+}
+
+function insertAgentDestination(db: Database.Database, mapping: SessionMapping): void {
+  if (!hasTable(db, 'agent_destinations')) return;
+
+  const existingTarget = db
+    .prepare(
+      `SELECT 1 AS present
+         FROM agent_destinations
+        WHERE agent_group_id = ? AND target_type = 'channel' AND target_id = ?
+        LIMIT 1`,
+    )
+    .get(mapping.agentGroupId, mapping.messagingGroupId);
+  if (existingTarget) return;
+
+  const messagingGroup = db
+    .prepare('SELECT channel_type, name FROM messaging_groups WHERE id = ?')
+    .get(mapping.messagingGroupId) as { channel_type: string; name: string | null } | undefined;
+  if (!messagingGroup) return;
+
+  const base = slug(messagingGroup.name || `${messagingGroup.channel_type}-${mapping.messagingGroupId.slice(0, 8)}`);
+  let localName = base;
+  let suffix = 2;
+  while (
+    db
+      .prepare('SELECT 1 AS present FROM agent_destinations WHERE agent_group_id = ? AND local_name = ? LIMIT 1')
+      .get(mapping.agentGroupId, localName)
+  ) {
+    localName = `${base}-${suffix}`;
+    suffix += 1;
+  }
+
+  db.prepare(
+    `INSERT INTO agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
+     VALUES (?, ?, 'channel', ?, ?)`,
+  ).run(mapping.agentGroupId, localName, mapping.messagingGroupId, groupCreatedAt());
 }
 
 function insertUsersAndRoles(db: Database.Database, report: YenteMigrationReport): void {
@@ -614,6 +652,10 @@ function slug(value: string): string {
 
 function shortHash(value: string): string {
   return crypto.createHash('sha256').update(value).digest('hex').slice(0, 12);
+}
+
+function hasTable(db: Database.Database, name: string): boolean {
+  return Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name));
 }
 
 function v1DbPath(stateRoot: string): string {

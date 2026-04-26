@@ -189,14 +189,38 @@ describe('yente v1-to-v2 migration apply', () => {
     expect((db.prepare('SELECT COUNT(*) AS c FROM messaging_group_agents').get() as { c: number }).c).toBe(3);
     expect((db.prepare('SELECT COUNT(*) AS c FROM users').get() as { c: number }).c).toBeGreaterThanOrEqual(4);
     expect((db.prepare('SELECT COUNT(*) AS c FROM user_roles').get() as { c: number }).c).toBe(2);
-    expect((db.prepare('SELECT COUNT(*) AS c FROM agent_group_members').get() as { c: number }).c).toBe(2);
-    expect(db.prepare("SELECT platform_id FROM messaging_groups WHERE channel_type = 'discord'").get()).toEqual({
+    expect((db.prepare('SELECT COUNT(*) AS c FROM agent_group_members').get() as { c: number }).c).toBeGreaterThanOrEqual(
+      3,
+    );
+    const mainAgentGroup = db.prepare("SELECT id FROM agent_groups WHERE folder = 'main'").get() as { id: string };
+    const mainMessagingGroup = db
+      .prepare("SELECT id, platform_id FROM messaging_groups WHERE channel_type = 'discord'")
+      .get() as { id: string; platform_id: string };
+    expect((db.prepare('SELECT COUNT(*) AS c FROM agent_destinations').get() as { c: number }).c).toBe(3);
+    expect(
+      db.prepare("SELECT local_name, target_type FROM agent_destinations WHERE agent_group_id = ? AND target_id = ?").get(
+        mainAgentGroup.id,
+        mainMessagingGroup.id,
+      ),
+    ).toEqual({
+      local_name: 'guild-general',
+      target_type: 'channel',
+    });
+    expect(
+      db
+        .prepare(
+          `SELECT 1 AS present
+             FROM agent_group_members
+            WHERE agent_group_id = ? AND user_id = ?`,
+        )
+        .get(mainAgentGroup.id, 'discord:admin-user'),
+    ).toEqual({ present: 1 });
+    expect(mainMessagingGroup).toMatchObject({
       platform_id: 'stage-discord-chan',
     });
 
     const mainContinuation = applyReport.continuations.find((c) => c.groupFolder === 'main');
     expect(mainContinuation).toBeDefined();
-    const mainAgentGroup = db.prepare("SELECT id FROM agent_groups WHERE folder = 'main'").get() as { id: string };
     const mainSessionRows = db
       .prepare("SELECT * FROM sessions WHERE agent_group_id = ? AND status = 'active'")
       .all(mainAgentGroup.id);
@@ -282,6 +306,46 @@ describe('yente v1-to-v2 migration apply', () => {
         reportPath: path.join(stateRoot, 'migration-apply-report.json'),
       }).applied,
     ).toBe(true);
+  });
+
+  it('seeds members from v1 message history when legacy known sender tables are absent', () => {
+    const v1Db = new Database(path.join(stateRoot, 'store', 'messages.db'));
+    v1Db.exec('DROP TABLE known_senders; DROP TABLE admin_senders;');
+    v1Db.close();
+
+    const reportPath = writeGoodDryRunReport('prod');
+    applyYenteMigration({
+      stateRoot,
+      configRoot,
+      assistantName: 'Yente',
+      target: 'prod',
+      dryRunReportPath: reportPath,
+      reportPath: path.join(tempDir, 'prod-apply.json'),
+      confirmProd: true,
+    });
+
+    const db = new Database(path.join(stateRoot, 'data', 'v2.db'));
+    const mainAgentGroup = db.prepare("SELECT id FROM agent_groups WHERE folder = 'main'").get() as { id: string };
+    const chavaAgentGroup = db.prepare("SELECT id FROM agent_groups WHERE folder = 'chava'").get() as { id: string };
+    expect(
+      db
+        .prepare(
+          `SELECT 1 AS present
+             FROM agent_group_members
+            WHERE agent_group_id = ? AND user_id = ?`,
+        )
+        .get(mainAgentGroup.id, 'discord:known-user'),
+    ).toEqual({ present: 1 });
+    expect(
+      db
+        .prepare(
+          `SELECT 1 AS present
+             FROM agent_group_members
+            WHERE agent_group_id = ? AND user_id = ?`,
+        )
+        .get(chavaAgentGroup.id, 'whatsapp:12015550100@s.whatsapp.net'),
+    ).toEqual({ present: 1 });
+    db.close();
   });
 
   it('quarantines unmapped due tasks in staging instead of leaving them active on production destinations', () => {

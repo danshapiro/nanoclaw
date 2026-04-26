@@ -21,6 +21,7 @@ import { SqliteStateAdapter } from '../state-sqlite.js';
 import { registerWebhookAdapter } from '../webhook-server.js';
 import { getAskQuestionRender } from '../db/sessions.js';
 import { normalizeOptions, type NormalizedOption } from './ask-question.js';
+import { normalizeDiscordApplicationCommandInteraction } from './discord-commands.js';
 import type { ChannelAdapter, ChannelSetup, InboundMessage } from './adapter.js';
 
 /** Adapter with optional gateway support (e.g., Discord). */
@@ -32,6 +33,13 @@ interface GatewayAdapter extends Adapter {
     webhookUrl?: string,
   ): Promise<Response>;
 }
+
+type ForwardedEventAdapter = Pick<GatewayAdapter, 'name' | 'handleWebhook'>;
+
+type FetchLike = (
+  url: string,
+  init: { method: 'POST'; headers: Record<string, string>; body: string },
+) => Promise<{ ok: boolean; status: number; text(): Promise<string> }>;
 
 /** Reply context extracted from a platform's raw message. */
 export interface ReplyContext {
@@ -522,11 +530,12 @@ function startLocalWebhookServer(
   });
 }
 
-async function handleForwardedEvent(
+export async function handleForwardedEvent(
   body: string,
-  adapter: GatewayAdapter,
+  adapter: ForwardedEventAdapter,
   setupConfig: ChannelSetup,
   botToken?: string,
+  fetchImpl: FetchLike = fetch,
 ): Promise<void> {
   let event: { type: string; data: Record<string, unknown> };
   try {
@@ -538,6 +547,31 @@ async function handleForwardedEvent(
   // Handle interaction events (button clicks) — not handled by adapter's handleForwardedGatewayEvent
   if (event.type === 'GATEWAY_INTERACTION_CREATE' && event.data) {
     const interaction = event.data;
+    if (interaction.type === 2) {
+      const normalized = normalizeDiscordApplicationCommandInteraction(interaction);
+      if (normalized) {
+        await acknowledgeDiscordInteraction(interaction, fetchImpl);
+        await setupConfig.onInbound(normalized.platformId, normalized.threadId, {
+          id:
+            typeof interaction.id === 'string'
+              ? `discord-command-${interaction.id}`
+              : `discord-command-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          kind: 'chat-sdk',
+          timestamp: new Date().toISOString(),
+          isMention: true,
+          isGroup: typeof interaction.guild_id === 'string',
+          content: {
+            text: normalized.text,
+            sender: normalized.senderName,
+            senderName: normalized.senderName,
+            senderId: normalized.userId.replace(/^discord:/, ''),
+            applicationCommand: true,
+            commandName: normalized.commandName,
+          },
+        });
+        return;
+      }
+    }
     // type 3 = MessageComponent (button/select)
     if (interaction.type === 3) {
       const customId = (interaction.data as Record<string, unknown>)?.custom_id as string;
@@ -571,7 +605,7 @@ async function handleForwardedEvent(
       const matchedOpt = render?.options.find((o) => o.value === selectedOption);
       const selectedLabel = matchedOpt?.selectedLabel ?? selectedOption ?? customId;
       try {
-        await fetch(`https://discord.com/api/v10/interactions/${interactionId}/${interactionToken}/callback`, {
+        await fetchImpl(`https://discord.com/api/v10/interactions/${interactionId}/${interactionToken}/callback`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -609,4 +643,29 @@ async function handleForwardedEvent(
     body,
   });
   await adapter.handleWebhook(fakeRequest, {});
+}
+
+async function acknowledgeDiscordInteraction(
+  interaction: Record<string, unknown>,
+  fetchImpl: FetchLike,
+): Promise<void> {
+  if (typeof interaction.id !== 'string' || typeof interaction.token !== 'string') return;
+  try {
+    const response = await fetchImpl(
+      `https://discord.com/api/v10/interactions/${interaction.id}/${interaction.token}/callback`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 5, data: { flags: 64 } }),
+      },
+    );
+    if (!response.ok) {
+      log.warn('Failed to acknowledge Discord application command', {
+        status: response.status,
+        text: await response.text(),
+      });
+    }
+  } catch (err) {
+    log.warn('Failed to acknowledge Discord application command', { err });
+  }
 }

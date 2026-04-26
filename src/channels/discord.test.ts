@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../db/index.js';
 import { inboundDbPath, resolveSession, writeSessionMessage } from '../session-manager.js';
+import { toDiscordThreadId, yenteDiscordPlatformIdFromThreadId } from './discord.js';
 
 vi.mock('../config.js', async () => {
   const actual = await vi.importActual('../config.js');
@@ -85,5 +86,30 @@ describe('Discord attachment contract', () => {
     expect(JSON.parse(row.content).text).toContain(
       '/workspace/agent/attachments/discord/discord-msg-1/file-1-image.png',
     );
+  });
+});
+
+describe('Discord v1 channel-id compatibility', () => {
+  it('uses the v1 channel id as the Yente platform id for encoded Discord thread ids', () => {
+    expect(yenteDiscordPlatformIdFromThreadId('discord:guild-1:channel-1')).toBe('channel-1');
+    expect(yenteDiscordPlatformIdFromThreadId('discord:guild-1:channel-1:thread-1')).toBe('channel-1');
+    expect(yenteDiscordPlatformIdFromThreadId('channel-1')).toBe('channel-1');
+  });
+
+  it('resolves v1 channel ids to Chat SDK Discord thread ids for outbound delivery', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ id: 'channel-1', guild_id: 'guild-1' }), {
+        status: 200,
+      }),
+    );
+
+    await expect(toDiscordThreadId('channel-1', 'bot-token')).resolves.toBe('discord:guild-1:channel-1');
+
+    expect(globalThis.fetch).toHaveBeenCalledWith('https://discord.com/api/v10/channels/channel-1', {
+      method: 'GET',
+      headers: { Authorization: 'Bot bot-token' },
+    });
+    globalThis.fetch = originalFetch;
   });
 });

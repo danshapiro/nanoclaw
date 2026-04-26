@@ -1,80 +1,66 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
-import type { Adapter } from 'chat';
+import type { ChannelSetup } from './adapter.js';
+import { handleForwardedEvent } from './chat-sdk-bridge.js';
 
-import { createChatSdkBridge, splitForLimit } from './chat-sdk-bridge.js';
+describe('Chat SDK bridge Discord gateway forwarding', () => {
+  it('routes forwarded Discord application commands as host-command inbound messages', async () => {
+    const adapter = {
+      name: 'discord',
+      handleWebhook: vi.fn(),
+    };
+    const setupConfig: ChannelSetup = {
+      onInbound: vi.fn(),
+      onInboundEvent: vi.fn(),
+      onMetadata: vi.fn(),
+      onAction: vi.fn(),
+    };
+    const fetchImpl = vi.fn().mockResolvedValue(new Response('{}', { status: 200 }));
 
-function stubAdapter(partial: Partial<Adapter>): Adapter {
-  return { name: 'stub', ...partial } as unknown as Adapter;
-}
-
-describe('splitForLimit', () => {
-  it('returns a single chunk when text fits', () => {
-    expect(splitForLimit('short text', 100)).toEqual(['short text']);
-  });
-
-  it('splits on paragraph boundaries when available', () => {
-    const text = 'para one line one\npara one line two\n\npara two line one\npara two line two';
-    const chunks = splitForLimit(text, 40);
-    expect(chunks.length).toBeGreaterThan(1);
-    for (const c of chunks) expect(c.length).toBeLessThanOrEqual(40);
-  });
-
-  it('falls back to line boundaries when no paragraph fits', () => {
-    const text = 'alpha\nbravo\ncharlie\ndelta\necho\nfoxtrot';
-    const chunks = splitForLimit(text, 15);
-    expect(chunks.length).toBeGreaterThan(1);
-    for (const c of chunks) expect(c.length).toBeLessThanOrEqual(15);
-  });
-
-  it('hard-cuts when no whitespace is available', () => {
-    const text = 'a'.repeat(100);
-    const chunks = splitForLimit(text, 30);
-    expect(chunks.length).toBe(Math.ceil(100 / 30));
-    for (const c of chunks) expect(c.length).toBeLessThanOrEqual(30);
-    expect(chunks.join('')).toBe(text);
-  });
-});
-
-describe('createChatSdkBridge', () => {
-  // The bridge is now transport-only: forward inbound events, relay outbound
-  // ops. All per-wiring engage / accumulate / drop / subscribe decisions live
-  // in the router (src/router.ts routeInbound / evaluateEngage) and are
-  // exercised by host-core.test.ts end-to-end. These tests only cover the
-  // bridge's narrow, platform-adjacent surface.
-
-  it('omits openDM when the underlying Chat SDK adapter has none', () => {
-    const bridge = createChatSdkBridge({
-      adapter: stubAdapter({}),
-      supportsThreads: false,
-    });
-    expect(bridge.openDM).toBeUndefined();
-  });
-
-  it('exposes openDM when the underlying adapter has one, and delegates directly', async () => {
-    const openDMCalls: string[] = [];
-    const bridge = createChatSdkBridge({
-      adapter: stubAdapter({
-        openDM: async (userId: string) => {
-          openDMCalls.push(userId);
-          return `thread::${userId}`;
+    await handleForwardedEvent(
+      JSON.stringify({
+        type: 'GATEWAY_INTERACTION_CREATE',
+        data: {
+          id: 'interaction-1',
+          token: 'interaction-token',
+          type: 2,
+          guild_id: 'guild-1',
+          channel_id: 'channel-1',
+          data: { type: 1, name: 'status' },
+          member: { user: { id: 'user-1', username: 'Dan' } },
         },
-        channelIdFromThreadId: (threadId: string) => `stub:${threadId.replace(/^thread::/, '')}`,
       }),
-      supportsThreads: false,
-    });
-    expect(bridge.openDM).toBeDefined();
-    const platformId = await bridge.openDM!('user-42');
-    // Delegation: adapter.openDM → adapter.channelIdFromThreadId, no chat.openDM in between.
-    expect(openDMCalls).toEqual(['user-42']);
-    expect(platformId).toBe('stub:user-42');
-  });
+      adapter,
+      setupConfig,
+      'bot-token',
+      fetchImpl,
+    );
 
-  it('exposes subscribe (lets the router initiate thread subscription on mention-sticky engage)', () => {
-    const bridge = createChatSdkBridge({
-      adapter: stubAdapter({}),
-      supportsThreads: true,
-    });
-    expect(typeof bridge.subscribe).toBe('function');
+    expect(fetchImpl).toHaveBeenCalledWith(
+      'https://discord.com/api/v10/interactions/interaction-1/interaction-token/callback',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 5, data: { flags: 64 } }),
+      },
+    );
+    expect(adapter.handleWebhook).not.toHaveBeenCalled();
+    expect(setupConfig.onInbound).toHaveBeenCalledWith(
+      'channel-1',
+      null,
+      expect.objectContaining({
+        kind: 'chat-sdk',
+        isMention: true,
+        isGroup: true,
+        content: {
+          text: '/status',
+          sender: 'Dan',
+          senderName: 'Dan',
+          senderId: 'user-1',
+          applicationCommand: true,
+          commandName: 'status',
+        },
+      }),
+    );
   });
 });

@@ -166,7 +166,7 @@ export interface ChannelAdapter {
 }
 
 /** Factory function that creates a channel adapter (returns null if credentials missing). */
-export type ChannelAdapterFactory = () => ChannelAdapter | Promise<ChannelAdapter> | null;
+export type ChannelAdapterFactory = () => ChannelAdapter | Promise<ChannelAdapter | null> | null;
 
 /** Registration entry for a channel adapter. */
 export interface ChannelRegistration {

@@ -2,7 +2,10 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
   buildYenteDiscordGuildCommandPayloads,
+  fetchDiscordApplicationConfig,
   normalizeDiscordApplicationCommandInteraction,
+  resolveDiscordGuildIdsForChannels,
+  syncYenteDiscordApplicationCommands,
   registerYenteDiscordGuildCommands,
   YENTE_DISCORD_COMMANDS,
 } from './discord-commands.js';
@@ -49,6 +52,81 @@ describe('Yente Discord application commands', () => {
     expect(fetchImpl.mock.calls.some(([url]) => String(url).endsWith('/applications/app-123/commands'))).toBe(false);
   });
 
+  it('discovers missing application config from the bot token', async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValue(new Response(JSON.stringify({ id: 'app-123', verify_key: 'a'.repeat(64) }), { status: 200 }));
+
+    await expect(
+      fetchDiscordApplicationConfig({
+        botToken: 'bot-token',
+        fetchImpl,
+      }),
+    ).resolves.toEqual({
+      applicationId: 'app-123',
+      publicKey: 'a'.repeat(64),
+    });
+
+    expect(fetchImpl).toHaveBeenCalledWith('https://discord.com/api/v10/oauth2/applications/@me', {
+      method: 'GET',
+      headers: { Authorization: 'Bot bot-token' },
+    });
+  });
+
+  it('resolves registered channel ids to unique guild ids', async () => {
+    const fetchImpl = vi.fn(async (url: string) => {
+      if (url.endsWith('/channels/channel-1')) {
+        return new Response(JSON.stringify({ id: 'channel-1', guild_id: 'guild-1' }), { status: 200 });
+      }
+      if (url.endsWith('/channels/channel-2')) {
+        return new Response(JSON.stringify({ id: 'channel-2', guild_id: 'guild-1' }), { status: 200 });
+      }
+      if (url.endsWith('/channels/dm-1')) {
+        return new Response(JSON.stringify({ id: 'dm-1' }), { status: 200 });
+      }
+      return new Response('missing', { status: 404 });
+    });
+
+    await expect(
+      resolveDiscordGuildIdsForChannels({
+        botToken: 'bot-token',
+        channelIds: ['channel-1', 'channel-2', 'dm-1'],
+        fetchImpl,
+      }),
+    ).resolves.toEqual(['guild-1']);
+  });
+
+  it('clears global commands and registers only resolved guild commands', async () => {
+    const fetchImpl = vi.fn(async (url: string, init?: { method?: string }) => {
+      if (url.endsWith('/oauth2/applications/@me')) {
+        return new Response(JSON.stringify({ id: 'app-123', verify_key: 'b'.repeat(64) }), { status: 200 });
+      }
+      if (url.endsWith('/channels/channel-1')) {
+        return new Response(JSON.stringify({ id: 'channel-1', guild_id: 'guild-1' }), { status: 200 });
+      }
+      if (url.endsWith('/applications/app-123/commands') && init?.method === 'PUT') {
+        return new Response('[]', { status: 200 });
+      }
+      if (url.endsWith('/applications/app-123/guilds/guild-1/commands') && init?.method === 'PUT') {
+        return new Response('[]', { status: 200 });
+      }
+      return new Response('unexpected', { status: 500 });
+    });
+
+    await syncYenteDiscordApplicationCommands({
+      botToken: 'bot-token',
+      channelIds: ['channel-1'],
+      fetchImpl,
+    });
+
+    expect(fetchImpl.mock.calls.map(([url, init]) => [url, init?.method ?? 'GET'])).toEqual([
+      ['https://discord.com/api/v10/oauth2/applications/@me', 'GET'],
+      ['https://discord.com/api/v10/channels/channel-1', 'GET'],
+      ['https://discord.com/api/v10/applications/app-123/commands', 'PUT'],
+      ['https://discord.com/api/v10/applications/app-123/guilds/guild-1/commands', 'PUT'],
+    ]);
+  });
+
   it('normalizes Discord application command interactions into host-command text', () => {
     const interaction = {
       type: 2,
@@ -66,7 +144,7 @@ describe('Yente Discord application commands', () => {
       requiresAdmin: true,
       userId: 'discord:user-1',
       senderName: 'User One',
-      platformId: 'discord:guild-1:channel-1',
+      platformId: 'channel-1',
       threadId: null,
     });
   });
