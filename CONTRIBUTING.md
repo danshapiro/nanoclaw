@@ -92,7 +92,6 @@ Skills that run inside the agent container, not on the host. These teach the con
 - Follow the same SKILL.md + frontmatter format
 - Use `allowed-tools` frontmatter to scope tool permissions
 - Keep them focused — the agent's context window is shared across all container skills
-- Runtime changes and container-skill changes must also pass a `FullQAPass` run on the live NanoClaw runtime in addition to repo tests
 
 ### SKILL.md format
 
@@ -117,7 +116,6 @@ Instructions here...
 ## Testing
 
 Test your contribution on a fresh clone before submitting. For skills, run the skill end-to-end and verify it works.
-If you changed the NanoClaw runtime or any container skill, include a successful `FullQAPass` run in your verification.
 
 ## Pull Requests
 

@@ -1,13 +1,13 @@
 ---
 name: FullQAPass
-description: Only use this skill if requested by name
+description: Only use this skill if requested by name.
 ---
 
 # FullQAPass
 
 Run a full NanoClaw runtime validation and emit a machine-readable result.
 
-## Output contract
+## Output Contract
 
 Return exactly one line per completed check:
 
@@ -20,7 +20,7 @@ SUMMARY FAIL
 
 Do not emit bullets, prose, or markdown outside those lines.
 
-## Required checks
+## Required Checks
 
 Always emit these checks in this order:
 
@@ -46,7 +46,7 @@ Always emit these checks in this order:
 
 If any check fails, continue running the remaining checks, then end with `SUMMARY FAIL`.
 
-## Scratch paths
+## Scratch Paths
 
 - Use `/workspace/group/full-qa-pass/` for temporary files.
 - Use `/workspace/portable-skills/.qa/` for the writable git probe.
@@ -54,11 +54,11 @@ If any check fails, continue running the remaining checks, then end with `SUMMAR
 
 ## Procedure
 
-### 1. Named invocation
+### 1. Named Invocation
 
 Confirm you are running because the user requested `FullQAPass` by name.
 
-### 2. Allowed tool surface
+### 2. Allowed Tool Surface
 
 Assert that the current environment includes these tool families:
 
@@ -84,21 +84,21 @@ Assert that the current environment includes these tool families:
 
 If any required family is missing, mark this check failed.
 
-### 3. Portable repo checks
+### 3. Portable Repo Checks
 
 - `portable_repo_visible_on_main`: verify `/workspace/portable-skills` exists.
 - `portable_repo_writable`: create and remove a temporary file under `/workspace/portable-skills/.qa/`.
 - `portable_repo_git_ok`: verify `/workspace/portable-skills` is a git working tree and ends clean after the probe.
 
-### 4. Settings validation
+### 4. Settings Validation
 
 Validate `/home/node/.claude/settings.json`:
 
-- the file exists
-- it contains valid JSON
-- `env` is an object when present
+- the file exists;
+- it contains valid JSON;
+- `env` is an object when present.
 
-### 5. Tool probes
+### 5. Tool Probes
 
 - `tool_bash_roundtrip`: use Bash to create, read, and delete a scratch file.
 - `tool_read_write_edit`: use `Write`, `Read`, and `Edit` on a file under `/workspace/group/full-qa-pass/`.
@@ -110,36 +110,35 @@ Validate `/home/node/.claude/settings.json`:
 - `tool_toolsearch`: use `ToolSearch` and confirm it returns at least one result relevant to this environment.
 - `tool_skill_nested`: invoke the built-in `status` skill by name and confirm it returns a result.
 
-### 6. Orchestration roundtrip
+### 6. Orchestration Roundtrip
 
 Exercise the orchestration tool family end-to-end in a bounded way:
 
-- create a temporary team named `fullqapass-probe`
-- do **not** use `Agent` or create a long-lived teammate for this check
-- use `Task` to start a short-lived probe that returns exactly `PROBE_OK`
-- use `TaskOutput` to confirm the task result contains `PROBE_OK`
-- if the task is still running after you capture its output, use `TaskStop` to stop it
-- delete the temporary team with `TeamDelete`
-- keep the temporary team memberless so `TeamDelete` can succeed immediately
+- create a temporary team named `fullqapass-probe`;
+- do not use `Agent` or create a long-lived teammate for this check;
+- use `Task` to start a short-lived probe that returns exactly `PROBE_OK`;
+- use `TaskOutput` to confirm the task result contains `PROBE_OK`;
+- if the task is still running after you capture its output, use `TaskStop` to stop it;
+- delete the temporary team with `TeamDelete`;
+- keep the temporary team memberless so `TeamDelete` can succeed immediately.
 
 Mark `orchestration_roundtrip` failed if any step fails.
 
-### 7. Managed skills visibility
+### 7. Managed Skills Visibility
 
 Confirm `/home/node/.claude/skills/` contains both built-in container skills and managed synced skills when present.
 At minimum, verify `status` and `FullQAPass` are visible there.
 
-### 8. NanoClaw MCP roundtrip
+### 8. NanoClaw MCP Roundtrip
 
-Use `Bash` or `Read` to inspect `/workspace/ipc/available_groups.json`, then select a `jid` from an entry with `"isRegistered": true`.
-If no registered group exists, fail this check immediately with that reason.
-Create a uniquely named temporary scheduled task with `mcp__nanoclaw__schedule_task`, passing the selected `jid` via `target_group_jid`.
+Create a uniquely named temporary scheduled task with `mcp__nanoclaw__schedule_task`.
+Use a far-future `processAfter` timestamp and rely on the current session routing; do not provide any target override.
 Because task snapshots are written asynchronously, retry `mcp__nanoclaw__list_tasks` up to 5 times with short delays between attempts until the task ID appears.
 Use `Bash` for the short delays when needed.
 Then remove the task with `mcp__nanoclaw__cancel_task`.
-Fail this check only if no registered target group can be selected, the task ID never appears before the retry budget is exhausted, or cleanup fails.
+Fail this check only if the schedule request fails, the task ID never appears before the retry budget is exhausted, or cleanup fails.
 
-### 9. Optional GWS check
+### 9. Optional GWS Check
 
 If `gws` is present in `PATH`, run a lightweight auth/status check and emit `gws_auth_status`.
 If `gws` is not present, omit this check entirely.
@@ -148,10 +147,10 @@ If `gws` is not present, omit this check entirely.
 
 Before returning:
 
-- remove `/workspace/group/full-qa-pass/` contents created by this run
-- remove `/workspace/portable-skills/.qa/` contents created by this run
-- ensure `/workspace/portable-skills` is not left dirty by the probe
+- remove `/workspace/group/full-qa-pass/` contents created by this run;
+- remove `/workspace/portable-skills/.qa/` contents created by this run;
+- ensure `/workspace/portable-skills` is not left dirty by the probe.
 
-## Final line
+## Final Line
 
 Emit `SUMMARY PASS` only when every required emitted check passed. Otherwise emit `SUMMARY FAIL`.
