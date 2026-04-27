@@ -6,6 +6,7 @@ import path from 'path';
 import {
   applyOneCliGatewayForContainerArgs,
   buildGwsConfigMount,
+  buildManagedReposMounts,
   buildPortableSkillsMount,
   resolveProviderName,
 } from './container-runner.js';
@@ -129,6 +130,58 @@ describe('portable skills mount', () => {
         NANOCLAW_WRITABLE_SKILLS_DIR: '/srv/nanoclaw/shared/repos/portable-skills',
       }),
     ).toBeNull();
+  });
+});
+
+describe('managed repos mounts', () => {
+  const baseGroup: AgentGroup = {
+    id: 'ag-main',
+    name: 'Yente',
+    folder: 'main',
+    agent_provider: null,
+    created_at: '2026-04-25T00:00:00.000Z',
+  };
+
+  it('mounts the managed repos root for main at the stable path and Claude additional-dir path', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-managed-repos-'));
+    try {
+      expect(
+        buildManagedReposMounts(baseGroup, {
+          NANOCLAW_MANAGED_REPOS_DIR: root,
+        }),
+      ).toEqual([
+        {
+          hostPath: root,
+          containerPath: '/workspace/repos',
+          readonly: false,
+        },
+        {
+          hostPath: root,
+          containerPath: '/workspace/extra/repos',
+          readonly: false,
+        },
+      ]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not mount managed repos for non-main groups', () => {
+    const researchGroup: AgentGroup = { ...baseGroup, id: 'ag-research', folder: 'research', name: 'Research' };
+
+    expect(
+      buildManagedReposMounts(researchGroup, {
+        NANOCLAW_MANAGED_REPOS_DIR: '/srv/nanoclaw/shared/repos/projects',
+      }),
+    ).toEqual([]);
+  });
+
+  it('fails closed when the configured managed repos root is missing', () => {
+    expect(() =>
+      buildManagedReposMounts(baseGroup, {
+        NANOCLAW_MANAGED_REPOS_DIR: '/definitely/missing/nanoclaw-managed-repos',
+      }),
+    ).toThrow('NANOCLAW_MANAGED_REPOS_DIR must exist');
   });
 });
 

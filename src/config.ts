@@ -46,6 +46,8 @@ export const ONECLI_GATEWAY_URL = process.env.ONECLI_GATEWAY_URL || envConfig.ON
 export const MAX_MESSAGES_PER_PROMPT = Math.max(1, parseInt(process.env.MAX_MESSAGES_PER_PROMPT || '10', 10) || 10);
 export const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '1800000', 10); // 30min default — how long to keep container alive after last result
 export const MAX_CONCURRENT_CONTAINERS = Math.max(1, parseInt(process.env.MAX_CONCURRENT_CONTAINERS || '5', 10) || 5);
+export const NANOCLAW_ROOT = process.env.NANOCLAW_ROOT || '/srv/nanoclaw';
+export const MANAGED_REPOS_DIR = process.env.NANOCLAW_MANAGED_REPOS_DIR || '';
 
 function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');

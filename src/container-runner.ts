@@ -15,6 +15,7 @@ import {
   CONTAINER_INSTALL_LABEL,
   DATA_DIR,
   GROUPS_DIR,
+  MANAGED_REPOS_DIR,
   ONECLI_API_KEY,
   ONECLI_URL,
   TIMEZONE,
@@ -368,6 +369,8 @@ function buildMounts(
     mounts.push(portableSkillsMount);
   }
 
+  mounts.push(...buildManagedReposMounts(agentGroup));
+
   const gwsConfigMount = buildGwsConfigMount();
   if (gwsConfigMount) {
     mounts.push(gwsConfigMount);
@@ -398,6 +401,29 @@ export function buildPortableSkillsMount(
     containerPath: '/workspace/portable-skills',
     readonly: false,
   };
+}
+
+export function buildManagedReposMounts(
+  agentGroup: Pick<AgentGroup, 'folder'>,
+  env: NodeJS.ProcessEnv = process.env,
+): VolumeMount[] {
+  const managedReposDir = env.NANOCLAW_MANAGED_REPOS_DIR?.trim() || MANAGED_REPOS_DIR;
+  if (!managedReposDir || agentGroup.folder !== 'main') return [];
+  if (!fs.existsSync(managedReposDir)) {
+    throw new Error(`NANOCLAW_MANAGED_REPOS_DIR must exist: ${managedReposDir}`);
+  }
+  return [
+    {
+      hostPath: managedReposDir,
+      containerPath: '/workspace/repos',
+      readonly: false,
+    },
+    {
+      hostPath: managedReposDir,
+      containerPath: '/workspace/extra/repos',
+      readonly: false,
+    },
+  ];
 }
 
 export function buildGwsConfigMount(dataDir = DATA_DIR, env: NodeJS.ProcessEnv = process.env): VolumeMount | null {
