@@ -10,7 +10,12 @@ export const REQUIRED_YENTE_PROXY_URLS = [
   compatibilityKeyEnv?: string;
 }[];
 
-export const REQUIRED_YENTE_ONECLI_SECRET_NAMES = ['Yente GWS Proxy', 'Yente Msgvault Proxy'] as const;
+export const REQUIRED_YENTE_ONECLI_SECRET_NAMES = [
+  'Yente GWS Proxy',
+  'Yente Msgvault Proxy',
+  'NanoClaw OpenAI',
+  'NanoClaw Gemini',
+] as const;
 export const ONECLI_MANAGED_PLACEHOLDER = 'onecli-managed';
 export const YENTE_LOCAL_PROXY_HOSTS = {
   gws: 'yente-gws-proxy.local',

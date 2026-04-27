@@ -4,7 +4,6 @@ import {
   assertOneCliApplied,
   buildNoProxy,
   ensureOneCliAgentSecretAccess,
-  REQUIRED_YENTE_ONECLI_SECRET_NAMES,
   REQUIRED_YENTE_PROXY_URLS,
   requireYenteHostEnv,
   YENTE_LOCAL_PROXY_HOSTS,
@@ -101,6 +100,8 @@ describe('Yente service env contract', () => {
           { id: 'secret-anthropic', name: 'NanoClaw Anthropic' },
           { id: 'secret-gws', name: 'Yente GWS Proxy' },
           { id: 'secret-msgvault', name: 'Yente Msgvault Proxy' },
+          { id: 'secret-openai', name: 'NanoClaw OpenAI' },
+          { id: 'secret-gemini', name: 'NanoClaw Gemini' },
         ]);
       }
       if (url.endsWith('/api/agents')) {
@@ -128,7 +129,9 @@ describe('Yente service env contract', () => {
 
     const update = calls.find((call) => call.init?.method === 'PUT');
     expect(update?.init?.body).toBe(
-      JSON.stringify({ secretIds: ['secret-anthropic', 'secret-gws', 'secret-msgvault'] }),
+      JSON.stringify({
+        secretIds: ['secret-anthropic', 'secret-gws', 'secret-msgvault', 'secret-openai', 'secret-gemini'],
+      }),
     );
     expect(calls.some((call) => call.url === 'https://onecli-gateway.local/api/cache/invalidate')).toBe(true);
   });
@@ -140,6 +143,8 @@ describe('Yente service env contract', () => {
         return Response.json([
           { id: 'secret-gws', name: 'Yente GWS Proxy' },
           { id: 'secret-msgvault', name: 'Yente Msgvault Proxy' },
+          { id: 'secret-openai', name: 'NanoClaw OpenAI' },
+          { id: 'secret-gemini', name: 'NanoClaw Gemini' },
         ]);
       }
       if (url.endsWith('/api/agents')) {
@@ -164,7 +169,12 @@ describe('Yente service env contract', () => {
   it('fails closed when a required OneCLI secret is missing', async () => {
     const fetchImpl = async (input: string | URL | Request): Promise<Response> => {
       const url = String(input);
-      if (url.endsWith('/api/secrets')) return Response.json([{ id: 'secret-gws', name: 'Yente GWS Proxy' }]);
+      if (url.endsWith('/api/secrets')) {
+        return Response.json([
+          { id: 'secret-gws', name: 'Yente GWS Proxy' },
+          { id: 'secret-msgvault', name: 'Yente Msgvault Proxy' },
+        ]);
+      }
       if (url.endsWith('/api/agents')) return Response.json([{ id: 'agent-main', identifier: 'ag-main' }]);
       return Response.json([]);
     };
@@ -176,6 +186,6 @@ describe('Yente service env contract', () => {
         agentIdentifier: 'ag-main',
         fetchImpl,
       }),
-    ).rejects.toThrow(`Missing OneCLI secret(s): ${REQUIRED_YENTE_ONECLI_SECRET_NAMES[1]}`);
+    ).rejects.toThrow('Missing OneCLI secret(s): NanoClaw OpenAI, NanoClaw Gemini');
   });
 });

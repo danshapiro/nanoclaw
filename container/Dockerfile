@@ -118,9 +118,19 @@ COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
 # ---- Workspace + permissions -------------------------------------------------
-RUN mkdir -p /workspace/group /workspace/extra && \
-    chown -R node:node /workspace && \
-    chmod 777 /home/node
+# Agent containers may run as the host `nanoclaw` uid/gid so bind-mounted
+# session files stay writable. Pre-create browser home directories before any
+# nested bind mount such as /home/node/.config/gws can cause Docker to create
+# the parent as root-owned; Chromium needs a writable config dir for crashpad
+# and profile startup.
+RUN mkdir -p \
+        /workspace/group \
+        /workspace/extra \
+        /home/node/.agent-browser \
+        /home/node/.cache \
+        /home/node/.config/gws && \
+    chown -R node:node /workspace /home/node/.agent-browser /home/node/.cache /home/node/.config && \
+    chmod 777 /home/node /home/node/.agent-browser /home/node/.cache /home/node/.config
 
 USER node
 WORKDIR /workspace/group
