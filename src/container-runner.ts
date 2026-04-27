@@ -20,6 +20,8 @@ import {
   ONECLI_URL,
   TIMEZONE,
 } from './config.js';
+import { loadAgentMcpConfigForGroup } from './agent-mcp-config.js';
+import { type AgentMcpBridge, startAgentMcpBridge } from './agent-mcp-bridge.js';
 import { readContainerConfig, writeContainerConfig } from './container-config.js';
 import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
@@ -54,6 +56,7 @@ const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
 
 /** Active containers tracked by session ID. */
 const activeContainers = new Map<string, { process: ChildProcess; containerName: string }>();
+const activeMcpBridges = new Map<string, AgentMcpBridge[]>();
 const containerExitWaiters = new Map<string, Set<() => void>>();
 
 /**
@@ -157,20 +160,28 @@ async function spawnContainer(session: Session): Promise<void> {
   // buildMounts and buildContainerArgs so side effects (mkdir, etc.) fire once.
   const { provider, contribution } = resolveProviderContribution(session, agentGroup, containerConfig);
 
-  const mounts = buildMounts(agentGroup, session, containerConfig, contribution);
   const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
   // OneCLI agent identifier is always the agent group id — stable across
   // sessions and reversible via getAgentGroup() for approval routing.
   const agentIdentifier = agentGroup.id;
-  const args = await buildContainerArgs(
-    mounts,
-    containerName,
-    agentGroup,
-    containerConfig,
-    provider,
-    contribution,
-    agentIdentifier,
-  );
+  let bridges: AgentMcpBridge[] = [];
+  let args: string[];
+  try {
+    const mounts = buildMounts(agentGroup, session, containerConfig, contribution);
+    bridges = await attachAgentMcpBridges(agentGroup, containerConfig, mounts);
+    args = await buildContainerArgs(
+      mounts,
+      containerName,
+      agentGroup,
+      containerConfig,
+      provider,
+      contribution,
+      agentIdentifier,
+    );
+  } catch (err) {
+    await stopAgentMcpBridges(bridges);
+    throw err;
+  }
 
   log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
 
@@ -183,6 +194,9 @@ async function spawnContainer(session: Session): Promise<void> {
   const container = spawn(CONTAINER_RUNTIME_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
   activeContainers.set(session.id, { process: container, containerName });
+  if (bridges.length > 0) {
+    activeMcpBridges.set(session.id, bridges);
+  }
   markContainerRunning(session.id);
 
   // Log stderr
@@ -212,6 +226,8 @@ async function spawnContainer(session: Session): Promise<void> {
 
 function finalizeContainerProcess(sessionId: string, containerName: string, code: number | null): void {
   const wasActive = activeContainers.delete(sessionId);
+  void stopAgentMcpBridges(activeMcpBridges.get(sessionId) ?? []);
+  activeMcpBridges.delete(sessionId);
   if (!wasActive) {
     notifyContainerExit(sessionId);
     return;
@@ -282,6 +298,138 @@ function resolveProviderContribution(
       })
     : {};
   return { provider, contribution };
+}
+
+export function resolveContainerIdentity(): { uid: number; gid: number } {
+  const hostUid = process.getuid?.();
+  const hostGid = process.getgid?.();
+  if (hostUid != null && hostGid != null && hostUid !== 0 && hostUid !== 1000) {
+    return { uid: hostUid, gid: hostGid };
+  }
+  return { uid: 1000, gid: 1000 };
+}
+
+function realpathIfExists(inputPath: string): string {
+  if (fs.existsSync(inputPath)) {
+    try {
+      return fs.realpathSync.native(inputPath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw err;
+      }
+    }
+  }
+  return path.resolve(inputPath);
+}
+
+function pathOverlaps(first: string, second: string): boolean {
+  const firstToSecond = path.relative(first, second);
+  const secondToFirst = path.relative(second, first);
+  return (
+    firstToSecond === '' ||
+    (!firstToSecond.startsWith('..') && !path.isAbsolute(firstToSecond)) ||
+    secondToFirst === '' ||
+    (!secondToFirst.startsWith('..') && !path.isAbsolute(secondToFirst))
+  );
+}
+
+function rejectAuthOverlappingMounts(mounts: VolumeMount[], authDirs: string[]): void {
+  const canonicalAuthDirs = authDirs.map(realpathIfExists);
+  for (const mount of mounts) {
+    const canonicalMount = realpathIfExists(mount.hostPath);
+    for (const authDir of canonicalAuthDirs) {
+      if (pathOverlaps(canonicalMount, authDir)) {
+        throw new Error(`Refusing to mount Granola MCP auth path or parent into agent container: ${mount.hostPath}`);
+      }
+    }
+  }
+}
+
+function syncAgentMcpRuntimeConfig(
+  groupFolder: string,
+  containerConfig: import('./container-config.js').ContainerConfig,
+  bridges: AgentMcpBridge[],
+  allowedTools: string[],
+): void {
+  const before = JSON.stringify({
+    mcpServers: containerConfig.mcpServers,
+    agentMcpServerNames: containerConfig.agentMcpServerNames,
+    agentMcpAllowedTools: containerConfig.agentMcpAllowedTools,
+  });
+
+  const previousManagedServers = new Set(containerConfig.agentMcpServerNames ?? []);
+  for (const [serverName, serverConfig] of Object.entries(containerConfig.mcpServers)) {
+    const isSocketBridge =
+      serverConfig.command === 'bun' &&
+      Array.isArray(serverConfig.args) &&
+      serverConfig.args.includes('/app/src/mcp-unix-socket-stdio.ts');
+    if (previousManagedServers.has(serverName) || isSocketBridge) {
+      delete containerConfig.mcpServers[serverName];
+    }
+  }
+
+  for (const bridge of bridges) {
+    containerConfig.mcpServers[bridge.serverName] = {
+      command: 'bun',
+      args: ['run', '/app/src/mcp-unix-socket-stdio.ts', bridge.containerSocketPath],
+      env: {},
+    };
+  }
+  containerConfig.agentMcpServerNames = bridges.map((bridge) => bridge.serverName);
+  containerConfig.agentMcpAllowedTools = [...allowedTools];
+
+  if (
+    JSON.stringify({
+      mcpServers: containerConfig.mcpServers,
+      agentMcpServerNames: containerConfig.agentMcpServerNames,
+      agentMcpAllowedTools: containerConfig.agentMcpAllowedTools,
+    }) !== before
+  ) {
+    writeContainerConfig(groupFolder, containerConfig);
+  }
+}
+
+async function attachAgentMcpBridges(
+  agentGroup: AgentGroup,
+  containerConfig: import('./container-config.js').ContainerConfig,
+  mounts: VolumeMount[],
+): Promise<AgentMcpBridge[]> {
+  const mcpConfig = loadAgentMcpConfigForGroup(agentGroup.folder);
+  const containerIdentity = resolveContainerIdentity();
+  const bridges: AgentMcpBridge[] = [];
+
+  try {
+    for (const [serverName, bridgeConfig] of Object.entries(mcpConfig.bridges)) {
+      const bridge = await startAgentMcpBridge({
+        groupFolder: agentGroup.folder,
+        agentGroupId: agentGroup.id,
+        bridge: { serverName, ...bridgeConfig },
+        containerUid: containerIdentity.uid,
+        containerGid: containerIdentity.gid,
+      });
+      bridges.push(bridge);
+      mounts.push({
+        hostPath: bridge.hostSocketDir,
+        containerPath: bridge.containerSocketDir,
+        readonly: false,
+      });
+    }
+    if (bridges.length > 0) {
+      rejectAuthOverlappingMounts(
+        mounts,
+        bridges.map((bridge) => bridge.authDir),
+      );
+    }
+    syncAgentMcpRuntimeConfig(agentGroup.folder, containerConfig, bridges, mcpConfig.allowedTools);
+    return bridges;
+  } catch (err) {
+    await stopAgentMcpBridges(bridges);
+    throw err;
+  }
+}
+
+async function stopAgentMcpBridges(bridges: AgentMcpBridge[]): Promise<void> {
+  await Promise.allSettled(bridges.map((bridge) => bridge.stop()));
 }
 
 function buildMounts(

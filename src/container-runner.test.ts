@@ -148,6 +148,36 @@ describe('workspace mount contract', () => {
     expect(source).not.toContain("containerPath: '/workspace/group'");
     expect(source).not.toContain("containerPath: '/workspace/project'");
   });
+
+  it('keeps host MCP tool grants driven by container config, not a provider hardcode', () => {
+    const providerSource = fs.readFileSync(
+      path.join(
+        path.dirname(fileURLToPath(import.meta.url)),
+        '..',
+        'container',
+        'agent-runner',
+        'src',
+        'providers',
+        'claude.ts',
+      ),
+      'utf8',
+    );
+    const runnerSource = fs.readFileSync(
+      path.join(
+        path.dirname(fileURLToPath(import.meta.url)),
+        '..',
+        'container',
+        'agent-runner',
+        'src',
+        'index.ts',
+      ),
+      'utf8',
+    );
+
+    expect(providerSource).not.toContain("'mcp__granola__*'");
+    expect(providerSource).toContain('buildClaudeToolAllowlist(options.allowedTools)');
+    expect(runnerSource).toContain('allowedTools: config.agentMcpAllowedTools');
+  });
 });
 
 describe('managed repos mounts', () => {

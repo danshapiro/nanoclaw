@@ -15,6 +15,7 @@ export interface RunnerConfig {
   groupName: string;
   agentGroupId: string;
   maxMessagesPerPrompt: number;
+  agentMcpAllowedTools: string[];
   mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }>;
 }
 
@@ -42,6 +43,9 @@ export function loadConfig(): RunnerConfig {
     groupName: (raw.groupName as string) || '',
     agentGroupId: (raw.agentGroupId as string) || '',
     maxMessagesPerPrompt: (raw.maxMessagesPerPrompt as number) || DEFAULT_MAX_MESSAGES,
+    agentMcpAllowedTools: Array.isArray(raw.agentMcpAllowedTools)
+      ? raw.agentMcpAllowedTools.filter((entry): entry is string => typeof entry === 'string')
+      : [],
     mcpServers: (raw.mcpServers as RunnerConfig['mcpServers']) || {},
   };
 

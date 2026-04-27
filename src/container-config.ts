@@ -34,6 +34,10 @@ export type SkillSelection = string[] | 'all';
 
 export interface ContainerConfig {
   mcpServers: Record<string, McpServerConfig>;
+  /** Host-managed MCP bridge server names. Removed/replaced at spawn time. */
+  agentMcpServerNames?: string[];
+  /** Host-managed provider tool allowlist entries for agent MCP bridges. */
+  agentMcpAllowedTools?: string[];
   packages: { apt: string[]; npm: string[] };
   imageTag?: string;
   additionalMounts: AdditionalMountConfig[];
@@ -77,6 +81,8 @@ export function readContainerConfig(folder: string): ContainerConfig {
     const raw = JSON.parse(fs.readFileSync(p, 'utf8')) as Partial<ContainerConfig>;
     return {
       mcpServers: raw.mcpServers ?? {},
+      agentMcpServerNames: raw.agentMcpServerNames ?? [],
+      agentMcpAllowedTools: raw.agentMcpAllowedTools ?? [],
       packages: {
         apt: raw.packages?.apt ?? [],
         npm: raw.packages?.npm ?? [],
