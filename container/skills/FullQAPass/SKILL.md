@@ -114,13 +114,15 @@ Validate `/home/node/.claude/settings.json`:
 
 Exercise the orchestration tool family end-to-end in a bounded way:
 
-- create a temporary team named `fullqapass-probe`;
+- create a temporary team named `fullqapass-probe-<unique-suffix>`, where the suffix is derived from the current run timestamp or random alphanumeric text;
+- if `TeamCreate` reports a name collision, retry once with a different unique suffix;
 - do not use `Agent` or create a long-lived teammate for this check;
 - use `Task` to start a short-lived probe that returns exactly `PROBE_OK`;
 - use `TaskOutput` to confirm the task result contains `PROBE_OK`;
 - if the task is still running after you capture its output, use `TaskStop` to stop it;
 - delete the temporary team with `TeamDelete`;
 - keep the temporary team memberless so `TeamDelete` can succeed immediately.
+- do not use Bash to remove `/home/node/.claude/teams/...`; team state is managed by orchestration tools and may be blocked as a sensitive path.
 
 Mark `orchestration_roundtrip` failed if any step fails.
 
