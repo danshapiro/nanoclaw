@@ -6,6 +6,7 @@ import path from 'path';
 import {
   applyOneCliGatewayForContainerArgs,
   buildGwsConfigMount,
+  buildManagedReposIpcMount,
   buildManagedReposMounts,
   buildPortableSkillsMount,
   resolveProviderName,
@@ -182,6 +183,18 @@ describe('managed repos mounts', () => {
         NANOCLAW_MANAGED_REPOS_DIR: '/definitely/missing/nanoclaw-managed-repos',
       }),
     ).toThrow('NANOCLAW_MANAGED_REPOS_DIR must exist');
+  });
+
+  it('mounts the main managed-repos IPC namespace for legacy reconcile requests', () => {
+    expect(buildManagedReposIpcMount(baseGroup)).toMatchObject({
+      containerPath: '/workspace/ipc',
+      readonly: false,
+    });
+  });
+
+  it('does not mount managed-repos IPC for non-main groups', () => {
+    const researchGroup: AgentGroup = { ...baseGroup, id: 'ag-research', folder: 'research', name: 'Research' };
+    expect(buildManagedReposIpcMount(researchGroup)).toBeNull();
   });
 });
 

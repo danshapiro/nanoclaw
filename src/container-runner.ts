@@ -26,6 +26,7 @@ import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable, isDbInitialized } from './db/connection.js';
 import { initGroupFilesystem } from './group-init.js';
+import { resolveGroupIpcPath } from './group-folder.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
@@ -371,6 +372,11 @@ function buildMounts(
 
   mounts.push(...buildManagedReposMounts(agentGroup));
 
+  const managedReposIpcMount = buildManagedReposIpcMount(agentGroup);
+  if (managedReposIpcMount) {
+    mounts.push(managedReposIpcMount);
+  }
+
   const gwsConfigMount = buildGwsConfigMount();
   if (gwsConfigMount) {
     mounts.push(gwsConfigMount);
@@ -424,6 +430,18 @@ export function buildManagedReposMounts(
       readonly: false,
     },
   ];
+}
+
+export function buildManagedReposIpcMount(agentGroup: Pick<AgentGroup, 'folder'>): VolumeMount | null {
+  if (agentGroup.folder !== 'main') return null;
+  const hostPath = resolveGroupIpcPath(agentGroup.folder);
+  fs.mkdirSync(path.join(hostPath, 'tasks'), { recursive: true });
+  fs.mkdirSync(path.join(hostPath, 'responses'), { recursive: true });
+  return {
+    hostPath,
+    containerPath: '/workspace/ipc',
+    readonly: false,
+  };
 }
 
 export function buildGwsConfigMount(dataDir = DATA_DIR, env: NodeJS.ProcessEnv = process.env): VolumeMount | null {
