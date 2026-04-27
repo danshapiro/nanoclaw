@@ -130,10 +130,10 @@ function formatDuration(milliseconds: number): string {
 function tokenAvailabilitySummary(): string {
   const known = [
     'ONECLI_API_KEY',
-    'GWS_PROXY_KEY',
-    'MSGVAULT_PROXY_KEY',
-    'FAMILIAR_PROXY_KEY',
-    'NYNE_PROXY_KEY',
+    'GWS_PROXY_URL',
+    'MSGVAULT_PROXY_URL',
+    'FAMILIAR_PROXY_URL',
+    'NYNE_PROXY_URL',
   ].filter((key) => Boolean(process.env[key]));
   if (known.length === 0) return 'unknown';
   return `${known.length} configured`;

@@ -20,6 +20,7 @@ vi.mock('child_process', () => ({
 import {
   CONTAINER_RUNTIME_BIN,
   readonlyMountArgs,
+  hostGatewayArgs,
   stopContainer,
   ensureContainerRuntimeRunning,
   cleanupOrphans,
@@ -37,6 +38,23 @@ describe('readonlyMountArgs', () => {
   it('returns -v flag with :ro suffix', () => {
     const args = readonlyMountArgs('/host/path', '/container/path');
     expect(args).toEqual(['-v', '/host/path:/container/path:ro']);
+  });
+});
+
+describe('hostGatewayArgs', () => {
+  it('maps distinct local proxy hostnames to the Docker host gateway', () => {
+    expect(hostGatewayArgs(['yente-msgvault-proxy.local', 'yente-gws-proxy.local'])).toEqual(
+      expect.arrayContaining([
+        '--add-host=host.docker.internal:host-gateway',
+        '--add-host=yente-msgvault-proxy.local:host-gateway',
+        '--add-host=yente-gws-proxy.local:host-gateway',
+      ]),
+    );
+  });
+
+  it('rejects unsafe additional hostnames', () => {
+    expect(() => hostGatewayArgs(['bad host'])).toThrow('Invalid host gateway alias');
+    expect(() => hostGatewayArgs(['bad:host'])).toThrow('Invalid host gateway alias');
   });
 });
 

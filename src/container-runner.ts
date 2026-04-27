@@ -29,7 +29,7 @@ import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
 import { resolveManagedSkillRoot, syncManagedSkillSymlinks } from './yente/managed-skills.js';
-import { assertOneCliApplied } from './yente/service-env.js';
+import { assertOneCliApplied, ensureOneCliAgentSecretAccess } from './yente/service-env.js';
 // Provider host-side config barrel — each provider that needs host-side
 // container setup self-registers on import.
 import './providers/index.js';
@@ -481,7 +481,7 @@ async function buildContainerArgs(
   });
 
   // Host gateway
-  args.push(...hostGatewayArgs());
+  args.push(...hostGatewayArgs(providerContribution.extraHosts));
 
   // User mapping
   const hostUid = process.getuid?.();
@@ -519,11 +519,21 @@ export async function applyOneCliGatewayForContainerArgs(
     containerName: string;
     agentGroupName: string;
     agentIdentifier?: string;
+    ensureSecretAccess?: (agentIdentifier: string) => Promise<void>;
   },
 ): Promise<void> {
   try {
     if (context.agentIdentifier) {
       await context.client.ensureAgent({ name: context.agentGroupName, identifier: context.agentIdentifier });
+      await (
+        context.ensureSecretAccess ??
+        ((agentIdentifier) =>
+          ensureOneCliAgentSecretAccess({
+            onecliUrl: ONECLI_URL,
+            onecliApiKey: ONECLI_API_KEY,
+            agentIdentifier,
+          }))
+      )(context.agentIdentifier);
     }
     const applied = await context.client.applyContainerConfig(args, {
       addHostMapping: false,

@@ -54,6 +54,7 @@ describe('OneCLI container gateway', () => {
         containerName: 'container-1',
         agentGroupName: 'Yente',
         agentIdentifier: 'ag-main',
+        ensureSecretAccess: vi.fn().mockResolvedValue(undefined),
       }),
     ).rejects.toThrow('OneCLI gateway did not apply container credentials');
 
@@ -73,8 +74,29 @@ describe('OneCLI container gateway', () => {
         containerName: 'container-1',
         agentGroupName: 'Yente',
         agentIdentifier: 'ag-main',
+        ensureSecretAccess: vi.fn().mockResolvedValue(undefined),
       }),
     ).rejects.toThrow('OneCLI gateway failed; refusing to start Yente container without credential isolation');
+  });
+
+  it('ensures OneCLI local proxy secrets are granted before applying container config', async () => {
+    const args = ['run'];
+    const client = {
+      ensureAgent: vi.fn().mockResolvedValue(undefined),
+      applyContainerConfig: vi.fn().mockResolvedValue(true),
+    };
+    const ensureSecretAccess = vi.fn().mockResolvedValue(undefined);
+
+    await applyOneCliGatewayForContainerArgs(args, {
+      client,
+      containerName: 'container-1',
+      agentGroupName: 'Yente',
+      agentIdentifier: 'ag-main',
+      ensureSecretAccess,
+    });
+
+    expect(ensureSecretAccess).toHaveBeenCalledWith('ag-main');
+    expect(client.applyContainerConfig).toHaveBeenCalledWith(args, { addHostMapping: false, agent: 'ag-main' });
   });
 });
 

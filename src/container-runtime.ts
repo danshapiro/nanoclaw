@@ -12,10 +12,17 @@ import { log } from './log.js';
 export const CONTAINER_RUNTIME_BIN = 'docker';
 
 /** CLI args needed for the container to resolve the host gateway. */
-export function hostGatewayArgs(): string[] {
+export function hostGatewayArgs(additionalHostnames: readonly string[] = []): string[] {
   // On Linux, host.docker.internal isn't built-in — add it explicitly
   if (os.platform() === 'linux') {
-    return ['--add-host=host.docker.internal:host-gateway'];
+    const args = ['--add-host=host.docker.internal:host-gateway'];
+    for (const hostname of additionalHostnames) {
+      if (!/^[a-zA-Z0-9][a-zA-Z0-9.-]*$/.test(hostname) || hostname.includes('..')) {
+        throw new Error(`Invalid host gateway alias: ${hostname}`);
+      }
+      args.push(`--add-host=${hostname}:host-gateway`);
+    }
+    return args;
   }
   return [];
 }

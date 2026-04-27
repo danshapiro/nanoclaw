@@ -36,6 +36,8 @@ export interface ProviderContainerContribution {
   mounts?: VolumeMount[];
   /** Extra env vars to pass to the container (`-e KEY=VALUE`). */
   env?: Record<string, string>;
+  /** Extra hostnames to map to the Docker host gateway for local host services. */
+  extraHosts?: readonly string[];
 }
 
 export type ProviderContainerConfigFn = (ctx: ProviderContainerContext) => ProviderContainerContribution;
