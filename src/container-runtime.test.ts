@@ -1,3 +1,6 @@
+import fs from 'fs';
+import path from 'path';
+
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // Mock log
@@ -55,6 +58,15 @@ describe('hostGatewayArgs', () => {
   it('rejects unsafe additional hostnames', () => {
     expect(() => hostGatewayArgs(['bad host'])).toThrow('Invalid host gateway alias');
     expect(() => hostGatewayArgs(['bad:host'])).toThrow('Invalid host gateway alias');
+  });
+});
+
+describe('agent container Dockerfile', () => {
+  it('includes the Python runtime needed by managed Python project repos', () => {
+    const dockerfile = fs.readFileSync(path.join(process.cwd(), 'container', 'Dockerfile'), 'utf8');
+
+    expect(dockerfile).toContain('python3');
+    expect(dockerfile).toContain('python3-jsonschema');
   });
 });
 
