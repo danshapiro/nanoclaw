@@ -48,7 +48,7 @@ If any check fails, continue running the remaining checks, then end with `SUMMAR
 
 ## Scratch Paths
 
-- Use `/workspace/group/full-qa-pass/` for temporary files.
+- Use `/workspace/agent/full-qa-pass/` for temporary files.
 - Use `/workspace/portable-skills/.qa/` for the writable git probe.
 - Clean both paths before finishing, even after failures.
 
@@ -101,7 +101,7 @@ Validate `/home/node/.claude/settings.json`:
 ### 5. Tool Probes
 
 - `tool_bash_roundtrip`: use Bash to create, read, and delete a scratch file.
-- `tool_read_write_edit`: use `Write`, `Read`, and `Edit` on a file under `/workspace/group/full-qa-pass/`.
+- `tool_read_write_edit`: use `Write`, `Read`, and `Edit` on a file under `/workspace/agent/full-qa-pass/`.
 - `tool_glob_grep`: use `Glob` and `Grep` against the scratch directory and confirm the created file is found.
 - `tool_todowrite`: create at least one todo item and mark it completed.
 - `tool_notebookedit`: create or update a notebook entry tied to this run.
@@ -149,7 +149,7 @@ If `gws` is not present, omit this check entirely.
 
 Before returning:
 
-- remove `/workspace/group/full-qa-pass/` contents created by this run;
+- remove `/workspace/agent/full-qa-pass/` contents created by this run;
 - remove `/workspace/portable-skills/.qa/` contents created by this run;
 - ensure `/workspace/portable-skills` is not left dirty by the probe.
 

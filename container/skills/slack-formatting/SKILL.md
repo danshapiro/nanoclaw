@@ -9,9 +9,9 @@ When responding to Slack channels, use Slack's mrkdwn syntax instead of standard
 
 ## How to detect Slack context
 
-Check your group folder name or workspace path:
+Use the current channel context or group folder name:
 - Folder starts with `slack_` (e.g., `slack_engineering`, `slack_general`)
-- Or check `/workspace/group/` path for `slack_` prefix
+- Channel metadata identifies Slack as the source
 
 ## Formatting reference
 

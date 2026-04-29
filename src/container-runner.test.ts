@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
 import {
   applyOneCliGatewayForContainerArgs,
@@ -134,6 +135,21 @@ describe('portable skills mount', () => {
   });
 });
 
+describe('workspace mount contract', () => {
+  it('mounts current workspace paths and does not mount retired paths', () => {
+    const source = fs.readFileSync(
+      path.join(path.dirname(fileURLToPath(import.meta.url)), 'container-runner.ts'),
+      'utf8',
+    );
+
+    expect(source).toContain("containerPath: '/workspace/agent'");
+    expect(source).toContain("containerPath: '/workspace/repos'");
+    expect(source).toContain("containerPath: '/workspace/extra/repos'");
+    expect(source).not.toContain("containerPath: '/workspace/group'");
+    expect(source).not.toContain("containerPath: '/workspace/project'");
+  });
+});
+
 describe('managed repos mounts', () => {
   const baseGroup: AgentGroup = {
     id: 'ag-main',
@@ -170,11 +186,12 @@ describe('managed repos mounts', () => {
   it('does not mount managed repos for non-main groups', () => {
     const researchGroup: AgentGroup = { ...baseGroup, id: 'ag-research', folder: 'research', name: 'Research' };
 
-    expect(
-      buildManagedReposMounts(researchGroup, {
-        NANOCLAW_MANAGED_REPOS_DIR: '/srv/nanoclaw/shared/repos/projects',
-      }),
-    ).toEqual([]);
+    const mounts = buildManagedReposMounts(researchGroup, {
+      NANOCLAW_MANAGED_REPOS_DIR: '/srv/nanoclaw/shared/repos/projects',
+    });
+
+    expect(mounts).toEqual([]);
+    expect(mounts.map((mount) => mount.containerPath)).not.toContain('/workspace/repos');
   });
 
   it('fails closed when the configured managed repos root is missing', () => {

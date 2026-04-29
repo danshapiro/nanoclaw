@@ -7,28 +7,12 @@ description: Quick read-only health check for session context, workspace mounts,
 
 Generate a concise, read-only status report for the current agent environment.
 
-## Main-Channel Check
-
-Only the main channel has `/workspace/project` mounted. Run:
-
-```bash
-test -d /workspace/project && echo "MAIN" || echo "NOT_MAIN"
-```
-
-If the result is `NOT_MAIN`, respond with:
-
-```text
-This command is available in your main chat only. Send /status there to check system status.
-```
-
-Then stop without generating the full report.
-
 ## Checks
 
 Gather the following information without changing state:
 
 1. Timestamp, working directory, and channel context.
-2. Visible workspace mounts under `/workspace`.
+2. Visible workspace mounts under `/workspace`, including `/workspace/agent`, `/workspace/repos`, `/workspace/portable-skills`, `/workspace/ipc`, and `/workspace/extra` when present.
 3. Tool families available in the current environment.
 4. Container utility versions when available.
 5. Scheduled task snapshot through `mcp__nanoclaw__list_tasks`.
@@ -48,7 +32,9 @@ Session:
 - Working dir: <path>
 
 Workspace:
-- Group folder: <summary>
+- Agent folder: <summary>
+- Managed repos: <summary>
+- Portable authoring: <summary>
 - Extra mounts: <summary>
 - IPC: <summary>
 

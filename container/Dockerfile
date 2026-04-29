@@ -124,7 +124,7 @@ RUN chmod +x /app/entrypoint.sh
 # the parent as root-owned; Chromium needs a writable config dir for crashpad
 # and profile startup.
 RUN mkdir -p \
-        /workspace/group \
+        /workspace/agent \
         /workspace/extra \
         /home/node/.agent-browser \
         /home/node/.cache \
@@ -133,7 +133,7 @@ RUN mkdir -p \
     chmod 777 /home/node /home/node/.agent-browser /home/node/.cache /home/node/.config
 
 USER node
-WORKDIR /workspace/group
+WORKDIR /workspace/agent
 
 # tini is PID 1, reaps zombies, forwards signals cleanly. entrypoint.sh does
 # `exec bun ...` so bun runs as tini's direct child.

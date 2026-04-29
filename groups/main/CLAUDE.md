@@ -84,18 +84,25 @@ Anthropic credentials must be either an API key from console.anthropic.com (`ANT
 
 ## Container Mounts
 
-Main has read-only access to the project, read-write access to the store (SQLite DB), and read-write access to its group folder:
+Main has writable access to group state, managed project repos, portable skill authoring, and managed-repo IPC:
 
 | Container Path | Host Path | Access |
 |----------------|-----------|--------|
-| `/workspace/project` | Project root | read-only |
-| `/workspace/project/store` | `store/` | read-write |
-| `/workspace/group` | `groups/main/` | read-write |
+| `/workspace/agent` | `groups/main/` | read-write |
+| `/workspace/global` | `groups/global/` | read-only |
+| `/workspace/portable-skills` | shared portable-skills repo | read-write |
+| `/workspace/repos/<repo-id>` | managed project repos | read-write |
+| `/workspace/repos/.managed/status.json` | managed repo status | read-only report |
+| `/workspace/ipc` | managed-repo apply/push IPC | read-write |
+| `/workspace/extra` | provider-visible extra mounts | read-only or read-write by mount |
 
 Key paths inside the container:
-- `/workspace/project/store/messages.db` - SQLite database (read-write)
-- `/workspace/project/store/messages.db` (registered_groups table) - Group config
-- `/workspace/project/groups/` - All group folders
+- `/workspace/agent/CLAUDE.local.md` - main group durable local memory
+- `/workspace/repos/yente-context` - canonical managed prompt/config authoring repo
+- `/workspace/repos/summarize-dnd` - managed D&D summarizer repo
+- `/workspace/repos/.managed/status.json` - last managed-repo reconciliation status
+- `/workspace/portable-skills` - main-group portable skill authoring checkout
+- `/workspace/ipc` - request directory for `apply_managed_repos` and `push_managed_repo`
 
 ---
 
@@ -129,18 +136,6 @@ echo '{"type": "refresh_groups"}' > /workspace/ipc/tasks/refresh_$(date +%s).jso
 
 Then wait a moment and re-read `available_groups.json`.
 
-**Fallback**: Query the SQLite database directly:
-
-```bash
-sqlite3 /workspace/project/store/messages.db "
-  SELECT jid, name, last_message_time
-  FROM chats
-  WHERE jid LIKE '%@g.us' AND jid != '__group_sync__'
-  ORDER BY last_message_time DESC
-  LIMIT 10;
-"
-```
-
 ### Registered Groups Config
 
 Groups are registered in the SQLite `registered_groups` table:
@@ -173,11 +168,11 @@ Fields:
 
 ### Adding a Group
 
-1. Query the database to find the group's JID
+1. Use the current NanoClaw MCP tools or `/workspace/ipc/available_groups.json` to find the group's JID.
 2. Ask the user whether the group should require a trigger word before registering
 3. Use the `register_group` MCP tool with the JID, name, folder, trigger, and the chosen `requiresTrigger` setting
 4. Optionally include `containerConfig` for additional mounts
-5. The group folder is created automatically: `/workspace/project/groups/{folder-name}/`
+5. The group folder is created automatically and will appear inside that group's containers at `/workspace/agent/`
 6. Optionally create an initial `CLAUDE.md` for the group
 
 Folder naming convention — channel prefix with underscore separator:
@@ -246,14 +241,11 @@ Notes:
 
 ### Removing a Group
 
-1. Read `/workspace/project/data/registered_groups.json`
-2. Remove the entry for that group
-3. Write the updated JSON back
-4. The group folder and its files remain (don't delete them)
+Use the current NanoClaw MCP group-management tool or host-side operator command. The group folder and its files remain unless the operator explicitly removes them.
 
 ### Listing Groups
 
-Read `/workspace/project/data/registered_groups.json` and format it nicely.
+Use the current NanoClaw MCP group listing or `/workspace/ipc/available_groups.json` and format the result nicely.
 
 ---
 
