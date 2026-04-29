@@ -1,5 +1,5 @@
 export const REQUIRED_YENTE_PROXY_URLS = [
-  { service: 'gws', urlEnv: 'GWS_PROXY_URL', apiUrlEnv: undefined },
+  { service: 'gws', urlEnv: 'GWS_PROXY_URL', apiUrlEnv: undefined, compatibilityKeyEnv: undefined },
   { service: 'msgvault', urlEnv: 'MSGVAULT_PROXY_URL', apiUrlEnv: 'MSGVAULT_API_URL', compatibilityKeyEnv: undefined },
   { service: 'familiar', urlEnv: 'FAMILIAR_PROXY_URL', apiUrlEnv: 'FAMILIAR_API_URL', compatibilityKeyEnv: undefined },
   { service: 'nyne', urlEnv: 'NYNE_PROXY_URL', apiUrlEnv: 'NYNE_API_URL', compatibilityKeyEnv: undefined },
