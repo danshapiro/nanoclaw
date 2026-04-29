@@ -1,5 +1,5 @@
 export const REQUIRED_YENTE_PROXY_URLS = [
-  { service: 'gws', urlEnv: 'GWS_PROXY_URL', apiUrlEnv: undefined, compatibilityKeyEnv: 'GWS_PROXY_KEY' },
+  { service: 'gws', urlEnv: 'GWS_PROXY_URL', apiUrlEnv: undefined },
   { service: 'msgvault', urlEnv: 'MSGVAULT_PROXY_URL', apiUrlEnv: 'MSGVAULT_API_URL', compatibilityKeyEnv: undefined },
   { service: 'familiar', urlEnv: 'FAMILIAR_PROXY_URL', apiUrlEnv: 'FAMILIAR_API_URL', compatibilityKeyEnv: undefined },
   { service: 'nyne', urlEnv: 'NYNE_PROXY_URL', apiUrlEnv: 'NYNE_API_URL', compatibilityKeyEnv: undefined },
@@ -13,8 +13,10 @@ export const REQUIRED_YENTE_PROXY_URLS = [
 export const REQUIRED_YENTE_ONECLI_SECRET_NAMES = [
   'Yente GWS Proxy',
   'Yente Msgvault Proxy',
+  'NanoClaw Anthropic',
   'NanoClaw OpenAI',
   'NanoClaw Gemini',
+  'AssemblyAI',
 ] as const;
 export const ONECLI_MANAGED_PLACEHOLDER = 'onecli-managed';
 export const YENTE_LOCAL_PROXY_HOSTS = {

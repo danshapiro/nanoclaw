@@ -54,7 +54,6 @@ describe('Yente service env contract', () => {
     expect(result.onecliApiKey).toBe('onecli-key');
     expect(result.containerEnv).toMatchObject({
       GWS_PROXY_URL: `http://${YENTE_LOCAL_PROXY_HOSTS.gws}:8083`,
-      GWS_PROXY_KEY: 'onecli-managed',
       MSGVAULT_PROXY_URL: `http://${YENTE_LOCAL_PROXY_HOSTS.msgvault}:8084`,
       MSGVAULT_API_URL: `http://${YENTE_LOCAL_PROXY_HOSTS.msgvault}:8084`,
       FAMILIAR_PROXY_URL: `http://${YENTE_LOCAL_PROXY_HOSTS.familiar}:8081`,
@@ -66,6 +65,7 @@ describe('Yente service env contract', () => {
     });
     expect(result.containerEnv).not.toHaveProperty('GOOGLE_APPLICATION_CREDENTIALS');
     expect(result.containerEnv).not.toHaveProperty('ANTHROPIC_API_KEY');
+    expect(result.containerEnv).not.toHaveProperty('GWS_PROXY_KEY');
     expect(result.containerEnv).not.toHaveProperty('MSGVAULT_PROXY_KEY');
     expect(result.containerEnv).not.toHaveProperty('MSGVAULT_API_KEY');
   });
@@ -102,6 +102,7 @@ describe('Yente service env contract', () => {
           { id: 'secret-msgvault', name: 'Yente Msgvault Proxy' },
           { id: 'secret-openai', name: 'NanoClaw OpenAI' },
           { id: 'secret-gemini', name: 'NanoClaw Gemini' },
+          { id: 'secret-assemblyai', name: 'AssemblyAI' },
         ]);
       }
       if (url.endsWith('/api/agents')) {
@@ -130,7 +131,14 @@ describe('Yente service env contract', () => {
     const update = calls.find((call) => call.init?.method === 'PUT');
     expect(update?.init?.body).toBe(
       JSON.stringify({
-        secretIds: ['secret-anthropic', 'secret-gws', 'secret-msgvault', 'secret-openai', 'secret-gemini'],
+        secretIds: [
+          'secret-anthropic',
+          'secret-gws',
+          'secret-msgvault',
+          'secret-openai',
+          'secret-gemini',
+          'secret-assemblyai',
+        ],
       }),
     );
     expect(calls.some((call) => call.url === 'https://onecli-gateway.local/api/cache/invalidate')).toBe(true);
@@ -143,8 +151,10 @@ describe('Yente service env contract', () => {
         return Response.json([
           { id: 'secret-gws', name: 'Yente GWS Proxy' },
           { id: 'secret-msgvault', name: 'Yente Msgvault Proxy' },
+          { id: 'secret-anthropic', name: 'NanoClaw Anthropic' },
           { id: 'secret-openai', name: 'NanoClaw OpenAI' },
           { id: 'secret-gemini', name: 'NanoClaw Gemini' },
+          { id: 'secret-assemblyai', name: 'AssemblyAI' },
         ]);
       }
       if (url.endsWith('/api/agents')) {
@@ -186,6 +196,6 @@ describe('Yente service env contract', () => {
         agentIdentifier: 'ag-main',
         fetchImpl,
       }),
-    ).rejects.toThrow('Missing OneCLI secret(s): NanoClaw OpenAI, NanoClaw Gemini');
+    ).rejects.toThrow('Missing OneCLI secret(s): NanoClaw Anthropic, NanoClaw OpenAI, NanoClaw Gemini, AssemblyAI');
   });
 });
