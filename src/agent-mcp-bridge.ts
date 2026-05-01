@@ -158,6 +158,18 @@ function removeEmptyDirIfExists(dirPath: string): void {
   }
 }
 
+function canonicalizeDataDir(dataDir: string): string {
+  const resolved = path.resolve(dataDir);
+  try {
+    return fs.realpathSync(resolved);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      return resolved;
+    }
+    throw err;
+  }
+}
+
 function spawnProxy(
   spawnImpl: SpawnLike,
   releaseRoot: string,
@@ -193,7 +205,7 @@ export async function startAgentMcpBridge(options: AgentMcpBridgeOptions): Promi
     throw new Error('Agent MCP bridge requires a known container UID/GID before startup');
   }
 
-  const dataDir = path.resolve(options.dataDir || DATA_DIR);
+  const dataDir = canonicalizeDataDir(options.dataDir || DATA_DIR);
   const releaseRoot = path.resolve(options.releaseRoot || process.cwd());
   const spawnImpl = options.spawnImpl || spawn;
   const lockWaitMs = options.lockWaitMs ?? DEFAULT_LOCK_WAIT_MS;

@@ -106,4 +106,39 @@ describe('startAgentMcpBridge', () => {
       fs.rmSync(releaseRoot, { recursive: true, force: true });
     }
   });
+
+  it('uses the canonical data path for host Unix socket paths', async () => {
+    const realDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nmc-'));
+    const symlinkParent = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-mcp-symlink-parent-'));
+    const releaseRoot = makeReleaseRoot();
+    const longReleaseRoot = path.join(symlinkParent, `release-${'x'.repeat(72)}`);
+    const symlinkedDataDir = path.join(longReleaseRoot, 'data');
+    fs.mkdirSync(longReleaseRoot, { recursive: true });
+    fs.symlinkSync(realDataDir, symlinkedDataDir);
+    const authDir = path.join(realDataDir, 'v2-sessions', 'ag-main', '.mcp-auth', 'granola');
+    fs.mkdirSync(authDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(authDir, '.nanoclaw-granola-auth-ok'), '');
+    const identity = serviceIdentity();
+    try {
+      const bridge = await startAgentMcpBridge({
+        groupFolder: 'main',
+        agentGroupId: 'ag-main',
+        bridge: granolaBridge,
+        containerUid: identity.uid,
+        containerGid: identity.gid,
+        dataDir: symlinkedDataDir,
+        releaseRoot,
+      });
+      try {
+        expect(bridge.hostSocketPath.startsWith(realDataDir)).toBe(true);
+        expect(Buffer.byteLength(bridge.hostSocketPath)).toBeLessThanOrEqual(99);
+      } finally {
+        await bridge.stop();
+      }
+    } finally {
+      fs.rmSync(realDataDir, { recursive: true, force: true });
+      fs.rmSync(symlinkParent, { recursive: true, force: true });
+      fs.rmSync(releaseRoot, { recursive: true, force: true });
+    }
+  });
 });
