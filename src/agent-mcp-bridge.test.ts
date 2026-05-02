@@ -1,4 +1,5 @@
 import fs from 'fs';
+import net from 'net';
 import os from 'os';
 import path from 'path';
 
@@ -6,11 +7,11 @@ import { describe, expect, it } from 'vitest';
 
 import { startAgentMcpBridge } from './agent-mcp-bridge.js';
 
-function makeReleaseRoot(): string {
+function makeReleaseRoot(proxySource = 'process.stdin.resume();'): string {
   const releaseRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-mcp-release-'));
   const proxyDir = path.join(releaseRoot, 'node_modules', 'mcp-remote', 'dist');
   fs.mkdirSync(proxyDir, { recursive: true });
-  fs.writeFileSync(path.join(proxyDir, 'proxy.js'), 'process.stdin.resume();');
+  fs.writeFileSync(path.join(proxyDir, 'proxy.js'), proxySource);
   return releaseRoot;
 }
 
@@ -138,6 +139,41 @@ describe('startAgentMcpBridge', () => {
     } finally {
       fs.rmSync(realDataDir, { recursive: true, force: true });
       fs.rmSync(symlinkParent, { recursive: true, force: true });
+      fs.rmSync(releaseRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('does not crash when proxy startup fails after the client disconnects', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-mcp-data-'));
+    const releaseRoot = makeReleaseRoot();
+    const authDir = path.join(dataDir, 'v2-sessions', 'ag-main', '.mcp-auth', 'granola');
+    fs.mkdirSync(authDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(authDir, '.nanoclaw-granola-auth-ok'), '');
+    const identity = serviceIdentity();
+    try {
+      const bridge = await startAgentMcpBridge({
+        groupFolder: 'main',
+        agentGroupId: 'ag-main',
+        bridge: granolaBridge,
+        containerUid: identity.uid,
+        containerGid: identity.gid,
+        dataDir,
+        releaseRoot,
+        startupWatchdogMs: 10,
+      });
+      try {
+        const client = net.createConnection(bridge.hostSocketPath);
+        await new Promise<void>((resolve, reject) => {
+          client.once('connect', resolve);
+          client.once('error', reject);
+        });
+        client.destroy();
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      } finally {
+        await bridge.stop();
+      }
+    } finally {
+      fs.rmSync(dataDir, { recursive: true, force: true });
       fs.rmSync(releaseRoot, { recursive: true, force: true });
     }
   });

@@ -200,6 +200,39 @@ function spawnProxy(
   ) as ChildProcessWithoutNullStreams;
 }
 
+function isExpectedSocketClose(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  return code === 'EPIPE' || code === 'ECONNRESET';
+}
+
+function warnUnexpectedSocketError(action: string, err: unknown): void {
+  if (isExpectedSocketClose(err)) return;
+  log.warn('Agent MCP bridge socket error', {
+    action,
+    err: err instanceof Error ? err.message : String(err),
+  });
+}
+
+function closeSocketQuietly(socket: net.Socket, message?: string): void {
+  if (socket.destroyed) return;
+  try {
+    if (message && socket.writable) {
+      socket.write(`${message}\n`, (err) => {
+        if (err) warnUnexpectedSocketError('write failure response', err);
+      });
+    }
+  } catch (err) {
+    warnUnexpectedSocketError('write failure response', err);
+  }
+
+  try {
+    socket.end();
+  } catch (err) {
+    warnUnexpectedSocketError('end socket', err);
+    socket.destroy();
+  }
+}
+
 export async function startAgentMcpBridge(options: AgentMcpBridgeOptions): Promise<AgentMcpBridge> {
   if (!Number.isInteger(options.containerUid) || !Number.isInteger(options.containerGid)) {
     throw new Error('Agent MCP bridge requires a known container UID/GID before startup');
@@ -264,11 +297,14 @@ export async function startAgentMcpBridge(options: AgentMcpBridgeOptions): Promi
     const fail = (message: string) => {
       if (settled) return;
       settled = true;
-      socket.write(`${message}\n`);
-      socket.end();
+      closeSocketQuietly(socket, message);
       if (child && !child.killed) child.kill();
       if (lock) releaseBridgeLock(lock);
     };
+
+    socket.on('error', (err) => {
+      warnUnexpectedSocketError('socket', err);
+    });
 
     void (async () => {
       const acquiredLock = await acquireBridgeLock(lockPath, lockKey, lockWaitMs).then(
@@ -311,7 +347,7 @@ export async function startAgentMcpBridge(options: AgentMcpBridgeOptions): Promi
           lock = undefined;
         }
         enforcePrivatePermissions(authDir);
-        if (!socket.destroyed) socket.end();
+        closeSocketQuietly(socket);
       });
       child.stdout.once('data', () => {
         settled = true;
