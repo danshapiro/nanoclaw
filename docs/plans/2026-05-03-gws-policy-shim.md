@@ -34,6 +34,30 @@ This is a deploy-affecting NanoClaw runtime change. Keep the implementation isol
 
 Because `container/Dockerfile` and `src/container-runner.ts` are upstream-sensitive runtime files, begin by fetching and comparing against both the fork's `origin/main` and the true upstream `upstream/main`. Keep the change scoped to the Yente/GWS mediation boundary, and do not introduce unrelated fork drift while restoring the documented security posture. If upstream already changed these surfaces, inspect and prefer the upstream shape before adding a Yente-specific overlay change.
 
+### Planning Misses To Carry Forward
+
+Previous plan-editor rounds found serious misses because this is not a single-file shim replacement; it is a cross-boundary security and deploy contract repair. Future execution and review should keep these misses visible instead of rediscovering them one at a time:
+
+- A plan that only changes NanoClaw source is incomplete. Production must run the fixed runtime, so the tested source tree must land on NanoClaw's long-lived `overlay/shapiroserver2` branch, and shapiroserver2's `deploy/nanoclaw` branch must pin and deploy that exact overlay commit.
+- A plan that deploys from a scratch branch or uses `NANOCLAW_ALLOW_PROD_DEPLOY_FROM_NON_DEPLOY_BRANCH=1` is the wrong source-of-truth path for this planned fix.
+- A plan that only proves `gws` works is too weak. The invariant is that agent `gws` is mediated, has no direct OAuth material, and fails closed for arbitrary recipients.
+- A plan that removes all `GWS_PROXY_KEY` usage is too broad. Host-side direct proxy tests may use the key to test `gws-proxy`; the hard boundary is that NanoClaw agent containers and their shim must not receive or depend on it.
+- A plan that changes the live recipient policy is solving the wrong problem. The `@glowforge.com` allowance is intentional and out of scope; the fix is to make all agent sends traverse the existing policy.
+- A plan that only greps transcripts after the fact is too weak. The final proof must include the user's exact natural-language probe, `send a message to dan@example.com`, plus a trusted Gmail Sent audit outside the agent.
+- A plan that moves `/srv/nanoclaw/shared/gws-config` now expands scope unnecessarily. The immediate security repair removes that credential root from agents; moving the proxy-owned credential root belongs to a later service-root hardening task.
+- A plan that updates only current-state docs is incomplete for shapiroserver2. Because this fixes a live machine issue and changes NanoClaw deployment behavior, the deploy branch and main reconciliation must also update `changes.md`.
+
+### Scope And Invariant Map
+
+Zoom out before editing or reviewing any step:
+
+- **Agent boundary:** agent containers get only non-secret proxy URLs, OneCLI networking env, CA trust, and `/usr/local/bin/gws`; they never get `GWS_PROXY_KEY`, Google OAuth files, `/home/node/.config/gws`, `/srv/nanoclaw/shared/gws-config`, or a real direct-auth GWS CLI.
+- **Proxy boundary:** `gws-proxy` is the trusted enforcement service. It may keep the real GWS CLI, OAuth state, bearer keys, recipient policy, rate limits, and audit logs.
+- **OneCLI boundary:** OneCLI owns agent-visible authorization injection. The shim must route through the configured proxy env and must not synthesize an `Authorization` header.
+- **Deploy boundary:** NanoClaw runtime changes land on `overlay/shapiroserver2`; production host pins and deploys from shapiroserver2 `deploy/nanoclaw`; durable non-pin host contract changes are reconciled back to shapiroserver2 `main`.
+- **Verification boundary:** static assertions prevent reintroducing the direct CLI or credential mount, deterministic live commands prove proxy denial, and the natural-language probe plus trusted Sent audit proves the user-reported bypass behavior is gone.
+- **Out of scope:** recipient-policy changes, moving the GWS credential root into a new service-owned directory, Docker group hardening, unrelated branch-history reconciliation, and broad security-posture document consolidation if that document is absent on the target branches.
+
 ## User-Visible Behavior
 
 After implementation and deploy:
@@ -93,6 +117,8 @@ shapiroserver2 host/deploy worktree: existing `deploy/nanoclaw` worktree if clea
   - Replace stale source validation and image smoke checks that expected `/home/node/.config/gws` with validation that requires the shim and forbids direct GWS CLI/OAuth mounting.
 - Modify: `services-and-security.md`
   - Replace the stale current-state browser image/GWS runtime text that still describes `/home/node/.config/gws` in agent images.
+- Modify: `changes.md`
+  - Record the live machine issue, deployed fix, and proof summary.
 - Modify: `docs/nanoclaw/Deployment.md`, `docs/nanoclaw/Upgrade.md`, `docs/nanoclaw/how-to-update-tokens.md`, `docs/nanoclaw/SecurityPosture.md` if present
   - Keep machine docs current with the fixed runtime contract.
 - Modify: `tests/test-skill-deploy.sh`
@@ -815,6 +841,7 @@ git commit -m "docs: document gws proxy shim boundary"
 - Modify as needed: `tests/validate.sh`
 - Modify as needed: `tests/check-nanoclaw-active-contracts.sh`
 - Modify docs as needed: `services-and-security.md`
+- Modify docs as needed: `changes.md`
 - Modify docs as needed: `docs/nanoclaw/Deployment.md`, `docs/nanoclaw/Upgrade.md`, `docs/nanoclaw/how-to-update-tokens.md`
 - Modify if present in the checked-out branch: `docs/nanoclaw/SecurityPosture.md`
 
@@ -1230,6 +1257,8 @@ Update current-state docs to say:
 
 At minimum update `services-and-security.md` and `docs/nanoclaw/Deployment.md` because both currently describe `/home/node/.config/gws` as an agent-image/browser contract. Update `docs/nanoclaw/how-to-update-tokens.md` so its GWS verification proves `gws auth status` proxy mode and the absence of `GWS_PROXY_KEY`, not just presence of `GWS_PROXY_URL`.
 
+Update `changes.md` with a dated entry for the GWS policy-shim repair. Include the old bypass shape, the new shim/no-agent-OAuth contract, the deployed NanoClaw SHA once known, and the final proof summary after Task 7. If the first docs commit happens before deploy, write the entry with the source-pin intent and amend or add a follow-up `changes.md` commit after live proof records the actual deployed SHA.
+
 Update shell validations only where needed so they enforce the new contract. Do not add broad historical grep bans that would catch old plan docs.
 
 - [ ] **Step 11: Run shapiroserver2 focused checks**
@@ -1265,6 +1294,7 @@ git -C "$SHAPIRO_WT" add \
   tests/test-nanoclaw-local-proxies-e2e.sh \
   tests/validate.sh \
   tests/check-nanoclaw-active-contracts.sh \
+  changes.md \
   services-and-security.md \
   docs/nanoclaw/Deployment.md \
   docs/nanoclaw/Upgrade.md \
@@ -1465,6 +1495,7 @@ Expected: PASS.
 - Modify as applicable: `tests/validate.sh`
 - Modify as applicable: `tests/check-nanoclaw-active-contracts.sh`
 - Modify as applicable: `services-and-security.md`
+- Modify as applicable: `changes.md`
 - Modify as applicable: `docs/nanoclaw/Deployment.md`
 - Modify as applicable: `docs/nanoclaw/Upgrade.md`
 - Modify as applicable: `docs/nanoclaw/how-to-update-tokens.md`
@@ -1517,6 +1548,7 @@ git checkout "$SHAPIRO_CONTRACT_COMMIT" -- \
   tests/test-nanoclaw-local-proxies-e2e.sh \
   tests/validate.sh \
   tests/check-nanoclaw-active-contracts.sh \
+  changes.md \
   services-and-security.md \
   docs/nanoclaw/Deployment.md \
   docs/nanoclaw/Upgrade.md \
@@ -1547,7 +1579,7 @@ bash tests/test-nanoclaw-deploy-contract.sh
 bash tests/validate.sh
 ```
 
-Expected: PASS. If `main` has pre-existing branch-drift informational output in `validate.sh`, do not broaden this task to reconcile branch history; this task reconciles only the GWS shim host contract.
+Expected: PASS. Do not broaden this task into unrelated branch-history reconciliation; this task reconciles only the GWS shim host contract.
 
 - [ ] **Step 4: Commit the `main` reconciliation**
 
@@ -1568,6 +1600,7 @@ else
     tests/test-nanoclaw-local-proxies-e2e.sh
     tests/validate.sh
     tests/check-nanoclaw-active-contracts.sh
+    changes.md
     services-and-security.md
     docs/nanoclaw/Deployment.md
     docs/nanoclaw/Upgrade.md
