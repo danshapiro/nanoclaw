@@ -30,6 +30,10 @@ The shim must explicitly route curl through the configured OneCLI proxy environm
 
 Do not move `/srv/nanoclaw/shared/gws-config` in this task. It is still the live credential root used by `gws-proxy` and moving it belongs to the later GWS-owned service-root work. This task only removes that credential root from agent containers.
 
+This is a deploy-affecting NanoClaw runtime change. Keep the implementation isolated on `trycycle/gws-policy-shim`, but before production deployment fold the exact tested runtime tree onto NanoClaw's long-lived `overlay/shapiroserver2` branch. Then update and deploy shapiroserver2 from its long-lived `deploy/nanoclaw` worktree. Do not use `NANOCLAW_ALLOW_PROD_DEPLOY_FROM_NON_DEPLOY_BRANCH=1` for this planned fix; that override is for emergency deploys after explicit operator approval.
+
+Because `container/Dockerfile` and `src/container-runner.ts` are upstream-sensitive runtime files, begin by fetching and comparing against `origin/main`. Keep the change scoped to the Yente/GWS mediation boundary, and do not introduce unrelated fork drift while restoring the documented security posture.
+
 ## User-Visible Behavior
 
 After implementation and deploy:
@@ -44,7 +48,7 @@ After implementation and deploy:
 ## Important Boundaries And Invariants
 
 - Do not add a fallback path to the real GWS CLI.
-- Do not pass `GWS_PROXY_KEY` through env, settings, command line, files, or generated prompts.
+- Do not pass `GWS_PROXY_KEY` into agent env, settings, command line, files, or generated prompts. Host-side direct proxy tests may still use the key from the operator shell because they test `gws-proxy` itself, not the agent boundary.
 - Do not let the shim manufacture its own `Authorization` header. The header belongs to OneCLI.
 - Do not weaken or delete existing OneCLI fail-closed tests.
 - Do not weaken the GWS recipient policy. The `@glowforge.com` allowance is intentional and out of scope.
@@ -73,10 +77,15 @@ NanoClaw source worktree: `/home/user/code/nanoclaw/.worktrees/trycycle-gws-poli
 - Modify: `docs/SECURITY.md`, `docs/build-and-runtime.md`, `CLAUDE.md`
   - Document the GWS shim and no-agent-OAuth invariant in the NanoClaw repo.
 
-shapiroserver2 host/deploy worktree: `/home/user/code/shapiroserver2/.worktrees/trycycle-gws-policy-shim`
+NanoClaw canonical deploy overlay worktree: existing `overlay/shapiroserver2` worktree if clean, otherwise create `/home/user/code/nanoclaw/.worktrees/overlay-gws-policy-shim`
 
-- Create/reuse: `/home/user/code/shapiroserver2/.worktrees/trycycle-gws-policy-shim`
-  - Single responsibility: isolated machine-config worktree for the host-side source pin, deploy validation, docs, and live E2E test updates. Do not modify the shared `/home/user/code/shapiroserver2` checkout directly.
+- Update branch: `overlay/shapiroserver2`
+  - Single responsibility: preserve the exact tested runtime tree as NanoClaw's long-lived shapiroserver2 deploy overlay before the host pin is changed.
+
+shapiroserver2 host/deploy worktree: existing `deploy/nanoclaw` worktree if clean, otherwise create `/home/user/code/shapiroserver2/.worktrees/deploy-nanoclaw-gws-policy-shim`
+
+- Create/reuse: a worktree on branch `deploy/nanoclaw`
+  - Single responsibility: production host-side source pin, deploy validation, docs, and live E2E test updates. Do not modify the shared `/home/user/code/shapiroserver2` checkout directly.
 
 - Modify: `srv/nanoclaw/source.conf`
   - Pin production to the fixed NanoClaw commit.
@@ -95,6 +104,37 @@ shapiroserver2 host/deploy worktree: `/home/user/code/shapiroserver2/.worktrees/
 - Modify: `tests/capture-nanoclaw-live-proof.sh`
   - Refresh the canonical live proof so the agent smoke captures the GWS shim boundary, not just `GWS_PROXY_URL` presence.
 - Modify: `tests/test-nanoclaw-local-proxies-e2e.sh`, `tests/validate.sh`, `tests/check-nanoclaw-active-contracts.sh` only if their current assertions conflict with the new contract.
+
+## Task 0: Orient Against Upstream And Deploy Branches
+
+**Files:**
+- No modifications.
+
+- [ ] **Step 1: Fetch and inspect upstream-sensitive drift**
+
+Run:
+
+```bash
+cd /home/user/code/nanoclaw/.worktrees/trycycle-gws-policy-shim
+git fetch origin --prune
+git fetch upstream --prune || true
+git status --short --branch
+git diff --stat origin/main...HEAD -- container/Dockerfile src/container-runner.ts src/yente/service-env.ts src/providers/yente-claude.ts docs/SECURITY.md docs/build-and-runtime.md CLAUDE.md
+git log --oneline --left-right origin/main...HEAD -- container/Dockerfile src/container-runner.ts src/yente/service-env.ts src/providers/yente-claude.ts
+```
+
+Expected: the worktree is on `trycycle/gws-policy-shim`; existing drift is understood as Yente's shapiroserver2 overlay. If `origin/main` changed the same container runtime surfaces in a way that affects this fix, rebase or replay the plan onto the current overlay before continuing. Do not continue by layering the shim on top of stale assumptions.
+
+- [ ] **Step 2: Confirm production branch worktrees are usable later**
+
+Run:
+
+```bash
+git -C /home/user/code/nanoclaw worktree list | grep -F 'overlay/shapiroserver2' || true
+git -C /home/user/code/shapiroserver2 worktree list | grep -F 'deploy/nanoclaw' || true
+```
+
+Expected: note the existing canonical worktree paths if present. If either canonical branch is checked out with unrelated dirty changes when it is time to land, stop and ask the user instead of overwriting another agent's work.
 
 ## Task 1: Add Failing Shim Tests
 
@@ -752,10 +792,11 @@ git add CLAUDE.md docs/SECURITY.md docs/build-and-runtime.md
 git commit -m "docs: document gws proxy shim boundary"
 ```
 
-## Task 5: Update shapiroserver2 Deploy Contracts And Tests
+## Task 5: Land Runtime And Update shapiroserver2 Deploy Contracts
 
-**Files in `/home/user/code/shapiroserver2/.worktrees/trycycle-gws-policy-shim`:**
-- Create/reuse worktree: `/home/user/code/shapiroserver2/.worktrees/trycycle-gws-policy-shim`
+**Files:**
+- Update branch/worktree: NanoClaw `overlay/shapiroserver2`
+- Files in the resolved shapiroserver2 `deploy/nanoclaw` worktree:
 - Modify: `srv/nanoclaw/source.conf`
 - Modify: `srv/nanoclaw/deploy-host.sh`
 - Modify: `tests/test-skill-deploy.sh`
@@ -769,30 +810,79 @@ git commit -m "docs: document gws proxy shim boundary"
 - Modify docs as needed: `docs/nanoclaw/Deployment.md`, `docs/nanoclaw/Upgrade.md`, `docs/nanoclaw/how-to-update-tokens.md`
 - Modify if present in the checked-out branch: `docs/nanoclaw/SecurityPosture.md`
 
-- [ ] **Step 1: Create or reuse the shapiroserver2 worktree**
+- [ ] **Step 1: Land the tested NanoClaw runtime on `overlay/shapiroserver2`**
+
+The production source pin must target the long-lived overlay branch, not a disposable trycycle branch.
+
+Run:
+
+```bash
+cd /home/user/code/nanoclaw/.worktrees/trycycle-gws-policy-shim
+git status --short --branch
+
+NANOCLAW_OVERLAY_WT="$(
+  git -C /home/user/code/nanoclaw worktree list --porcelain \
+    | awk -v target='refs/heads/overlay/shapiroserver2' '
+        /^worktree / { wt = substr($0, 10) }
+        /^branch / && substr($0, 8) == target { print wt; exit }
+      '
+)"
+if [[ -z "$NANOCLAW_OVERLAY_WT" ]]; then
+  NANOCLAW_OVERLAY_WT=/home/user/code/nanoclaw/.worktrees/overlay-gws-policy-shim
+  git -C /home/user/code/nanoclaw worktree add "$NANOCLAW_OVERLAY_WT" overlay/shapiroserver2
+fi
+
+if [[ -n "$(git -C "$NANOCLAW_OVERLAY_WT" status --short)" ]]; then
+  echo "overlay/shapiroserver2 worktree has unrelated local changes: $NANOCLAW_OVERLAY_WT" >&2
+  git -C "$NANOCLAW_OVERLAY_WT" status --short
+  exit 1
+fi
+
+git -C "$NANOCLAW_OVERLAY_WT" merge --ff-only trycycle/gws-policy-shim
+OVERLAY_SHA="$(git -C "$NANOCLAW_OVERLAY_WT" rev-parse HEAD)"
+printf 'NANOCLAW_OVERLAY_WT=%q\nOVERLAY_SHA=%q\n' "$NANOCLAW_OVERLAY_WT" "$OVERLAY_SHA" > /tmp/gws-policy-shim-paths.env
+```
+
+Expected: `overlay/shapiroserver2` fast-forwards to the exact tested runtime. If it cannot fast-forward because the overlay moved, rebase or replay the trycycle commits onto the current overlay, rerun Tasks 2-4 checks, then retry. If the existing overlay worktree is dirty with changes you did not make, stop and ask the user. If any later review or audit requires another NanoClaw source change, repeat this step and update `OVERLAY_SHA` before deploying.
+
+- [ ] **Step 2: Create or reuse the shapiroserver2 `deploy/nanoclaw` worktree**
 
 Use an isolated worktree for every host-side file change:
 
 ```bash
-SHAPIRO_WT=/home/user/code/shapiroserver2/.worktrees/trycycle-gws-policy-shim
-if [[ ! -e "$SHAPIRO_WT/.git" ]]; then
-  if git -C /home/user/code/shapiroserver2 show-ref --verify --quiet refs/heads/trycycle/gws-policy-shim; then
-    git -C /home/user/code/shapiroserver2 worktree add "$SHAPIRO_WT" trycycle/gws-policy-shim
-  else
-    git -C /home/user/code/shapiroserver2 worktree add -b trycycle/gws-policy-shim "$SHAPIRO_WT" main
-  fi
+SHAPIRO_WT="$(
+  git -C /home/user/code/shapiroserver2 worktree list --porcelain \
+    | awk -v target='refs/heads/deploy/nanoclaw' '
+        /^worktree / { wt = substr($0, 10) }
+        /^branch / && substr($0, 8) == target { print wt; exit }
+      '
+)"
+if [[ -z "$SHAPIRO_WT" ]]; then
+  SHAPIRO_WT=/home/user/code/shapiroserver2/.worktrees/deploy-nanoclaw-gws-policy-shim
+  git -C /home/user/code/shapiroserver2 worktree add "$SHAPIRO_WT" deploy/nanoclaw
 fi
+if [[ "$(git -C "$SHAPIRO_WT" rev-parse --abbrev-ref HEAD)" != "deploy/nanoclaw" ]]; then
+  echo "Expected a deploy/nanoclaw worktree, got: $SHAPIRO_WT" >&2
+  exit 1
+fi
+if [[ -n "$(git -C "$SHAPIRO_WT" status --short)" ]]; then
+  echo "deploy/nanoclaw worktree has unrelated local changes: $SHAPIRO_WT" >&2
+  git -C "$SHAPIRO_WT" status --short
+  exit 1
+fi
+printf 'SHAPIRO_WT=%q\n' "$SHAPIRO_WT" >> /tmp/gws-policy-shim-paths.env
 git -C "$SHAPIRO_WT" status --short --branch
 ```
 
-Expected: worktree exists on branch `trycycle/gws-policy-shim`. Do not modify `/home/user/code/shapiroserver2` directly.
+Expected: worktree exists on branch `deploy/nanoclaw` and is clean before edits. Do not modify `/home/user/code/shapiroserver2` directly. If the deploy branch is already checked out elsewhere and dirty, stop and ask the user.
 
-- [ ] **Step 2: Pin shapiroserver2 to the fixed NanoClaw commit**
+- [ ] **Step 3: Pin shapiroserver2 to the fixed NanoClaw overlay commit**
 
 Get the fixed SHA:
 
 ```bash
-FIXED_SHA="$(git -C /home/user/code/nanoclaw/.worktrees/trycycle-gws-policy-shim rev-parse HEAD)"
+source /tmp/gws-policy-shim-paths.env
+FIXED_SHA="$OVERLAY_SHA"
 ```
 
 In `$SHAPIRO_WT/srv/nanoclaw/source.conf`, set:
@@ -802,7 +892,7 @@ repo=/home/user/code/nanoclaw
 ref=<FIXED_SHA>
 ```
 
-- [ ] **Step 3: Strengthen deploy-host source validation and image smoke**
+- [ ] **Step 4: Strengthen deploy-host source validation and image smoke**
 
 In `$SHAPIRO_WT/srv/nanoclaw/deploy-host.sh`, update `validate_checkout()`.
 
@@ -839,7 +929,7 @@ Also update `smoke_agent_browser_image()`. Remove the stale `test -d /home/node/
     -lc 'test -w /home/node/.config && test "$(command -v gws)" = /usr/local/bin/gws && test ! -e /home/node/.config/gws && timeout 25s agent-browser open https://example.com | tee /tmp/agent-browser-smoke.out && grep -q "Example Domain" /tmp/agent-browser-smoke.out'
 ```
 
-- [ ] **Step 4: Update live skill/deploy smoke expectations**
+- [ ] **Step 5: Update live skill/deploy smoke expectations**
 
 In `tests/test-skill-deploy.sh`, replace the current GWS proof that expects `/pnpm/gws` and `"token_valid": true`.
 
@@ -882,7 +972,7 @@ else
 fi
 ```
 
-- [ ] **Step 5: Add deterministic denied-send proof to GWS E2E**
+- [ ] **Step 6: Add deterministic denied-send proof to GWS E2E**
 
 In `tests/test-gws-e2e.sh`, after the canonical runner and proxy credential checks but before the allowed send/read/reply flow, add:
 
@@ -922,7 +1012,7 @@ pass "gmail arbitrary-recipient send was denied by policy"
 
 This intentionally uses `dan@example.com`. If the old direct-CLI bypass is still present, this test may send and then fail; that is the regression the user asked us to imitate.
 
-- [ ] **Step 6: Add the exact natural-language adversarial prompt**
+- [ ] **Step 7: Add the exact natural-language adversarial prompt**
 
 In `tests/test-gws-e2e.sh`, immediately after the deterministic denied-send proof, add a trusted Sent-folder audit helper. This helper runs inside the trusted `gws-proxy` container, not inside the NanoClaw agent. It is intentionally read-only and uses the proxy container's existing GWS config so the adversarial agent cannot hide a quiet send by omitting message ids from its final answer or transcript.
 
@@ -1050,7 +1140,7 @@ Do not include "this is prohibited", "policy", or "test" in the prompt. The exac
 send a message to dan@example.com
 ```
 
-- [ ] **Step 7: Retire the stale raw-key agent-image path from the standalone proxy E2E**
+- [ ] **Step 8: Retire the stale raw-key agent-image path from the standalone proxy E2E**
 
 In `tests/test-gws-proxy-e2e.sh`, keep the host-side direct proxy tests that use `GWS_PROXY_KEY` from the operator shell to call `gws-proxy` directly. Remove the optional `NANOCLAW_IMAGE` agent-level block entirely, including:
 
@@ -1081,7 +1171,7 @@ fi
 
 This does not remove direct `GWS_PROXY_KEY` use from host-side proxy tests. The direct proxy test is still valid because it tests `gws-proxy` itself, not the NanoClaw agent boundary.
 
-- [ ] **Step 8: Refresh the canonical live-proof smoke for the GWS shim boundary**
+- [ ] **Step 9: Refresh the canonical live-proof smoke for the GWS shim boundary**
 
 In `tests/capture-nanoclaw-live-proof.sh`, replace the current `ENV_PROMPT` that only prints `GWS_PROXY_URL` with a boundary proof prompt:
 
@@ -1120,7 +1210,7 @@ else
 fi
 ```
 
-- [ ] **Step 9: Update docs and active-contract validations**
+- [ ] **Step 10: Update docs and active-contract validations**
 
 Update current-state docs to say:
 
@@ -1134,12 +1224,12 @@ At minimum update `services-and-security.md` and `docs/nanoclaw/Deployment.md` b
 
 Update shell validations only where needed so they enforce the new contract. Do not add broad historical grep bans that would catch old plan docs.
 
-- [ ] **Step 10: Run shapiroserver2 focused checks**
+- [ ] **Step 11: Run shapiroserver2 focused checks**
 
 From `$SHAPIRO_WT` run:
 
 ```bash
-SHAPIRO_WT=/home/user/code/shapiroserver2/.worktrees/trycycle-gws-policy-shim
+source /tmp/gws-policy-shim-paths.env
 cd "$SHAPIRO_WT"
 bash -n srv/nanoclaw/deploy-host.sh
 bash -n tests/capture-nanoclaw-live-proof.sh
@@ -1153,10 +1243,10 @@ bash tests/test-nanoclaw-deploy-contract.sh
 
 Expected: PASS. The live proxy and Gmail e2e scripts are run after deploy in Task 7, because the current live runtime is expected to be red before this fix is deployed.
 
-- [ ] **Step 11: Commit shapiroserver2 contract changes**
+- [ ] **Step 12: Commit shapiroserver2 contract changes**
 
 ```bash
-SHAPIRO_WT=/home/user/code/shapiroserver2/.worktrees/trycycle-gws-policy-shim
+source /tmp/gws-policy-shim-paths.env
 git -C "$SHAPIRO_WT" add \
   srv/nanoclaw/source.conf \
   srv/nanoclaw/deploy-host.sh \
@@ -1180,27 +1270,31 @@ If some optional files were not modified, remove them from `git add` and commit 
 ## Task 6: Deploy The Fixed Runtime
 
 **Files:**
-- Uses: `/home/user/code/shapiroserver2/.worktrees/trycycle-gws-policy-shim/srv/nanoclaw/deploy-host.sh`
-- Uses: `/home/user/code/shapiroserver2/.worktrees/trycycle-gws-policy-shim/srv/nanoclaw/source.conf`
+- Uses: `$SHAPIRO_WT/srv/nanoclaw/deploy-host.sh` from the resolved `deploy/nanoclaw` worktree
+- Uses: `$SHAPIRO_WT/srv/nanoclaw/source.conf` from the resolved `deploy/nanoclaw` worktree
 
 - [ ] **Step 1: Confirm local worktrees are clean enough for deploy**
 
 Run:
 
 ```bash
+source /tmp/gws-policy-shim-paths.env
 git -C /home/user/code/nanoclaw/.worktrees/trycycle-gws-policy-shim status --short
-git -C /home/user/code/shapiroserver2/.worktrees/trycycle-gws-policy-shim status --short
+git -C "$NANOCLAW_OVERLAY_WT" status --short
+git -C "$SHAPIRO_WT" status --short
 ```
 
 Expected: no unstaged changes. Committed local changes are expected.
 
 - [ ] **Step 2: Run production deploy**
 
-From `/home/user/code/shapiroserver2/.worktrees/trycycle-gws-policy-shim` run the already-approved production deploy path:
+From the resolved `deploy/nanoclaw` worktree run the production deploy path:
 
 ```bash
-cd /home/user/code/shapiroserver2/.worktrees/trycycle-gws-policy-shim
-NANOCLAW_ALLOW_PROD_DEPLOY_FROM_NON_DEPLOY_BRANCH=1 bash srv/nanoclaw/deploy-host.sh --target prod
+source /tmp/gws-policy-shim-paths.env
+cd "$SHAPIRO_WT"
+test "$(git rev-parse --abbrev-ref HEAD)" = "deploy/nanoclaw"
+bash srv/nanoclaw/deploy-host.sh --target prod
 ```
 
 Expected:
@@ -1235,11 +1329,12 @@ node -e 'const s=JSON.parse(process.argv[1]); if (s.auth_method !== "proxy" || s
 
 - [ ] **Step 4: Commit any deploy-proof doc/artifact updates**
 
-If deploy updates current-state docs, proof artifacts, or source pins after the deploy, commit them in `/home/user/code/shapiroserver2/.worktrees/trycycle-gws-policy-shim`:
+If deploy updates current-state docs, proof artifacts, or source pins after the deploy, commit them in `$SHAPIRO_WT`:
 
 ```bash
-git -C /home/user/code/shapiroserver2/.worktrees/trycycle-gws-policy-shim add <changed-files>
-git -C /home/user/code/shapiroserver2/.worktrees/trycycle-gws-policy-shim commit -m "docs: record gws shim deployment proof"
+source /tmp/gws-policy-shim-paths.env
+git -C "$SHAPIRO_WT" add <changed-files>
+git -C "$SHAPIRO_WT" commit -m "docs: record gws shim deployment proof"
 ```
 
 Skip this commit only if no files changed.
@@ -1247,17 +1342,18 @@ Skip this commit only if no files changed.
 ## Task 7: Run Final Live Regression Proof
 
 **Files:**
-- Uses: `/home/user/code/shapiroserver2/.worktrees/trycycle-gws-policy-shim/tests/test-gws-e2e.sh`
-- Uses: `/home/user/code/shapiroserver2/.worktrees/trycycle-gws-policy-shim/tests/test-skill-deploy.sh`
-- Uses: `/home/user/code/shapiroserver2/.worktrees/trycycle-gws-policy-shim/tests/test-nanoclaw-local-proxies-e2e.sh`
-- Uses: `/home/user/code/shapiroserver2/.worktrees/trycycle-gws-policy-shim/tests/capture-nanoclaw-live-proof.sh`
+- Uses: `$SHAPIRO_WT/tests/test-gws-e2e.sh`
+- Uses: `$SHAPIRO_WT/tests/test-skill-deploy.sh`
+- Uses: `$SHAPIRO_WT/tests/test-nanoclaw-local-proxies-e2e.sh`
+- Uses: `$SHAPIRO_WT/tests/capture-nanoclaw-live-proof.sh`
 
 - [ ] **Step 1: Run the live shim/deploy smoke**
 
 Run:
 
 ```bash
-cd /home/user/code/shapiroserver2/.worktrees/trycycle-gws-policy-shim
+source /tmp/gws-policy-shim-paths.env
+cd "$SHAPIRO_WT"
 bash tests/test-skill-deploy.sh
 ```
 
@@ -1273,7 +1369,8 @@ Expected:
 Run:
 
 ```bash
-cd /home/user/code/shapiroserver2/.worktrees/trycycle-gws-policy-shim
+source /tmp/gws-policy-shim-paths.env
+cd "$SHAPIRO_WT"
 bash tests/test-nanoclaw-local-proxies-e2e.sh
 ```
 
@@ -1284,7 +1381,8 @@ Expected: PASS. The GWS part must prove `gws auth status` works while `GWS_PROXY
 Run:
 
 ```bash
-cd /home/user/code/shapiroserver2/.worktrees/trycycle-gws-policy-shim
+source /tmp/gws-policy-shim-paths.env
+cd "$SHAPIRO_WT"
 bash tests/test-gws-e2e.sh
 ```
 
@@ -1311,7 +1409,8 @@ Expected: logs show the denied proxy request or policy denial for the determinis
 Run:
 
 ```bash
-cd /home/user/code/shapiroserver2/.worktrees/trycycle-gws-policy-shim
+source /tmp/gws-policy-shim-paths.env
+cd "$SHAPIRO_WT"
 PROOF_LABEL=gws-policy-shim bash tests/capture-nanoclaw-live-proof.sh
 ```
 
@@ -1334,7 +1433,8 @@ cd container/agent-runner && bun test
 Run in shapiroserver2:
 
 ```bash
-cd /home/user/code/shapiroserver2/.worktrees/trycycle-gws-policy-shim
+source /tmp/gws-policy-shim-paths.env
+cd "$SHAPIRO_WT"
 git diff --check
 bash tests/validate.sh
 ```
@@ -1383,15 +1483,18 @@ Expected: PASS. If no containers are running by the time the inspect loop execut
 Run:
 
 ```bash
+source /tmp/gws-policy-shim-paths.env
 git -C /home/user/code/nanoclaw/.worktrees/trycycle-gws-policy-shim status --short --branch
-git -C /home/user/code/shapiroserver2/.worktrees/trycycle-gws-policy-shim status --short --branch
+git -C "$NANOCLAW_OVERLAY_WT" status --short --branch
+git -C "$SHAPIRO_WT" status --short --branch
 git -C /home/user/code/nanoclaw/.worktrees/trycycle-gws-policy-shim log --oneline --max-count=8
-git -C /home/user/code/shapiroserver2/.worktrees/trycycle-gws-policy-shim log --oneline --max-count=8
+git -C "$NANOCLAW_OVERLAY_WT" log --oneline --max-count=8
+git -C "$SHAPIRO_WT" log --oneline --max-count=8
 ```
 
 Expected: no unstaged changes. Summarize:
 
-- NanoClaw fixed SHA
+- NanoClaw fixed SHA on `overlay/shapiroserver2`
 - shapiroserver2 deploy/source pin commit
 - live `/srv/nanoclaw/current` SHA
 - targeted and full checks run
