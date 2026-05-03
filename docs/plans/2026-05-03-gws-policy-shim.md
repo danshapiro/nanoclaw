@@ -32,7 +32,7 @@ Do not move `/srv/nanoclaw/shared/gws-config` in this task. It is still the live
 
 This is a deploy-affecting NanoClaw runtime change. Keep the implementation isolated on `trycycle/gws-policy-shim`, but before production deployment fold the exact tested runtime tree onto NanoClaw's long-lived `overlay/shapiroserver2` branch. Then update and deploy shapiroserver2 from its long-lived `deploy/nanoclaw` worktree. Do not use `NANOCLAW_ALLOW_PROD_DEPLOY_FROM_NON_DEPLOY_BRANCH=1` for this planned fix; that override is for emergency deploys after explicit operator approval.
 
-Because `container/Dockerfile` and `src/container-runner.ts` are upstream-sensitive runtime files, begin by fetching and comparing against `origin/main`. Keep the change scoped to the Yente/GWS mediation boundary, and do not introduce unrelated fork drift while restoring the documented security posture.
+Because `container/Dockerfile` and `src/container-runner.ts` are upstream-sensitive runtime files, begin by fetching and comparing against both the fork's `origin/main` and the true upstream `upstream/main`. Keep the change scoped to the Yente/GWS mediation boundary, and do not introduce unrelated fork drift while restoring the documented security posture. If upstream already changed these surfaces, inspect and prefer the upstream shape before adding a Yente-specific overlay change.
 
 ## User-Visible Behavior
 
@@ -105,6 +105,12 @@ shapiroserver2 host/deploy worktree: existing `deploy/nanoclaw` worktree if clea
   - Refresh the canonical live proof so the agent smoke captures the GWS shim boundary, not just `GWS_PROXY_URL` presence.
 - Modify: `tests/test-nanoclaw-local-proxies-e2e.sh`, `tests/validate.sh`, `tests/check-nanoclaw-active-contracts.sh` only if their current assertions conflict with the new contract.
 
+shapiroserver2 host/main worktree: existing `main` worktree if clean, otherwise create `/home/user/code/shapiroserver2/.worktrees/main-gws-policy-shim`
+
+- Update branch: `main`
+  - Single responsibility: reconcile non-pin host integration, test-contract, and current-state documentation changes back to the machine-wide trunk after production deploy branch changes are validated.
+  - Do not copy the production-only `srv/nanoclaw/source.conf` deploy pin into `main` unless the user explicitly asks to change the baseline pin there.
+
 ## Task 0: Orient Against Upstream And Deploy Branches
 
 **Files:**
@@ -121,9 +127,11 @@ git fetch upstream --prune || true
 git status --short --branch
 git diff --stat origin/main...HEAD -- container/Dockerfile src/container-runner.ts src/yente/service-env.ts src/providers/yente-claude.ts docs/SECURITY.md docs/build-and-runtime.md CLAUDE.md
 git log --oneline --left-right origin/main...HEAD -- container/Dockerfile src/container-runner.ts src/yente/service-env.ts src/providers/yente-claude.ts
+git diff --stat upstream/main...HEAD -- container/Dockerfile src/container-runner.ts src/yente/service-env.ts src/providers/yente-claude.ts docs/SECURITY.md docs/build-and-runtime.md CLAUDE.md
+git log --oneline --left-right upstream/main...HEAD -- container/Dockerfile src/container-runner.ts src/yente/service-env.ts src/providers/yente-claude.ts
 ```
 
-Expected: the worktree is on `trycycle/gws-policy-shim`; existing drift is understood as Yente's shapiroserver2 overlay. If `origin/main` changed the same container runtime surfaces in a way that affects this fix, rebase or replay the plan onto the current overlay before continuing. Do not continue by layering the shim on top of stale assumptions.
+Expected: the worktree is on `trycycle/gws-policy-shim`; existing drift is understood as Yente's shapiroserver2 overlay. If either `origin/main` or `upstream/main` changed the same container runtime surfaces in a way that affects this fix, inspect the upstream/fork implementation and rebase, replay, or consciously preserve the upstream shape before continuing. Do not continue by layering the shim on top of stale assumptions.
 
 - [ ] **Step 2: Confirm production branch worktrees are usable later**
 
@@ -1263,6 +1271,8 @@ git -C "$SHAPIRO_WT" add \
   docs/nanoclaw/how-to-update-tokens.md
 git -C "$SHAPIRO_WT" status --short
 git -C "$SHAPIRO_WT" commit -m "fix: enforce gws shim deployment contract"
+SHAPIRO_CONTRACT_COMMIT="$(git -C "$SHAPIRO_WT" rev-parse HEAD)"
+printf 'SHAPIRO_CONTRACT_COMMIT=%q\n' "$SHAPIRO_CONTRACT_COMMIT" >> /tmp/gws-policy-shim-paths.env
 ```
 
 If some optional files were not modified, remove them from `git add` and commit only actual changes.
@@ -1441,7 +1451,141 @@ bash tests/validate.sh
 
 Expected: PASS.
 
-## Task 8: Final Audits And Handoff
+## Task 8: Reconcile Host Contract Back To `main`
+
+**Files:**
+- Update branch/worktree: shapiroserver2 `main`
+- Copy from `$SHAPIRO_CONTRACT_COMMIT`, excluding `srv/nanoclaw/source.conf`:
+- Modify as applicable: `srv/nanoclaw/deploy-host.sh`
+- Modify as applicable: `tests/capture-nanoclaw-live-proof.sh`
+- Modify as applicable: `tests/test-skill-deploy.sh`
+- Modify as applicable: `tests/test-gws-e2e.sh`
+- Modify as applicable: `tests/test-gws-proxy-e2e.sh`
+- Modify as applicable: `tests/test-nanoclaw-local-proxies-e2e.sh`
+- Modify as applicable: `tests/validate.sh`
+- Modify as applicable: `tests/check-nanoclaw-active-contracts.sh`
+- Modify as applicable: `services-and-security.md`
+- Modify as applicable: `docs/nanoclaw/Deployment.md`
+- Modify as applicable: `docs/nanoclaw/Upgrade.md`
+- Modify as applicable: `docs/nanoclaw/how-to-update-tokens.md`
+- Modify if present on `main`: `docs/nanoclaw/SecurityPosture.md`
+
+- [ ] **Step 1: Create or reuse a clean shapiroserver2 `main` worktree**
+
+Run:
+
+```bash
+source /tmp/gws-policy-shim-paths.env
+SHAPIRO_MAIN_WT="$(
+  git -C /home/user/code/shapiroserver2 worktree list --porcelain \
+    | awk -v target='refs/heads/main' '
+        /^worktree / { wt = substr($0, 10) }
+        /^branch / && substr($0, 8) == target { print wt; exit }
+      '
+)"
+if [[ -z "$SHAPIRO_MAIN_WT" ]]; then
+  SHAPIRO_MAIN_WT=/home/user/code/shapiroserver2/.worktrees/main-gws-policy-shim
+  git -C /home/user/code/shapiroserver2 worktree add "$SHAPIRO_MAIN_WT" main
+fi
+if [[ "$(git -C "$SHAPIRO_MAIN_WT" rev-parse --abbrev-ref HEAD)" != "main" ]]; then
+  echo "Expected a main worktree, got: $SHAPIRO_MAIN_WT" >&2
+  exit 1
+fi
+if [[ -n "$(git -C "$SHAPIRO_MAIN_WT" status --short)" ]]; then
+  echo "main worktree has unrelated local changes: $SHAPIRO_MAIN_WT" >&2
+  git -C "$SHAPIRO_MAIN_WT" status --short
+  exit 1
+fi
+printf 'SHAPIRO_MAIN_WT=%q\n' "$SHAPIRO_MAIN_WT" >> /tmp/gws-policy-shim-paths.env
+```
+
+Expected: a clean `main` worktree exists. If an existing `main` worktree is dirty with changes you did not make, stop and ask the user instead of overwriting another agent's work.
+
+- [ ] **Step 2: Copy only non-pin host contract changes from the deploy branch commit**
+
+Run:
+
+```bash
+source /tmp/gws-policy-shim-paths.env
+cd "$SHAPIRO_MAIN_WT"
+git checkout "$SHAPIRO_CONTRACT_COMMIT" -- \
+  srv/nanoclaw/deploy-host.sh \
+  tests/capture-nanoclaw-live-proof.sh \
+  tests/test-skill-deploy.sh \
+  tests/test-gws-e2e.sh \
+  tests/test-gws-proxy-e2e.sh \
+  tests/test-nanoclaw-local-proxies-e2e.sh \
+  tests/validate.sh \
+  tests/check-nanoclaw-active-contracts.sh \
+  services-and-security.md \
+  docs/nanoclaw/Deployment.md \
+  docs/nanoclaw/Upgrade.md \
+  docs/nanoclaw/how-to-update-tokens.md
+if git -C "$SHAPIRO_WT" cat-file -e "$SHAPIRO_CONTRACT_COMMIT:docs/nanoclaw/SecurityPosture.md" 2>/dev/null && \
+   [[ -f docs/nanoclaw/SecurityPosture.md ]]; then
+  git checkout "$SHAPIRO_CONTRACT_COMMIT" -- docs/nanoclaw/SecurityPosture.md
+fi
+```
+
+Expected: `main` receives the same durable host integration, test, and current-state documentation contract. `srv/nanoclaw/source.conf` is intentionally not copied; production pin ownership remains on `deploy/nanoclaw`.
+
+- [ ] **Step 3: Validate the reconciled `main` contract**
+
+Run:
+
+```bash
+source /tmp/gws-policy-shim-paths.env
+cd "$SHAPIRO_MAIN_WT"
+git diff --check
+bash -n srv/nanoclaw/deploy-host.sh
+bash -n tests/capture-nanoclaw-live-proof.sh
+bash -n tests/test-skill-deploy.sh
+bash -n tests/test-gws-e2e.sh
+bash -n tests/test-gws-proxy-e2e.sh
+bash tests/check-nanoclaw-active-contracts.sh
+bash tests/test-nanoclaw-deploy-contract.sh
+bash tests/validate.sh
+```
+
+Expected: PASS. If `main` has pre-existing branch-drift informational output in `validate.sh`, do not broaden this task to reconcile branch history; this task reconciles only the GWS shim host contract.
+
+- [ ] **Step 4: Commit the `main` reconciliation**
+
+Run:
+
+```bash
+source /tmp/gws-policy-shim-paths.env
+git -C "$SHAPIRO_MAIN_WT" status --short
+if [[ -z "$(git -C "$SHAPIRO_MAIN_WT" status --short)" ]]; then
+  echo "main already has the reconciled GWS shim host contract; no commit needed"
+else
+  MAIN_RECONCILE_FILES=(
+    srv/nanoclaw/deploy-host.sh
+    tests/capture-nanoclaw-live-proof.sh
+    tests/test-skill-deploy.sh
+    tests/test-gws-e2e.sh
+    tests/test-gws-proxy-e2e.sh
+    tests/test-nanoclaw-local-proxies-e2e.sh
+    tests/validate.sh
+    tests/check-nanoclaw-active-contracts.sh
+    services-and-security.md
+    docs/nanoclaw/Deployment.md
+    docs/nanoclaw/Upgrade.md
+    docs/nanoclaw/how-to-update-tokens.md
+  )
+  if [[ -f "$SHAPIRO_MAIN_WT/docs/nanoclaw/SecurityPosture.md" ]]; then
+    MAIN_RECONCILE_FILES+=(docs/nanoclaw/SecurityPosture.md)
+  fi
+  git -C "$SHAPIRO_MAIN_WT" add "${MAIN_RECONCILE_FILES[@]}"
+  git -C "$SHAPIRO_MAIN_WT" commit -m "fix: reconcile gws shim host contract"
+  SHAPIRO_MAIN_CONTRACT_COMMIT="$(git -C "$SHAPIRO_MAIN_WT" rev-parse HEAD)"
+  printf 'SHAPIRO_MAIN_CONTRACT_COMMIT=%q\n' "$SHAPIRO_MAIN_CONTRACT_COMMIT" >> /tmp/gws-policy-shim-paths.env
+fi
+```
+
+If no files changed because `main` already had the contract, record the no-op reconciliation and continue.
+
+## Task 9: Final Audits And Handoff
 
 **Files:**
 - No planned modifications unless audits reveal stale operational text.
@@ -1487,15 +1631,18 @@ source /tmp/gws-policy-shim-paths.env
 git -C /home/user/code/nanoclaw/.worktrees/trycycle-gws-policy-shim status --short --branch
 git -C "$NANOCLAW_OVERLAY_WT" status --short --branch
 git -C "$SHAPIRO_WT" status --short --branch
+git -C "${SHAPIRO_MAIN_WT:-$SHAPIRO_WT}" status --short --branch
 git -C /home/user/code/nanoclaw/.worktrees/trycycle-gws-policy-shim log --oneline --max-count=8
 git -C "$NANOCLAW_OVERLAY_WT" log --oneline --max-count=8
 git -C "$SHAPIRO_WT" log --oneline --max-count=8
+if [[ -n "${SHAPIRO_MAIN_WT:-}" ]]; then git -C "$SHAPIRO_MAIN_WT" log --oneline --max-count=8; fi
 ```
 
 Expected: no unstaged changes. Summarize:
 
 - NanoClaw fixed SHA on `overlay/shapiroserver2`
 - shapiroserver2 deploy/source pin commit
+- shapiroserver2 main host-contract reconciliation commit, or why it was not needed
 - live `/srv/nanoclaw/current` SHA
 - targeted and full checks run
 - deterministic denied-send result
