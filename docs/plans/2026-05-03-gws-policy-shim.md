@@ -26,7 +26,7 @@ The correct steady-state is the security posture already documented for Yente:
 
 The old shim from commit `42e05f8` is a useful shape but not the exact final answer because it expected `GWS_PROXY_KEY` in the agent environment. This plan keeps the shim pattern and updates it for the current OneCLI-mediated design.
 
-The shim must explicitly route curl through the configured OneCLI proxy environment when present. Do not rely only on curl's ambient proxy auto-detection: curl intentionally ignores uppercase `HTTP_PROXY` for plain HTTP URLs, while OneCLI-provided container config may include uppercase proxy env names. The shim should support lowercase and uppercase proxy env variants without adding an `Authorization` header itself.
+The shim must explicitly route curl through the configured OneCLI proxy environment when present. Do not rely only on curl's ambient proxy auto-detection: curl intentionally ignores uppercase `HTTP_PROXY` for plain HTTP URLs, while OneCLI-provided container config may include uppercase proxy env names. The shim should support lowercase and uppercase proxy env variants without adding an `Authorization` header itself. When it selects a configured proxy, it must also force proxy use with `--noproxy ""` so inherited `NO_PROXY` or `no_proxy` entries cannot accidentally bypass the OneCLI gateway for `yente-gws-proxy.local`.
 
 Do not move `/srv/nanoclaw/shared/gws-config` in this task. It is still the live credential root used by `gws-proxy` and moving it belongs to the later GWS-owned service-root work. This task only removes that credential root from agent containers.
 
@@ -288,6 +288,40 @@ describe('gws proxy shim', () => {
     ]);
   });
 
+  it('forces the configured proxy even when NO_PROXY would otherwise match the mediated host', async () => {
+    const records: RequestRecord[] = [];
+    const onecliGateway = await withProxy((req, res, body) => {
+      records.push({
+        method: req.method,
+        url: req.url,
+        authorization: req.headers.authorization,
+        contentType: headerValue(req.headers['content-type']),
+        body,
+      });
+      res.writeHead(200, { 'Content-Type': 'text/plain', 'X-Exit-Code': '0' });
+      res.end('proxied-despite-no-proxy');
+    });
+
+    const result = runShim(['gmail', '+triage'], {
+      GWS_PROXY_URL: 'http://yente-gws-proxy.local:8083',
+      HTTP_PROXY: onecliGateway.url,
+      NO_PROXY: 'yente-gws-proxy.local,.local,*',
+      no_proxy: 'yente-gws-proxy.local,.local,*',
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe('proxied-despite-no-proxy');
+    expect(records).toEqual([
+      {
+        method: 'POST',
+        url: 'http://yente-gws-proxy.local:8083/exec',
+        authorization: undefined,
+        contentType: 'application/json',
+        body: JSON.stringify({ args: ['gmail', '+triage'] }),
+      },
+    ]);
+  });
+
   it('surfaces proxy policy denials as clear command failures', async () => {
     const proxy = await withProxy((_req, res) => {
       res.writeHead(403, { 'Content-Type': 'text/plain' });
@@ -412,7 +446,7 @@ GWS_PROXY_URL="${GWS_PROXY_URL%/}"
 curl_with_configured_proxy() {
   proxy="${http_proxy:-${HTTP_PROXY:-${HTTPS_PROXY:-${https_proxy:-${ALL_PROXY:-${all_proxy:-}}}}}}"
   if [ -n "$proxy" ]; then
-    curl --proxy "$proxy" "$@"
+    curl --noproxy "" --proxy "$proxy" "$@"
   else
     curl "$@"
   fi
@@ -573,6 +607,8 @@ describe('GWS proxy mediation boundary', () => {
 });
 ```
 
+Also remove `buildGwsConfigMount` from the import list at the top of `src/container-runner.test.ts`; the helper should no longer exist after this task.
+
 - [ ] **Step 2: Run the updated test and verify it fails**
 
 Run:
@@ -669,7 +705,9 @@ Suggested `docs/build-and-runtime.md` change in the global CLIs section:
 `container/shim/gws` to `/usr/local/bin/gws`; the shim is the only supported
 agent-facing GWS command and relies on OneCLI-mediated access to `gws-proxy`.
 It explicitly supports lowercase and uppercase proxy env variants so curl
-traffic to `GWS_PROXY_URL` stays on the OneCLI-mediated route.
+traffic to `GWS_PROXY_URL` stays on the OneCLI-mediated route, and it forces
+that route even if inherited `NO_PROXY` values would otherwise match the
+mediated proxy host.
 ```
 
 - [ ] **Step 2: Run documentation grep audit**
@@ -944,13 +982,22 @@ if grep -Eq '[0-9a-f]{16,}' <<<"$NATURAL_RESULT" && grep -Eiq 'gmail|message|thr
 fi
 pass "natural-language arbitrary-recipient probe did not report a successful send"
 
-NATURAL_SENT_AFTER="$(trusted_sent_ids_for_dan_example)"
-NEW_NATURAL_SENT_IDS="$(
-  comm -13 \
-    <(printf '%s\n' "$NATURAL_SENT_BEFORE" | sort -u) \
-    <(printf '%s\n' "$NATURAL_SENT_AFTER" | sort -u) \
-    || true
-)"
+NEW_NATURAL_SENT_IDS=""
+for audit_attempt in 1 2 3 4 5 6; do
+  NATURAL_SENT_AFTER="$(trusted_sent_ids_for_dan_example)"
+  NEW_NATURAL_SENT_IDS="$(
+    comm -13 \
+      <(printf '%s\n' "$NATURAL_SENT_BEFORE" | sort -u) \
+      <(printf '%s\n' "$NATURAL_SENT_AFTER" | sort -u) \
+      || true
+  )"
+  if [[ -n "$NEW_NATURAL_SENT_IDS" ]]; then
+    break
+  fi
+  if [[ "$audit_attempt" -lt 6 ]]; then
+    sleep 10
+  fi
+done
 if [[ -n "$NEW_NATURAL_SENT_IDS" ]]; then
   printf 'New sent message ids found after natural-language probe:\n%s\n' "$NEW_NATURAL_SENT_IDS"
   fail "natural-language arbitrary-recipient probe created a Gmail Sent message to dan@example.com"
@@ -1254,7 +1301,7 @@ Expected:
 Run:
 
 ```bash
-ssh shapiroserver2-lan 'sudo docker logs --since 20m gws-proxy-gws-proxy 2>&1 | tail -n 200'
+ssh shapiroserver2-lan 'sudo docker logs --since 20m gws-proxy 2>&1 | tail -n 200'
 ```
 
 Expected: logs show the denied proxy request or policy denial for the deterministic arbitrary-recipient command. If the logs are too sparse but `tests/test-gws-e2e.sh` captured the proxy policy body, do not fail solely on missing log detail.
