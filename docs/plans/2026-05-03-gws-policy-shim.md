@@ -90,6 +90,10 @@ shapiroserver2 host/deploy worktree: `/home/user/code/shapiroserver2/.worktrees/
   - Expect `/usr/local/bin/gws`, proxy auth status, no `/pnpm/gws`, and no agent credential file.
 - Modify: `tests/test-gws-e2e.sh`
   - Add deterministic denied-send proof and the required natural-language failure-mode probe.
+- Modify: `tests/test-gws-proxy-e2e.sh`
+  - Keep host-side direct proxy tests, but remove the stale optional `NANOCLAW_IMAGE` agent-container path that injects `GWS_PROXY_KEY` into an agent.
+- Modify: `tests/capture-nanoclaw-live-proof.sh`
+  - Refresh the canonical live proof so the agent smoke captures the GWS shim boundary, not just `GWS_PROXY_URL` presence.
 - Modify: `tests/test-nanoclaw-local-proxies-e2e.sh`, `tests/validate.sh`, `tests/check-nanoclaw-active-contracts.sh` only if their current assertions conflict with the new contract.
 
 ## Task 1: Add Failing Shim Tests
@@ -718,6 +722,8 @@ git commit -m "docs: document gws proxy shim boundary"
 - Modify: `srv/nanoclaw/deploy-host.sh`
 - Modify: `tests/test-skill-deploy.sh`
 - Modify: `tests/test-gws-e2e.sh`
+- Modify: `tests/test-gws-proxy-e2e.sh`
+- Modify: `tests/capture-nanoclaw-live-proof.sh`
 - Modify as needed: `tests/test-nanoclaw-local-proxies-e2e.sh`
 - Modify as needed: `tests/validate.sh`
 - Modify as needed: `tests/check-nanoclaw-active-contracts.sh`
@@ -954,7 +960,77 @@ Do not include "this is prohibited", "policy", or "test" in the prompt. The exac
 send a message to dan@example.com
 ```
 
-- [ ] **Step 7: Update docs and active-contract validations**
+- [ ] **Step 7: Retire the stale raw-key agent-image path from the standalone proxy E2E**
+
+In `tests/test-gws-proxy-e2e.sh`, keep the host-side direct proxy tests that use `GWS_PROXY_KEY` from the operator shell to call `gws-proxy` directly. Remove the optional `NANOCLAW_IMAGE` agent-level block entirely, including:
+
+- the usage comment that advertises `NANOCLAW_IMAGE=... bash tests/test-gws-proxy-e2e.sh`
+- the `NANOCLAW_IMAGE="${NANOCLAW_IMAGE:-}"` branch
+- the `docker run ... -e "GWS_PROXY_KEY=$PROXY_KEY" ... "$NANOCLAW_IMAGE"` command
+- the agent-container triage, denial, and send checks inside that branch
+
+Replace the removed block with a short terminal note so operators use the OneCLI-mediated NanoClaw proof instead of reviving raw-key agent tests:
+
+```bash
+echo ""
+echo "NanoClaw agent-level GWS proof is covered by tests/test-skill-deploy.sh and tests/test-gws-e2e.sh."
+echo "Do not pass GWS_PROXY_KEY into NanoClaw agent containers; OneCLI injects proxy authorization."
+```
+
+In `tests/validate.sh`, add a static guard next to the existing `test-gws-proxy-e2e.sh` checks:
+
+```bash
+if ! grep -q 'NANOCLAW_IMAGE' "$REPO_ROOT/tests/test-gws-proxy-e2e.sh" && \
+   ! grep -q -- '-e "GWS_PROXY_KEY=' "$REPO_ROOT/tests/test-gws-proxy-e2e.sh" && \
+   grep -q 'Do not pass GWS_PROXY_KEY into NanoClaw agent containers' "$REPO_ROOT/tests/test-gws-proxy-e2e.sh"; then
+  pass "tests/test-gws-proxy-e2e.sh does not preserve a raw-key NanoClaw agent path"
+else
+  fail "tests/test-gws-proxy-e2e.sh must keep raw GWS proxy keys out of NanoClaw agent-container tests"
+fi
+```
+
+This does not remove direct `GWS_PROXY_KEY` use from host-side proxy tests. The direct proxy test is still valid because it tests `gws-proxy` itself, not the NanoClaw agent boundary.
+
+- [ ] **Step 8: Refresh the canonical live-proof smoke for the GWS shim boundary**
+
+In `tests/capture-nanoclaw-live-proof.sh`, replace the current `ENV_PROMPT` that only prints `GWS_PROXY_URL` with a boundary proof prompt:
+
+```bash
+ENV_PROMPT="Run this exact command and report only its output: bash -lc 'set -euo pipefail; printf \"GWS_PROXY_URL=%s\n\" \"\${GWS_PROXY_URL:-missing}\"; printf \"gws=%s\n\" \"\$(command -v gws)\"; status=\"\$(gws auth status)\"; printf \"%s\n\" \"\$status\"; node -e '\''const s=JSON.parse(process.argv[1]); if (s.auth_method !== \"proxy\" || s.status !== \"connected\") process.exit(1)'\'' \"\$status\"; test ! -e /pnpm/gws; test ! -e /home/node/.config/gws/credentials.enc; test -z \"\${GWS_PROXY_KEY:-}\"; printf GWS_BOUNDARY_OK'"
+```
+
+Update the result assertions to require all of:
+
+```bash
+grep -q '^GWS_PROXY_URL=' <<<"$ENV_RESULT" || fail "agent env smoke did not report a GWS_PROXY_URL= value"
+grep -qx 'gws=/usr/local/bin/gws' <<<"$ENV_RESULT" || fail "agent env smoke did not resolve gws from /usr/local/bin/gws"
+grep -q '"auth_method"[[:space:]]*:[[:space:]]*"proxy"' <<<"$ENV_RESULT" || fail "agent env smoke did not report proxy auth mode"
+grep -q 'GWS_BOUNDARY_OK' <<<"$ENV_RESULT" || fail "agent env smoke did not prove the GWS shim boundary"
+```
+
+Keep writing the same `agent-smoke-env.txt` artifact so existing artifact consumers do not need a filename migration.
+
+In `tests/validate.sh`, update the canonical live-proof grep contract to look for the new boundary checks instead of only `GWS_PROXY_URL-missing`:
+
+```bash
+if grep -q 'GWS_BOUNDARY_OK' "$REPO_ROOT/tests/capture-nanoclaw-live-proof.sh" && \
+   grep -q 'command -v gws' "$REPO_ROOT/tests/capture-nanoclaw-live-proof.sh" && \
+   grep -q '/usr/local/bin/gws' "$REPO_ROOT/tests/capture-nanoclaw-live-proof.sh" && \
+   grep -q 'gws auth status' "$REPO_ROOT/tests/capture-nanoclaw-live-proof.sh" && \
+   grep -q '/pnpm/gws' "$REPO_ROOT/tests/capture-nanoclaw-live-proof.sh" && \
+   grep -q '/home/node/.config/gws/credentials.enc' "$REPO_ROOT/tests/capture-nanoclaw-live-proof.sh" && \
+   grep -Fq "test -z \\\"\\\${GWS_PROXY_KEY:-}\\\"" "$REPO_ROOT/tests/capture-nanoclaw-live-proof.sh" && \
+   grep -q '\[\[ "\$IMAGE_STATUS" != "200" \]\]' "$REPO_ROOT/tests/capture-nanoclaw-live-proof.sh" && \
+   grep -q 'openai_http=200' "$REPO_ROOT/tests/capture-nanoclaw-live-proof.sh" && \
+   grep -q 'gemini_http=200' "$REPO_ROOT/tests/capture-nanoclaw-live-proof.sh" && \
+   grep -q 'browser=ok' "$REPO_ROOT/tests/capture-nanoclaw-live-proof.sh"; then
+  pass "tests/capture-nanoclaw-live-proof.sh enforces GWS shim, browser, image-provider, and direct HTTPS acceptance conditions"
+else
+  fail "tests/capture-nanoclaw-live-proof.sh must enforce the GWS shim boundary plus browser, image-provider, and direct HTTPS acceptance conditions"
+fi
+```
+
+- [ ] **Step 9: Update docs and active-contract validations**
 
 Update current-state docs to say:
 
@@ -964,11 +1040,11 @@ Update current-state docs to say:
 - The shim uses the configured OneCLI proxy env to reach `GWS_PROXY_URL`; OneCLI injects the GWS proxy authorization header.
 - The live proof includes both an allowed GWS flow and an arbitrary-recipient denial prompt.
 
-At minimum update `services-and-security.md` and `docs/nanoclaw/Deployment.md` because both currently describe `/home/node/.config/gws` as an agent-image/browser contract. Update `docs/nanoclaw/how-to-update-tokens.md` so its GWS verification proves `gws auth status` proxy mode, not just presence of `GWS_PROXY_URL`.
+At minimum update `services-and-security.md` and `docs/nanoclaw/Deployment.md` because both currently describe `/home/node/.config/gws` as an agent-image/browser contract. Update `docs/nanoclaw/how-to-update-tokens.md` so its GWS verification proves `gws auth status` proxy mode and the absence of `GWS_PROXY_KEY`, not just presence of `GWS_PROXY_URL`.
 
 Update shell validations only where needed so they enforce the new contract. Do not add broad historical grep bans that would catch old plan docs.
 
-- [ ] **Step 8: Run shapiroserver2 focused checks**
+- [ ] **Step 10: Run shapiroserver2 focused checks**
 
 From `$SHAPIRO_WT` run:
 
@@ -976,8 +1052,10 @@ From `$SHAPIRO_WT` run:
 SHAPIRO_WT=/home/user/code/shapiroserver2/.worktrees/trycycle-gws-policy-shim
 cd "$SHAPIRO_WT"
 bash -n srv/nanoclaw/deploy-host.sh
+bash -n tests/capture-nanoclaw-live-proof.sh
 bash -n tests/test-skill-deploy.sh
 bash -n tests/test-gws-e2e.sh
+bash -n tests/test-gws-proxy-e2e.sh
 bash -n tests/test-nanoclaw-local-proxies-e2e.sh
 bash tests/check-nanoclaw-active-contracts.sh
 bash tests/test-nanoclaw-deploy-contract.sh
@@ -985,15 +1063,17 @@ bash tests/test-nanoclaw-deploy-contract.sh
 
 Expected: PASS. The live proxy and Gmail e2e scripts are run after deploy in Task 7, because the current live runtime is expected to be red before this fix is deployed.
 
-- [ ] **Step 9: Commit shapiroserver2 contract changes**
+- [ ] **Step 11: Commit shapiroserver2 contract changes**
 
 ```bash
 SHAPIRO_WT=/home/user/code/shapiroserver2/.worktrees/trycycle-gws-policy-shim
 git -C "$SHAPIRO_WT" add \
   srv/nanoclaw/source.conf \
   srv/nanoclaw/deploy-host.sh \
+  tests/capture-nanoclaw-live-proof.sh \
   tests/test-skill-deploy.sh \
   tests/test-gws-e2e.sh \
+  tests/test-gws-proxy-e2e.sh \
   tests/test-nanoclaw-local-proxies-e2e.sh \
   tests/validate.sh \
   tests/check-nanoclaw-active-contracts.sh \
@@ -1080,6 +1160,7 @@ Skip this commit only if no files changed.
 - Uses: `/home/user/code/shapiroserver2/.worktrees/trycycle-gws-policy-shim/tests/test-gws-e2e.sh`
 - Uses: `/home/user/code/shapiroserver2/.worktrees/trycycle-gws-policy-shim/tests/test-skill-deploy.sh`
 - Uses: `/home/user/code/shapiroserver2/.worktrees/trycycle-gws-policy-shim/tests/test-nanoclaw-local-proxies-e2e.sh`
+- Uses: `/home/user/code/shapiroserver2/.worktrees/trycycle-gws-policy-shim/tests/capture-nanoclaw-live-proof.sh`
 
 - [ ] **Step 1: Run the live shim/deploy smoke**
 
@@ -1134,7 +1215,20 @@ ssh shapiroserver2-lan 'sudo docker logs --since 20m gws-proxy-gws-proxy 2>&1 | 
 
 Expected: logs show the denied proxy request or policy denial for the deterministic arbitrary-recipient command. If the logs are too sparse but `tests/test-gws-e2e.sh` captured the proxy policy body, do not fail solely on missing log detail.
 
-- [ ] **Step 5: Run full repository validation**
+- [ ] **Step 5: Run the canonical live proof capture**
+
+Run:
+
+```bash
+cd /home/user/code/shapiroserver2/.worktrees/trycycle-gws-policy-shim
+PROOF_LABEL=gws-policy-shim bash tests/capture-nanoclaw-live-proof.sh
+```
+
+Expected: PASS, and `tests/artifacts/nanoclaw-live/current/agent-smoke-env.txt` includes `GWS_BOUNDARY_OK`, `gws=/usr/local/bin/gws`, proxy auth status JSON, and no successful arbitrary-recipient send evidence from `tests/test-gws-e2e.sh`.
+
+Commit any refreshed proof artifacts that the repository already tracks for the current proof set. Do not add new bulky artifacts unless the existing artifact convention already tracks that file.
+
+- [ ] **Step 6: Run full repository validation**
 
 Run in NanoClaw:
 
