@@ -12,13 +12,13 @@
    - **What it does:** Uses existing Vitest tests and grep audits to assert the Dockerfile, container runner, and docs preserve the no-direct-GWS boundary.
    - **What it exposes:** File content assertions, exported mount helper behavior where still applicable, TypeScript build/typecheck results, and repo-wide grep output.
    - **Estimated complexity:** Low; extend existing `src/container-runtime.test.ts`, `src/container-runner.test.ts`, and audit commands.
-   - **Dependent tests:** Tests 2, 3, 4, 10, 11, 12, 13.
+   - **Dependent tests:** Tests 2, 3, 4, 10, 11, 12, 13, 14A.
 
 3. **Agent image smoke harness**
    - **What it does:** Builds the agent image and runs commands inside the built container image.
    - **What it exposes:** `command -v gws`, file existence checks for `/pnpm/gws` and `/home/node/.config/gws/credentials.enc`, and shim version output.
    - **Estimated complexity:** Medium; uses the existing `container/build.sh` plus `docker run`.
-   - **Dependent tests:** Test 14.
+   - **Dependent tests:** Tests 14, 14A.
 
 4. **shapiroserver2 deploy-contract harness**
    - **What it does:** Runs shell syntax checks, deploy-contract tests, validation checks, and deploy-host source validation from an isolated `deploy/nanoclaw` worktree.
@@ -97,7 +97,7 @@
    - **Harness:** NanoClaw shim contract harness
    - **Preconditions:** Fake proxy returns `200` from `/health`.
    - **Actions:** Execute `gws auth status` with `GWS_PROXY_URL` pointing at the fake proxy.
-   - **Expected outcome:** Stdout is JSON with `auth_method:"proxy"`, `status:"connected"`, and the proxy URL; fake proxy records a `GET /health` request without an `Authorization` header. Source of truth: implementation plan "User-Visible Behavior" and OneCLI boundary that the shim must not synthesize auth.
+   - **Expected outcome:** Stdout is clean JSON with `auth_method:"proxy"`, `status:"connected"`, and the proxy URL; stderr has no Node experimental warning noise; fake proxy records a `GET /health` request without an `Authorization` header. Source of truth: implementation plan "User-Visible Behavior" and OneCLI boundary that the shim must not synthesize auth.
    - **Interactions:** Local fake HTTP proxy.
 
 7. **Shim forwards argv to `/exec` without an Authorization header**
@@ -160,7 +160,7 @@
     - **Harness:** NanoClaw source/runtime static harness
     - **Preconditions:** Source docs and tests have been updated.
     - **Actions:** Run `rg -n '@googleworkspace/cli|GWS_CLI_VERSION|buildGwsConfigMount|GWS_CONFIG_DIR|credentials\.enc|/home/node/\.config/gws|GWS_PROXY_KEY' container src docs CLAUDE.md --glob '!docs/plans/**'`.
-    - **Expected outcome:** No hits for direct CLI install symbols or mount helper names; `credentials.enc`, `/home/node/.config/gws`, and `GWS_PROXY_KEY` appear only in negative tests or security documentation explaining agent absence. Source of truth: implementation plan final audit.
+    - **Expected outcome:** No hits for operational direct CLI install symbols or mount helper names. `@googleworkspace/cli` appears only in reserved-package rejection code/tests or security text explaining it is forbidden in agents. `credentials.enc`, `/home/node/.config/gws`, and `GWS_PROXY_KEY` appear only in negative tests or security documentation explaining agent absence. Source of truth: implementation plan final audit.
     - **Interactions:** Documentation and test text.
 
 14. **Built agent image exposes only `/usr/local/bin/gws`**
@@ -171,6 +171,15 @@
     - **Actions:** Run `bash container/build.sh gws-policy-shim-test`, then `docker run --rm` the built image and assert `command -v gws` is `/usr/local/bin/gws`, `/pnpm/gws` is absent, `/home/node/.config/gws/credentials.enc` is absent, and `gws --version` prints `gws-proxy-shim`.
     - **Expected outcome:** All image-surface checks exit 0. Source of truth: implementation plan Task 2 Step 6.
     - **Interactions:** Docker build cache, pnpm global CLI install block, image filesystem.
+
+14A. **Per-agent package rebuilds cannot reintroduce a direct `gws` binary**
+    - **Type:** invariant
+    - **Disposition:** new
+    - **Harness:** NanoClaw source/runtime static harness plus Agent image smoke harness
+    - **Preconditions:** `src/container-runner.ts` and `src/modules/self-mod/request.ts` have been updated.
+    - **Actions:** Run `pnpm exec vitest run src/container-runner.test.ts src/modules/self-mod/request.test.ts`. Then rebuild the image and run the Docker reproduction from implementation plan Task 3A Step 5, based on `@googleworkspace/cli@0.18.1`, to verify that creating `/pnpm/gws` trips the same guard expected in `buildAgentGroupImage()`.
+    - **Expected outcome:** A self-mod request for `@googleworkspace/cli` is rejected with a clear agent-visible error and does not request approval. The generated per-agent image build path contains a reserved-command guard after package installs, requiring `command -v gws` to remain `/usr/local/bin/gws` and `/pnpm/gws` to be absent before the rebuilt image can be saved. The Docker reproduction demonstrates the reviewed failure mode by failing when `/pnpm/gws` appears. Source of truth: implementation plan "Agent boundary" and Task 3A.
+    - **Interactions:** self-mod package validation, per-agent Dockerfile generation, pnpm global package bins, PATH precedence, reserved command names.
 
 15. **deploy-host refuses stale NanoClaw source checkouts**
     - **Type:** invariant
@@ -287,6 +296,7 @@ Covered action space:
 - Trusted read-only Gmail Sent audit for `dan@example.com`.
 - Transcript scan for bypass markers in files touched by the probe.
 - Dockerfile image build and container `docker run` surface.
+- Per-agent `install_packages` request validation and package-rebuild Dockerfile surface, including the `@googleworkspace/cli` `/pnpm/gws` bypass shape.
 - Live Docker inspect mount surface for agent containers.
 - `deploy-host.sh --target prod` source validation, image smoke, and service activation.
 - `tests/test-gws-proxy-e2e.sh` host-side proxy endpoint actions: `/health`, invalid auth, triage, allowed send, denied send, blocked drafts send, calendar agenda, denied calendar invitee, and unknown service denial.

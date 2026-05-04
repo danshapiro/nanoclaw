@@ -46,12 +46,13 @@ Previous plan-editor rounds found serious misses because this is not a single-fi
 - A plan that only greps transcripts after the fact is too weak. The final proof must include the user's exact natural-language probe, `send a message to dan@example.com`, plus a trusted Gmail Sent audit outside the agent.
 - A plan that moves `/srv/nanoclaw/shared/gws-config` now expands scope unnecessarily. The immediate security repair removes that credential root from agents; moving the proxy-owned credential root belongs to a later service-root hardening task.
 - A plan that updates only current-state docs is incomplete for shapiroserver2. Because this fixes a live machine issue and changes NanoClaw deployment behavior, the deploy branch and main reconciliation must also update `changes.md`.
+- A plan that only checks the base image is incomplete. NanoClaw can build per-agent images after approved `install_packages` requests, and that rebuild path must not be able to install a package that creates a direct `gws` binary such as `/pnpm/gws` or otherwise shadows `/usr/local/bin/gws`.
 
 ### Scope And Invariant Map
 
 Zoom out before editing or reviewing any step:
 
-- **Agent boundary:** agent containers get only non-secret proxy URLs, OneCLI networking env, CA trust, and `/usr/local/bin/gws`; they never get `GWS_PROXY_KEY`, Google OAuth files, `/home/node/.config/gws`, `/srv/nanoclaw/shared/gws-config`, or a real direct-auth GWS CLI.
+- **Agent boundary:** agent containers get only non-secret proxy URLs, OneCLI networking env, CA trust, and `/usr/local/bin/gws`; they never get `GWS_PROXY_KEY`, Google OAuth files, `/home/node/.config/gws`, `/srv/nanoclaw/shared/gws-config`, or a real direct-auth GWS CLI. This applies to the base agent image and to every per-agent image rebuilt through self-mod `install_packages`.
 - **Proxy boundary:** `gws-proxy` is the trusted enforcement service. It may keep the real GWS CLI, OAuth state, bearer keys, recipient policy, rate limits, and audit logs.
 - **OneCLI boundary:** OneCLI owns agent-visible authorization injection. The shim must route through the configured proxy env and must not synthesize an `Authorization` header.
 - **Deploy boundary:** NanoClaw runtime changes land on `overlay/shapiroserver2`; production host pins and deploys from shapiroserver2 `deploy/nanoclaw`; durable non-pin host contract changes are reconciled back to shapiroserver2 `main`.
@@ -63,6 +64,7 @@ Zoom out before editing or reviewing any step:
 After implementation and deploy:
 
 - `gws auth status` inside an agent reports proxy mode, not OAuth mode.
+- `gws auth status` inside an agent prints clean proxy-mode JSON without Node runtime warning noise around it.
 - `command -v gws` inside an agent is `/usr/local/bin/gws`, not `/pnpm/gws`.
 - `/home/node/.config/gws/credentials.enc` is absent inside an agent.
 - A deterministic command such as `gws gmail +send --to dan@example.com --subject ... --body ...` is denied by `gws-proxy` with the existing policy message.
@@ -72,6 +74,7 @@ After implementation and deploy:
 ## Important Boundaries And Invariants
 
 - Do not add a fallback path to the real GWS CLI.
+- Treat `gws` as a reserved agent command. Approved package rebuilds must reject known direct-GWS packages such as `@googleworkspace/cli`, and the image build must fail closed if any requested apt or npm package creates another `gws` executable on `PATH` or at `/pnpm/gws`.
 - Do not pass `GWS_PROXY_KEY` into agent env, settings, command line, files, or generated prompts. Host-side direct proxy tests may still use the key from the operator shell because they test `gws-proxy` itself, not the agent boundary.
 - Do not let the shim manufacture its own `Authorization` header. The header belongs to OneCLI.
 - Do not weaken or delete existing OneCLI fail-closed tests.
@@ -94,8 +97,14 @@ NanoClaw source worktree: `/home/user/code/nanoclaw/.worktrees/trycycle-gws-poli
   - Copy the shim into `/usr/local/bin/gws`.
 - Modify: `src/container-runner.ts`
   - Remove `buildGwsConfigMount()` and its call from `buildMounts()`.
+  - Harden `buildAgentGroupImage()` so per-agent package rebuilds cannot create or prefer a direct `gws` binary over the shim.
 - Modify: `src/container-runner.test.ts`
   - Replace the old "mounts shared gws config" tests with negative credential-mount tests.
+  - Add regression coverage for the per-agent rebuild path that would otherwise recreate `/pnpm/gws`.
+- Modify: `src/modules/self-mod/request.ts`
+  - Reject agent package requests for known direct-GWS packages before they reach approval.
+- Create: `src/modules/self-mod/request.test.ts`
+  - Cover the user-friendly rejection for `@googleworkspace/cli`.
 - Modify: `src/container-runtime.test.ts`
   - Strengthen Dockerfile static contract tests for shim/no-real-CLI.
 - Modify: `docs/SECURITY.md`, `docs/build-and-runtime.md`, `CLAUDE.md`
@@ -738,6 +747,141 @@ git add src/container-runner.ts src/container-runner.test.ts
 git commit -m "fix: remove gws oauth mount from agents"
 ```
 
+## Task 3A: Harden Per-Agent Package Rebuilds Against GWS Binary Reintroduction
+
+**Files:**
+- Modify: `src/container-runner.ts`
+- Modify: `src/container-runner.test.ts`
+- Modify: `src/modules/self-mod/request.ts`
+- Create: `src/modules/self-mod/request.test.ts`
+
+- [ ] **Step 1: Add failing tests for the reviewed rebuild bypass**
+
+In `src/container-runner.test.ts`, add coverage for the per-agent image rebuild path. The test must fail against the current vulnerable shape where `buildAgentGroupImage()` writes a Dockerfile that can run `pnpm install -g @googleworkspace/cli` without a post-install reserved-command guard.
+
+At minimum, assert the generated per-agent Dockerfile behavior indirectly or by extracting a helper if needed:
+
+```ts
+it('keeps gws reserved during per-agent npm package rebuilds', () => {
+  const runnerSource = fs.readFileSync(path.join(process.cwd(), 'src', 'container-runner.ts'), 'utf8');
+
+  expect(runnerSource).toContain('assertNoReservedAgentCommandCollisions');
+  expect(runnerSource).toContain('gws');
+  expect(runnerSource).toContain('command -v gws');
+  expect(runnerSource).toContain('/usr/local/bin/gws');
+  expect(runnerSource).toContain('/pnpm/gws');
+});
+```
+
+If an existing test can instantiate `buildAgentGroupImage()` with a temporary group config, prefer that over source assertions. The decisive expected behavior is that a package list containing `@googleworkspace/cli` is rejected before or during rebuild, and any package that creates `/pnpm/gws` makes the image build fail before the rebuilt image is saved to `container.json`.
+
+In `src/modules/self-mod/request.test.ts`, add a request-layer test for a user-friendly denial:
+
+```ts
+it('rejects direct Google Workspace CLI package requests', async () => {
+  await handleInstallPackages(
+    { npm: ['@googleworkspace/cli'], reason: 'bypass test' },
+    testSession,
+  );
+
+  expect(notifyAgent).toHaveBeenCalledWith(
+    testSession,
+    expect.stringContaining('install_packages failed'),
+  );
+  expect(notifyAgent).toHaveBeenCalledWith(
+    testSession,
+    expect.stringContaining('GWS proxy shim'),
+  );
+  expect(requestApproval).not.toHaveBeenCalled();
+});
+```
+
+Use the repository's existing mock style for `notifyAgent`, `requestApproval`, and `getAgentGroup`. Keep the message clear and user-facing; do not silently drop the package.
+
+- [ ] **Step 2: Run the new tests and verify they fail**
+
+Run:
+
+```bash
+pnpm exec vitest run src/container-runner.test.ts src/modules/self-mod/request.test.ts
+```
+
+Expected: FAIL because the current package request validator accepts `@googleworkspace/cli`, and the per-agent rebuild path does not reserve `gws` or check for `/pnpm/gws` after global installs.
+
+- [ ] **Step 3: Reject known direct-GWS packages before approval**
+
+In `src/modules/self-mod/request.ts`, add a small reserved-package check after the existing npm package-name validation and before `requestApproval()`:
+
+```ts
+const RESERVED_NPM_PACKAGES = new Map<string, string>([
+  ['@googleworkspace/cli', 'NanoClaw agents use the GWS proxy shim; the direct Google Workspace CLI is not allowed.'],
+]);
+
+const reservedNpm = npm.find((p) => RESERVED_NPM_PACKAGES.has(p));
+if (reservedNpm) {
+  notifyAgent(session, `install_packages failed: ${RESERVED_NPM_PACKAGES.get(reservedNpm)}`);
+  log.warn('install_packages: reserved npm package rejected', { pkg: reservedNpm });
+  return;
+}
+```
+
+Do not make this a broad fallback or policy bypass. This is an early, user-friendly rejection for a known direct-GWS package; the per-agent image build guard in the next step is still required because other packages could also create a `gws` binary.
+
+- [ ] **Step 4: Add a fail-closed reserved-command guard to per-agent image builds**
+
+In `src/container-runner.ts`, add a helper near `buildAgentGroupImage()`:
+
+```ts
+function assertNoReservedAgentCommandCollisionsShell(): string {
+  return [
+    'test "$(command -v gws)" = "/usr/local/bin/gws"',
+    'test ! -e /pnpm/gws',
+  ].join(' && ');
+}
+```
+
+Then append that guard immediately after any per-agent apt or npm installs in the generated Dockerfile, before `USER node` and before `containerConfig.imageTag` is written. The generated Dockerfile should fail closed if `pnpm install -g ...` creates `/pnpm/gws` or changes `command -v gws` away from `/usr/local/bin/gws`.
+
+The guard is intentionally build-time, not only request-time: it protects against manually edited `container.json`, future package aliases, and packages other than `@googleworkspace/cli` that provide a `gws` executable.
+
+- [ ] **Step 5: Reproduce the reviewed bypass shape with a Docker smoke**
+
+After rebuilding the base image, run a direct reproduction of the review finding as a red/green check. The final expected result is that the attempt cannot produce a usable rebuilt agent image with `/pnpm/gws`:
+
+```bash
+bash container/build.sh gws-policy-shim-rebuild-guard
+IMAGE_BASE="$(bash -lc 'source setup/lib/install-slug.sh; container_image_base')"
+tmp="$(mktemp -d)"
+printf '%s\n' \
+  "FROM ${IMAGE_BASE}:gws-policy-shim-rebuild-guard" \
+  "USER root" \
+  "RUN pnpm install -g @googleworkspace/cli@0.18.1" \
+  'RUN test "$(command -v gws)" = "/usr/local/bin/gws" && test ! -e /pnpm/gws' \
+  "USER node" >"$tmp/Dockerfile"
+docker build -f "$tmp/Dockerfile" "$tmp"
+```
+
+Expected before the fix: the first `RUN pnpm install -g @googleworkspace/cli@0.18.1` can create `/pnpm/gws` and the guard fails. Expected after the fix: the real `buildAgentGroupImage()` generated Dockerfile contains the same guard, and tests prove this failure would prevent saving a rebuilt image. This standalone Docker smoke is a review-reproduction aid; do not treat it as a substitute for the `buildAgentGroupImage()` test.
+
+- [ ] **Step 6: Verify source tests and commit**
+
+Run:
+
+```bash
+pnpm exec vitest run src/container-runner.test.ts src/modules/self-mod/request.test.ts src/gws-shim.test.ts src/container-runtime.test.ts
+pnpm run build
+pnpm test
+```
+
+Expected: PASS. No skipped tests in the summary.
+
+Commit:
+
+```bash
+git add src/container-runner.ts src/container-runner.test.ts src/modules/self-mod/request.ts src/modules/self-mod/request.test.ts
+git commit -m "fix: reserve gws across agent package rebuilds"
+```
+
 ## Task 4: Update NanoClaw Source Documentation
 
 **Files:**
@@ -756,6 +900,7 @@ Required content:
 - Agents must not receive `GWS_PROXY_KEY`.
 - Agents must not mount `/srv/nanoclaw/shared/gws-config`.
 - Agents must not have the real Google Workspace CLI or OAuth files.
+- Per-agent `install_packages` rebuilds must preserve the same boundary; `gws` is a reserved command and package installs fail closed if they create another `gws` executable such as `/pnpm/gws`.
 - The trusted proxy service may still hold the real CLI and OAuth state.
 
 Suggested `CLAUDE.md` addition under "Secrets / Credentials / OneCLI":
@@ -770,6 +915,9 @@ header for the configured proxy hostname.
 Agent containers must not receive `GWS_PROXY_KEY`, `/srv/nanoclaw/shared/gws-config`,
 Google OAuth files, or a direct-auth Google Workspace CLI binary. The real
 GWS CLI and OAuth state belong only behind the `gws-proxy` policy boundary.
+Per-agent package rebuilds must preserve this boundary: `gws` is reserved for
+the shim, and package installs must fail closed if they create another `gws`
+executable such as `/pnpm/gws`.
 ```
 
 Suggested `docs/build-and-runtime.md` change in the global CLIs section:
@@ -794,7 +942,8 @@ rg -n '@googleworkspace/cli|GWS_CLI_VERSION|/home/node/.config/gws|GWS_CONFIG_DI
 
 Expected:
 
-- No hits for `@googleworkspace/cli`, `GWS_CLI_VERSION`, or `GWS_CONFIG_DIR`.
+- No hits for operational `@googleworkspace/cli` install text, `GWS_CLI_VERSION`, or `GWS_CONFIG_DIR`.
+- `@googleworkspace/cli` hits are acceptable only in reserved-package rejection code/tests or security text explaining that the direct CLI is forbidden in agents.
 - No operational source hits for `/home/node/.config/gws` or `credentials.enc`; hits are acceptable only in negative tests or security documentation.
 - `GWS_PROXY_KEY` and `gws-config` hits are only in negative/security text explaining that agents must not receive them.
 
@@ -1634,7 +1783,8 @@ rg -n '@googleworkspace/cli|GWS_CLI_VERSION|buildGwsConfigMount|GWS_CONFIG_DIR|c
 
 Expected:
 
-- No hits for `@googleworkspace/cli`, `GWS_CLI_VERSION`, `buildGwsConfigMount`, or `GWS_CONFIG_DIR`.
+- No hits for operational `@googleworkspace/cli` install text, `GWS_CLI_VERSION`, `buildGwsConfigMount`, or `GWS_CONFIG_DIR`.
+- `@googleworkspace/cli` hits are acceptable only in reserved-package rejection code/tests or security text explaining that the direct CLI is forbidden in agents.
 - No operational source hits for `credentials.enc` or `/home/node/.config/gws`; hits are acceptable only in negative tests or security documentation.
 - `GWS_PROXY_KEY` appears only in negative/security text and tests proving it is absent.
 
