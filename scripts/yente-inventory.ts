@@ -583,6 +583,7 @@ function listFiles(root: string): string[] {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       const full = path.join(dir, entry.name);
       const rel = path.relative(root, full).split(path.sep).join('/');
+      if (entry.isDirectory() && isSourceHashPrunedDirectory(rel)) continue;
       if (entry.isDirectory()) {
         walk(full);
       } else if (entry.isFile()) {
@@ -593,6 +594,10 @@ function listFiles(root: string): string[] {
 
   walk(root);
   return files.sort();
+}
+
+function isSourceHashPrunedDirectory(rel: string): boolean {
+  return rel === 'backups' || rel.startsWith('backups/');
 }
 
 function parseJsonObject(raw: string | null): Record<string, unknown> | null {
