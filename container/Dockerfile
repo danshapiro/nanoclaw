@@ -22,7 +22,6 @@ ARG INSTALL_CJK_FONTS=false
 ARG CLAUDE_CODE_VERSION=2.1.116
 ARG AGENT_BROWSER_VERSION=latest
 ARG VERCEL_VERSION=latest
-ARG GWS_CLI_VERSION=0.18.1
 ARG BUN_VERSION=1.3.12
 
 # ---- System dependencies -----------------------------------------------------
@@ -89,8 +88,7 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
 #
 # only-built-dependencies gates pnpm's supply-chain policy:
 #   - agent-browser has a postinstall build step.
-#   - @googleworkspace/cli and esbuild install their runtime binaries during
-#     postinstall; otherwise the non-root agent user tries and fails at runtime.
+#   - esbuild installs its runtime binary during postinstall.
 #   - @anthropic-ai/claude-code's postinstall downloads the native Claude
 #     binary (linux-arm64 variant on our image). Without the allowlist
 #     the SDK fails at spawn time with "native binary not found".
@@ -100,7 +98,6 @@ RUN corepack enable
 
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     echo "only-built-dependencies[]=agent-browser" > /root/.npmrc && \
-    echo "only-built-dependencies[]=@googleworkspace/cli" >> /root/.npmrc && \
     echo "only-built-dependencies[]=esbuild" >> /root/.npmrc && \
     echo "only-built-dependencies[]=@anthropic-ai/claude-code" >> /root/.npmrc && \
     printf 'export PNPM_HOME=/pnpm\nexport PATH=/pnpm:$PATH\n' > /etc/profile.d/pnpm-home.sh && \
@@ -110,10 +107,14 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
     pnpm install -g "agent-browser@${AGENT_BROWSER_VERSION}"
 
 RUN --mount=type=cache,target=/root/.cache/pnpm \
-    pnpm install -g "@googleworkspace/cli@${GWS_CLI_VERSION}"
-
-RUN --mount=type=cache,target=/root/.cache/pnpm \
     pnpm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+
+# ---- GWS policy proxy shim ---------------------------------------------------
+# Agent containers must not include the real Google Workspace CLI or OAuth
+# files. This CLI-shaped shim forwards to gws-proxy; OneCLI injects the proxy
+# authorization header for the configured GWS_PROXY_URL host.
+COPY shim/gws /usr/local/bin/gws
+RUN chmod +x /usr/local/bin/gws
 
 # ---- Entrypoint --------------------------------------------------------------
 COPY entrypoint.sh /app/entrypoint.sh
@@ -121,16 +122,14 @@ RUN chmod +x /app/entrypoint.sh
 
 # ---- Workspace + permissions -------------------------------------------------
 # Agent containers may run as the host `nanoclaw` uid/gid so bind-mounted
-# session files stay writable. Pre-create browser home directories before any
-# nested bind mount such as /home/node/.config/gws can cause Docker to create
-# the parent as root-owned; Chromium needs a writable config dir for crashpad
-# and profile startup.
+# session files stay writable. Chromium needs writable config and cache
+# directories for crashpad and profile startup.
 RUN mkdir -p \
         /workspace/agent \
         /workspace/extra \
         /home/node/.agent-browser \
         /home/node/.cache \
-        /home/node/.config/gws && \
+        /home/node/.config && \
     chown -R node:node /workspace /home/node/.agent-browser /home/node/.cache /home/node/.config && \
     chmod 777 /home/node /home/node/.agent-browser /home/node/.cache /home/node/.config
 

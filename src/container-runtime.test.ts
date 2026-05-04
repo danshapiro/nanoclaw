@@ -68,6 +68,21 @@ describe('agent container Dockerfile', () => {
     expect(dockerfile).toContain('python3');
     expect(dockerfile).toContain('python3-jsonschema');
   });
+
+  it('installs the GWS proxy shim instead of the real Google Workspace CLI', () => {
+    const dockerfile = fs.readFileSync(path.join(process.cwd(), 'container', 'Dockerfile'), 'utf8');
+
+    expect(dockerfile).toContain('COPY shim/gws /usr/local/bin/gws');
+    expect(dockerfile).toContain('chmod +x /usr/local/bin/gws');
+    expect(dockerfile).not.toContain('GWS_CLI_VERSION');
+    expect(dockerfile).not.toContain('@googleworkspace/cli');
+  });
+
+  it('does not create a GWS OAuth config path in the agent image', () => {
+    const dockerfile = fs.readFileSync(path.join(process.cwd(), 'container', 'Dockerfile'), 'utf8');
+
+    expect(dockerfile).not.toContain('/home/node/.config/gws');
+  });
 });
 
 describe('stopContainer', () => {
