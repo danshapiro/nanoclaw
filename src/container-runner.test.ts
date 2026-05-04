@@ -6,7 +6,6 @@ import { fileURLToPath } from 'url';
 
 import {
   applyOneCliGatewayForContainerArgs,
-  buildGwsConfigMount,
   buildManagedReposIpcMount,
   buildManagedReposMounts,
   buildPortableSkillsMount,
@@ -163,14 +162,7 @@ describe('workspace mount contract', () => {
       'utf8',
     );
     const runnerSource = fs.readFileSync(
-      path.join(
-        path.dirname(fileURLToPath(import.meta.url)),
-        '..',
-        'container',
-        'agent-runner',
-        'src',
-        'index.ts',
-      ),
+      path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'container', 'agent-runner', 'src', 'index.ts'),
       'utf8',
     );
 
@@ -245,35 +237,13 @@ describe('managed repos mounts', () => {
   });
 });
 
-describe('gws config mount', () => {
-  it('mounts the shared gws config into the agent home when credentials are provisioned', () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-gws-mount-'));
-    try {
-      const sharedData = path.join(root, 'shared', 'data');
-      const gwsConfig = path.join(root, 'shared', 'gws-config');
-      fs.mkdirSync(sharedData, { recursive: true });
-      fs.mkdirSync(gwsConfig, { recursive: true });
-      fs.writeFileSync(path.join(gwsConfig, 'credentials.enc'), 'encrypted');
+describe('GWS proxy mediation boundary', () => {
+  it('does not contain a helper that can mount GWS OAuth config into agents', () => {
+    const runnerSource = fs.readFileSync(path.join(process.cwd(), 'src', 'container-runner.ts'), 'utf8');
 
-      expect(buildGwsConfigMount(sharedData)).toEqual({
-        hostPath: gwsConfig,
-        containerPath: '/home/node/.config/gws',
-        readonly: false,
-      });
-    } finally {
-      fs.rmSync(root, { recursive: true, force: true });
-    }
-  });
-
-  it('does not mount gws config until credentials are provisioned', () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-gws-mount-'));
-    try {
-      const sharedData = path.join(root, 'shared', 'data');
-      fs.mkdirSync(sharedData, { recursive: true });
-
-      expect(buildGwsConfigMount(sharedData)).toBeNull();
-    } finally {
-      fs.rmSync(root, { recursive: true, force: true });
-    }
+    expect(runnerSource).not.toContain('buildGwsConfigMount');
+    expect(runnerSource).not.toContain('GWS_CONFIG_DIR');
+    expect(runnerSource).not.toContain('credentials.enc');
+    expect(runnerSource).not.toContain('/home/node/.config/gws');
   });
 });

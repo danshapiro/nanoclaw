@@ -525,11 +525,6 @@ function buildMounts(
     mounts.push(managedReposIpcMount);
   }
 
-  const gwsConfigMount = buildGwsConfigMount();
-  if (gwsConfigMount) {
-    mounts.push(gwsConfigMount);
-  }
-
   // Additional mounts from container config
   if (containerConfig.additionalMounts && containerConfig.additionalMounts.length > 0) {
     const validated = validateAdditionalMounts(containerConfig.additionalMounts, agentGroup.name);
@@ -588,29 +583,6 @@ export function buildManagedReposIpcMount(agentGroup: Pick<AgentGroup, 'folder'>
   return {
     hostPath,
     containerPath: '/workspace/ipc',
-    readonly: false,
-  };
-}
-
-export function buildGwsConfigMount(dataDir = DATA_DIR, env: NodeJS.ProcessEnv = process.env): VolumeMount | null {
-  let gwsConfigDir = env.GWS_CONFIG_DIR?.trim();
-  if (!gwsConfigDir) {
-    let sharedDataDir = dataDir;
-    try {
-      sharedDataDir = fs.realpathSync(dataDir);
-    } catch {
-      // If dataDir does not exist yet, derive from the configured path.
-    }
-    gwsConfigDir = path.join(path.dirname(sharedDataDir), 'gws-config');
-  }
-
-  if (!fs.existsSync(path.join(gwsConfigDir, 'credentials.enc'))) {
-    return null;
-  }
-
-  return {
-    hostPath: gwsConfigDir,
-    containerPath: '/home/node/.config/gws',
     readonly: false,
   };
 }
