@@ -716,6 +716,10 @@ export async function applyOneCliGatewayForContainerArgs(
   }
 }
 
+function assertNoReservedAgentCommandCollisionsShell(): string {
+  return ['test "$(command -v gws)" = "/usr/local/bin/gws"', 'test ! -e /pnpm/gws'].join(' && ');
+}
+
 /** Build a per-agent-group Docker image with custom packages. */
 export async function buildAgentGroupImage(agentGroupId: string): Promise<void> {
   const agentGroup = getAgentGroup(agentGroupId);
@@ -741,6 +745,7 @@ export async function buildAgentGroupImage(agentGroupId: string): Promise<void> 
     const allowlist = npmPackages.map((p) => `echo 'only-built-dependencies[]=${p}' >> /root/.npmrc`).join(' && ');
     dockerfile += `RUN ${allowlist} && pnpm install -g ${npmPackages.join(' ')}\n`;
   }
+  dockerfile += `RUN ${assertNoReservedAgentCommandCollisionsShell()}\n`;
   dockerfile += 'USER node\n';
 
   const imageTag = `${CONTAINER_IMAGE_BASE}:${agentGroupId}`;

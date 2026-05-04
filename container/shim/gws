@@ -40,21 +40,26 @@ curl_with_configured_proxy() {
   fi
 }
 
+json_string() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
 case "${1:-}" in
   auth)
     if [ "${2:-}" = "status" ]; then
       http_code="$(curl_with_configured_proxy -fsS -o /dev/null -w "%{http_code}" "$GWS_PROXY_URL/health" 2>/dev/null || true)"
+      proxy_url_json="$(json_string "$GWS_PROXY_URL")"
       if [ "$http_code" = "200" ]; then
-        node -e 'process.stdout.write(JSON.stringify({auth_method:"proxy",proxy_url:process.env.GWS_PROXY_URL,status:"connected"}) + "\n")'
+        printf '{"auth_method":"proxy","proxy_url":"%s","status":"connected"}\n' "$proxy_url_json"
         exit 0
       fi
-      node -e 'process.stdout.write(JSON.stringify({auth_method:"proxy",proxy_url:process.env.GWS_PROXY_URL,status:"unreachable"}) + "\n")'
+      printf '{"auth_method":"proxy","proxy_url":"%s","status":"unreachable"}\n' "$proxy_url_json"
       exit 1
     fi
     ;;
 esac
 
-args_json="$(node -e 'process.stdout.write(JSON.stringify(process.argv.slice(1)))' -- "$@")"
+args_json="$(NODE_NO_WARNINGS=1 node -e 'process.stdout.write(JSON.stringify(process.argv.slice(1)))' -- "$@")"
 tmp_headers="$(mktemp)"
 tmp_body="$(mktemp)"
 cleanup() {

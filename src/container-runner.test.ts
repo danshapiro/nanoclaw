@@ -246,4 +246,14 @@ describe('GWS proxy mediation boundary', () => {
     expect(runnerSource).not.toContain('credentials.enc');
     expect(runnerSource).not.toContain('/home/node/.config/gws');
   });
+
+  it('keeps gws reserved during per-agent npm package rebuilds', () => {
+    const runnerSource = fs.readFileSync(path.join(process.cwd(), 'src', 'container-runner.ts'), 'utf8');
+
+    expect(runnerSource).toContain('assertNoReservedAgentCommandCollisions');
+    expect(runnerSource).toContain('gws');
+    expect(runnerSource).toContain('command -v gws');
+    expect(runnerSource).toContain('/usr/local/bin/gws');
+    expect(runnerSource).toContain('/pnpm/gws');
+  });
 });

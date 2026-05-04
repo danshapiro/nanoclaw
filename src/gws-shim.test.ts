@@ -118,6 +118,7 @@ describe('gws proxy shim', () => {
 
     const result = await runShim(['auth', 'status'], { GWS_PROXY_URL: proxy.url });
     expect(result.status).toBe(0);
+    expect(result.stderr).toBe('');
     expect(JSON.parse(result.stdout)).toMatchObject({
       auth_method: 'proxy',
       status: 'connected',

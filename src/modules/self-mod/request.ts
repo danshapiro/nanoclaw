@@ -17,6 +17,10 @@ import { log } from '../../log.js';
 import type { Session } from '../../types.js';
 import { notifyAgent, requestApproval } from '../approvals/index.js';
 
+const RESERVED_NPM_PACKAGES = new Map<string, string>([
+  ['@googleworkspace/cli', 'NanoClaw agents use the GWS proxy shim; the direct Google Workspace CLI is not allowed.'],
+]);
+
 export async function handleInstallPackages(content: Record<string, unknown>, session: Session): Promise<void> {
   const agentGroup = getAgentGroup(session.agent_group_id);
   if (!agentGroup) {
@@ -49,6 +53,12 @@ export async function handleInstallPackages(content: Record<string, unknown>, se
   if (invalidNpm) {
     notifyAgent(session, `install_packages failed: invalid npm package name "${invalidNpm}".`);
     log.warn('install_packages: invalid npm package rejected', { pkg: invalidNpm });
+    return;
+  }
+  const reservedNpm = npm.find((p) => RESERVED_NPM_PACKAGES.has(p));
+  if (reservedNpm) {
+    notifyAgent(session, `install_packages failed: ${RESERVED_NPM_PACKAGES.get(reservedNpm)}`);
+    log.warn('install_packages: reserved npm package rejected', { pkg: reservedNpm });
     return;
   }
 

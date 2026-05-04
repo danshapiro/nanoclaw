@@ -28,6 +28,10 @@ It explicitly supports lowercase and uppercase proxy env variants so curl
 traffic to `GWS_PROXY_URL` stays on the OneCLI-mediated route, and it forces
 that route even if inherited `NO_PROXY` values would otherwise match the
 mediated proxy host.
+Per-agent `install_packages` image rebuilds must keep that command reserved:
+known direct-GWS packages such as `@googleworkspace/cli` are rejected at request
+time, and the generated rebuild Dockerfile fails closed if package installation
+creates or shadows `gws`, including the reviewed `/pnpm/gws` bypass shape.
 
 ## Lockfiles
 

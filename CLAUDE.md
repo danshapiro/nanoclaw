@@ -108,6 +108,9 @@ header for the configured proxy hostname.
 Agent containers must not receive `GWS_PROXY_KEY`, `/srv/nanoclaw/shared/gws-config`,
 Google OAuth files, or a direct-auth Google Workspace CLI binary. The real
 GWS CLI and OAuth state belong only behind the `gws-proxy` policy boundary.
+Per-agent package rebuilds must preserve this boundary: `gws` is reserved for
+the shim, and package installs must fail closed if they create another `gws`
+executable such as `/pnpm/gws`.
 
 ### Gotcha: auto-created agents start in `selective` secret mode
 
