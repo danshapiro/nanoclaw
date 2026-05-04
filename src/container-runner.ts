@@ -716,8 +716,17 @@ export async function applyOneCliGatewayForContainerArgs(
   }
 }
 
-function assertNoReservedAgentCommandCollisionsShell(): string {
-  return ['test "$(command -v gws)" = "/usr/local/bin/gws"', 'test ! -e /pnpm/gws'].join(' && ');
+function shellSingleQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+export function assertNoReservedAgentCommandCollisionsShell(expectedGwsPath = '/usr/local/bin/gws'): string {
+  const expected = shellSingleQuote(expectedGwsPath);
+  return [
+    `expected_gws=${expected}; test "$(command -v gws)" = "$expected_gws" || exit 1`,
+    `old_ifs="$IFS"; IFS=:; for dir in $PATH; do test -n "$dir" || dir=.; candidate="$dir/gws"; if test -x "$candidate" && test "$candidate" != "$expected_gws"; then echo "reserved gws command collision: $candidate" >&2; exit 1; fi; done; IFS="$old_ifs"`,
+    'test ! -e /pnpm/gws',
+  ].join(' && ');
 }
 
 /** Build a per-agent-group Docker image with custom packages. */

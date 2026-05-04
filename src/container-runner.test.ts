@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { spawnSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -6,6 +7,7 @@ import { fileURLToPath } from 'url';
 
 import {
   applyOneCliGatewayForContainerArgs,
+  assertNoReservedAgentCommandCollisionsShell,
   buildManagedReposIpcMount,
   buildManagedReposMounts,
   buildPortableSkillsMount,
@@ -238,6 +240,19 @@ describe('managed repos mounts', () => {
 });
 
 describe('GWS proxy mediation boundary', () => {
+  function writeExecutable(filePath: string): void {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, '#!/bin/sh\nprintf gws\\n', 'utf8');
+    fs.chmodSync(filePath, 0o755);
+  }
+
+  function runReservedCommandGuard(pathEntries: string[], expectedGwsPath: string) {
+    return spawnSync('/bin/sh', ['-c', assertNoReservedAgentCommandCollisionsShell(expectedGwsPath)], {
+      env: { ...process.env, PATH: pathEntries.join(':') },
+      encoding: 'utf8',
+    });
+  }
+
   it('does not contain a helper that can mount GWS OAuth config into agents', () => {
     const runnerSource = fs.readFileSync(path.join(process.cwd(), 'src', 'container-runner.ts'), 'utf8');
 
@@ -255,5 +270,23 @@ describe('GWS proxy mediation boundary', () => {
     expect(runnerSource).toContain('command -v gws');
     expect(runnerSource).toContain('/usr/local/bin/gws');
     expect(runnerSource).toContain('/pnpm/gws');
+  });
+
+  it('fails the per-agent rebuild guard when another executable gws appears later on PATH', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-gws-path-'));
+    try {
+      const expectedDir = path.join(root, 'usr', 'local', 'bin');
+      const secondaryDir = path.join(root, 'usr', 'bin');
+      writeExecutable(path.join(expectedDir, 'gws'));
+      writeExecutable(path.join(secondaryDir, 'gws'));
+
+      const result = runReservedCommandGuard([expectedDir, secondaryDir], path.join(expectedDir, 'gws'));
+
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain('reserved gws command collision');
+      expect(result.stderr).toContain(path.join(secondaryDir, 'gws'));
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });

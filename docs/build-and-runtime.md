@@ -31,7 +31,8 @@ mediated proxy host.
 Per-agent `install_packages` image rebuilds must keep that command reserved:
 known direct-GWS packages such as `@googleworkspace/cli` are rejected at request
 time, and the generated rebuild Dockerfile fails closed if package installation
-creates or shadows `gws`, including the reviewed `/pnpm/gws` bypass shape.
+creates another executable `gws` anywhere on `PATH` other than
+`/usr/local/bin/gws`, including the explicit `/pnpm/gws` bypass shape.
 
 ## Lockfiles
 
