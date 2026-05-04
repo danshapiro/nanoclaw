@@ -99,6 +99,16 @@ A second tier (direct source-level self-edits via a draft/activate flow) is plan
 
 API keys, OAuth tokens, and auth credentials are managed by the OneCLI gateway. Secrets are injected into per-agent containers at request time — none are passed in env vars or through chat context. `src/onecli-approvals.ts`, `ensureAgent()` in `container-runner.ts`. Run `onecli --help`.
 
+### GWS policy proxy
+
+Yente's agent-facing `gws` command is a shim at `/usr/local/bin/gws`, not the
+real Google Workspace CLI. The shim forwards argv to `GWS_PROXY_URL` through
+the configured OneCLI proxy environment; OneCLI injects the proxy authorization
+header for the configured proxy hostname.
+Agent containers must not receive `GWS_PROXY_KEY`, `/srv/nanoclaw/shared/gws-config`,
+Google OAuth files, or a direct-auth Google Workspace CLI binary. The real
+GWS CLI and OAuth state belong only behind the `gws-proxy` policy boundary.
+
 ### Gotcha: auto-created agents start in `selective` secret mode
 
 When the host first spawns a session for a new agent group, `container-runner.ts:385` calls `onecli.ensureAgent({ name, identifier })`. The OneCLI `POST /api/agents` endpoint creates the agent in **`selective`** secret mode — meaning **no secrets are assigned to it by default**, even if the secrets exist in the vault and have host patterns that would otherwise match.
@@ -226,7 +236,7 @@ The agent container runs on **Bun**; the host runs on **Node** (pnpm). They comm
 - **Bumping `@anthropic-ai/claude-agent-sdk`, `@modelcontextprotocol/sdk`, or any agent-runner runtime dep** → no `minimumReleaseAge` policy applies to this tree. Check the release date on npm, pin deliberately, never `bun update` blindly.
 - **Writing a new named-param SQL insert/update in the container** → use `$name` in both SQL and JS keys: `.run({ $id: msg.id })`. `bun:sqlite` does not auto-strip the prefix the way `better-sqlite3` does on the host. Positional `?` params work normally.
 - **Adding a test in `container/agent-runner/src/`** → import from `bun:test`, not `vitest`. Vitest runs on Node and can't load `bun:sqlite`. `vitest.config.ts` excludes this tree.
-- **Adding a Node CLI the agent invokes at runtime** (like `agent-browser`, `claude-code`, `vercel`) → put it in the Dockerfile's pnpm global-install block, pinned to an exact version via a new `ARG`. Don't use `bun install -g` — that bypasses the pnpm supply-chain policy.
+- **Adding a Node CLI the agent invokes at runtime** (like `agent-browser`, `claude-code`, `vercel`) → put it in the Dockerfile's pnpm global-install block, pinned to an exact version via a new `ARG`. Don't use `bun install -g` — that bypasses the pnpm supply-chain policy. `gws` is the exception: it is a local policy-proxy shim copied to `/usr/local/bin/gws`, not a pnpm-installed direct-auth CLI.
 - **Changing the Dockerfile entrypoint or the dynamic-spawn command** (`src/container-runner.ts` line ~301) → keep `exec bun ...` so signals forward cleanly. The image has no `/app/dist`; don't reintroduce a tsc build step.
 - **Changing session-DB pragmas** (`container/agent-runner/src/db/connection.ts`) → `journal_mode=DELETE` is load-bearing for cross-mount visibility. Read the comment block at the top of the file first.
 

@@ -21,6 +21,14 @@ Host and container each have their own package tree:
 
 The container image also has pnpm + Node inside for global CLIs (`@anthropic-ai/claude-code`, `agent-browser`, `vercel`). Those are Node binaries the agent invokes at runtime, not library deps. Keeping them on pnpm preserves the supply-chain policy for CLI versions.
 
+`gws` is intentionally not a pnpm-installed global CLI. The image copies
+`container/shim/gws` to `/usr/local/bin/gws`; the shim is the only supported
+agent-facing GWS command and relies on OneCLI-mediated access to `gws-proxy`.
+It explicitly supports lowercase and uppercase proxy env variants so curl
+traffic to `GWS_PROXY_URL` stays on the OneCLI-mediated route, and it forces
+that route even if inherited `NO_PROXY` values would otherwise match the
+mediated proxy host.
+
 ## Lockfiles
 
 | Tree | Lockfile | Manager | Regenerate after dep change |
@@ -74,6 +82,7 @@ Any failure fails the PR.
 - **Agent-runner tests run under `bun:test`, not vitest.** `vitest.config.ts` excludes the `container/agent-runner/` tree because vitest runs on Node and can't load `bun:sqlite`.
 - **No tsc build step in the container image.** Re-adding one would reintroduce the ~200-500ms per-session-wake cost we removed.
 - **Global container CLIs stay on pnpm, not Bun.** `agent-browser`, `@anthropic-ai/claude-code`, `vercel` and any future Node CLIs the agent invokes should be pinned versions under the Dockerfile's pnpm global-install block. `bun install -g` would bypass the pnpm supply-chain policy.
+- **GWS stays mediated.** The agent image must expose `/usr/local/bin/gws` as the policy-proxy shim, must not install the real Google Workspace CLI, and must not create or receive a Google OAuth config path. The trusted `gws-proxy` service owns the real CLI and OAuth state.
 
 ## Migration history
 
