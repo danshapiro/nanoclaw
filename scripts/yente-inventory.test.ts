@@ -148,6 +148,20 @@ describe('yente inventory', () => {
       fs.chmodSync(envPath, 0o600);
     }
   });
+
+  it('excludes host backup directories from the source state hash', () => {
+    const before = hashSourceState(stateRoot);
+    const backupDir = path.join(stateRoot, 'backups', 'predeploy-archive');
+    fs.mkdirSync(backupDir, { recursive: true });
+    fs.writeFileSync(path.join(backupDir, 'nanoclaw-state.tar.gz'), 'generated backup material');
+
+    try {
+      fs.chmodSync(backupDir, 0o000);
+      expect(hashSourceState(stateRoot)).toBe(before);
+    } finally {
+      fs.chmodSync(backupDir, 0o700);
+    }
+  });
 });
 
 function createInventoryFixture(root: string, config: string): void {
