@@ -83,6 +83,13 @@ describe('agent container Dockerfile', () => {
 
     expect(dockerfile).not.toContain('/home/node/.config/gws');
   });
+
+  it('lets docker run command arguments bypass the app runtime entrypoint', () => {
+    const entrypoint = fs.readFileSync(path.join(process.cwd(), 'container', 'entrypoint.sh'), 'utf8');
+
+    expect(entrypoint).toMatch(/if \[\[ "\$#" -gt 0 \]\]; then\n\s+exec "\$@"/);
+    expect(entrypoint.indexOf('exec "$@"')).toBeLessThan(entrypoint.indexOf('cat > /tmp/input.json'));
+  });
 });
 
 describe('stopContainer', () => {
