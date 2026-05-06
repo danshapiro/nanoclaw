@@ -20,13 +20,37 @@ interface SkillRootSource {
   root: string;
 }
 
+let _cleanupRan = false;
+
+export function cleanupStaleTempRoots(dataDir: string): void {
+  // Run once per process lifetime. Called from buildMounts before any
+  // temp roots are created, so it only removes dirs from a prior process.
+  if (_cleanupRan) return;
+  _cleanupRan = true;
+
+  try {
+    for (const entry of fs.readdirSync(dataDir)) {
+      if (entry.startsWith('.nanoclaw-skills-')) {
+        const dir = path.join(dataDir, entry);
+        try {
+          fs.rmSync(dir, { recursive: true, force: true });
+        } catch {
+          // Mount still active or permissions — skip, not fatal.
+        }
+      }
+    }
+  } catch {
+    // dataDir may not exist yet on first-ever run.
+  }
+}
+
 export function resolveManagedSkillRoot(args: {
   projectRoot: string;
   dataDir: string;
   env?: NodeJS.ProcessEnv;
+  root?: string;
 }): ManagedSkillRoot {
   const env = args.env ?? process.env;
-  const mergedRoot = path.join(args.dataDir, 'managed-skills');
   const sources = collectSkillRootSources(args.projectRoot, env);
   const skillsByName = new Map<string, ManagedSkill>();
   const seenSourceRoots = new Set<string>();
@@ -48,15 +72,28 @@ export function resolveManagedSkillRoot(args: {
       skillsByName.set(skill.name, {
         name: skill.name,
         sourcePath: skill.sourcePath,
-        mergedPath: path.join(mergedRoot, skill.name),
+        mergedPath: '', // set below
         sourceKind: source.kind,
       });
     }
   }
 
   const skills = [...skillsByName.values()].sort((a, b) => a.name.localeCompare(b.name));
-  refreshMergedRoot(mergedRoot, skills);
-  return { root: mergedRoot, skills };
+
+  // Each spawn gets a fresh, isolated merged root. If the caller provides
+  // a root path (created externally with its own lifecycle), use it.
+  // Otherwise create one under the data directory.
+  const root = args.root ?? fs.mkdtempSync(path.join(args.dataDir, '.nanoclaw-skills-'));
+  for (const skill of skills) {
+    skill.mergedPath = path.join(root, skill.name);
+    fs.cpSync(skill.sourcePath, skill.mergedPath, { recursive: true, dereference: true });
+  }
+
+  return { root, skills };
+}
+
+export function clearManagedSkillRootCache(): void {
+  _cleanupRan = false;
 }
 
 export function syncManagedSkillSymlinks(args: {
@@ -104,15 +141,19 @@ export function syncManagedSkillSymlinks(args: {
 }
 
 function collectSkillRootSources(projectRoot: string, env: NodeJS.ProcessEnv): SkillRootSource[] {
-  const sources: SkillRootSource[] = [{ kind: 'bundled', root: path.join(projectRoot, 'container', 'skills') }];
+  const sources: SkillRootSource[] = [];
 
-  for (const root of splitPathList(env.NANOCLAW_MANAGED_SKILLS_DIRS)) {
-    sources.push({ kind: 'managed', root });
-  }
-
+  // Portable sources are added before managed so the realpath dedup
+  // classifies overlapping roots as portable.
   const writableSkillsDir = env.NANOCLAW_WRITABLE_SKILLS_DIR?.trim();
   if (writableSkillsDir) {
     sources.push({ kind: 'portable', root: path.join(writableSkillsDir, 'skills') });
+  }
+
+  sources.push({ kind: 'bundled', root: path.join(projectRoot, 'container', 'skills') });
+
+  for (const root of splitPathList(env.NANOCLAW_MANAGED_SKILLS_DIRS)) {
+    sources.push({ kind: 'managed', root });
   }
 
   return sources;
@@ -157,14 +198,6 @@ function listSkillNames(root: string): string[] {
 function isDirectory(entryPath: string): boolean {
   if (!fs.existsSync(entryPath)) return false;
   return fs.statSync(entryPath).isDirectory();
-}
-
-function refreshMergedRoot(root: string, skills: ManagedSkill[]): void {
-  fs.rmSync(root, { recursive: true, force: true });
-  fs.mkdirSync(root, { recursive: true });
-  for (const skill of skills) {
-    fs.cpSync(skill.sourcePath, skill.mergedPath, { recursive: true, dereference: true });
-  }
 }
 
 function pathExistsNoFollow(entryPath: string): boolean {

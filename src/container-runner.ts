@@ -32,7 +32,7 @@ import { resolveGroupIpcPath } from './group-folder.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
-import { resolveManagedSkillRoot, syncManagedSkillSymlinks } from './yente/managed-skills.js';
+import { cleanupStaleTempRoots, resolveManagedSkillRoot, syncManagedSkillSymlinks } from './yente/managed-skills.js';
 import { assertOneCliApplied, ensureOneCliAgentSecretAccess } from './yente/service-env.js';
 // Provider host-side config barrel — each provider that needs host-side
 // container setup self-registers on import.
@@ -166,8 +166,11 @@ async function spawnContainer(session: Session): Promise<void> {
   const agentIdentifier = agentGroup.id;
   let bridges: AgentMcpBridge[] = [];
   let args: string[];
+  let managedSkillsRoot = '';
   try {
-    const mounts = buildMounts(agentGroup, session, containerConfig, contribution);
+    const buildResult = buildMounts(agentGroup, session, containerConfig, contribution);
+    const mounts = buildResult.mounts;
+    managedSkillsRoot = buildResult.managedSkillsRoot;
     bridges = await attachAgentMcpBridges(agentGroup, containerConfig, mounts);
     args = await buildContainerArgs(
       mounts,
@@ -179,6 +182,7 @@ async function spawnContainer(session: Session): Promise<void> {
       agentIdentifier,
     );
   } catch (err) {
+    cleanupTempSkillRoot(managedSkillsRoot);
     await stopAgentMcpBridges(bridges);
     throw err;
   }
@@ -216,12 +220,23 @@ async function spawnContainer(session: Session): Promise<void> {
 
   container.on('close', (code) => {
     finalizeContainerProcess(session.id, containerName, code);
+    cleanupTempSkillRoot(managedSkillsRoot);
   });
 
   container.on('error', (err) => {
     finalizeContainerProcess(session.id, containerName, null);
+    cleanupTempSkillRoot(managedSkillsRoot);
     log.error('Container spawn error', { sessionId: session.id, err });
   });
+}
+
+function cleanupTempSkillRoot(root: string): void {
+  if (!root || !root.includes('.nanoclaw-skills-')) return;
+  try {
+    fs.rmSync(root, { recursive: true, force: true });
+  } catch {
+    // Non-fatal — stale temp roots are swept on next startup.
+  }
 }
 
 function finalizeContainerProcess(sessionId: string, containerName: string, code: number | null): void {
@@ -437,7 +452,7 @@ function buildMounts(
   session: Session,
   containerConfig: import('./container-config.js').ContainerConfig,
   providerContribution: ProviderContainerContribution,
-): VolumeMount[] {
+): { mounts: VolumeMount[]; managedSkillsRoot: string } {
   const projectRoot = process.cwd();
 
   // Per-group filesystem state lives forever after first creation. Init is
@@ -445,98 +460,109 @@ function buildMounts(
   // is a no-op for groups that have spawned before.
   initGroupFilesystem(agentGroup);
 
-  const managedSkills = resolveManagedSkillRoot({ projectRoot, dataDir: DATA_DIR, env: process.env });
+  // Sweep stale temp roots from a previous process before creating ours.
+  cleanupStaleTempRoots(DATA_DIR);
 
-  // Sync skill symlinks based on container.json selection before mounting.
-  const claudeDir = path.join(DATA_DIR, 'v2-sessions', agentGroup.id, '.claude-shared');
-  syncManagedSkillSymlinks({ claudeDir, skillRoot: managedSkills.root, selection: containerConfig.skills });
+  // Create temp root here so we own its lifecycle. If any step below throws,
+  // the catch block ensures the temp dir is cleaned up.
+  const tempRoot = fs.mkdtempSync(path.join(DATA_DIR, '.nanoclaw-skills-'));
+  try {
+    const managedSkills = resolveManagedSkillRoot({ projectRoot, dataDir: DATA_DIR, env: process.env, root: tempRoot });
 
-  // Compose CLAUDE.md fresh every spawn from the shared base, enabled skill
-  // fragments, and MCP server instructions. See `claude-md-compose.ts`.
-  composeGroupClaudeMd(agentGroup);
+    // Sync skill symlinks based on container.json selection before mounting.
+    const claudeDir = path.join(DATA_DIR, 'v2-sessions', agentGroup.id, '.claude-shared');
+    syncManagedSkillSymlinks({ claudeDir, skillRoot: managedSkills.root, selection: containerConfig.skills });
 
-  const mounts: VolumeMount[] = [];
-  const sessDir = sessionDir(agentGroup.id, session.id);
-  ensureSessionWorkspaceDirs(agentGroup.id, session.id);
-  const groupDir = path.resolve(GROUPS_DIR, agentGroup.folder);
+    // Compose CLAUDE.md fresh every spawn from the shared base, enabled skill
+    // fragments, and MCP server instructions. See `claude-md-compose.ts`.
+    composeGroupClaudeMd(agentGroup);
 
-  // Session folder at /workspace (contains inbound.db, outbound.db, outbox/, .claude/)
-  mounts.push({ hostPath: sessDir, containerPath: '/workspace', readonly: false });
+    const mounts: VolumeMount[] = [];
+    const sessDir = sessionDir(agentGroup.id, session.id);
+    ensureSessionWorkspaceDirs(agentGroup.id, session.id);
+    const groupDir = path.resolve(GROUPS_DIR, agentGroup.folder);
 
-  // Agent group folder at /workspace/agent (RW for working files + CLAUDE.local.md)
-  mounts.push({ hostPath: groupDir, containerPath: '/workspace/agent', readonly: false });
+    // Session folder at /workspace (contains inbound.db, outbound.db, outbox/, .claude/)
+    mounts.push({ hostPath: sessDir, containerPath: '/workspace', readonly: false });
 
-  // container.json — nested RO mount on top of RW group dir so the agent
-  // can read its config but cannot modify it.
-  const containerJsonPath = path.join(groupDir, 'container.json');
-  if (fs.existsSync(containerJsonPath)) {
-    mounts.push({ hostPath: containerJsonPath, containerPath: '/workspace/agent/container.json', readonly: true });
+    // Agent group folder at /workspace/agent (RW for working files + CLAUDE.local.md)
+    mounts.push({ hostPath: groupDir, containerPath: '/workspace/agent', readonly: false });
+
+    // container.json — nested RO mount on top of RW group dir so the agent
+    // can read its config but cannot modify it.
+    const containerJsonPath = path.join(groupDir, 'container.json');
+    if (fs.existsSync(containerJsonPath)) {
+      mounts.push({ hostPath: containerJsonPath, containerPath: '/workspace/agent/container.json', readonly: true });
+    }
+
+    // Composer-managed CLAUDE.md artifacts — nested RO mounts. These are
+    // regenerated from the shared base + fragments on every spawn; any
+    // agent-side writes would be clobbered, so enforce read-only. Only
+    // CLAUDE.local.md (per-group memory) remains RW via the group-dir mount.
+    // `.claude-shared.md` is a symlink whose target (`/app/CLAUDE.md`) is
+    // already RO-mounted, so writes through it fail regardless — no need for
+    // a nested mount there.
+    const composedClaudeMd = path.join(groupDir, 'CLAUDE.md');
+    if (fs.existsSync(composedClaudeMd)) {
+      mounts.push({ hostPath: composedClaudeMd, containerPath: '/workspace/agent/CLAUDE.md', readonly: true });
+    }
+    const fragmentsDir = path.join(groupDir, '.claude-fragments');
+    if (fs.existsSync(fragmentsDir)) {
+      mounts.push({ hostPath: fragmentsDir, containerPath: '/workspace/agent/.claude-fragments', readonly: true });
+    }
+
+    // Global memory directory — always read-only.
+    const globalDir = path.join(GROUPS_DIR, 'global');
+    if (fs.existsSync(globalDir)) {
+      mounts.push({ hostPath: globalDir, containerPath: '/workspace/global', readonly: true });
+    }
+
+    // Shared CLAUDE.md — read-only, imported by the composed entry point via
+    // the `.claude-shared.md` symlink inside the group dir.
+    const sharedClaudeMd = path.join(process.cwd(), 'container', 'CLAUDE.md');
+    if (fs.existsSync(sharedClaudeMd)) {
+      mounts.push({ hostPath: sharedClaudeMd, containerPath: '/app/CLAUDE.md', readonly: true });
+    }
+
+    // Per-group .claude-shared at /home/node/.claude (Claude state, settings,
+    // skill symlinks)
+    mounts.push({ hostPath: claudeDir, containerPath: '/home/node/.claude', readonly: false });
+
+    // Shared agent-runner source — read-only, same code for all groups.
+    const agentRunnerSrc = path.join(projectRoot, 'container', 'agent-runner', 'src');
+    mounts.push({ hostPath: agentRunnerSrc, containerPath: '/app/src', readonly: true });
+
+    // Shared skills — read-only, symlinks in .claude-shared/skills/ point here.
+    mounts.push({ hostPath: managedSkills.root, containerPath: '/app/skills', readonly: true });
+
+    const portableSkillsMount = buildPortableSkillsMount(agentGroup);
+    if (portableSkillsMount) {
+      mounts.push(portableSkillsMount);
+    }
+
+    mounts.push(...buildManagedReposMounts(agentGroup));
+
+    const managedReposIpcMount = buildManagedReposIpcMount(agentGroup);
+    if (managedReposIpcMount) {
+      mounts.push(managedReposIpcMount);
+    }
+
+    // Additional mounts from container config
+    if (containerConfig.additionalMounts && containerConfig.additionalMounts.length > 0) {
+      const validated = validateAdditionalMounts(containerConfig.additionalMounts, agentGroup.name);
+      mounts.push(...validated);
+    }
+
+    // Provider-contributed mounts (e.g. opencode-xdg)
+    if (providerContribution.mounts) {
+      mounts.push(...providerContribution.mounts);
+    }
+
+    return { mounts, managedSkillsRoot: managedSkills.root };
+  } catch (_err) {
+    cleanupTempSkillRoot(tempRoot);
+    throw _err;
   }
-
-  // Composer-managed CLAUDE.md artifacts — nested RO mounts. These are
-  // regenerated from the shared base + fragments on every spawn; any
-  // agent-side writes would be clobbered, so enforce read-only. Only
-  // CLAUDE.local.md (per-group memory) remains RW via the group-dir mount.
-  // `.claude-shared.md` is a symlink whose target (`/app/CLAUDE.md`) is
-  // already RO-mounted, so writes through it fail regardless — no need for
-  // a nested mount there.
-  const composedClaudeMd = path.join(groupDir, 'CLAUDE.md');
-  if (fs.existsSync(composedClaudeMd)) {
-    mounts.push({ hostPath: composedClaudeMd, containerPath: '/workspace/agent/CLAUDE.md', readonly: true });
-  }
-  const fragmentsDir = path.join(groupDir, '.claude-fragments');
-  if (fs.existsSync(fragmentsDir)) {
-    mounts.push({ hostPath: fragmentsDir, containerPath: '/workspace/agent/.claude-fragments', readonly: true });
-  }
-
-  // Global memory directory — always read-only.
-  const globalDir = path.join(GROUPS_DIR, 'global');
-  if (fs.existsSync(globalDir)) {
-    mounts.push({ hostPath: globalDir, containerPath: '/workspace/global', readonly: true });
-  }
-
-  // Shared CLAUDE.md — read-only, imported by the composed entry point via
-  // the `.claude-shared.md` symlink inside the group dir.
-  const sharedClaudeMd = path.join(process.cwd(), 'container', 'CLAUDE.md');
-  if (fs.existsSync(sharedClaudeMd)) {
-    mounts.push({ hostPath: sharedClaudeMd, containerPath: '/app/CLAUDE.md', readonly: true });
-  }
-
-  // Per-group .claude-shared at /home/node/.claude (Claude state, settings,
-  // skill symlinks)
-  mounts.push({ hostPath: claudeDir, containerPath: '/home/node/.claude', readonly: false });
-
-  // Shared agent-runner source — read-only, same code for all groups.
-  const agentRunnerSrc = path.join(projectRoot, 'container', 'agent-runner', 'src');
-  mounts.push({ hostPath: agentRunnerSrc, containerPath: '/app/src', readonly: true });
-
-  // Shared skills — read-only, symlinks in .claude-shared/skills/ point here.
-  mounts.push({ hostPath: managedSkills.root, containerPath: '/app/skills', readonly: true });
-
-  const portableSkillsMount = buildPortableSkillsMount(agentGroup);
-  if (portableSkillsMount) {
-    mounts.push(portableSkillsMount);
-  }
-
-  mounts.push(...buildManagedReposMounts(agentGroup));
-
-  const managedReposIpcMount = buildManagedReposIpcMount(agentGroup);
-  if (managedReposIpcMount) {
-    mounts.push(managedReposIpcMount);
-  }
-
-  // Additional mounts from container config
-  if (containerConfig.additionalMounts && containerConfig.additionalMounts.length > 0) {
-    const validated = validateAdditionalMounts(containerConfig.additionalMounts, agentGroup.name);
-    mounts.push(...validated);
-  }
-
-  // Provider-contributed mounts (e.g. opencode-xdg)
-  if (providerContribution.mounts) {
-    mounts.push(...providerContribution.mounts);
-  }
-
-  return mounts;
 }
 
 export function buildPortableSkillsMount(

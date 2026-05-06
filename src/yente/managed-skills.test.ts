@@ -4,7 +4,7 @@ import path from 'path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { resolveManagedSkillRoot, syncManagedSkillSymlinks } from './managed-skills.js';
+import { clearManagedSkillRootCache, resolveManagedSkillRoot, syncManagedSkillSymlinks } from './managed-skills.js';
 
 const tempRoots: string[] = [];
 
@@ -22,6 +22,7 @@ function makeSkill(root: string, name: string): string {
 }
 
 afterEach(() => {
+  clearManagedSkillRootCache();
   for (const root of tempRoots.splice(0)) {
     fs.rmSync(root, { recursive: true, force: true });
   }
@@ -64,8 +65,8 @@ describe('resolveManagedSkillRoot', () => {
       },
     });
 
-    expect(result.root).toBe(path.join(dataDir, 'managed-skills'));
     expect(result.skills.map((skill) => skill.name).sort()).toEqual(['bundled-one', 'managed-one', 'portable-one']);
+    expect(result.root).toContain(path.join(dataDir, '.nanoclaw-skills-'));
     expect(fs.lstatSync(path.join(result.root, 'bundled-one')).isSymbolicLink()).toBe(false);
     expect(fs.lstatSync(path.join(result.root, 'managed-one')).isSymbolicLink()).toBe(false);
     expect(fs.lstatSync(path.join(result.root, 'portable-one')).isSymbolicLink()).toBe(false);
@@ -78,6 +79,62 @@ describe('resolveManagedSkillRoot', () => {
     expect(fs.readFileSync(path.join(result.root, 'portable-one', 'SKILL.md'), 'utf8')).toBe(
       fs.readFileSync(path.join(portableSkill, 'SKILL.md'), 'utf8'),
     );
+  });
+
+  it('gives each spawn an isolated root', () => {
+    const projectRoot = makeTempDir();
+    const dataDir = makeTempDir();
+    makeSkill(path.join(projectRoot, 'container', 'skills'), 'bundled-one');
+
+    const first = resolveManagedSkillRoot({ projectRoot, dataDir });
+    const second = resolveManagedSkillRoot({ projectRoot, dataDir });
+
+    // Each spawn gets a unique root — no sharing, no races
+    expect(first.root).not.toBe(second.root);
+    expect(first.skills.map((s) => s.name)).toEqual(['bundled-one']);
+    expect(second.skills.map((s) => s.name)).toEqual(['bundled-one']);
+  });
+
+  it('picks up skill changes between spawns (fresh copy each time)', () => {
+    const projectRoot = makeTempDir();
+    const dataDir = makeTempDir();
+    const writableRoot = makeTempDir();
+    const portableSkillsRoot = path.join(writableRoot, 'skills');
+
+    makeSkill(path.join(projectRoot, 'container', 'skills'), 'bundled-one');
+    makeSkill(portableSkillsRoot, 'portable-alpha');
+
+    const env = { NANOCLAW_WRITABLE_SKILLS_DIR: writableRoot };
+
+    const first = resolveManagedSkillRoot({ projectRoot, dataDir, env });
+    expect(first.skills.map((s) => s.name).sort()).toEqual(['bundled-one', 'portable-alpha']);
+
+    // Add a new portable skill between spawns
+    makeSkill(portableSkillsRoot, 'portable-beta');
+
+    const second = resolveManagedSkillRoot({ projectRoot, dataDir, env });
+    expect(second.skills.map((s) => s.name).sort()).toEqual(['bundled-one', 'portable-alpha', 'portable-beta']);
+    expect(fs.existsSync(path.join(second.root, 'portable-beta', 'SKILL.md'))).toBe(true);
+  });
+
+  it('reflects removed skills on next spawn', () => {
+    const projectRoot = makeTempDir();
+    const dataDir = makeTempDir();
+    const writableRoot = makeTempDir();
+    const portableSkillsRoot = path.join(writableRoot, 'skills');
+
+    makeSkill(path.join(projectRoot, 'container', 'skills'), 'bundled-one');
+    const portableAlpha = makeSkill(portableSkillsRoot, 'portable-alpha');
+    makeSkill(portableSkillsRoot, 'portable-beta');
+
+    const env = { NANOCLAW_WRITABLE_SKILLS_DIR: writableRoot };
+    const first = resolveManagedSkillRoot({ projectRoot, dataDir, env });
+    expect(first.skills.length).toBe(3);
+
+    fs.rmSync(portableAlpha, { recursive: true, force: true });
+
+    const second = resolveManagedSkillRoot({ projectRoot, dataDir, env });
+    expect(second.skills.map((s) => s.name).sort()).toEqual(['bundled-one', 'portable-beta']);
   });
 
   it('throws on duplicate skill names and names both source paths', () => {
