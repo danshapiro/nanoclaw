@@ -94,23 +94,27 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
 #     binary (linux-arm64 variant on our image). Without the allowlist
 #     the SDK fails at spawn time with "native binary not found".
 ENV PNPM_HOME="/pnpm"
-ENV PATH="$PNPM_HOME:$PATH"
+ENV PATH="${PNPM_HOME}/bin:${PNPM_HOME}:$PATH"
 RUN corepack enable
 
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     echo "only-built-dependencies[]=agent-browser" > /root/.npmrc && \
     echo "only-built-dependencies[]=esbuild" >> /root/.npmrc && \
     echo "only-built-dependencies[]=@anthropic-ai/claude-code" >> /root/.npmrc && \
-    printf 'export PNPM_HOME=/pnpm\nexport PATH=/pnpm:$PATH\n' > /etc/profile.d/pnpm-home.sh && \
+    printf 'export PNPM_HOME=/pnpm\nexport PATH=/pnpm/bin:/pnpm:$PATH\n' > /etc/profile.d/pnpm-home.sh && \
+    export PATH="/pnpm/bin:/pnpm:$PATH" && \
     pnpm install -g "vercel@${VERCEL_VERSION}"
 
 RUN --mount=type=cache,target=/root/.cache/pnpm \
+    export PATH="/pnpm/bin:/pnpm:$PATH" && \
     pnpm install -g "agent-browser@${AGENT_BROWSER_VERSION}"
 
 RUN --mount=type=cache,target=/root/.cache/pnpm \
+    export PATH="/pnpm/bin:/pnpm:$PATH" && \
     pnpm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
 
 RUN --mount=type=cache,target=/root/.cache/pnpm \
+    export PATH="/pnpm/bin:/pnpm:$PATH" && \
     pnpm install -g "opencode-ai@${OPENCODE_VERSION}"
 
 # ---- GWS policy proxy shim ---------------------------------------------------
