@@ -29,11 +29,10 @@ function killProcessTree(proc: ChildProcess): void {
   }
 }
 
-function spawnOpencodeServer(config: Record<string, unknown>, timeoutMs = 10_000): Promise<{ url: string; proc: ChildProcess }> {
+function spawnOpencodeServer(config: Record<string, unknown>, timeoutMs = 30_000): Promise<{ url: string; proc: ChildProcess }> {
   return new Promise((resolve, reject) => {
     const hostname = '127.0.0.1';
-    const port = 4096;
-    const proc = spawn('opencode', ['serve', `--hostname=${hostname}`, `--port=${port}`], {
+    const proc = spawn('opencode', ['serve', `--hostname=${hostname}`, `--port=0`], {
       env: {
         ...process.env,
         OPENCODE_CONFIG_CONTENT: JSON.stringify(config),
@@ -87,27 +86,14 @@ function buildOpenCodeConfig(options: ProviderOptions): Record<string, unknown> 
   const provider = process.env.OPENCODE_PROVIDER || 'anthropic';
   const model = process.env.OPENCODE_MODEL;
   const smallModel = process.env.OPENCODE_SMALL_MODEL;
-  const proxyUrl = process.env.ANTHROPIC_BASE_URL;
-
-  const providerModelId = model ? model.replace(new RegExp(`^${provider}/`), '') : undefined;
-  const providerSmallModelId = smallModel ? smallModel.replace(new RegExp(`^${provider}/`), '') : undefined;
-  const modelsToRegister = [providerModelId, providerSmallModelId]
-    .filter(Boolean)
-    .filter((mid, i, a) => a.indexOf(mid as string) === i);
+  const apiKey = process.env.OPENCODE_API_KEY || 'placeholder';
 
   const providerOptions: Record<string, unknown> =
     provider === 'anthropic'
       ? {}
       : {
           [provider]: {
-            options: { apiKey: 'placeholder', baseURL: proxyUrl },
-            ...(modelsToRegister.length > 0
-              ? {
-                  models: Object.fromEntries(
-                    modelsToRegister.map((mid) => [mid, { id: mid, name: mid, tool_call: true }]),
-                  ),
-                }
-              : {}),
+            options: { apiKey },
           },
         };
 

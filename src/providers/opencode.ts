@@ -9,7 +9,7 @@ registerProviderContainerConfig('opencode', ({ hostEnv }) => {
       OPENCODE_PROVIDER: hostEnv.OPENCODE_PROVIDER ?? 'opencode-go',
       OPENCODE_MODEL: hostEnv.OPENCODE_MODEL ?? 'opencode-go/deepseek-v4-pro',
       OPENCODE_SMALL_MODEL: hostEnv.OPENCODE_SMALL_MODEL ?? 'opencode-go/deepseek-v4-flash',
-      ANTHROPIC_BASE_URL: hostEnv.ANTHROPIC_BASE_URL ?? 'https://opencode.ai/zen/v1',
+      OPENCODE_API_KEY: hostEnv.OPENCODE_API_KEY ?? '',
     },
     extraHosts: YENTE_LOCAL_PROXY_HOSTNAMES,
   };
