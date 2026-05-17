@@ -16,6 +16,20 @@ const SESSION_STATUS_RETRY_ERROR_AFTER = 3;
 const STALE_SESSION_RE =
   /no conversation found|ENOENT.*\.jsonl|session.*not found|NotFoundError|connection reset|ECONNRESET|404|event timeout/i;
 
+function errorText(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === 'string') return err;
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return String(err);
+  }
+}
+
+export function isStaleSessionError(err: unknown): boolean {
+  return STALE_SESSION_RE.test(errorText(err));
+}
+
 function killProcessTree(proc: ChildProcess): void {
   if (!proc.pid) return;
   try {
@@ -29,7 +43,10 @@ function killProcessTree(proc: ChildProcess): void {
   }
 }
 
-function spawnOpencodeServer(config: Record<string, unknown>, timeoutMs = 30_000): Promise<{ url: string; proc: ChildProcess }> {
+function spawnOpencodeServer(
+  config: Record<string, unknown>,
+  timeoutMs = 30_000,
+): Promise<{ url: string; proc: ChildProcess }> {
   return new Promise((resolve, reject) => {
     const hostname = '127.0.0.1';
     const proc = spawn('opencode', ['serve', `--hostname=${hostname}`, `--port=0`], {
@@ -195,6 +212,84 @@ function sessionErrorMessage(props: { error?: unknown }): string {
   return JSON.stringify(props.error) || 'OpenCode session error';
 }
 
+type SessionClient = Pick<OpencodeClient['session'], 'create' | 'promptAsync'>;
+
+async function createSession(client: SessionClient): Promise<string> {
+  const created = await client.create();
+  if (created.error) {
+    throw new Error(`OpenCode: failed to create session: ${errorText(created.error)}`);
+  }
+  const sessionId = created.data?.id;
+  if (!sessionId) throw new Error('OpenCode: failed to create session (no id)');
+  return sessionId;
+}
+
+export async function promptSession(
+  client: SessionClient,
+  preferredSessionId: string | undefined,
+  text: string,
+): Promise<{ sessionId: string; recoveredFromStale: boolean }> {
+  let sessionId = preferredSessionId;
+  let recoveredFromStale = false;
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (!sessionId) {
+      sessionId = await createSession(client);
+    }
+
+    try {
+      const promptRes = await client.promptAsync({
+        path: { id: sessionId },
+        body: { parts: [{ type: 'text', text }] },
+      });
+      if (!promptRes.error) {
+        return { sessionId, recoveredFromStale };
+      }
+
+      const err = new Error(`OpenCode promptAsync: ${errorText(promptRes.error)}`);
+      if (preferredSessionId && sessionId === preferredSessionId && isStaleSessionError(err)) {
+        log(`Stale OpenCode session ${preferredSessionId}; starting a fresh session`);
+        sessionId = undefined;
+        recoveredFromStale = true;
+        continue;
+      }
+      throw err;
+    } catch (err) {
+      if (preferredSessionId && sessionId === preferredSessionId && isStaleSessionError(err)) {
+        log(`Stale OpenCode session ${preferredSessionId}; starting a fresh session`);
+        sessionId = undefined;
+        recoveredFromStale = true;
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  throw new Error('OpenCode promptAsync: stale session recovery exhausted');
+}
+
+export async function nextOpenCodeEvent<T>(
+  stream: AsyncGenerator<T, void, void>,
+  sessionId: string,
+  timeoutMs: number,
+  onTimeout: () => void,
+): Promise<IteratorResult<T, void>> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      stream.next(),
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => {
+          onTimeout();
+          reject(new Error(`OpenCode event timeout (${timeoutMs}ms) for session ${sessionId}`));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
 export class OpenCodeProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = false;
 
@@ -206,8 +301,7 @@ export class OpenCodeProvider implements AgentProvider {
   }
 
   isSessionInvalid(err: unknown): boolean {
-    const msg = err instanceof Error ? err.message : String(err);
-    return STALE_SESSION_RE.test(msg);
+    return isStaleSessionError(err);
   }
 
   query(input: QueryInput): AgentQuery {
@@ -249,131 +343,101 @@ export class OpenCodeProvider implements AgentProvider {
         if (pending.length === 0 && ended) return;
 
         const text = pending.shift()!;
-        let sessionId = self.activeSessionId;
+        const prompted = await promptSession(client.session, self.activeSessionId, text);
+        const sessionId = prompted.sessionId;
+        self.activeSessionId = sessionId;
 
-        if (!sessionId) {
-          const created = await client.session.create();
-          if (created.error) {
-            throw new Error(`OpenCode: failed to create session: ${JSON.stringify(created.error)}`);
-          }
-          sessionId = created.data?.id;
-          if (!sessionId) throw new Error('OpenCode: failed to create session (no id)');
-          self.activeSessionId = sessionId;
-        }
-
-        if (!initYielded) {
+        if (!initYielded || prompted.recoveredFromStale) {
           yield { type: 'init', continuation: sessionId };
           initYielded = true;
         }
 
-        const promptRes = await client.session.promptAsync({
-          path: { id: sessionId },
-          body: { parts: [{ type: 'text', text }] },
-        });
-        if (promptRes.error) {
-          self.activeSessionId = undefined;
-          throw new Error(`OpenCode promptAsync: ${JSON.stringify(promptRes.error)}`);
-        }
-
         const partTextByMessageId = new Map<string, string>();
         const roleByMessageId = new Map<string, string>();
-        let lastEventAt = Date.now();
-        let eventTimedOut = false;
-        const timeoutCheck = setInterval(() => {
-          if (Date.now() - lastEventAt > IDLE_TIMEOUT_MS) {
-            log(`OpenCode event timeout (${IDLE_TIMEOUT_MS}ms) — clearing session ${sessionId}`);
-            eventTimedOut = true;
+        const handleTimeout = () => {
+          log(`OpenCode event timeout (${IDLE_TIMEOUT_MS}ms) — clearing session ${sessionId}`);
+          self.activeSessionId = undefined;
+          destroySharedRuntime();
+        };
+
+        turn: while (true) {
+          if (aborted) return;
+
+          const { value: ev, done } = await nextOpenCodeEvent(stream, sessionId, IDLE_TIMEOUT_MS, handleTimeout);
+          if (done) {
             self.activeSessionId = undefined;
-            destroySharedRuntime();
-            kick();
+            throw new Error('OpenCode SSE stream ended unexpectedly');
           }
-        }, 5000);
 
-        try {
-          turn: while (true) {
-            if (aborted) return;
-            if (eventTimedOut) {
-              throw new Error(`OpenCode event timeout (${IDLE_TIMEOUT_MS}ms)`);
+          if (!ev?.type || ev.type === 'server.connected' || ev.type === 'server.heartbeat') continue;
+
+          yield { type: 'activity' };
+
+          switch (ev.type) {
+            case 'message.updated': {
+              const info = ev.properties.info as { id?: string; role?: string } | undefined;
+              if (info?.id && info?.role) {
+                roleByMessageId.set(info.id, info.role);
+              }
+              break;
             }
-
-            const { value: ev, done } = await stream.next();
-            if (done) {
-              throw new Error('OpenCode SSE stream ended unexpectedly');
+            case 'message.part.updated': {
+              const part = ev.properties.part as { type?: string; messageID?: string; text?: string } | undefined;
+              if (part?.type === 'text' && part.messageID && part.text) {
+                partTextByMessageId.set(part.messageID, part.text);
+              }
+              break;
             }
-
-            if (!ev?.type || ev.type === 'server.connected' || ev.type === 'server.heartbeat') continue;
-
-            lastEventAt = Date.now();
-            yield { type: 'activity' };
-
-            switch (ev.type) {
-              case 'message.updated': {
-                const info = ev.properties.info as { id?: string; role?: string } | undefined;
-                if (info?.id && info?.role) {
-                  roleByMessageId.set(info.id, info.role);
+            case 'permission.updated': {
+              const perm = ev.properties as { id?: string; sessionID?: string };
+              if (perm.sessionID === sessionId && perm.id) {
+                try {
+                  await client.postSessionIdPermissionsPermissionId({
+                    path: { id: sessionId, permissionID: perm.id },
+                    body: { response: 'always' },
+                  });
+                } catch (err) {
+                  log(`Failed to auto-reply permission: ${err instanceof Error ? err.message : String(err)}`);
                 }
-                break;
               }
-              case 'message.part.updated': {
-                const part = ev.properties.part as { type?: string; messageID?: string; text?: string } | undefined;
-                if (part?.type === 'text' && part.messageID && part.text) {
-                  partTextByMessageId.set(part.messageID, part.text);
-                }
-                break;
-              }
-              case 'permission.updated': {
-                const perm = ev.properties as { id?: string; sessionID?: string };
-                if (perm.sessionID === sessionId && perm.id) {
-                  try {
-                    await client.postSessionIdPermissionsPermissionId({
-                      path: { id: sessionId, permissionID: perm.id },
-                      body: { response: 'always' },
-                    });
-                  } catch (err) {
-                    log(`Failed to auto-reply permission: ${err instanceof Error ? err.message : String(err)}`);
-                  }
-                }
-                break;
-              }
-              case 'session.status': {
-                const props = ev.properties as {
-                  sessionID?: string;
-                  status?: { type?: string; attempt?: number; message?: string };
-                };
-                if (props.sessionID !== sessionId) break;
-                const st = props.status;
-                if (
-                  st?.type === 'retry' &&
-                  typeof st.attempt === 'number' &&
-                  st.attempt >= SESSION_STATUS_RETRY_ERROR_AFTER &&
-                  st.message
-                ) {
-                  self.activeSessionId = undefined;
-                  throw new Error(`OpenCode retry limit (${st.attempt}): ${st.message}`);
-                }
-                break;
-              }
-              case 'session.error': {
-                const props = ev.properties as { sessionID?: string; error?: unknown };
-                if (props.sessionID === sessionId || props.sessionID === undefined) {
-                  self.activeSessionId = undefined;
-                  throw new Error(sessionErrorMessage(props));
-                }
-                break;
-              }
-              case 'session.idle': {
-                const sid = (ev.properties as { sessionID?: string }).sessionID;
-                if (sid === sessionId) {
-                  break turn;
-                }
-                break;
-              }
-              default:
-                break;
+              break;
             }
+            case 'session.status': {
+              const props = ev.properties as {
+                sessionID?: string;
+                status?: { type?: string; attempt?: number; message?: string };
+              };
+              if (props.sessionID !== sessionId) break;
+              const st = props.status;
+              if (
+                st?.type === 'retry' &&
+                typeof st.attempt === 'number' &&
+                st.attempt >= SESSION_STATUS_RETRY_ERROR_AFTER &&
+                st.message
+              ) {
+                self.activeSessionId = undefined;
+                throw new Error(`OpenCode retry limit (${st.attempt}): ${st.message}`);
+              }
+              break;
+            }
+            case 'session.error': {
+              const props = ev.properties as { sessionID?: string; error?: unknown };
+              if (props.sessionID === sessionId || props.sessionID === undefined) {
+                self.activeSessionId = undefined;
+                throw new Error(sessionErrorMessage(props));
+              }
+              break;
+            }
+            case 'session.idle': {
+              const sid = (ev.properties as { sessionID?: string }).sessionID;
+              if (sid === sessionId) {
+                break turn;
+              }
+              break;
+            }
+            default:
+              break;
           }
-        } finally {
-          clearInterval(timeoutCheck);
         }
 
         let resultText = '';

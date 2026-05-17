@@ -3,14 +3,60 @@
  * ACTION-ITEMS item 9. Lives on the pure helper `decideStuckAction` so we
  * don't have to mock the filesystem or the container runner.
  */
+import Database from 'better-sqlite3';
 import { describe, expect, it } from 'vitest';
 
-import { ABSOLUTE_CEILING_MS, CLAIM_STUCK_MS, decideStuckAction } from './host-sweep.js';
+import { getProcessingClaims } from './db/session-db.js';
+import {
+  ABSOLUTE_CEILING_MS,
+  CLAIM_STUCK_MS,
+  decideStuckAction,
+  parseSqliteUtc,
+  resetStuckProcessingRows,
+} from './host-sweep.js';
+import type { Session } from './types.js';
 
 const BASE = Date.parse('2026-04-20T12:00:00.000Z');
 
 function claim(id: string, offsetMs: number) {
   return { message_id: id, status_changed: new Date(BASE - offsetMs).toISOString() };
+}
+
+function fakeSession(): Session {
+  return {
+    id: 'sess-test',
+    agent_group_id: 'ag-test',
+    messaging_group_id: null,
+    thread_id: null,
+    agent_provider: null,
+    status: 'active',
+    container_status: 'running',
+    last_active: null,
+    created_at: new Date(BASE).toISOString(),
+  };
+}
+
+function testDbs() {
+  const inDb = new Database(':memory:');
+  inDb.exec(`
+    CREATE TABLE messages_in (
+      id            TEXT PRIMARY KEY,
+      status        TEXT DEFAULT 'pending',
+      tries         INTEGER DEFAULT 0,
+      process_after TEXT
+    );
+  `);
+
+  const outDb = new Database(':memory:');
+  outDb.exec(`
+    CREATE TABLE processing_ack (
+      message_id     TEXT PRIMARY KEY,
+      status         TEXT NOT NULL,
+      status_changed TEXT NOT NULL
+    );
+  `);
+
+  return { inDb, outDb };
 }
 
 describe('decideStuckAction', () => {
@@ -142,5 +188,64 @@ describe('decideStuckAction', () => {
       claims: [{ message_id: 'x', status_changed: 'not-a-date' }],
     });
     expect(res.action).toBe('ok');
+  });
+});
+
+describe('parseSqliteUtc', () => {
+  const utcMs = Date.parse('2026-04-20T12:00:00.000Z');
+
+  it('treats a SQLite-style timestamp with no zone marker as UTC', () => {
+    expect(parseSqliteUtc('2026-04-20 12:00:00')).toBe(utcMs);
+    expect(parseSqliteUtc('2026-04-20T12:00:00')).toBe(utcMs);
+    expect(parseSqliteUtc('2026-04-20T12:00:00.000')).toBe(utcMs);
+  });
+
+  it('preserves explicit timezone markers', () => {
+    expect(parseSqliteUtc('2026-04-20T12:00:00.000Z')).toBe(utcMs);
+    expect(parseSqliteUtc('2026-04-20T14:00:00+02:00')).toBe(utcMs);
+    expect(parseSqliteUtc('2026-04-20T07:00:00-0500')).toBe(utcMs);
+  });
+
+  it('returns NaN for unparseable input', () => {
+    expect(Number.isNaN(parseSqliteUtc('not a date'))).toBe(true);
+  });
+});
+
+describe('resetStuckProcessingRows', () => {
+  it('clears orphan processing claims when retrying a stale pending message', () => {
+    const { inDb, outDb } = testDbs();
+    inDb.prepare("INSERT INTO messages_in (id, status, tries) VALUES ('m-1', 'pending', 0)").run();
+    outDb.prepare("INSERT INTO processing_ack VALUES ('m-1', 'processing', ?)").run('2026-04-20 11:00:00');
+
+    resetStuckProcessingRows(inDb, outDb, fakeSession(), 'absolute-ceiling', outDb);
+
+    expect(getProcessingClaims(outDb)).toEqual([]);
+    const row = inDb.prepare("SELECT tries, process_after as processAfter FROM messages_in WHERE id = 'm-1'").get() as {
+      tries: number;
+      processAfter: string | null;
+    };
+    expect(row.tries).toBe(1);
+    expect(row.processAfter).not.toBeNull();
+
+    inDb.close();
+    outDb.close();
+  });
+
+  it('does not bump retries for a message already backed off into the future', () => {
+    const { inDb, outDb } = testDbs();
+    const future = new Date(Date.now() + 60_000).toISOString();
+    inDb
+      .prepare("INSERT INTO messages_in (id, status, tries, process_after) VALUES ('m-2', 'pending', 1, ?)")
+      .run(future);
+    outDb.prepare("INSERT INTO processing_ack VALUES ('m-2', 'processing', ?)").run('2026-04-20 11:00:00');
+
+    resetStuckProcessingRows(inDb, outDb, fakeSession(), 'claim-stuck', outDb);
+
+    expect(getProcessingClaims(outDb)).toEqual([]);
+    const row = inDb.prepare("SELECT tries FROM messages_in WHERE id = 'm-2'").get() as { tries: number };
+    expect(row.tries).toBe(1);
+
+    inDb.close();
+    outDb.close();
   });
 });

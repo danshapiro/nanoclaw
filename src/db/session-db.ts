@@ -32,6 +32,14 @@ export function openOutboundDb(dbPath: string): Database.Database {
   return db;
 }
 
+/** Open the outbound DB for a session with write access. Only safe to call when no container is running. */
+export function openOutboundDbRw(dbPath: string): Database.Database {
+  const db = new Database(dbPath);
+  db.pragma('journal_mode = DELETE');
+  db.pragma('busy_timeout = 5000');
+  return db;
+}
+
 /** Open the outbound DB for host-authored direct responses. */
 export function openOutboundDbForWrite(dbPath: string): Database.Database {
   const db = new Database(dbPath);
@@ -186,6 +194,15 @@ export function getProcessingClaims(outDb: Database.Database): ProcessingClaim[]
   return outDb
     .prepare("SELECT message_id, status_changed FROM processing_ack WHERE status = 'processing'")
     .all() as ProcessingClaim[];
+}
+
+/**
+ * Delete orphan 'processing' rows. Called by the host after killing a
+ * container so the leftover claim doesn't trip claim-stuck on the next sweep
+ * tick before the fresh agent-runner can clear stale rows on startup.
+ */
+export function deleteOrphanProcessingClaims(outDb: Database.Database): number {
+  return outDb.prepare("DELETE FROM processing_ack WHERE status = 'processing'").run().changes;
 }
 
 export interface ContainerState {
