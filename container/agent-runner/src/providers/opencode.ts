@@ -290,6 +290,30 @@ export async function nextOpenCodeEvent<T>(
   }
 }
 
+function isOpenCodeKeepaliveEvent(ev: { type?: string } | undefined): boolean {
+  return !ev?.type || ev.type === 'server.connected' || ev.type === 'server.heartbeat';
+}
+
+export async function nextMeaningfulOpenCodeEvent<T extends { type?: string }>(
+  stream: AsyncGenerator<T, void, void>,
+  sessionId: string,
+  timeoutMs: number,
+  onTimeout: () => void,
+): Promise<IteratorResult<T, void>> {
+  const deadline = Date.now() + timeoutMs;
+
+  while (true) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) {
+      onTimeout();
+      throw new Error(`OpenCode event timeout (${timeoutMs}ms) for session ${sessionId}`);
+    }
+
+    const result = await nextOpenCodeEvent(stream, sessionId, remainingMs, onTimeout);
+    if (result.done || !isOpenCodeKeepaliveEvent(result.value)) return result;
+  }
+}
+
 export class OpenCodeProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = false;
 
@@ -363,13 +387,16 @@ export class OpenCodeProvider implements AgentProvider {
         turn: while (true) {
           if (aborted) return;
 
-          const { value: ev, done } = await nextOpenCodeEvent(stream, sessionId, IDLE_TIMEOUT_MS, handleTimeout);
+          const { value: ev, done } = await nextMeaningfulOpenCodeEvent(
+            stream,
+            sessionId,
+            IDLE_TIMEOUT_MS,
+            handleTimeout,
+          );
           if (done) {
             self.activeSessionId = undefined;
             throw new Error('OpenCode SSE stream ended unexpectedly');
           }
-
-          if (!ev?.type || ev.type === 'server.connected' || ev.type === 'server.heartbeat') continue;
 
           yield { type: 'activity' };
 

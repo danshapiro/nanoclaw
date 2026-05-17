@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'bun:test';
 
-import { isStaleSessionError, nextOpenCodeEvent, promptSession } from './opencode.js';
+import { isStaleSessionError, nextMeaningfulOpenCodeEvent, nextOpenCodeEvent, promptSession } from './opencode.js';
 
 describe('OpenCodeProvider stale session handling', () => {
   it('classifies missing OpenCode sessions as stale continuations', () => {
@@ -67,6 +67,40 @@ describe('nextOpenCodeEvent', () => {
     let timedOut = false;
     await expect(
       nextOpenCodeEvent(stream(), 's1', 5, () => {
+        timedOut = true;
+      }),
+    ).rejects.toThrow(/OpenCode event timeout/);
+    expect(timedOut).toBe(true);
+  });
+});
+
+describe('nextMeaningfulOpenCodeEvent', () => {
+  it('skips keepalive events while waiting for meaningful provider progress', async () => {
+    async function* stream() {
+      yield { type: 'server.connected', properties: {} };
+      yield { type: 'server.heartbeat', properties: {} };
+      yield { type: 'session.idle', properties: { sessionID: 's1' } };
+    }
+
+    const result = await nextMeaningfulOpenCodeEvent(stream(), 's1', 50, () => {
+      throw new Error('unexpected timeout');
+    });
+
+    expect(result.done).toBe(false);
+    expect(result.value?.type).toBe('session.idle');
+  });
+
+  it('does not let heartbeat-only streams reset the idle timeout', async () => {
+    async function* stream() {
+      while (true) {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        yield { type: 'server.heartbeat', properties: {} };
+      }
+    }
+
+    let timedOut = false;
+    await expect(
+      nextMeaningfulOpenCodeEvent(stream(), 's1', 8, () => {
         timedOut = true;
       }),
     ).rejects.toThrow(/OpenCode event timeout/);
