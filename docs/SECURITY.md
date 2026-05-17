@@ -4,8 +4,7 @@
 
 | Entity | Trust Level | Rationale |
 |--------|-------------|-----------|
-| Main group | Trusted | Private self-chat, admin control |
-| Non-main groups | Untrusted | Other users may be malicious |
+| Agent groups | Trusted according to their channel membership | Each group is an isolated conversation/workspace, not a privilege tier |
 | Container agents | Sandboxed | Isolated execution environment |
 | Incoming messages | User input | Potential prompt injection |
 
@@ -38,11 +37,11 @@ private_key, .secret
 **Protections:**
 - Symlink resolution before validation (prevents traversal attacks)
 - Container path validation (rejects `..` and absolute paths)
-- `nonMainReadOnly` option forces read-only for non-main groups
+- Additional mounts are read-only unless the allowlisted root permits read-write and the group config explicitly requests it
 
-**Read-Only Project Root:**
+**Shared Workspace Mounts:**
 
-The main group's project root is mounted read-only. Writable paths the agent needs (store, group folder, IPC, `.claude/`) are mounted separately. This prevents the agent from modifying host application code (`src/`, `dist/`, `package.json`, etc.) which would bypass the sandbox entirely on next restart. The `store/` directory is mounted read-write so the main agent can access the SQLite database directly.
+Every agent group gets the same shared project surfaces: managed repos at `/workspace/repos`, portable skill authoring at `/workspace/portable-skills`, and managed-repo IPC at `/workspace/ipc`. Release source and host configuration remain outside the container; agents only see explicit bind mounts.
 
 ### 3. Session Isolation
 
@@ -89,15 +88,16 @@ Yente agents use `GWS_PROXY_URL` and the `/usr/local/bin/gws` shim for Google Wo
 
 ## Privilege Comparison
 
-| Capability | Main Group | Non-Main Group |
-|------------|------------|----------------|
-| Project root access | `/workspace/project` (ro) | None |
-| Store (SQLite DB) | `/workspace/project/store` (rw) | None |
-| Group folder | `/workspace/group` (rw) | `/workspace/group` (rw) |
-| Global memory | Implicit via project | `/workspace/global` (ro) |
-| Additional mounts | Configurable | Read-only unless allowed |
-| Network access | Unrestricted | Unrestricted |
-| MCP tools | All | All |
+| Capability | Agent Groups |
+|------------|--------------|
+| Group folder | `/workspace/agent` (rw) |
+| Global memory | `/workspace/global` (ro) |
+| Managed project repos | `/workspace/repos` and `/workspace/extra/repos` (rw) |
+| Portable skill checkout | `/workspace/portable-skills` (rw) |
+| Managed-repo IPC | `/workspace/ipc` (rw) |
+| Additional mounts | Configurable; read-only unless explicitly allowed read-write |
+| Network access | Unrestricted |
+| MCP tools | All configured tools for the group |
 
 ## Security Architecture Diagram
 

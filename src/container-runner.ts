@@ -572,11 +572,11 @@ function buildMounts(
 }
 
 export function buildPortableSkillsMount(
-  agentGroup: Pick<AgentGroup, 'folder'>,
+  _agentGroup: Pick<AgentGroup, 'folder'>,
   env: NodeJS.ProcessEnv = process.env,
 ): VolumeMount | null {
   const writableDir = env.NANOCLAW_WRITABLE_SKILLS_DIR?.trim();
-  if (!writableDir || agentGroup.folder !== 'main') return null;
+  if (!writableDir) return null;
   return {
     hostPath: writableDir,
     containerPath: '/workspace/portable-skills',
@@ -585,11 +585,11 @@ export function buildPortableSkillsMount(
 }
 
 export function buildManagedReposMounts(
-  agentGroup: Pick<AgentGroup, 'folder'>,
+  _agentGroup: Pick<AgentGroup, 'folder'>,
   env: NodeJS.ProcessEnv = process.env,
 ): VolumeMount[] {
   const managedReposDir = env.NANOCLAW_MANAGED_REPOS_DIR?.trim() || MANAGED_REPOS_DIR;
-  if (!managedReposDir || agentGroup.folder !== 'main') return [];
+  if (!managedReposDir) return [];
   if (!fs.existsSync(managedReposDir)) {
     throw new Error(`NANOCLAW_MANAGED_REPOS_DIR must exist: ${managedReposDir}`);
   }
@@ -608,7 +608,6 @@ export function buildManagedReposMounts(
 }
 
 export function buildManagedReposIpcMount(agentGroup: Pick<AgentGroup, 'folder'>): VolumeMount | null {
-  if (agentGroup.folder !== 'main') return null;
   const hostPath = resolveGroupIpcPath(agentGroup.folder);
   fs.mkdirSync(path.join(hostPath, 'tasks'), { recursive: true });
   fs.mkdirSync(path.join(hostPath, 'responses'), { recursive: true });

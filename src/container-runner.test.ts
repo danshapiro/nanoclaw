@@ -113,7 +113,7 @@ describe('portable skills mount', () => {
     created_at: '2026-04-25T00:00:00.000Z',
   };
 
-  it('mounts the writable portable skills root only for the main group', () => {
+  it('mounts the writable portable skills root for any agent group', () => {
     expect(
       buildPortableSkillsMount(baseGroup, {
         NANOCLAW_WRITABLE_SKILLS_DIR: '/srv/nanoclaw/shared/repos/portable-skills',
@@ -125,14 +125,18 @@ describe('portable skills mount', () => {
     });
   });
 
-  it('does not mount portable authoring for non-main groups', () => {
+  it('uses the same portable authoring mount for non-main groups', () => {
     const researchGroup: AgentGroup = { ...baseGroup, id: 'ag-research', folder: 'research', name: 'Research' };
 
     expect(
       buildPortableSkillsMount(researchGroup, {
         NANOCLAW_WRITABLE_SKILLS_DIR: '/srv/nanoclaw/shared/repos/portable-skills',
       }),
-    ).toBeNull();
+    ).toEqual({
+      hostPath: '/srv/nanoclaw/shared/repos/portable-skills',
+      containerPath: '/workspace/portable-skills',
+      readonly: false,
+    });
   });
 });
 
@@ -183,7 +187,7 @@ describe('managed repos mounts', () => {
     created_at: '2026-04-25T00:00:00.000Z',
   };
 
-  it('mounts the managed repos root for main at the stable path and Claude additional-dir path', () => {
+  it('mounts the managed repos root at the stable path and provider additional-dir path', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-managed-repos-'));
     try {
       expect(
@@ -207,15 +211,19 @@ describe('managed repos mounts', () => {
     }
   });
 
-  it('does not mount managed repos for non-main groups', () => {
+  it('mounts managed repos for non-main groups too', () => {
     const researchGroup: AgentGroup = { ...baseGroup, id: 'ag-research', folder: 'research', name: 'Research' };
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-managed-repos-'));
 
-    const mounts = buildManagedReposMounts(researchGroup, {
-      NANOCLAW_MANAGED_REPOS_DIR: '/srv/nanoclaw/shared/repos/projects',
-    });
+    try {
+      const mounts = buildManagedReposMounts(researchGroup, {
+        NANOCLAW_MANAGED_REPOS_DIR: root,
+      });
 
-    expect(mounts).toEqual([]);
-    expect(mounts.map((mount) => mount.containerPath)).not.toContain('/workspace/repos');
+      expect(mounts.map((mount) => mount.containerPath)).toEqual(['/workspace/repos', '/workspace/extra/repos']);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('fails closed when the configured managed repos root is missing', () => {
@@ -226,16 +234,19 @@ describe('managed repos mounts', () => {
     ).toThrow('NANOCLAW_MANAGED_REPOS_DIR must exist');
   });
 
-  it('mounts the main managed-repos IPC namespace for legacy reconcile requests', () => {
+  it('mounts the group managed-repos IPC namespace for reconcile requests', () => {
     expect(buildManagedReposIpcMount(baseGroup)).toMatchObject({
       containerPath: '/workspace/ipc',
       readonly: false,
     });
   });
 
-  it('does not mount managed-repos IPC for non-main groups', () => {
+  it('mounts managed-repos IPC for non-main groups too', () => {
     const researchGroup: AgentGroup = { ...baseGroup, id: 'ag-research', folder: 'research', name: 'Research' };
-    expect(buildManagedReposIpcMount(researchGroup)).toBeNull();
+    expect(buildManagedReposIpcMount(researchGroup)).toMatchObject({
+      containerPath: '/workspace/ipc',
+      readonly: false,
+    });
   });
 });
 

@@ -69,21 +69,17 @@ function notifyAgent(session: Session, text: string): void {
   }
 }
 
-function requireMainGroup(session: Session): boolean {
+function requireKnownGroup(session: Session): boolean {
   const group = getAgentGroup(session.agent_group_id);
   if (!group) {
     notifyAgent(session, 'managed repos action failed: source agent group not found.');
-    return false;
-  }
-  if (group.folder !== 'main') {
-    notifyAgent(session, 'managed repos actions are only available to the main agent group.');
     return false;
   }
   return true;
 }
 
 async function applyManagedRepos(session: Session): Promise<void> {
-  if (!requireMainGroup(session)) return;
+  if (!requireKnownGroup(session)) return;
   try {
     const result = await runManagedRepoCommand('apply-managed-repos.sh');
     notifyAgent(session, formatCommandResult('apply_managed_repos', result));
@@ -94,7 +90,7 @@ async function applyManagedRepos(session: Session): Promise<void> {
 }
 
 async function pushManagedRepo(content: Record<string, unknown>, session: Session): Promise<void> {
-  if (!requireMainGroup(session)) return;
+  if (!requireKnownGroup(session)) return;
   const repoId = content.repoId;
   if (typeof repoId !== 'string' || !REPO_ID_RE.test(repoId)) {
     notifyAgent(session, 'push_managed_repo failed: repoId must be a managed repo id.');

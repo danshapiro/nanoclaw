@@ -26,7 +26,7 @@ Always emit these checks in this order:
 
 1. `skill_named_invocation`
 2. `allowed_tool_surface`
-3. `portable_repo_visible_on_main`
+3. `portable_repo_visible`
 4. `portable_repo_writable`
 5. `portable_repo_git_ok`
 6. `settings_json_valid`
@@ -86,7 +86,7 @@ If any required family is missing, mark this check failed.
 
 ### 3. Portable Repo Checks
 
-- `portable_repo_visible_on_main`: verify `/workspace/portable-skills` exists.
+- `portable_repo_visible`: verify `/workspace/portable-skills` exists.
 - `portable_repo_writable`: create and remove a temporary file under `/workspace/portable-skills/.qa/`.
 - `portable_repo_git_ok`: verify `/workspace/portable-skills` is a git working tree and ends clean after the probe.
 

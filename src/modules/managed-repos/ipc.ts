@@ -62,18 +62,6 @@ async function processManagedReposIpcTask(data: ManagedReposIpcTask, sourceGroup
   }
   const repoId = 'repoId' in data ? data.repoId : undefined;
 
-  if (sourceGroup !== 'main') {
-    writeResponse(sourceGroup, {
-      ok: false,
-      requestId: data.requestId,
-      type: data.type,
-      repoId,
-      stdout: '',
-      stderr: `${data.type} is only available to the main group`,
-    });
-    return true;
-  }
-
   if (data.type === 'push_managed_repo' && !data.repoId) {
     writeResponse(sourceGroup, {
       ok: false,

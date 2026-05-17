@@ -1,6 +1,6 @@
 ## Managed Project Repos
 
-The main agent has managed project repos at `/workspace/repos/<repo-id>`.
+Every agent group has managed project repos at `/workspace/repos/<repo-id>`.
 Status is recorded at `/workspace/repos/.managed/status.json`.
 
 When you change `/workspace/portable-skills/repos/manifest.json` or committed prompt/config state inside `/workspace/repos/yente-context`, call:

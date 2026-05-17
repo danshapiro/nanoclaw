@@ -84,11 +84,11 @@ Anthropic credentials must be either an API key from console.anthropic.com (`ANT
 
 ## Container Mounts
 
-Main has writable access to group state, managed project repos, portable skill authoring, and managed-repo IPC:
+Each agent group has writable access to its own group state, managed project repos, portable skill authoring, and managed-repo IPC:
 
 | Container Path | Host Path | Access |
 |----------------|-----------|--------|
-| `/workspace/agent` | `groups/main/` | read-write |
+| `/workspace/agent` | this group's state directory | read-write |
 | `/workspace/global` | `groups/global/` | read-only |
 | `/workspace/portable-skills` | shared portable-skills repo | read-write |
 | `/workspace/repos/<repo-id>` | managed project repos | read-write |
@@ -97,11 +97,11 @@ Main has writable access to group state, managed project repos, portable skill a
 | `/workspace/extra` | provider-visible extra mounts | read-only or read-write by mount |
 
 Key paths inside the container:
-- `/workspace/agent/CLAUDE.local.md` - main group durable local memory
+- `/workspace/agent/CLAUDE.local.md` - this group's durable local memory
 - `/workspace/repos/yente-context` - canonical managed prompt/config authoring repo
 - `/workspace/repos/summarize-dnd` - managed D&D summarizer repo
 - `/workspace/repos/.managed/status.json` - last managed-repo reconciliation status
-- `/workspace/portable-skills` - main-group portable skill authoring checkout
+- `/workspace/portable-skills` - portable skill authoring checkout
 - `/workspace/ipc` - request directory for `apply_managed_repos` and `push_managed_repo`
 
 ---
@@ -157,12 +157,12 @@ Fields:
 - **folder**: Channel-prefixed folder name under `groups/` for this group's files and memory
 - **trigger**: The trigger word (usually same as global, but could differ)
 - **requiresTrigger**: Whether `@trigger` prefix is needed (default: `true`). Set to `false` for solo/personal chats where all messages should be processed
-- **isMain**: Whether this is the main control group (elevated privileges, no trigger required)
+- **isMain**: Legacy flag for the original main control group. Do not treat it as a repository, skill, or workspace privilege tier.
 - **added_at**: ISO timestamp when registered
 
 ### Trigger Behavior
 
-- **Main group** (`isMain: true`): No trigger needed — all messages are processed automatically
+- **Legacy main group** (`isMain: true`): No trigger needed — all messages are processed automatically
 - **Groups with `requiresTrigger: false`**: No trigger needed — all messages processed (use for 1-on-1 or solo chats)
 - **Other groups** (default): Messages must start with `@AssistantName` to be processed
 
