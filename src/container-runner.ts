@@ -23,7 +23,13 @@ import {
 import { loadAgentMcpConfigForGroup } from './agent-mcp-config.js';
 import { type AgentMcpBridge, startAgentMcpBridge } from './agent-mcp-bridge.js';
 import { readContainerConfig, writeContainerConfig } from './container-config.js';
-import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
+import {
+  CONTAINER_RUNTIME_BIN,
+  hostGatewayArgs,
+  readonlyMountArgs,
+  stopContainer,
+  stopContainerAsync,
+} from './container-runtime.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable, isDbInitialized } from './db/connection.js';
@@ -298,6 +304,50 @@ export function killContainer(sessionId: string, reason: string): void {
     stopContainer(entry.containerName);
   } catch {
     entry.process.kill('SIGKILL');
+  }
+}
+
+function processAppearsAlive(proc: ChildProcess): boolean {
+  if (!proc.pid) return false;
+  try {
+    process.kill(proc.pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function cleanupContainerForSession(sessionId: string, reason: string): Promise<boolean> {
+  const entry = activeContainers.get(sessionId);
+  if (!entry) return false;
+
+  log.info('Cleaning up container for superseded session', {
+    sessionId,
+    reason,
+    containerName: entry.containerName,
+  });
+
+  try {
+    await stopContainerAsync(entry.containerName);
+    return true;
+  } catch (stopErr) {
+    if (!processAppearsAlive(entry.process)) {
+      log.info('Superseded session container already exited during cleanup', {
+        sessionId,
+        reason,
+        containerName: entry.containerName,
+      });
+      return true;
+    }
+    try {
+      entry.process.kill('SIGKILL');
+      return true;
+    } catch (killErr) {
+      if (!processAppearsAlive(entry.process)) {
+        return true;
+      }
+      throw new AggregateError([stopErr, killErr], `Failed to clean up container for session ${sessionId}`);
+    }
   }
 }
 

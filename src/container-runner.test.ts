@@ -52,7 +52,15 @@ async function loadContainerRunnerHarness() {
 
   const oneCliStarted = deferred();
   const oneCliRelease = deferred();
-  const spawnMock = vi.fn(() => fakeChildProcess());
+  const spawnedProcesses: Array<ReturnType<typeof fakeChildProcess>> = [];
+  const spawnMock = vi.fn(() => {
+    const proc = fakeChildProcess(12345 + spawnedProcesses.length);
+    spawnedProcesses.push(proc);
+    return proc;
+  });
+  const execFileMock = vi.fn((_file, _args, _options, cb) => {
+    cb(null, '', '');
+  });
   const execSyncMock = vi.fn();
   const applyContainerConfigMock = vi.fn(async () => {
     oneCliStarted.resolve();
@@ -65,6 +73,7 @@ async function loadContainerRunnerHarness() {
     const actual = await importOriginal<typeof import('child_process')>();
     return {
       ...actual,
+      execFile: execFileMock,
       execSync: execSyncMock,
       spawn: spawnMock,
     };
@@ -144,6 +153,8 @@ async function loadContainerRunnerHarness() {
     oneCliStarted,
     session,
     sessions,
+    execFileMock,
+    spawnedProcesses,
     spawnMock,
   };
 }
@@ -267,6 +278,65 @@ describe('session wake lifecycle', () => {
       expect(harness.applyContainerConfigMock).toHaveBeenCalled();
       expect(harness.spawnMock).not.toHaveBeenCalled();
       expect(harness.sessions.getSession(harness.session.id)?.container_status).toBe('stopped');
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('stops the active container for a superseded session asynchronously', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      const wake = harness.containerRunner.wakeContainer(harness.session);
+      await harness.oneCliStarted.promise;
+      harness.oneCliRelease.resolve();
+      await wake;
+
+      await expect(
+        harness.containerRunner.cleanupContainerForSession(harness.session.id, 'yente-session-reset'),
+      ).resolves.toBe(true);
+
+      const containerName = harness.spawnMock.mock.calls[0][1][3];
+      expect(harness.execFileMock).toHaveBeenCalledWith(
+        'docker',
+        ['stop', '-t', '1', containerName],
+        { timeout: 5000 },
+        expect.any(Function),
+      );
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('throws when async stop and process kill both fail', async () => {
+    const harness = await loadContainerRunnerHarness();
+    const processKill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    try {
+      harness.execFileMock.mockImplementationOnce((_file, _args, _options, cb) => {
+        cb(new Error('stop failed'));
+      });
+      const wake = harness.containerRunner.wakeContainer(harness.session);
+      await harness.oneCliStarted.promise;
+      harness.oneCliRelease.resolve();
+      await wake;
+      harness.spawnedProcesses[0].kill.mockImplementationOnce(() => {
+        throw new Error('kill failed');
+      });
+
+      await expect(
+        harness.containerRunner.cleanupContainerForSession(harness.session.id, 'yente-session-reset'),
+      ).rejects.toThrow('Failed to clean up container for session');
+    } finally {
+      processKill.mockRestore();
+      harness.close();
+    }
+  });
+
+  it('returns false when no active container exists for the session', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      await expect(
+        harness.containerRunner.cleanupContainerForSession('missing-session', 'yente-session-reset'),
+      ).resolves.toBe(false);
     } finally {
       harness.close();
     }

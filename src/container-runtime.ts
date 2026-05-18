@@ -2,7 +2,7 @@
  * Container runtime abstraction for NanoClaw.
  * All runtime-specific logic lives here so swapping runtimes means changing one file.
  */
-import { execSync } from 'child_process';
+import { execFile, execSync } from 'child_process';
 import os from 'os';
 
 import { CONTAINER_INSTALL_LABEL } from './config.js';
@@ -38,6 +38,18 @@ export function stopContainer(name: string): void {
     throw new Error(`Invalid container name: ${name}`);
   }
   execSync(`${CONTAINER_RUNTIME_BIN} stop -t 1 ${name}`, { stdio: 'pipe' });
+}
+
+export function stopContainerAsync(name: string): Promise<void> {
+  if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(name)) {
+    return Promise.reject(new Error(`Invalid container name: ${name}`));
+  }
+  return new Promise((resolve, reject) => {
+    execFile(CONTAINER_RUNTIME_BIN, ['stop', '-t', '1', name], { timeout: 5000 }, (err) => {
+      if (err) reject(err);
+      else resolve();
+    });
+  });
 }
 
 /** Ensure the container runtime is running, starting it if needed. */
