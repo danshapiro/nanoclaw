@@ -11,7 +11,7 @@ import { TIMEZONE, formatLocalTime } from './timezone.js';
  */
 export type CommandCategory = 'admin' | 'filtered' | 'passthrough' | 'none';
 
-const ADMIN_COMMANDS = new Set(['/remote-control', '/clear', '/compact', '/context', '/cost', '/files']);
+const ADMIN_COMMANDS = new Set(['/remote-control', '/compact', '/context', '/cost', '/files']);
 const FILTERED_COMMANDS = new Set(['/help', '/login', '/logout', '/doctor', '/config', '/start']);
 
 export interface CommandInfo {
@@ -53,17 +53,6 @@ export function categorizeMessage(msg: MessageInRow): CommandInfo {
   }
 
   return { category: 'passthrough', command, text, senderId };
-}
-
-/**
- * Narrow check for /clear — the only command the runner handles directly.
- * All other command gating (filtered, admin) is done by the host router
- * before messages reach the container.
- */
-export function isClearCommand(msg: MessageInRow): boolean {
-  const content = parseContent(msg.content);
-  const text = (content.text || '').trim();
-  return text.toLowerCase().startsWith('/clear');
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any

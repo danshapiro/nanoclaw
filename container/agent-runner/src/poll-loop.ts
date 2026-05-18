@@ -7,7 +7,6 @@ import {
   formatMessages,
   extractRouting,
   categorizeMessage,
-  isClearCommand,
   stripInternalTags,
   type RoutingContext,
 } from './formatter.js';
@@ -15,6 +14,7 @@ import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
+const HOST_OWNED_COMMANDS = new Set(['/new', '/clear']);
 
 function log(msg: string): void {
   console.error(`[poll-loop] ${msg}`);
@@ -99,52 +99,16 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     const routing = extractRouting(messages);
 
-    // Command handling: the host router gates filtered and unauthorized
-    // admin commands before they reach the container. The only command
-    // the runner handles directly is /clear (session reset).
-    const normalMessages: MessageInRow[] = [];
-    const commandIds: string[] = [];
-
-    for (const msg of messages) {
-      if ((msg.kind === 'chat' || msg.kind === 'chat-sdk') && isClearCommand(msg)) {
-        log('Clearing session (resetting continuation)');
-        continuation = undefined;
-        clearContinuation(config.providerName);
-        writeMessageOut({
-          id: generateId(),
-          kind: 'chat',
-          platform_id: routing.platformId,
-          channel_type: routing.channelType,
-          thread_id: routing.threadId,
-          content: JSON.stringify({ text: 'Session cleared.' }),
-        });
-        commandIds.push(msg.id);
-        continue;
-      }
-      normalMessages.push(msg);
-    }
-
-    if (commandIds.length > 0) {
-      markCompleted(commandIds);
-    }
-
-    if (normalMessages.length === 0) {
-      const remainingIds = ids.filter((id) => !commandIds.includes(id));
-      if (remainingIds.length > 0) markCompleted(remainingIds);
-      log(`All ${messages.length} message(s) were commands, skipping query`);
-      continue;
-    }
-
     // Pre-task scripts: for any task rows with a `script`, run it before the
     // provider call. Scripts returning wakeAgent=false (or erroring) gate
     // their own task row only — surviving messages still go to the agent.
     // Without the scheduling module, the marker block is empty, `keep`
-    // falls back to `normalMessages`, and no gating happens.
-    let keep: MessageInRow[] = normalMessages;
+    // falls back to `messages`, and no gating happens.
+    let keep: MessageInRow[] = messages;
     let skipped: string[] = [];
     // MODULE-HOOK:scheduling-pre-task:start
     const { applyPreTaskScripts } = await import('./scheduling/task-script.js');
-    const preTask = await applyPreTaskScripts(normalMessages);
+    const preTask = await applyPreTaskScripts(messages);
     keep = preTask.keep;
     skipped = preTask.skipped;
     if (skipped.length > 0) {
@@ -154,7 +118,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // MODULE-HOOK:scheduling-pre-task:end
 
     if (keep.length === 0) {
-      log(`All ${normalMessages.length} non-command message(s) gated by script, skipping query`);
+      log(`All ${messages.length} message(s) gated by script, skipping query`);
       continue;
     }
 
@@ -173,7 +137,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     // Process the query while concurrently polling for new messages
     const skippedSet = new Set(skipped);
-    const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
+    const processingIds = ids.filter((id) => !skippedSet.has(id));
     const replyAccounting = {
       requiresUserVisibleReply: requiresUserVisibleReply(keep),
       outboundNonSystemCountBefore: countOutboundNonSystemMessages(),
@@ -235,7 +199,10 @@ function formatMessagesWithCommands(messages: MessageInRow[], nativeSlashCommand
   for (const msg of messages) {
     if (nativeSlashCommands && (msg.kind === 'chat' || msg.kind === 'chat-sdk')) {
       const cmdInfo = categorizeMessage(msg);
-      if (cmdInfo.category === 'passthrough' || cmdInfo.category === 'admin') {
+      if (
+        !HOST_OWNED_COMMANDS.has(cmdInfo.command) &&
+        (cmdInfo.category === 'passthrough' || cmdInfo.category === 'admin')
+      ) {
         // Flush normal batch first
         if (normalBatch.length > 0) {
           parts.push(formatMessages(normalBatch));
@@ -307,18 +274,14 @@ async function processQuery(
   const pollHandle = setInterval(() => {
     if (done) return;
 
-    // Skip system messages (MCP tool responses) and /clear (needs fresh query).
+    // Skip system messages (MCP tool responses).
     // Thread routing is the router's concern — if a message landed in this
     // session, the agent should see it. Per-thread sessions already isolate
     // threads into separate containers; shared sessions intentionally merge
     // everything. Filtering on thread_id here caused deadlocks when the
     // initial batch and follow-ups had mismatched thread_ids (e.g. a
     // host-generated welcome trigger with null thread vs a Discord DM reply).
-    const newMessages = getPendingMessages().filter((m) => {
-      if (m.kind === 'system') return false;
-      if ((m.kind === 'chat' || m.kind === 'chat-sdk') && isClearCommand(m)) return false;
-      return true;
-    });
+    const newMessages = getPendingMessages().filter((m) => m.kind !== 'system');
     if (newMessages.length > 0) {
       const newIds = newMessages.map((m) => m.id);
       markProcessing(newIds);

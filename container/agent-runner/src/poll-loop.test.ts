@@ -66,6 +66,10 @@ class ScriptedProvider implements AgentProvider {
   }
 }
 
+class NativeScriptedProvider extends ScriptedProvider {
+  override readonly supportsNativeSlashCommands = true;
+}
+
 describe('formatter', () => {
   it('should format a single chat message', () => {
     insertMessage('m1', 'chat', { sender: 'John', text: 'Hello world' });
@@ -401,7 +405,141 @@ describe('poll-loop conversational reply accounting', () => {
 
     await loopPromise.catch(() => {});
   });
+
+  it('does not handle /clear inside the runner', async () => {
+    insertMessage(
+      'clear-1',
+      'chat',
+      { sender: 'Admin', text: '/clear' },
+      { platformId: 'chan-1', channelType: 'discord' },
+    );
+    const provider = new ScriptedProvider(async function* (input) {
+      expect(input.prompt).toContain('/clear');
+      yield { type: 'init', continuation: 'runner-clear-still-provider-owned' };
+      yield { type: 'result', text: 'provider saw clear' };
+    });
+
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({
+      provider,
+      providerName: 'test',
+      cwd: '/tmp',
+      signal: controller.signal,
+    });
+    await waitFor(() => getUndeliveredMessages().length > 0, 1500);
+    controller.abort();
+    await loopPromise.catch(() => {});
+
+    const out = getUndeliveredMessages();
+    expect(out.map((m) => JSON.parse(m.content).text)).not.toContain('Session cleared.');
+    expect(JSON.parse(out[0].content).text).toBe('provider saw clear');
+  });
+
+  it('pushes /clear into an active provider query as normal text', async () => {
+    insertMessage(
+      'initial-chat',
+      'chat',
+      { sender: 'User', text: 'first' },
+      { platformId: 'chan-1', channelType: 'discord' },
+    );
+
+    let releaseQuery!: () => void;
+    const queryStarted = deferred();
+    const pushes: string[] = [];
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query(input) {
+        expect(input.prompt).toContain('first');
+        queryStarted.resolve();
+        return {
+          push(message) {
+            pushes.push(message);
+          },
+          end() {
+            releaseQuery?.();
+          },
+          abort() {
+            releaseQuery?.();
+          },
+          events: (async function* () {
+            yield { type: 'init', continuation: 'active-clear-query' };
+            await new Promise<void>((resolve) => {
+              releaseQuery = resolve;
+            });
+            yield { type: 'result', text: 'done' };
+          })(),
+        };
+      },
+    };
+
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({
+      provider,
+      providerName: 'test',
+      cwd: '/tmp',
+      signal: controller.signal,
+    });
+
+    await queryStarted.promise;
+    insertMessage(
+      'clear-follow-up',
+      'chat',
+      { sender: 'Admin', text: '/clear' },
+      { platformId: 'chan-1', channelType: 'discord' },
+    );
+    await waitFor(() => pushes.some((prompt) => prompt.includes('/clear')), 1500);
+    controller.abort();
+    releaseQuery();
+    await loopPromise.catch(() => {});
+
+    expect(pushes.some((prompt) => prompt.includes('/clear'))).toBe(true);
+    expect(getUndeliveredMessages().map((m) => JSON.parse(m.content).text)).not.toContain('Session cleared.');
+  });
+
+  it('does not pass host-owned reset commands as provider-native slash commands', async () => {
+    insertMessage(
+      'clear-native',
+      'chat',
+      { sender: 'Admin', text: '/clear' },
+      { platformId: 'chan-1', channelType: 'discord' },
+    );
+    insertMessage(
+      'new-native',
+      'chat',
+      { sender: 'Admin', text: '/new' },
+      { platformId: 'chan-1', channelType: 'discord' },
+    );
+    const provider = new NativeScriptedProvider(async function* (input) {
+      expect(input.prompt).toContain('<message');
+      expect(input.prompt).toContain('/clear');
+      expect(input.prompt).toContain('/new');
+      expect(input.prompt.trim()).not.toBe('/clear\n\n/new');
+      yield { type: 'result', text: 'provider saw host-owned commands as text' };
+    });
+
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({
+      provider,
+      providerName: 'test',
+      cwd: '/tmp',
+      signal: controller.signal,
+    });
+    await waitFor(() => getUndeliveredMessages().length > 0, 1500);
+    controller.abort();
+    await loopPromise.catch(() => {});
+
+    expect(JSON.parse(getUndeliveredMessages()[0].content).text).toBe('provider saw host-owned commands as text');
+  });
 });
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
 
 async function runPollLoopWithTimeout(provider: AgentProvider, signal: AbortSignal, timeoutMs = 2000): Promise<void> {
   return Promise.race([
