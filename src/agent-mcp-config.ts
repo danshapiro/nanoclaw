@@ -79,6 +79,45 @@ function configuredPath(): string | undefined {
   return process.env.AGENT_MCP_CONFIG_PATH || process.env.NANOCLAW_AGENT_MCP_CONFIG || AGENT_MCP_CONFIG_PATH;
 }
 
+function parseAgentMcpConfigBlock(rawConfig: unknown, name: string): AgentMcpConfigForGroup {
+  if (rawConfig == null) {
+    return { allowedTools: [], bridges: {} };
+  }
+
+  const config = asRecord(rawConfig, name);
+  const allowedToolsRaw = config.allowedTools ?? [];
+  if (!Array.isArray(allowedToolsRaw) || !allowedToolsRaw.every((entry) => typeof entry === 'string')) {
+    throw new Error(`Agent MCP config ${name}.allowedTools must be a string array`);
+  }
+
+  const bridgesRaw = config.bridges == null ? {} : asRecord(config.bridges, `${name}.bridges`);
+  const bridges: Record<string, AgentMcpBridgeConfig> = {};
+  for (const [serverName, rawBridge] of Object.entries(bridgesRaw)) {
+    validateServerName(serverName);
+    const bridge = asRecord(rawBridge, `${name}.bridges.${serverName}`);
+    if (bridge.type !== 'mcp-remote-unix-socket') {
+      throw new Error(`Agent MCP bridge ${serverName} type must be mcp-remote-unix-socket`);
+    }
+    bridges[serverName] = {
+      type: 'mcp-remote-unix-socket',
+      remoteUrl: validateRemoteUrl(serverName, bridge.remoteUrl),
+      callbackPort: validateCallbackPort(serverName, bridge.callbackPort),
+      socketNamePrefix: validateSocketNamePrefix(serverName, bridge.socketNamePrefix),
+    };
+  }
+
+  return { allowedTools: allowedToolsRaw, bridges };
+}
+
+function validateMergedConfig(groupFolder: string, config: AgentMcpConfigForGroup): AgentMcpConfigForGroup {
+  const expectedTools = new Set(Object.keys(config.bridges).map((serverName) => `mcp__${serverName}__*`));
+  const actualTools = new Set(config.allowedTools);
+  if (expectedTools.size !== actualTools.size || [...expectedTools].some((tool) => !actualTools.has(tool))) {
+    throw new Error(`Agent MCP config groups.${groupFolder}.allowedTools must match configured bridge servers`);
+  }
+  return config;
+}
+
 export function loadAgentMcpConfigForGroup(groupFolder: string): AgentMcpConfigForGroup {
   const configPath = configuredPath();
   if (!configPath) {
@@ -98,40 +137,12 @@ export function loadAgentMcpConfigForGroup(groupFolder: string): AgentMcpConfigF
   }
 
   const root = asRecord(parsed, 'root');
-  const groups = asRecord(root.groups, 'groups');
-  const groupConfig = groups[groupFolder];
-  if (groupConfig == null) {
-    return { allowedTools: [], bridges: {} };
-  }
+  const defaults = parseAgentMcpConfigBlock(root.defaults, 'defaults');
+  const groups = asRecord(root.groups ?? {}, 'groups');
+  const group = parseAgentMcpConfigBlock(groups[groupFolder], `groups.${groupFolder}`);
 
-  const group = asRecord(groupConfig, `groups.${groupFolder}`);
-  const allowedToolsRaw = group.allowedTools;
-  if (!Array.isArray(allowedToolsRaw) || !allowedToolsRaw.every((entry) => typeof entry === 'string')) {
-    throw new Error(`Agent MCP config groups.${groupFolder}.allowedTools must be a string array`);
-  }
-
-  const bridgesRaw = asRecord(group.bridges, `groups.${groupFolder}.bridges`);
-  const bridges: Record<string, AgentMcpBridgeConfig> = {};
-  for (const [serverName, rawBridge] of Object.entries(bridgesRaw)) {
-    validateServerName(serverName);
-    const bridge = asRecord(rawBridge, `groups.${groupFolder}.bridges.${serverName}`);
-    if (bridge.type !== 'mcp-remote-unix-socket') {
-      throw new Error(`Agent MCP bridge ${serverName} type must be mcp-remote-unix-socket`);
-    }
-    bridges[serverName] = {
-      type: 'mcp-remote-unix-socket',
-      remoteUrl: validateRemoteUrl(serverName, bridge.remoteUrl),
-      callbackPort: validateCallbackPort(serverName, bridge.callbackPort),
-      socketNamePrefix: validateSocketNamePrefix(serverName, bridge.socketNamePrefix),
-    };
-  }
-
-  const allowedTools = allowedToolsRaw as string[];
-  const expectedTools = new Set(Object.keys(bridges).map((serverName) => `mcp__${serverName}__*`));
-  const actualTools = new Set(allowedTools);
-  if (expectedTools.size !== actualTools.size || [...expectedTools].some((tool) => !actualTools.has(tool))) {
-    throw new Error(`Agent MCP config groups.${groupFolder}.allowedTools must match configured bridge servers`);
-  }
-
-  return { allowedTools, bridges };
+  return validateMergedConfig(groupFolder, {
+    allowedTools: [...new Set([...defaults.allowedTools, ...group.allowedTools])],
+    bridges: { ...defaults.bridges, ...group.bridges },
+  });
 }

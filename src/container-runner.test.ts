@@ -14,6 +14,8 @@ import {
   buildPortableSkillsMount,
   resolveProviderName,
 } from './container-runner.js';
+import type { AgentMcpBridgeOptions } from './agent-mcp-bridge.js';
+import type { AgentMcpConfigForGroup } from './agent-mcp-config.js';
 import type { AgentGroup } from './types.js';
 
 type Deferred = {
@@ -43,7 +45,11 @@ function fakeChildProcess(pid = 12345): NodeJS.EventEmitter & { pid: number; kil
   return proc;
 }
 
-async function loadContainerRunnerHarness() {
+async function loadContainerRunnerHarness(
+  options: {
+    mcpConfigForGroup?: (folder: string) => AgentMcpConfigForGroup;
+  } = {},
+) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-container-runner-'));
   const dataDir = path.join(root, 'data');
   const groupsDir = path.join(root, 'groups');
@@ -67,6 +73,18 @@ async function loadContainerRunnerHarness() {
     await oneCliRelease.promise;
     return true;
   });
+  const loadAgentMcpConfigForGroupMock = vi.fn(
+    (folder: string) => options.mcpConfigForGroup?.(folder) ?? { bridges: {}, allowedTools: [] },
+  );
+  const startAgentMcpBridgeMock = vi.fn(async (opts: AgentMcpBridgeOptions) => ({
+    serverName: opts.bridge.serverName,
+    hostSocketDir: path.join(root, 'mcp-runs', opts.bridge.serverName),
+    hostSocketPath: path.join(root, 'mcp-runs', opts.bridge.serverName, `${opts.bridge.socketNamePrefix}.sock`),
+    containerSocketDir: `/workspace/mcp/${opts.bridge.serverName}`,
+    containerSocketPath: `/workspace/mcp/${opts.bridge.serverName}/${opts.bridge.socketNamePrefix}.sock`,
+    authDir: path.join(root, 'auth', opts.bridge.serverName),
+    stop: vi.fn(),
+  }));
 
   vi.resetModules();
   vi.doMock('child_process', async (importOriginal) => {
@@ -96,10 +114,10 @@ async function loadContainerRunnerHarness() {
     };
   });
   vi.doMock('./agent-mcp-config.js', () => ({
-    loadAgentMcpConfigForGroup: vi.fn(() => ({ bridges: {}, allowedTools: [] })),
+    loadAgentMcpConfigForGroup: loadAgentMcpConfigForGroupMock,
   }));
   vi.doMock('./agent-mcp-bridge.js', () => ({
-    startAgentMcpBridge: vi.fn(),
+    startAgentMcpBridge: startAgentMcpBridgeMock,
   }));
   vi.doMock('./providers/index.js', () => ({}));
   vi.doMock('./yente/service-env.js', () => ({
@@ -154,8 +172,12 @@ async function loadContainerRunnerHarness() {
     session,
     sessions,
     execFileMock,
+    groupsDir,
+    loadAgentMcpConfigForGroupMock,
+    root,
     spawnedProcesses,
     spawnMock,
+    startAgentMcpBridgeMock,
   };
 }
 
@@ -278,6 +300,51 @@ describe('session wake lifecycle', () => {
       expect(harness.applyContainerConfigMock).toHaveBeenCalled();
       expect(harness.spawnMock).not.toHaveBeenCalled();
       expect(harness.sessions.getSession(harness.session.id)?.container_status).toBe('stopped');
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('starts configured agent MCP bridges for non-main groups before spawn', async () => {
+    const harness = await loadContainerRunnerHarness({
+      mcpConfigForGroup: (folder) => {
+        expect(folder).toBe('agent');
+        return {
+          allowedTools: ['mcp__granola__*'],
+          bridges: {
+            granola: {
+              type: 'mcp-remote-unix-socket',
+              remoteUrl: 'https://mcp.granola.ai/mcp',
+              callbackPort: 37947,
+              socketNamePrefix: 'granola',
+            },
+          },
+        };
+      },
+    });
+    try {
+      const wake = harness.containerRunner.wakeContainer(harness.session);
+      await harness.oneCliStarted.promise;
+      harness.oneCliRelease.resolve();
+      await wake;
+
+      expect(harness.loadAgentMcpConfigForGroupMock).toHaveBeenCalledWith('agent');
+      expect(harness.startAgentMcpBridgeMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          groupFolder: 'agent',
+          agentGroupId: 'ag-1',
+          bridge: expect.objectContaining({
+            serverName: 'granola',
+            remoteUrl: 'https://mcp.granola.ai/mcp',
+          }),
+        }),
+      );
+      expect(JSON.stringify(harness.spawnMock.mock.calls[0])).toContain('/workspace/mcp/granola');
+      const containerJson = JSON.parse(
+        fs.readFileSync(path.join(harness.groupsDir, 'agent', 'container.json'), 'utf8'),
+      );
+      expect(containerJson.mcpServers.granola.args).toContain('/workspace/mcp/granola/granola.sock');
+      expect(containerJson.agentMcpAllowedTools).toEqual(['mcp__granola__*']);
     } finally {
       harness.close();
     }

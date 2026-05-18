@@ -57,6 +57,73 @@ describe('loadAgentMcpConfigForGroup', () => {
     }
   });
 
+  it('applies default user MCP bridges to groups without explicit entries', () => {
+    const root = writeConfig({
+      defaults: {
+        allowedTools: ['mcp__granola__*'],
+        bridges: {
+          granola: {
+            type: 'mcp-remote-unix-socket',
+            remoteUrl: 'https://mcp.granola.ai/mcp',
+            callbackPort: 37947,
+            socketNamePrefix: 'granola',
+          },
+        },
+      },
+      groups: {},
+    });
+    try {
+      expect(loadAgentMcpConfigForGroup('discord_yente-dvora')).toEqual({
+        allowedTools: ['mcp__granola__*'],
+        bridges: {
+          granola: {
+            type: 'mcp-remote-unix-socket',
+            remoteUrl: 'https://mcp.granola.ai/mcp',
+            callbackPort: 37947,
+            socketNamePrefix: 'granola',
+          },
+        },
+      });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('merges group-specific bridges with defaults and validates allowed tools', () => {
+    const root = writeConfig({
+      defaults: {
+        allowedTools: ['mcp__granola__*'],
+        bridges: {
+          granola: {
+            type: 'mcp-remote-unix-socket',
+            remoteUrl: 'https://mcp.granola.ai/mcp',
+            callbackPort: 37947,
+            socketNamePrefix: 'granola',
+          },
+        },
+      },
+      groups: {
+        main: {
+          allowedTools: ['mcp__granola__*', 'mcp__other__*'],
+          bridges: {
+            other: {
+              type: 'mcp-remote-unix-socket',
+              remoteUrl: 'https://example.com/mcp',
+              callbackPort: 37948,
+              socketNamePrefix: 'other',
+            },
+          },
+        },
+      },
+    });
+    try {
+      expect(Object.keys(loadAgentMcpConfigForGroup('main').bridges).sort()).toEqual(['granola', 'other']);
+      expect(loadAgentMcpConfigForGroup('main').allowedTools.sort()).toEqual(['mcp__granola__*', 'mcp__other__*']);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('rejects allowedTools that do not match configured bridge servers', () => {
     const root = writeConfig({
       groups: {
