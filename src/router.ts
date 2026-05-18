@@ -27,12 +27,13 @@ import {
   getMessagingGroupWithAgentCount,
 } from './db/messaging-groups.js';
 import { findSessionForAgent } from './db/sessions.js';
+import { deliverSessionMessages, dropInactiveSessionOutbound } from './delivery.js';
 import { startTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { resolveSession, writeSessionMessage, writeOutboundDirect } from './session-manager.js';
-import { wakeContainer } from './container-runner.js';
+import { cleanupContainerForSession, wakeContainer } from './container-runner.js';
 import { getSession } from './db/sessions.js';
-import type { AgentGroup, MessagingGroup, MessagingGroupAgent } from './types.js';
+import type { AgentGroup, MessagingGroup, MessagingGroupAgent, Session } from './types.js';
 import type { InboundEvent } from './channels/adapter.js';
 import { handleYenteHostCommand } from './yente/host-commands.js';
 
@@ -419,9 +420,24 @@ async function deliverToAgent(
         content: JSON.stringify({ text: hostCommand.outboundText }),
       });
       log.info('Yente host command handled', {
+        command: hostCommand.command,
         sessionId: hostCommand.sessionForOutbound.id,
+        supersededSessionId: hostCommand.supersededSessionId,
         agentGroupId: agent.agent_group_id,
+        messagingGroupId: mg.id,
+        platformId: deliveryAddr.platformId,
+        threadId: deliveryAddr.threadId,
+        userId,
       });
+      const successDelivery = deliverSessionMessages(hostCommand.sessionForOutbound);
+      scheduleSupersededSessionCleanup({
+        command: hostCommand.command,
+        supersededSessionId: hostCommand.supersededSessionId,
+        freshSession: hostCommand.sessionForOutbound,
+        deliveryAddr,
+        successDelivery,
+      });
+      await successDelivery;
       return;
     }
   }
@@ -480,6 +496,76 @@ async function deliverToAgent(
       await wakeContainer(freshSession);
     }
   }
+}
+
+function scheduleSupersededSessionCleanup(args: {
+  command: string;
+  supersededSessionId: string | undefined;
+  freshSession: Session;
+  deliveryAddr: { channelType: string; platformId: string; threadId: string | null };
+  successDelivery: Promise<void>;
+}): void {
+  if (!args.supersededSessionId || args.supersededSessionId === args.freshSession.id) return;
+
+  void dropInactiveSessionOutbound(args.supersededSessionId, `yente-session-${args.command}-pre-cleanup`).catch((err) =>
+    log.warn('Failed to drain inactive session outbound before cleanup', {
+      command: args.command,
+      supersededSessionId: args.supersededSessionId,
+      err,
+    }),
+  );
+
+  const timer = setTimeout(() => {
+    cleanupContainerForSession(args.supersededSessionId!, `yente-session-${args.command}`)
+      .then(async (cleaned) => {
+        await dropInactiveSessionOutbound(args.supersededSessionId!, `yente-session-${args.command}-post-cleanup`).catch(
+          (err) =>
+            log.warn('Failed to drain inactive session outbound after cleanup', {
+              command: args.command,
+              supersededSessionId: args.supersededSessionId,
+              err,
+            }),
+        );
+        log.info('Yente session reset cleanup finished', {
+          command: args.command,
+          supersededSessionId: args.supersededSessionId,
+          freshSessionId: args.freshSession.id,
+          cleaned,
+        });
+      })
+      .catch(async (err) => {
+        await dropInactiveSessionOutbound(args.supersededSessionId!, `yente-session-${args.command}-cleanup-failed`).catch(
+          (drainErr) =>
+            log.warn('Failed to drain inactive session outbound after cleanup failure', {
+              command: args.command,
+              supersededSessionId: args.supersededSessionId,
+              drainErr,
+            }),
+        );
+        log.error('Yente session reset cleanup failed', {
+          command: args.command,
+          supersededSessionId: args.supersededSessionId,
+          freshSessionId: args.freshSession.id,
+          err,
+        });
+        writeOutboundDirect(args.freshSession.agent_group_id, args.freshSession.id, {
+          id: `cleanup-error-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          kind: 'chat',
+          platformId: args.deliveryAddr.platformId,
+          channelType: args.deliveryAddr.channelType,
+          threadId: args.deliveryAddr.threadId,
+          content: JSON.stringify({ text: 'Error: old session cleanup failed.' }),
+        });
+        await args.successDelivery.catch(() => undefined);
+        void deliverSessionMessages(args.freshSession).catch((deliveryErr) =>
+          log.error('Failed to deliver Yente cleanup error', {
+            sessionId: args.freshSession.id,
+            deliveryErr,
+          }),
+        );
+      });
+  }, 0);
+  timer.unref?.();
 }
 
 /**
