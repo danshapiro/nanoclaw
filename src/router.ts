@@ -27,7 +27,7 @@ import {
   getMessagingGroupWithAgentCount,
 } from './db/messaging-groups.js';
 import { findSessionForAgent } from './db/sessions.js';
-import { deliverSessionMessages, dropInactiveSessionOutbound } from './delivery.js';
+import { deliverSessionMessages, dropInactiveSessionOutbound, suppressSessionOutbound } from './delivery.js';
 import { startTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { resolveSession, writeSessionMessage, writeOutboundDirect } from './session-manager.js';
@@ -411,6 +411,12 @@ async function deliverToAgent(
       sessionMode: effectiveSessionMode,
     });
     if (hostCommand.handled) {
+      if (hostCommand.supersededSessionId && hostCommand.supersededSessionId !== hostCommand.sessionForOutbound.id) {
+        await suppressSessionOutbound(
+          hostCommand.supersededSessionId,
+          `yente-session-${hostCommand.command}-before-success`,
+        );
+      }
       writeOutboundDirect(hostCommand.sessionForOutbound.agent_group_id, hostCommand.sessionForOutbound.id, {
         id: `host-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         kind: 'chat',

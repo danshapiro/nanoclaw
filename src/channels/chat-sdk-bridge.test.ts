@@ -63,4 +63,53 @@ describe('Chat SDK bridge Discord gateway forwarding', () => {
       }),
     );
   });
+
+  it('routes forwarded Discord thread commands through the parent channel messaging group', async () => {
+    const adapter = {
+      name: 'discord',
+      handleWebhook: vi.fn(),
+    };
+    const setupConfig: ChannelSetup = {
+      onInbound: vi.fn(),
+      onInboundEvent: vi.fn(),
+      onMetadata: vi.fn(),
+      onAction: vi.fn(),
+    };
+    const fetchImpl = vi.fn().mockResolvedValue(new Response('{}', { status: 200 }));
+
+    await handleForwardedEvent(
+      JSON.stringify({
+        type: 'GATEWAY_INTERACTION_CREATE',
+        data: {
+          id: 'interaction-thread-1',
+          token: 'interaction-token',
+          type: 2,
+          guild_id: 'guild-1',
+          channel_id: 'thread-1',
+          channel: { id: 'thread-1', type: 11, parent_id: 'channel-1' },
+          data: { type: 1, name: 'new' },
+          member: { user: { id: 'user-1', username: 'Dan' } },
+        },
+      }),
+      adapter,
+      setupConfig,
+      'bot-token',
+      fetchImpl,
+    );
+
+    expect(setupConfig.onInbound).toHaveBeenCalledWith(
+      'channel-1',
+      'discord:guild-1:channel-1:thread-1',
+      expect.objectContaining({
+        kind: 'chat-sdk',
+        isMention: true,
+        isGroup: true,
+        content: expect.objectContaining({
+          text: '/new',
+          applicationCommand: true,
+          commandName: 'new',
+        }),
+      }),
+    );
+  });
 });

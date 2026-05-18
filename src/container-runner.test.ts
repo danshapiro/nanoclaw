@@ -307,24 +307,52 @@ describe('session wake lifecycle', () => {
     }
   });
 
-  it('throws when async stop and process kill both fail', async () => {
+  it('throws when stop fails and the container still appears to be running', async () => {
     const harness = await loadContainerRunnerHarness();
     const processKill = vi.spyOn(process, 'kill').mockImplementation(() => true);
     try {
-      harness.execFileMock.mockImplementationOnce((_file, _args, _options, cb) => {
-        cb(new Error('stop failed'));
-      });
       const wake = harness.containerRunner.wakeContainer(harness.session);
       await harness.oneCliStarted.promise;
       harness.oneCliRelease.resolve();
       await wake;
-      harness.spawnedProcesses[0].kill.mockImplementationOnce(() => {
-        throw new Error('kill failed');
+      const containerName = harness.spawnMock.mock.calls[0][1][3];
+      harness.execFileMock.mockImplementation((_file, args: string[], _options, cb) => {
+        if (args[0] === 'stop') {
+          cb(new Error('stop failed'));
+          return;
+        }
+        cb(null, `${containerName}\n`, '');
       });
 
       await expect(
         harness.containerRunner.cleanupContainerForSession(harness.session.id, 'yente-session-reset'),
       ).rejects.toThrow('Failed to clean up container for session');
+    } finally {
+      processKill.mockRestore();
+      harness.close();
+    }
+  });
+
+  it('returns true when stop fails but verification shows the container is gone', async () => {
+    const harness = await loadContainerRunnerHarness();
+    const processKill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    try {
+      const wake = harness.containerRunner.wakeContainer(harness.session);
+      await harness.oneCliStarted.promise;
+      harness.oneCliRelease.resolve();
+      await wake;
+      harness.execFileMock.mockImplementation((_file, args: string[], _options, cb) => {
+        if (args[0] === 'stop') {
+          cb(new Error('stop failed'));
+          return;
+        }
+        cb(null, '', '');
+      });
+
+      await expect(
+        harness.containerRunner.cleanupContainerForSession(harness.session.id, 'yente-session-reset'),
+      ).resolves.toBe(true);
+      expect(harness.spawnedProcesses[0].kill).toHaveBeenCalledWith('SIGKILL');
     } finally {
       processKill.mockRestore();
       harness.close();

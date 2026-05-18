@@ -27,6 +27,7 @@ import {
   CONTAINER_RUNTIME_BIN,
   hostGatewayArgs,
   readonlyMountArgs,
+  isContainerRunningAsync,
   stopContainer,
   stopContainerAsync,
 } from './container-runtime.js';
@@ -331,7 +332,27 @@ export async function cleanupContainerForSession(sessionId: string, reason: stri
     await stopContainerAsync(entry.containerName);
     return true;
   } catch (stopErr) {
-    if (!processAppearsAlive(entry.process)) {
+    let killErr: unknown;
+    if (processAppearsAlive(entry.process)) {
+      try {
+        entry.process.kill('SIGKILL');
+      } catch (err) {
+        killErr = err;
+      }
+    }
+
+    let stillRunning: boolean;
+    try {
+      stillRunning = await isContainerRunningAsync(entry.containerName);
+    } catch (inspectErr) {
+      throw new AggregateError(
+        [stopErr, killErr, inspectErr].filter((err) => err !== undefined),
+        `Failed to verify cleanup for session ${sessionId}`,
+        { cause: inspectErr },
+      );
+    }
+
+    if (!stillRunning) {
       log.info('Superseded session container already exited during cleanup', {
         sessionId,
         reason,
@@ -339,17 +360,12 @@ export async function cleanupContainerForSession(sessionId: string, reason: stri
       });
       return true;
     }
-    try {
-      entry.process.kill('SIGKILL');
-      return true;
-    } catch (killErr) {
-      if (!processAppearsAlive(entry.process)) {
-        return true;
-      }
-      throw new AggregateError([stopErr, killErr], `Failed to clean up container for session ${sessionId}`, {
-        cause: killErr,
-      });
-    }
+
+    throw new AggregateError(
+      [stopErr, killErr].filter((err) => err !== undefined),
+      `Failed to clean up container for session ${sessionId}`,
+      { cause: stopErr },
+    );
   }
 }
 

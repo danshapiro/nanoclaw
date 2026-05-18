@@ -167,4 +167,25 @@ describe('Yente Discord application commands', () => {
       threadId: 'discord:@me:dm-channel-1',
     });
   });
+
+  it('normalizes Discord thread application commands to the parent channel platform id', () => {
+    expect(
+      normalizeDiscordApplicationCommandInteraction({
+        type: 2,
+        guild_id: 'guild-1',
+        channel_id: 'thread-1',
+        channel: { id: 'thread-1', type: 11, parent_id: 'channel-1' },
+        member: { user: { id: 'user-3', username: 'Thread User' } },
+        data: { type: 1, name: 'new' },
+      }),
+    ).toEqual({
+      commandName: 'new',
+      text: '/new',
+      requiresAdmin: true,
+      userId: 'discord:user-3',
+      senderName: 'Thread User',
+      platformId: 'channel-1',
+      threadId: 'discord:guild-1:channel-1:thread-1',
+    });
+  });
 });

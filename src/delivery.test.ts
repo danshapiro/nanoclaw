@@ -29,7 +29,12 @@ const TEST_DIR = '/tmp/nanoclaw-test-delivery';
 import { initTestDb, closeDb, runMigrations, createAgentGroup, createMessagingGroup } from './db/index.js';
 import { archiveSession } from './db/sessions.js';
 import { resolveSession, outboundDbPath, inboundDbPath } from './session-manager.js';
-import { deliverSessionMessages, dropInactiveSessionOutbound, setDeliveryAdapter } from './delivery.js';
+import {
+  deliverSessionMessages,
+  dropInactiveSessionOutbound,
+  setDeliveryAdapter,
+  suppressSessionOutbound,
+} from './delivery.js';
 
 function now(): string {
   return new Date().toISOString();
@@ -193,22 +198,39 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     expect(delivered).toEqual([]);
   });
 
-  it('drops remaining outbound if a session is archived during delivery', async () => {
+  it('waits for in-flight delivery before suppressing remaining reset outbound', async () => {
     seedAgentAndChannel();
     const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
     insertOutbound('ag-1', session.id, 'out-1', 'first');
     insertOutbound('ag-1', session.id, 'out-2', 'second');
 
+    const deliveryStarted = deferred();
+    const deliveryRelease = deferred();
+    let suppressResolved = false;
     const delivered: string[] = [];
     setDeliveryAdapter({
       async deliver(_channelType, _platformId, _threadId, _kind, content) {
         delivered.push(JSON.parse(content).text as string);
-        archiveSession(session.id);
+        deliveryStarted.resolve();
+        await deliveryRelease.promise;
         return 'platform-first';
       },
     });
 
-    await deliverSessionMessages(session);
+    const delivery = deliverSessionMessages(session);
+    await deliveryStarted.promise;
+
+    archiveSession(session.id);
+    const suppression = suppressSessionOutbound(session.id, 'yente-session-reset').then((count) => {
+      suppressResolved = true;
+      return count;
+    });
+    await Promise.resolve();
+
+    expect(suppressResolved).toBe(false);
+    deliveryRelease.resolve();
+    await expect(suppression).resolves.toBe(0);
+    await delivery;
 
     expect(delivered).toEqual(['first']);
     expect(deliveredRows('ag-1', session.id)).toEqual([
@@ -243,3 +265,11 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     expect(delivered).toEqual([]);
   });
 });
+
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}

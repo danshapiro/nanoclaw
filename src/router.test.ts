@@ -314,6 +314,55 @@ describe('Yente host command routing', () => {
     expect(cleanupContainerForSessionMock).toHaveBeenCalledWith(original.id, 'yente-session-new');
   });
 
+  it('does not deliver reset success until old-session delivery suppression is complete', async () => {
+    const { routeInbound } = await import('./router.js');
+    const oldDeliveryStarted = deferred();
+    const oldDeliveryRelease = deferred();
+    const deliveredTexts: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        const text = JSON.parse(content).text as string;
+        deliveredTexts.push(text);
+        if (text === 'old response') {
+          oldDeliveryStarted.resolve();
+          await oldDeliveryRelease.promise;
+        }
+        return `platform-${deliveredTexts.length}`;
+      },
+    });
+
+    await routeInbound(event('hello first', 'msg-first-before-suppress'));
+    const original = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
+    writeOutboundDirect('ag-yente', original.id, {
+      id: 'old-session-outbound-in-flight',
+      kind: 'chat',
+      platformId: DISCORD_PLATFORM_ID,
+      channelType: 'discord',
+      threadId: DISCORD_THREAD_ID,
+      content: JSON.stringify({ text: 'old response' }),
+    });
+
+    const oldDelivery = (await import('./delivery.js')).deliverSessionMessages(original);
+    await oldDeliveryStarted.promise;
+    const reset = routeInbound(event('/new', 'msg-new-during-old-delivery'));
+    await Promise.resolve();
+
+    expect(deliveredTexts).toEqual(['old response']);
+    oldDeliveryRelease.resolve();
+    await oldDelivery;
+    await reset;
+
+    const fresh = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
+    expect(deliveredTexts).toEqual(['old response', `Started a fresh session: ${fresh.id}`]);
+    expect(deliveredRows(original.id)).toContainEqual({
+      message_out_id: 'old-session-outbound-in-flight',
+      platform_message_id: 'platform-1',
+      status: 'delivered',
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+
   it('reports cleanup failure after the success response is delivered', async () => {
     vi.useFakeTimers();
     try {

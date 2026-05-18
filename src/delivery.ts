@@ -47,7 +47,8 @@ const deliveryAttempts = new Map<string, number>();
  * Skipping (vs. queueing) is correct: any message left over when the
  * second caller skips will be picked up on the next poll tick (~1s).
  */
-const inflightDeliveries = new Set<string>();
+const inflightDeliveries = new Map<string, Promise<number>>();
+const suppressedSessionOutbound = new Set<string>();
 
 export interface ChannelDeliveryAdapter {
   deliver(
@@ -152,12 +153,15 @@ export async function deliverSessionMessages(session: Session): Promise<void> {
   // Reject re-entry from a concurrent poll on the same session — see the
   // comment on inflightDeliveries above.
   if (inflightDeliveries.has(session.id)) return;
-  inflightDeliveries.add(session.id);
 
+  const delivery = drainSession(session);
+  inflightDeliveries.set(session.id, delivery);
   try {
-    await drainSession(session);
+    await delivery;
   } finally {
-    inflightDeliveries.delete(session.id);
+    if (inflightDeliveries.get(session.id) === delivery) {
+      inflightDeliveries.delete(session.id);
+    }
   }
 }
 
@@ -167,6 +171,23 @@ export async function dropInactiveSessionOutbound(sessionId: string, reason: str
   return drainSession(session, { inactiveOnly: true, staleReason: reason });
 }
 
+export async function suppressSessionOutbound(sessionId: string, reason: string): Promise<number> {
+  suppressedSessionOutbound.add(sessionId);
+
+  const activeDelivery = inflightDeliveries.get(sessionId);
+  if (activeDelivery) {
+    await activeDelivery.catch((err) => {
+      log.warn('In-flight delivery failed while suppressing session outbound', {
+        sessionId,
+        reason,
+        err,
+      });
+    });
+  }
+
+  return dropInactiveSessionOutbound(sessionId, reason);
+}
+
 type DrainSessionOptions = {
   inactiveOnly?: boolean;
   staleReason?: string;
@@ -174,6 +195,10 @@ type DrainSessionOptions = {
 
 function isSessionActive(sessionId: string): boolean {
   return getSession(sessionId)?.status === 'active';
+}
+
+function shouldDropSessionOutbound(sessionId: string): boolean {
+  return suppressedSessionOutbound.has(sessionId) || !isSessionActive(sessionId);
 }
 
 function markStaleOutboundDropped(inDb: Database.Database, messageId: string): void {
@@ -218,7 +243,7 @@ async function drainSession(session: Session, options: DrainSessionOptions = {})
     // Ensure platform_message_id column exists (migration for existing sessions)
     migrateDeliveredTable(inDb);
 
-    if (!isSessionActive(session.id)) {
+    if (shouldDropSessionOutbound(session.id)) {
       for (const msg of undelivered) {
         markStaleOutboundDropped(inDb, msg.id);
       }
@@ -228,7 +253,7 @@ async function drainSession(session: Session, options: DrainSessionOptions = {})
 
     let staleDropCount = 0;
     for (const msg of undelivered) {
-      if (!isSessionActive(session.id)) {
+      if (shouldDropSessionOutbound(session.id)) {
         markStaleOutboundDropped(inDb, msg.id);
         staleDropCount++;
         continue;

@@ -78,6 +78,11 @@ interface DiscordApplicationCommandInteraction {
   type?: unknown;
   guild_id?: unknown;
   channel_id?: unknown;
+  channel?: {
+    id?: unknown;
+    type?: unknown;
+    parent_id?: unknown;
+  };
   data?: {
     type?: unknown;
     name?: unknown;
@@ -93,10 +98,29 @@ function commandByName(name: unknown): YenteDiscordCommand | undefined {
   return YENTE_DISCORD_COMMANDS.find((command) => command.name === name);
 }
 
-function threadIdFromInteraction(interaction: DiscordApplicationCommandInteraction, channelId: string): string | null {
+const DISCORD_THREAD_CHANNEL_TYPES = new Set([10, 11, 12]);
+
+function channelAddressFromInteraction(interaction: DiscordApplicationCommandInteraction): {
+  platformId: string;
+  threadId: string | null;
+} | null {
+  const channelId =
+    (typeof interaction.channel?.id === 'string' && interaction.channel.id) ||
+    (typeof interaction.channel_id === 'string' && interaction.channel_id) ||
+    '';
   if (!channelId) return null;
   const guildId = typeof interaction.guild_id === 'string' && interaction.guild_id ? interaction.guild_id : '@me';
-  return `discord:${guildId}:${channelId}`;
+  const parentId = typeof interaction.channel?.parent_id === 'string' ? interaction.channel.parent_id : '';
+  if (parentId && DISCORD_THREAD_CHANNEL_TYPES.has(Number(interaction.channel?.type))) {
+    return {
+      platformId: parentId,
+      threadId: `discord:${guildId}:${parentId}:${channelId}`,
+    };
+  }
+  return {
+    platformId: channelId,
+    threadId: `discord:${guildId}:${channelId}`,
+  };
 }
 
 export function buildYenteDiscordGuildCommandPayloads(): DiscordApplicationCommandPayload[] {
@@ -258,8 +282,8 @@ export function normalizeDiscordApplicationCommandInteraction(
     (typeof user?.username === 'string' && user.username) ||
     userId ||
     'Discord user';
-  const channelId = typeof interaction.channel_id === 'string' ? interaction.channel_id : '';
-  const threadId = threadIdFromInteraction(interaction, channelId);
+  const channelAddress = channelAddressFromInteraction(interaction);
+  if (!channelAddress) return null;
 
   return {
     commandName: command.name,
@@ -267,8 +291,8 @@ export function normalizeDiscordApplicationCommandInteraction(
     requiresAdmin: command.requiresAdmin,
     userId: `discord:${userId}`,
     senderName,
-    platformId: channelId,
-    threadId,
+    platformId: channelAddress.platformId,
+    threadId: channelAddress.threadId,
   };
 }
 
