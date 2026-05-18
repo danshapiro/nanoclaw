@@ -334,10 +334,7 @@ describe('Yente host command routing', () => {
       await Promise.resolve();
 
       expect(outboundTexts(fresh.id)).toContain('Error: old session cleanup failed.');
-      expect(deliveredTexts).toEqual([
-        `Started a fresh session: ${fresh.id}`,
-        'Error: old session cleanup failed.',
-      ]);
+      expect(deliveredTexts).toEqual([`Started a fresh session: ${fresh.id}`, 'Error: old session cleanup failed.']);
     } finally {
       vi.useRealTimers();
     }
@@ -375,10 +372,7 @@ describe('Yente host command routing', () => {
       await Promise.resolve();
 
       const fresh = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
-      expect(deliveredTexts).toEqual([
-        `Started a fresh session: ${fresh.id}`,
-        'Error: old session cleanup failed.',
-      ]);
+      expect(deliveredTexts).toEqual([`Started a fresh session: ${fresh.id}`, 'Error: old session cleanup failed.']);
     } finally {
       vi.useRealTimers();
     }

@@ -22,7 +22,10 @@ function now(): string {
   return new Date().toISOString();
 }
 
-function inboundMessages(agentGroupId: string, sessionId: string): Array<{ id: string; kind: string; content: string }> {
+function inboundMessages(
+  agentGroupId: string,
+  sessionId: string,
+): Array<{ id: string; kind: string; content: string }> {
   const db = new Database(inboundDbPath(agentGroupId, sessionId));
   try {
     return db.prepare('SELECT id, kind, content FROM messages_in ORDER BY seq').all() as Array<{

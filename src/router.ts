@@ -518,13 +518,15 @@ function scheduleSupersededSessionCleanup(args: {
   const timer = setTimeout(() => {
     cleanupContainerForSession(args.supersededSessionId!, `yente-session-${args.command}`)
       .then(async (cleaned) => {
-        await dropInactiveSessionOutbound(args.supersededSessionId!, `yente-session-${args.command}-post-cleanup`).catch(
-          (err) =>
-            log.warn('Failed to drain inactive session outbound after cleanup', {
-              command: args.command,
-              supersededSessionId: args.supersededSessionId,
-              err,
-            }),
+        await dropInactiveSessionOutbound(
+          args.supersededSessionId!,
+          `yente-session-${args.command}-post-cleanup`,
+        ).catch((err) =>
+          log.warn('Failed to drain inactive session outbound after cleanup', {
+            command: args.command,
+            supersededSessionId: args.supersededSessionId,
+            err,
+          }),
         );
         log.info('Yente session reset cleanup finished', {
           command: args.command,
@@ -534,13 +536,15 @@ function scheduleSupersededSessionCleanup(args: {
         });
       })
       .catch(async (err) => {
-        await dropInactiveSessionOutbound(args.supersededSessionId!, `yente-session-${args.command}-cleanup-failed`).catch(
-          (drainErr) =>
-            log.warn('Failed to drain inactive session outbound after cleanup failure', {
-              command: args.command,
-              supersededSessionId: args.supersededSessionId,
-              drainErr,
-            }),
+        await dropInactiveSessionOutbound(
+          args.supersededSessionId!,
+          `yente-session-${args.command}-cleanup-failed`,
+        ).catch((drainErr) =>
+          log.warn('Failed to drain inactive session outbound after cleanup failure', {
+            command: args.command,
+            supersededSessionId: args.supersededSessionId,
+            drainErr,
+          }),
         );
         log.error('Yente session reset cleanup failed', {
           command: args.command,

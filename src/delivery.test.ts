@@ -63,7 +63,10 @@ function insertOutbound(agentGroupId: string, sessionId: string, msgId: string, 
   db.close();
 }
 
-function deliveredRows(agentGroupId: string, sessionId: string): Array<{
+function deliveredRows(
+  agentGroupId: string,
+  sessionId: string,
+): Array<{
   message_out_id: string;
   platform_message_id: string | null;
   status: string;
