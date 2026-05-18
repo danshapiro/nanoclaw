@@ -45,6 +45,7 @@ registerChannelAdapter('discord', {
       botToken,
       extractReplyContext,
       supportsThreads: true,
+      transformOutboundText: (t) => t.replace(/^(\d+)\.$/gm, '$1\\.'),
     });
   },
 });
