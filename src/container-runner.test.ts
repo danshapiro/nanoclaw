@@ -53,7 +53,7 @@ async function loadContainerRunnerHarness() {
   const oneCliStarted = deferred();
   const oneCliRelease = deferred();
   const spawnedProcesses: Array<ReturnType<typeof fakeChildProcess>> = [];
-  const spawnMock = vi.fn(() => {
+  const spawnMock = vi.fn((_command: string, _args: string[], _options?: unknown) => {
     const proc = fakeChildProcess(12345 + spawnedProcesses.length);
     spawnedProcesses.push(proc);
     return proc;

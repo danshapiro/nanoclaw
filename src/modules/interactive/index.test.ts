@@ -84,7 +84,7 @@ describe('interactive question responses', () => {
       channel_type: 'telegram',
       thread_id: null,
       title: 'Choose',
-      options: [{ label: 'Yes', value: 'yes' }],
+      options: [{ label: 'Yes', selectedLabel: 'Yes', value: 'yes' }],
       created_at: now(),
     });
     archiveSession(session.id);

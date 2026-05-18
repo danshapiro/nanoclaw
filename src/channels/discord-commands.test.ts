@@ -153,8 +153,6 @@ describe('Yente Discord application commands', () => {
     expect(
       normalizeDiscordApplicationCommandInteraction({
         type: 2,
-        id: 'interaction-2',
-        token: 'token-2',
         channel_id: 'dm-channel-1',
         user: { id: 'user-2', username: 'DM User' },
         data: { type: 1, name: 'new' },
