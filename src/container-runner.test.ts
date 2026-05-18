@@ -12,10 +12,12 @@ import {
   buildManagedReposIpcMount,
   buildManagedReposMounts,
   buildPortableSkillsMount,
+  resolveAgentImageForRun,
   resolveProviderName,
 } from './container-runner.js';
 import type { AgentMcpBridgeOptions } from './agent-mcp-bridge.js';
 import type { AgentMcpConfigForGroup } from './agent-mcp-config.js';
+import type { ContainerConfig } from './container-config.js';
 import type { AgentGroup } from './types.js';
 
 type Deferred = {
@@ -207,6 +209,124 @@ describe('resolveProviderName', () => {
   it('treats empty string as unset (falls through)', () => {
     expect(resolveProviderName('', 'codex', null)).toBe('codex');
     expect(resolveProviderName(null, '', 'opencode')).toBe('opencode');
+  });
+});
+
+describe('resolveAgentImageForRun', () => {
+  it('does not reuse a per-agent image from an older release base', async () => {
+    const config = {
+      mcpServers: {},
+      packages: { apt: ['jq'], npm: [] },
+      imageTag: 'nanoclaw-agent-v2-oldbase:ag-discord-yente-dvora',
+      additionalMounts: [],
+      skills: 'all',
+    } satisfies ContainerConfig;
+
+    const result = await resolveAgentImageForRun({
+      agentGroupId: 'ag-discord-yente-dvora',
+      groupFolder: 'discord_yente-dvora',
+      containerConfig: config,
+      currentImageBase: 'nanoclaw-agent-v2-newbase',
+      currentImage: 'nanoclaw-agent-v2-newbase:newsha',
+      rebuildAgentGroupImage: async () => 'nanoclaw-agent-v2-newbase:ag-discord-yente-dvora',
+    });
+
+    expect(result.imageTag).toBe('nanoclaw-agent-v2-newbase:ag-discord-yente-dvora');
+    expect(result.rebuilt).toBe(true);
+  });
+
+  it('rebuilds when packages are configured but no per-agent image tag is present', async () => {
+    const config = {
+      mcpServers: {},
+      packages: { apt: [], npm: ['playwright'] },
+      additionalMounts: [],
+      skills: 'all',
+    } satisfies ContainerConfig;
+
+    const result = await resolveAgentImageForRun({
+      agentGroupId: 'ag-main',
+      groupFolder: 'main',
+      containerConfig: config,
+      currentImageBase: 'nanoclaw-agent-v2-newbase',
+      currentImage: 'nanoclaw-agent-v2-newbase:newsha',
+      rebuildAgentGroupImage: async () => 'nanoclaw-agent-v2-newbase:ag-main',
+    });
+
+    expect(result.imageTag).toBe('nanoclaw-agent-v2-newbase:ag-main');
+    expect(result.rebuilt).toBe(true);
+  });
+
+  it('clears leftover per-agent image tags when no packages are configured', async () => {
+    const config = {
+      mcpServers: {},
+      packages: { apt: [], npm: [] },
+      imageTag: 'nanoclaw-agent-v2-newbase:ag-main',
+      additionalMounts: [],
+      skills: 'all',
+    } satisfies ContainerConfig;
+    const writeContainerConfigForGroup = vi.fn();
+
+    const result = await resolveAgentImageForRun({
+      agentGroupId: 'ag-main',
+      groupFolder: 'main',
+      containerConfig: config,
+      currentImageBase: 'nanoclaw-agent-v2-newbase',
+      currentImage: 'nanoclaw-agent-v2-newbase:newsha',
+      rebuildAgentGroupImage: async () => {
+        throw new Error('unexpected rebuild');
+      },
+      writeContainerConfigForGroup,
+    });
+
+    expect(result.imageTag).toBe('nanoclaw-agent-v2-newbase:newsha');
+    expect(result.rebuilt).toBe(false);
+    expect(config.imageTag).toBeUndefined();
+    expect(writeContainerConfigForGroup).toHaveBeenCalledWith('main', config);
+  });
+
+  it('does not accept the base release image when packages are configured', async () => {
+    const config = {
+      mcpServers: {},
+      packages: { apt: ['jq'], npm: [] },
+      imageTag: 'nanoclaw-agent-v2-newbase:newsha',
+      additionalMounts: [],
+      skills: 'all',
+    } satisfies ContainerConfig;
+
+    const result = await resolveAgentImageForRun({
+      agentGroupId: 'ag-discord-yente-dvora',
+      groupFolder: 'discord_yente-dvora',
+      containerConfig: config,
+      currentImageBase: 'nanoclaw-agent-v2-newbase',
+      currentImage: 'nanoclaw-agent-v2-newbase:newsha',
+      rebuildAgentGroupImage: async () => 'nanoclaw-agent-v2-newbase:ag-discord-yente-dvora',
+    });
+
+    expect(result.imageTag).toBe('nanoclaw-agent-v2-newbase:ag-discord-yente-dvora');
+    expect(result.rebuilt).toBe(true);
+  });
+
+  it('fails clearly when rebuild does not produce the current-base per-agent image', async () => {
+    const config = {
+      mcpServers: {},
+      packages: { apt: ['jq'], npm: [] },
+      imageTag: 'nanoclaw-agent-v2-oldbase:ag-main',
+      additionalMounts: [],
+      skills: 'all',
+    } satisfies ContainerConfig;
+
+    await expect(
+      resolveAgentImageForRun({
+        agentGroupId: 'ag-main',
+        groupFolder: 'main',
+        containerConfig: config,
+        currentImageBase: 'nanoclaw-agent-v2-newbase',
+        currentImage: 'nanoclaw-agent-v2-newbase:newsha',
+        rebuildAgentGroupImage: async () => 'nanoclaw-agent-v2-oldbase:ag-main',
+      }),
+    ).rejects.toThrow(
+      "Per-agent image for main was rebuilt as 'nanoclaw-agent-v2-oldbase:ag-main', expected 'nanoclaw-agent-v2-newbase:ag-main'",
+    );
   });
 });
 

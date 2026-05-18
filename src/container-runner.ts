@@ -22,7 +22,7 @@ import {
 } from './config.js';
 import { loadAgentMcpConfigForGroup } from './agent-mcp-config.js';
 import { type AgentMcpBridge, startAgentMcpBridge } from './agent-mcp-bridge.js';
-import { readContainerConfig, writeContainerConfig } from './container-config.js';
+import { readContainerConfig, writeContainerConfig, type ContainerConfig } from './container-config.js';
 import {
   CONTAINER_RUNTIME_BIN,
   hostGatewayArgs,
@@ -708,10 +708,7 @@ export function buildManagedReposIpcMount(agentGroup: Pick<AgentGroup, 'folder'>
  * change (e.g. group rename). Only writes if values differ to avoid
  * unnecessary file churn.
  */
-function ensureRuntimeFields(
-  containerConfig: import('./container-config.js').ContainerConfig,
-  agentGroup: AgentGroup,
-): void {
+function ensureRuntimeFields(containerConfig: ContainerConfig, agentGroup: AgentGroup): void {
   let dirty = false;
   if (containerConfig.agentGroupId !== agentGroup.id) {
     containerConfig.agentGroupId = agentGroup.id;
@@ -728,6 +725,53 @@ function ensureRuntimeFields(
   if (dirty) {
     writeContainerConfig(agentGroup.folder, containerConfig);
   }
+}
+
+type ResolveAgentImageForRunOptions = {
+  agentGroupId: string;
+  groupFolder: string;
+  containerConfig: ContainerConfig;
+  currentImageBase?: string;
+  currentImage?: string;
+  rebuildAgentGroupImage?: (agentGroupId: string) => Promise<string | void>;
+  readContainerConfigForGroup?: (groupFolder: string) => ContainerConfig;
+  writeContainerConfigForGroup?: (groupFolder: string, containerConfig: ContainerConfig) => void;
+};
+
+export async function resolveAgentImageForRun(
+  options: ResolveAgentImageForRunOptions,
+): Promise<{ imageTag: string; rebuilt: boolean }> {
+  const currentImageBase = options.currentImageBase ?? CONTAINER_IMAGE_BASE;
+  const currentImage = options.currentImage ?? CONTAINER_IMAGE;
+  const packages = options.containerConfig.packages;
+  const hasPackages = (packages?.apt?.length ?? 0) > 0 || (packages?.npm?.length ?? 0) > 0;
+  const expectedPackageImage = `${currentImageBase}:${options.agentGroupId}`;
+
+  if (!hasPackages) {
+    if (options.containerConfig.imageTag !== undefined) {
+      delete options.containerConfig.imageTag;
+      const writeConfig = options.writeContainerConfigForGroup ?? writeContainerConfig;
+      writeConfig(options.groupFolder, options.containerConfig);
+    }
+    return { imageTag: currentImage, rebuilt: false };
+  }
+
+  if (options.containerConfig.imageTag === expectedPackageImage) {
+    return { imageTag: options.containerConfig.imageTag, rebuilt: false };
+  }
+
+  const rebuild = options.rebuildAgentGroupImage ?? buildAgentGroupImage;
+  const rebuiltTag = await rebuild(options.agentGroupId);
+  const readConfig = options.readContainerConfigForGroup ?? readContainerConfig;
+  const freshTag = typeof rebuiltTag === 'string' ? rebuiltTag : readConfig(options.groupFolder).imageTag;
+
+  if (freshTag !== expectedPackageImage) {
+    throw new Error(
+      `Per-agent image for ${options.groupFolder} was rebuilt as '${freshTag || 'missing'}', expected '${expectedPackageImage}'`,
+    );
+  }
+
+  return { imageTag: freshTag, rebuilt: true };
 }
 
 async function buildContainerArgs(
@@ -782,9 +826,12 @@ async function buildContainerArgs(
   // Override entrypoint: run v2 entry point directly via Bun (no tsc, no stdin).
   args.push('--entrypoint', 'bash');
 
-  // Use per-agent-group image if one has been built, otherwise base image
-  const imageTag = containerConfig.imageTag || CONTAINER_IMAGE;
-  args.push(imageTag);
+  const image = await resolveAgentImageForRun({
+    agentGroupId: agentGroup.id,
+    groupFolder: agentGroup.folder,
+    containerConfig,
+  });
+  args.push(image.imageTag);
 
   args.push('-c', 'exec bun run /app/src/index.ts');
 
