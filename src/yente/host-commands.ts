@@ -51,7 +51,7 @@ export function handleYenteHostCommand(context: YenteHostCommandContext): YenteH
       outboundText: [
         'Yente commands:',
         '/help - show this help.',
-        '/status - show current runtime status.',
+        '/status - show current status.',
         '/new - start a fresh session for this conversation.',
         '/clear - start a fresh session for this conversation.',
         '/compact - compact the active session.',
