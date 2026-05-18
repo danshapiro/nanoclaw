@@ -30,6 +30,16 @@ async function handleInteractiveResponse(payload: ResponsePayload): Promise<bool
     return true; // claimed — we owned this questionId even though the session is gone
   }
 
+  if (session.status !== 'active') {
+    log.info('Dropping response for inactive interactive session', {
+      questionId: payload.questionId,
+      sessionId: session.id,
+      status: session.status,
+    });
+    deletePendingQuestion(payload.questionId);
+    return true;
+  }
+
   writeSessionMessage(session.agent_group_id, session.id, {
     id: `qr-${payload.questionId}-${Date.now()}`,
     kind: 'system',

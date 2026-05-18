@@ -27,6 +27,7 @@ import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContaine
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable, isDbInitialized } from './db/connection.js';
+import { getSession } from './db/sessions.js';
 import { initGroupFilesystem } from './group-init.js';
 import { resolveGroupIpcPath } from './group-folder.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
@@ -82,6 +83,10 @@ export function isContainerRunning(sessionId: string): boolean {
   return activeContainers.has(sessionId);
 }
 
+function sessionIsActiveForWake(sessionId: string): boolean {
+  return getSession(sessionId)?.status === 'active';
+}
+
 export function waitForContainerExit(sessionId: string, timeoutMs = 30000): Promise<boolean> {
   if (!activeContainers.has(sessionId)) {
     return Promise.resolve(true);
@@ -115,6 +120,10 @@ export function waitForContainerExit(sessionId: string, timeoutMs = 30000): Prom
  * The container runs the v2 agent-runner which polls the session DB.
  */
 export function wakeContainer(session: Session): Promise<void> {
+  if (!sessionIsActiveForWake(session.id)) {
+    log.info('Skipping container wake for inactive session', { sessionId: session.id });
+    return Promise.resolve();
+  }
   if (activeContainers.has(session.id)) {
     log.debug('Container already running', { sessionId: session.id });
     return Promise.resolve();
@@ -191,6 +200,13 @@ async function spawnContainer(session: Session): Promise<void> {
     cleanupTempSkillRoot(managedSkillsRoot);
     await stopAgentMcpBridges(bridges);
     throw err;
+  }
+
+  if (!sessionIsActiveForWake(session.id)) {
+    log.info('Aborting container spawn for inactive session', { sessionId: session.id, containerName });
+    cleanupTempSkillRoot(managedSkillsRoot);
+    await stopAgentMcpBridges(bridges);
+    return;
   }
 
   log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });

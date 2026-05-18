@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { spawnSync } from 'child_process';
+import { EventEmitter } from 'events';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -14,6 +15,138 @@ import {
   resolveProviderName,
 } from './container-runner.js';
 import type { AgentGroup } from './types.js';
+
+type Deferred = {
+  promise: Promise<void>;
+  resolve: () => void;
+};
+
+function deferred(): Deferred {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+function fakeChildProcess(pid = 12345): NodeJS.EventEmitter & { pid: number; kill: ReturnType<typeof vi.fn> } {
+  const proc = new EventEmitter() as NodeJS.EventEmitter & {
+    pid: number;
+    kill: ReturnType<typeof vi.fn>;
+    stdout: EventEmitter;
+    stderr: EventEmitter;
+  };
+  proc.pid = pid;
+  proc.kill = vi.fn();
+  proc.stdout = new EventEmitter();
+  proc.stderr = new EventEmitter();
+  return proc;
+}
+
+async function loadContainerRunnerHarness() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-container-runner-'));
+  const dataDir = path.join(root, 'data');
+  const groupsDir = path.join(root, 'groups');
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.mkdirSync(groupsDir, { recursive: true });
+
+  const oneCliStarted = deferred();
+  const oneCliRelease = deferred();
+  const spawnMock = vi.fn(() => fakeChildProcess());
+  const execSyncMock = vi.fn();
+  const applyContainerConfigMock = vi.fn(async () => {
+    oneCliStarted.resolve();
+    await oneCliRelease.promise;
+    return true;
+  });
+
+  vi.resetModules();
+  vi.doMock('child_process', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('child_process')>();
+    return {
+      ...actual,
+      execSync: execSyncMock,
+      spawn: spawnMock,
+    };
+  });
+  vi.doMock('@onecli-sh/sdk', () => ({
+    OneCLI: class {
+      ensureAgent = vi.fn().mockResolvedValue(undefined);
+      applyContainerConfig = applyContainerConfigMock;
+    },
+  }));
+  vi.doMock('./config.js', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('./config.js')>();
+    return {
+      ...actual,
+      DATA_DIR: dataDir,
+      GROUPS_DIR: groupsDir,
+      MANAGED_REPOS_DIR: '',
+      ONECLI_API_KEY: 'test-key',
+      ONECLI_URL: 'http://onecli.test',
+    };
+  });
+  vi.doMock('./agent-mcp-config.js', () => ({
+    loadAgentMcpConfigForGroup: vi.fn(() => ({ bridges: {}, allowedTools: [] })),
+  }));
+  vi.doMock('./agent-mcp-bridge.js', () => ({
+    startAgentMcpBridge: vi.fn(),
+  }));
+  vi.doMock('./providers/index.js', () => ({}));
+  vi.doMock('./yente/service-env.js', () => ({
+    assertOneCliApplied(applied: boolean): void {
+      if (!applied) throw new Error('OneCLI gateway did not apply container credentials');
+    },
+    ensureOneCliAgentSecretAccess: vi.fn().mockResolvedValue(undefined),
+  }));
+
+  const db = await import('./db/index.js');
+  const sessions = await import('./db/sessions.js');
+  const sessionManager = await import('./session-manager.js');
+  const containerRunner = await import('./container-runner.js');
+
+  const mainDb = db.initTestDb();
+  db.runMigrations(mainDb);
+  db.createAgentGroup({
+    id: 'ag-1',
+    name: 'Agent',
+    folder: 'agent',
+    agent_provider: null,
+    created_at: new Date().toISOString(),
+  });
+  db.createMessagingGroup({
+    id: 'mg-1',
+    channel_type: 'telegram',
+    platform_id: 'telegram:123',
+    name: 'Test Chat',
+    is_group: 0,
+    unknown_sender_policy: 'public',
+    created_at: new Date().toISOString(),
+  });
+  const { session } = sessionManager.resolveSession('ag-1', 'mg-1', null, 'shared');
+
+  return {
+    applyContainerConfigMock,
+    close() {
+      db.closeDb();
+      fs.rmSync(root, { recursive: true, force: true });
+      vi.doUnmock('child_process');
+      vi.doUnmock('@onecli-sh/sdk');
+      vi.doUnmock('./config.js');
+      vi.doUnmock('./agent-mcp-config.js');
+      vi.doUnmock('./agent-mcp-bridge.js');
+      vi.doUnmock('./providers/index.js');
+      vi.doUnmock('./yente/service-env.js');
+      vi.resetModules();
+    },
+    containerRunner,
+    oneCliRelease,
+    oneCliStarted,
+    session,
+    sessions,
+    spawnMock,
+  };
+}
 
 describe('resolveProviderName', () => {
   it('prefers session over group and container.json', () => {
@@ -101,6 +234,42 @@ describe('OneCLI container gateway', () => {
 
     expect(ensureSecretAccess).toHaveBeenCalledWith('ag-main');
     expect(client.applyContainerConfig).toHaveBeenCalledWith(args, { addHostMapping: false, agent: 'ag-main' });
+  });
+});
+
+describe('session wake lifecycle', () => {
+  it('does not wake an archived session', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      harness.sessions.archiveSession(harness.session.id);
+
+      const wake = harness.containerRunner.wakeContainer(harness.session);
+      harness.oneCliRelease.resolve();
+      await wake;
+
+      expect(harness.spawnMock).not.toHaveBeenCalled();
+      expect(harness.sessions.getSession(harness.session.id)?.container_status).toBe('stopped');
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('aborts an in-flight wake when the session is archived before spawn', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      const wake = harness.containerRunner.wakeContainer(harness.session);
+      await harness.oneCliStarted.promise;
+
+      harness.sessions.archiveSession(harness.session.id);
+      harness.oneCliRelease.resolve();
+      await wake;
+
+      expect(harness.applyContainerConfigMock).toHaveBeenCalled();
+      expect(harness.spawnMock).not.toHaveBeenCalled();
+      expect(harness.sessions.getSession(harness.session.id)?.container_status).toBe('stopped');
+    } finally {
+      harness.close();
+    }
   });
 });
 
