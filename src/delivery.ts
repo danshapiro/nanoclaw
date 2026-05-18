@@ -9,7 +9,7 @@
  */
 import type Database from 'better-sqlite3';
 
-import { getRunningSessions, getActiveSessions, createPendingQuestion } from './db/sessions.js';
+import { getRunningSessions, getActiveSessions, createPendingQuestion, getSession } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
 import { getMessagingGroupByPlatform } from './db/messaging-groups.js';
@@ -161,9 +161,40 @@ export async function deliverSessionMessages(session: Session): Promise<void> {
   }
 }
 
-async function drainSession(session: Session): Promise<void> {
+export async function dropInactiveSessionOutbound(sessionId: string, reason: string): Promise<number> {
+  const session = getSession(sessionId);
+  if (!session || session.status === 'active') return 0;
+  return drainSession(session, { inactiveOnly: true, staleReason: reason });
+}
+
+type DrainSessionOptions = {
+  inactiveOnly?: boolean;
+  staleReason?: string;
+};
+
+function isSessionActive(sessionId: string): boolean {
+  return getSession(sessionId)?.status === 'active';
+}
+
+function markStaleOutboundDropped(inDb: Database.Database, messageId: string): void {
+  markDelivered(inDb, messageId, null);
+}
+
+function logStaleOutboundDropped(session: Session, count: number, reason: string): void {
+  if (count === 0) return;
+  log.info('Dropped outbound rows from inactive session', {
+    sessionId: session.id,
+    agentGroupId: session.agent_group_id,
+    count,
+    reason,
+  });
+}
+
+async function drainSession(session: Session, options: DrainSessionOptions = {}): Promise<number> {
+  if (options.inactiveOnly && isSessionActive(session.id)) return 0;
+
   const agentGroup = getAgentGroup(session.agent_group_id);
-  if (!agentGroup) return;
+  if (!agentGroup) return 0;
 
   let outDb: Database.Database;
   let inDb: Database.Database;
@@ -171,23 +202,38 @@ async function drainSession(session: Session): Promise<void> {
     outDb = openOutboundDb(agentGroup.id, session.id);
     inDb = openInboundDb(agentGroup.id, session.id);
   } catch {
-    return; // DBs might not exist yet
+    return 0; // DBs might not exist yet
   }
 
   try {
     // Read all due messages from outbound.db (read-only)
     const allDue = getDueOutboundMessages(outDb);
-    if (allDue.length === 0) return;
+    if (allDue.length === 0) return 0;
 
     // Filter out already-delivered messages using inbound.db's delivered table
     const delivered = getDeliveredIds(inDb);
     const undelivered = allDue.filter((m) => !delivered.has(m.id));
-    if (undelivered.length === 0) return;
+    if (undelivered.length === 0) return 0;
 
     // Ensure platform_message_id column exists (migration for existing sessions)
     migrateDeliveredTable(inDb);
 
+    if (!isSessionActive(session.id)) {
+      for (const msg of undelivered) {
+        markStaleOutboundDropped(inDb, msg.id);
+      }
+      logStaleOutboundDropped(session, undelivered.length, options.staleReason ?? 'inactive-session-delivery');
+      return undelivered.length;
+    }
+
+    let staleDropCount = 0;
     for (const msg of undelivered) {
+      if (!isSessionActive(session.id)) {
+        markStaleOutboundDropped(inDb, msg.id);
+        staleDropCount++;
+        continue;
+      }
+
       try {
         const platformMsgId = await deliverMessage(msg, session, inDb);
         markDelivered(inDb, msg.id, platformMsgId ?? null);
@@ -225,6 +271,8 @@ async function drainSession(session: Session): Promise<void> {
         }
       }
     }
+    logStaleOutboundDropped(session, staleDropCount, options.staleReason ?? 'inactive-session-delivery');
+    return staleDropCount;
   } finally {
     outDb.close();
     inDb.close();

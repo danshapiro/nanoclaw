@@ -27,8 +27,9 @@ vi.mock('./config.js', async () => {
 const TEST_DIR = '/tmp/nanoclaw-test-delivery';
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup, createMessagingGroup } from './db/index.js';
-import { resolveSession, outboundDbPath } from './session-manager.js';
-import { deliverSessionMessages, setDeliveryAdapter } from './delivery.js';
+import { archiveSession } from './db/sessions.js';
+import { resolveSession, outboundDbPath, inboundDbPath } from './session-manager.js';
+import { deliverSessionMessages, dropInactiveSessionOutbound, setDeliveryAdapter } from './delivery.js';
 
 function now(): string {
   return new Date().toISOString();
@@ -53,13 +54,32 @@ function seedAgentAndChannel(): void {
   });
 }
 
-function insertOutbound(agentGroupId: string, sessionId: string, msgId: string): void {
+function insertOutbound(agentGroupId: string, sessionId: string, msgId: string, text = 'hello'): void {
   const db = new Database(outboundDbPath(agentGroupId, sessionId));
   db.prepare(
-    `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, content)
-     VALUES (?, datetime('now'), 'chat', 'telegram:123', 'telegram', ?)`,
-  ).run(msgId, JSON.stringify({ text: 'hello' }));
+    `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, thread_id, content)
+     VALUES (?, datetime('now'), 'chat', 'telegram:123', 'telegram', NULL, ?)`,
+  ).run(msgId, JSON.stringify({ text }));
   db.close();
+}
+
+function deliveredRows(agentGroupId: string, sessionId: string): Array<{
+  message_out_id: string;
+  platform_message_id: string | null;
+  status: string;
+}> {
+  const db = new Database(inboundDbPath(agentGroupId, sessionId));
+  try {
+    return db
+      .prepare('SELECT message_out_id, platform_message_id, status FROM delivered ORDER BY message_out_id')
+      .all() as Array<{
+      message_out_id: string;
+      platform_message_id: string | null;
+      status: string;
+    }>;
+  } finally {
+    db.close();
+  }
 }
 
 beforeEach(() => {
@@ -144,5 +164,79 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     await deliverSessionMessages(session);
 
     expect(callCount).toBe(1);
+  });
+
+  it('marks archived-session outbound as delivered without calling the adapter', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'stale-1');
+    archiveSession(session.id);
+
+    const delivered: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        delivered.push(content);
+        return 'should-not-send';
+      },
+    });
+
+    await deliverSessionMessages(session);
+    expect(delivered).toEqual([]);
+    expect(deliveredRows('ag-1', session.id)).toEqual([
+      { message_out_id: 'stale-1', platform_message_id: null, status: 'delivered' },
+    ]);
+
+    await deliverSessionMessages(session);
+    expect(delivered).toEqual([]);
+  });
+
+  it('drops remaining outbound if a session is archived during delivery', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-1', 'first');
+    insertOutbound('ag-1', session.id, 'out-2', 'second');
+
+    const delivered: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        delivered.push(JSON.parse(content).text as string);
+        archiveSession(session.id);
+        return 'platform-first';
+      },
+    });
+
+    await deliverSessionMessages(session);
+
+    expect(delivered).toEqual(['first']);
+    expect(deliveredRows('ag-1', session.id)).toEqual([
+      { message_out_id: 'out-1', platform_message_id: 'platform-first', status: 'delivered' },
+      { message_out_id: 'out-2', platform_message_id: null, status: 'delivered' },
+    ]);
+  });
+
+  it('explicitly drains inactive-session outbound without re-marking rows', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    archiveSession(session.id);
+    insertOutbound('ag-1', session.id, 'late-1', 'late one');
+    insertOutbound('ag-1', session.id, 'late-2', 'late two');
+
+    const delivered: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        delivered.push(content);
+        return 'should-not-send';
+      },
+    });
+
+    await expect(dropInactiveSessionOutbound(session.id, 'yente-session-reset')).resolves.toBe(2);
+    expect(delivered).toEqual([]);
+    expect(deliveredRows('ag-1', session.id)).toEqual([
+      { message_out_id: 'late-1', platform_message_id: null, status: 'delivered' },
+      { message_out_id: 'late-2', platform_message_id: null, status: 'delivered' },
+    ]);
+
+    await expect(dropInactiveSessionOutbound(session.id, 'yente-session-reset')).resolves.toBe(0);
+    expect(delivered).toEqual([]);
   });
 });
