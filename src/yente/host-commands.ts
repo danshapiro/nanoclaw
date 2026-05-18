@@ -15,7 +15,13 @@ export interface YenteHostCommandContext {
 
 export type YenteHostCommandResult =
   | { handled: false }
-  | { handled: true; outboundText: string; sessionForOutbound: Session };
+  | {
+      handled: true;
+      outboundText: string;
+      sessionForOutbound: Session;
+      supersededSessionId?: string;
+      command: YenteHostCommandName;
+    };
 
 const COMMANDS = new Set<YenteHostCommandName>(['help', 'status', 'new', 'clear', 'compact']);
 const STARTED_AT = Date.now();
@@ -40,6 +46,7 @@ export function handleYenteHostCommand(context: YenteHostCommandContext): YenteH
   if (command === 'help') {
     return {
       handled: true,
+      command,
       sessionForOutbound: context.session,
       outboundText: [
         'Yente commands:',
@@ -55,6 +62,7 @@ export function handleYenteHostCommand(context: YenteHostCommandContext): YenteH
   if (command === 'status') {
     return {
       handled: true,
+      command,
       sessionForOutbound: context.session,
       outboundText: [
         'Yente status:',
@@ -74,11 +82,12 @@ export function handleYenteHostCommand(context: YenteHostCommandContext): YenteH
     return { handled: false };
   }
 
-  const gate = gateCommand('/clear', context.userId, context.agentGroup.id);
+  const gate = gateCommand(`/${command}`, context.userId, context.agentGroup.id);
   if (gate.action === 'deny') {
     return denied(command, context.session);
   }
 
+  const supersededSessionId = context.session.id;
   const fresh = rollActiveSession({
     agentGroupId: context.agentGroup.id,
     messagingGroupId: context.messagingGroup.id,
@@ -88,7 +97,9 @@ export function handleYenteHostCommand(context: YenteHostCommandContext): YenteH
 
   return {
     handled: true,
+    command,
     sessionForOutbound: fresh,
+    supersededSessionId,
     outboundText: `Started a fresh session: ${fresh.id}`,
   };
 }
@@ -96,6 +107,7 @@ export function handleYenteHostCommand(context: YenteHostCommandContext): YenteH
 function denied(command: YenteHostCommandName, session: Session): YenteHostCommandResult {
   return {
     handled: true,
+    command,
     sessionForOutbound: session,
     outboundText: `Permission denied: /${command} requires admin access.`,
   };

@@ -136,6 +136,7 @@ describe('handleYenteHostCommand', () => {
     expect(result.handled).toBe(true);
     expect(getSession(original.id)?.status).toBe('archived');
     expect(result.handled && result.sessionForOutbound.id).not.toBe(original.id);
+    expect(result.handled && result.supersededSessionId).toBe(original.id);
     expect(result.handled && result.sessionForOutbound.messaging_group_id).toBe(messagingGroup.id);
     expect(result.handled && result.sessionForOutbound.thread_id).toBe('thread-1');
 
@@ -145,6 +146,7 @@ describe('handleYenteHostCommand', () => {
     });
     expect(clear.handled).toBe(true);
     expect(clear.handled && clear.sessionForOutbound.id).not.toBe(result.handled && result.sessionForOutbound.id);
+    expect(clear.handled && clear.supersededSessionId).toBe(result.handled && result.sessionForOutbound.id);
   });
 
   it('uses the generic admin policy for denied and authorized admin commands', () => {
@@ -152,6 +154,15 @@ describe('handleYenteHostCommand', () => {
     expect(denied).toMatchObject({
       handled: true,
       outboundText: 'Permission denied: /new requires admin access.',
+    });
+    expect(denied.handled && 'supersededSessionId' in denied).toBe(false);
+
+    const deniedNew = handleYenteHostCommand(context('/new', 'discord:member'));
+    const deniedClear = handleYenteHostCommand(context('/clear', 'discord:member'));
+    expect(deniedNew).toMatchObject({ handled: true, outboundText: 'Permission denied: /new requires admin access.' });
+    expect(deniedClear).toMatchObject({
+      handled: true,
+      outboundText: 'Permission denied: /clear requires admin access.',
     });
 
     grantAdmin('discord:admin');
