@@ -346,7 +346,9 @@ export async function cleanupContainerForSession(sessionId: string, reason: stri
       if (!processAppearsAlive(entry.process)) {
         return true;
       }
-      throw new AggregateError([stopErr, killErr], `Failed to clean up container for session ${sessionId}`);
+      throw new AggregateError([stopErr, killErr], `Failed to clean up container for session ${sessionId}`, {
+        cause: killErr,
+      });
     }
   }
 }
