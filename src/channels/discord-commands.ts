@@ -93,6 +93,12 @@ function commandByName(name: unknown): YenteDiscordCommand | undefined {
   return YENTE_DISCORD_COMMANDS.find((command) => command.name === name);
 }
 
+function threadIdFromInteraction(interaction: DiscordApplicationCommandInteraction, channelId: string): string | null {
+  if (!channelId) return null;
+  const guildId = typeof interaction.guild_id === 'string' && interaction.guild_id ? interaction.guild_id : '@me';
+  return `discord:${guildId}:${channelId}`;
+}
+
 export function buildYenteDiscordGuildCommandPayloads(): DiscordApplicationCommandPayload[] {
   return YENTE_DISCORD_COMMANDS.map((command) => ({
     name: command.name,
@@ -253,6 +259,7 @@ export function normalizeDiscordApplicationCommandInteraction(
     userId ||
     'Discord user';
   const channelId = typeof interaction.channel_id === 'string' ? interaction.channel_id : '';
+  const threadId = threadIdFromInteraction(interaction, channelId);
 
   return {
     commandName: command.name,
@@ -261,7 +268,7 @@ export function normalizeDiscordApplicationCommandInteraction(
     userId: `discord:${userId}`,
     senderName,
     platformId: channelId,
-    threadId: null,
+    threadId,
   };
 }
 

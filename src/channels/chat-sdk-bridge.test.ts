@@ -47,7 +47,7 @@ describe('Chat SDK bridge Discord gateway forwarding', () => {
     expect(adapter.handleWebhook).not.toHaveBeenCalled();
     expect(setupConfig.onInbound).toHaveBeenCalledWith(
       'channel-1',
-      null,
+      'discord:guild-1:channel-1',
       expect.objectContaining({
         kind: 'chat-sdk',
         isMention: true,

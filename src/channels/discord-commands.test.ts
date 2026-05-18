@@ -145,7 +145,28 @@ describe('Yente Discord application commands', () => {
       userId: 'discord:user-1',
       senderName: 'User One',
       platformId: 'channel-1',
-      threadId: null,
+      threadId: 'discord:guild-1:channel-1',
+    });
+  });
+
+  it('normalizes Discord DM application commands into a stable DM thread id', () => {
+    expect(
+      normalizeDiscordApplicationCommandInteraction({
+        type: 2,
+        id: 'interaction-2',
+        token: 'token-2',
+        channel_id: 'dm-channel-1',
+        user: { id: 'user-2', username: 'DM User' },
+        data: { type: 1, name: 'new' },
+      }),
+    ).toEqual({
+      commandName: 'new',
+      text: '/new',
+      requiresAdmin: true,
+      userId: 'discord:user-2',
+      senderName: 'DM User',
+      platformId: 'dm-channel-1',
+      threadId: 'discord:@me:dm-channel-1',
     });
   });
 });
