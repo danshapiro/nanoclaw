@@ -46,6 +46,12 @@ Always emit these checks in this order:
 
 If any check fails, continue running the remaining checks, then end with `SUMMARY FAIL`.
 
+Provider note: NanoClaw can run under either the Claude Code SDK provider or
+the OpenCode provider. The OpenCode provider intentionally exposes a smaller
+tool surface. In OpenCode sessions, do not fail checks solely because these
+Claude-only tools are absent: `WebSearch`, `ToolSearch`, `NotebookEdit`,
+`TaskOutput`, `TaskStop`, `TeamCreate`, and `TeamDelete`.
+
 ## Scratch Paths
 
 - Use `/workspace/agent/full-qa-pass/` for temporary files.
@@ -60,7 +66,13 @@ Confirm you are running because the user requested `FullQAPass` by name.
 
 ### 2. Allowed Tool Surface
 
-Assert that the current environment includes these tool families:
+Determine the provider profile from visible environment/config clues. Treat the
+session as OpenCode when `AGENT_PROVIDER=opencode`, `OPENCODE_PROVIDER` is set,
+or the available tool list lacks the Claude-only orchestration/tool-discovery
+families while OpenCode model variables are present.
+
+For the Claude profile, assert that the current environment includes these tool
+families:
 
 - `Bash`
 - `Read`
@@ -82,7 +94,25 @@ Assert that the current environment includes these tool families:
 - `NotebookEdit`
 - `mcp__nanoclaw__*`
 
-If any required family is missing, mark this check failed.
+For the OpenCode profile, assert that the current environment includes these
+tool families:
+
+- `Bash`
+- `Read`
+- `Write`
+- `Edit`
+- `Glob`
+- `Grep`
+- `WebFetch`
+- `Task`
+- `SendMessage`
+- `TodoWrite`
+- `Skill`
+- `mcp__nanoclaw__*`
+
+If a provider-required family is missing, mark this check failed. If only
+Claude-only families are absent in the OpenCode profile, emit
+`CHECK allowed_tool_surface PASS opencode profile; Claude-only tools absent as expected`.
 
 ### 3. Portable Repo Checks
 
@@ -104,15 +134,16 @@ Validate `/home/node/.claude/settings.json`:
 - `tool_read_write_edit`: use `Write`, `Read`, and `Edit` on a file under `/workspace/agent/full-qa-pass/`.
 - `tool_glob_grep`: use `Glob` and `Grep` against the scratch directory and confirm the created file is found.
 - `tool_todowrite`: create at least one todo item and mark it completed.
-- `tool_notebookedit`: create or update a notebook entry tied to this run.
-- `tool_websearch_https`: perform an HTTPS web search and confirm the result URLs are HTTPS.
+- `tool_notebookedit`: in the Claude profile, create or update a notebook entry tied to this run. In the OpenCode profile, emit PASS noting NotebookEdit is Claude-only and not expected.
+- `tool_websearch_https`: in the Claude profile, perform an HTTPS web search and confirm the result URLs are HTTPS. In the OpenCode profile, emit PASS noting WebSearch is Claude-only and covered by the WebFetch HTTPS check.
 - `tool_webfetch_https`: fetch an HTTPS URL and confirm content was returned.
-- `tool_toolsearch`: use `ToolSearch` and confirm it returns at least one result relevant to this environment.
+- `tool_toolsearch`: in the Claude profile, use `ToolSearch` and confirm it returns at least one result relevant to this environment. In the OpenCode profile, emit PASS noting ToolSearch is Claude-only and not expected.
 - `tool_skill_nested`: invoke the built-in `status` skill by name and confirm it returns a result.
 
 ### 6. Orchestration Roundtrip
 
-Exercise the orchestration tool family end-to-end in a bounded way:
+In the Claude profile, exercise the orchestration tool family end-to-end in a
+bounded way:
 
 - create a temporary team named `fullqapass-probe-<unique-suffix>`, where the suffix is derived from the current run timestamp or random alphanumeric text;
 - if `TeamCreate` reports a name collision, retry once with a different unique suffix;
@@ -125,6 +156,8 @@ Exercise the orchestration tool family end-to-end in a bounded way:
 - do not use Bash to remove `/home/node/.claude/teams/...`; team state is managed by orchestration tools and may be blocked as a sensitive path.
 
 Mark `orchestration_roundtrip` failed if any step fails.
+
+In the OpenCode profile, emit `CHECK orchestration_roundtrip PASS opencode profile; Claude team tools are not expected` after confirming `Task` is available and `nanoclaw_mcp_roundtrip` will exercise durable scheduling.
 
 ### 7. Managed Skills Visibility
 
