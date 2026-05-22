@@ -15,6 +15,13 @@ function makeReleaseRoot(proxySource = 'process.stdin.resume();'): string {
   return releaseRoot;
 }
 
+function makeReadyProxyReleaseRoot(): string {
+  return makeReleaseRoot(`
+process.stdout.write('ready');
+process.stdin.resume();
+`);
+}
+
 function serviceIdentity(): { uid: number; gid: number } {
   return {
     uid: process.getuid?.() ?? 1000,
@@ -169,6 +176,90 @@ describe('startAgentMcpBridge', () => {
         });
         client.destroy();
         await new Promise((resolve) => setTimeout(resolve, 50));
+      } finally {
+        await bridge.stop();
+      }
+    } finally {
+      fs.rmSync(dataDir, { recursive: true, force: true });
+      fs.rmSync(releaseRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('reclaims stale legacy lock files before connecting the proxy', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-mcp-data-'));
+    const releaseRoot = makeReadyProxyReleaseRoot();
+    const authDir = path.join(dataDir, 'v2-sessions', 'ag-main', '.mcp-auth', 'granola');
+    const socketRoot = path.join(dataDir, 'v2-sessions', 'ag-main', 'mcp-runs');
+    fs.mkdirSync(authDir, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(socketRoot, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(authDir, '.nanoclaw-granola-auth-ok'), '');
+    const lockPath = path.join(socketRoot, 'granola.lock');
+    fs.writeFileSync(lockPath, '');
+    const staleTime = new Date(Date.now() - 120_000);
+    fs.utimesSync(lockPath, staleTime, staleTime);
+    const identity = serviceIdentity();
+    try {
+      const bridge = await startAgentMcpBridge({
+        groupFolder: 'main',
+        agentGroupId: 'ag-main',
+        bridge: granolaBridge,
+        containerUid: identity.uid,
+        containerGid: identity.gid,
+        dataDir,
+        releaseRoot,
+      });
+      try {
+        const client = net.createConnection(bridge.hostSocketPath);
+        const firstChunk = await new Promise<Buffer>((resolve, reject) => {
+          client.once('data', resolve);
+          client.once('error', reject);
+        });
+        expect(firstChunk.toString()).toBe('ready');
+        client.destroy();
+      } finally {
+        await bridge.stop();
+      }
+    } finally {
+      fs.rmSync(dataDir, { recursive: true, force: true });
+      fs.rmSync(releaseRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('releases the group lock after proxy startup so another session can connect', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-mcp-data-'));
+    const releaseRoot = makeReadyProxyReleaseRoot();
+    const authDir = path.join(dataDir, 'v2-sessions', 'ag-main', '.mcp-auth', 'granola');
+    fs.mkdirSync(authDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(authDir, '.nanoclaw-granola-auth-ok'), '');
+    const identity = serviceIdentity();
+    try {
+      const bridge = await startAgentMcpBridge({
+        groupFolder: 'main',
+        agentGroupId: 'ag-main',
+        bridge: granolaBridge,
+        containerUid: identity.uid,
+        containerGid: identity.gid,
+        dataDir,
+        releaseRoot,
+      });
+      try {
+        const firstClient = net.createConnection(bridge.hostSocketPath);
+        await new Promise<Buffer>((resolve, reject) => {
+          firstClient.once('data', resolve);
+          firstClient.once('error', reject);
+        });
+
+        const lockPath = path.join(dataDir, 'v2-sessions', 'ag-main', 'mcp-runs', 'granola.lock');
+        expect(fs.existsSync(lockPath)).toBe(false);
+
+        const secondClient = net.createConnection(bridge.hostSocketPath);
+        const secondChunk = await new Promise<Buffer>((resolve, reject) => {
+          secondClient.once('data', resolve);
+          secondClient.once('error', reject);
+        });
+        expect(secondChunk.toString()).toBe('ready');
+        firstClient.destroy();
+        secondClient.destroy();
       } finally {
         await bridge.stop();
       }

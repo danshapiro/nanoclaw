@@ -104,18 +104,64 @@ function resolveProxyEntrypoint(releaseRoot: string): string {
   return entrypoint;
 }
 
+const LEGACY_LOCK_STALE_MS = 60_000;
+
+function processExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    return code === 'EPERM';
+  }
+}
+
+function shouldReclaimBridgeLock(lockPath: string): boolean {
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(lockPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw err;
+  }
+
+  let raw = '';
+  try {
+    raw = fs.readFileSync(lockPath, 'utf8').trim();
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw err;
+  }
+
+  if (!raw) {
+    return Date.now() - stat.mtimeMs > LEGACY_LOCK_STALE_MS;
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as { pid?: unknown };
+    return typeof parsed.pid === 'number' && !processExists(parsed.pid);
+  } catch {
+    return Date.now() - stat.mtimeMs > LEGACY_LOCK_STALE_MS;
+  }
+}
+
 async function acquireBridgeLock(lockPath: string, key: string, waitMs: number): Promise<HeldLock> {
   const start = Date.now();
   while (true) {
     if (!inProcessLocks.has(key)) {
       try {
         const fd = fs.openSync(lockPath, 'wx', 0o600);
+        fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, key, createdAt: new Date().toISOString() }));
         fs.closeSync(fd);
         inProcessLocks.add(key);
         return { key, lockPath };
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== 'EEXIST') {
           throw err;
+        }
+        if (shouldReclaimBridgeLock(lockPath)) {
+          removeFileIfExists(lockPath);
+          continue;
         }
       }
     }
@@ -352,6 +398,10 @@ export async function startAgentMcpBridge(options: AgentMcpBridgeOptions): Promi
       child.stdout.once('data', () => {
         settled = true;
         clearTimeout(watchdog);
+        if (lock) {
+          releaseBridgeLock(lock);
+          lock = undefined;
+        }
       });
       child.stdout.pipe(socket, { end: false });
       socket.pipe(child.stdin);
