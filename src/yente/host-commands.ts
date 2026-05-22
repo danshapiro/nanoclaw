@@ -27,7 +27,7 @@ const COMMANDS = new Set<YenteHostCommandName>(['help', 'status', 'new', 'clear'
 const STARTED_AT = Date.now();
 
 export function parseYenteHostCommandFromContent(content: string): YenteHostCommandName | null {
-  const text = extractText(content).trim();
+  const text = stripLeadingDiscordMention(extractText(content).trim());
   if (!text) return null;
 
   if (text.startsWith('/')) {
@@ -102,6 +102,10 @@ export function handleYenteHostCommand(context: YenteHostCommandContext): YenteH
     supersededSessionId,
     outboundText: `Started a fresh session: ${fresh.id}`,
   };
+}
+
+function stripLeadingDiscordMention(text: string): string {
+  return text.replace(/^<@!?\d+>\s*/, '').trim();
 }
 
 function denied(command: YenteHostCommandName, session: Session): YenteHostCommandResult {

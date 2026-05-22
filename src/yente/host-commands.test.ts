@@ -83,6 +83,8 @@ describe('parseYenteHostCommandFromContent', () => {
   it('recognizes slash commands and exact bare aliases only', () => {
     expect(parseYenteHostCommandFromContent(JSON.stringify({ text: '/help' }))).toBe('help');
     expect(parseYenteHostCommandFromContent(JSON.stringify({ text: '/status now' }))).toBe('status');
+    expect(parseYenteHostCommandFromContent(JSON.stringify({ text: '<@1464490804734197938> /new' }))).toBe('new');
+    expect(parseYenteHostCommandFromContent('<@!1464490804734197938> /clear')).toBe('clear');
     expect(parseYenteHostCommandFromContent('new')).toBe('new');
     expect(parseYenteHostCommandFromContent('clear')).toBe('clear');
     expect(parseYenteHostCommandFromContent('compact')).toBe('compact');
