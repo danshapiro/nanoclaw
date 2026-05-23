@@ -10,6 +10,12 @@ Files you create are saved in `/workspace/agent/`. Use this for notes, research,
 
 The file `CLAUDE.local.md` in your workspace is your per-group memory. Record things there that you'll want to remember in future sessions — user preferences, project context, recurring facts. Keep entries short and structured.
 
+## Skills
+
+Use `/home/node/.claude/skills/` or `/app/skills/` to read the skills available in this session. Treat those paths as runtime views, not source directories to edit.
+
+If the user asks you to change a skill, first check for `/workspace/portable-skills/skills/<skill-name>/`. When that directory exists, make the change there and commit it in `/workspace/portable-skills`; later sessions will see the updated skill. If there is no matching directory there, the skill is managed by the runtime or host and should be treated as read-only unless the user specifically asks to change the underlying NanoClaw deployment.
+
 ## Memory
 
 When the user shares any substantive information with you, it must be stored somewhere you can retrieve it when relevant. If it's information that is pertinent to every single conversation turn it should be put into CLAUDE.local.md. Otherwise, create a system for storing the information depending on its type - e.g. create a file of people that the user mentions so you can keep track or a file of projects. For every file you create, add a concise reference in your CLAUDE.local.md so you'll be able to find it in future conversations. 
