@@ -129,6 +129,25 @@ describe('formatter', () => {
     expect(prompt).toContain('A&lt;B');
     expect(prompt).toContain('x &gt; y &amp;&amp; z');
   });
+
+  it('renders workspace attachment metadata as text fallback', () => {
+    insertMessage('m1', 'chat-sdk', {
+      sender: 'User',
+      text: 'What is this?',
+      attachments: [
+        {
+          workspacePath: '/workspace/agent/attachments/discord/msg/photo.png',
+          originalName: 'photo.png',
+          contentType: 'image/png',
+          sizeBytes: 1234,
+        },
+      ],
+    });
+    const prompt = formatMessages(getPendingMessages());
+    expect(prompt).toContain(
+      '[image/png: photo.png - 1234 bytes - saved to /workspace/agent/attachments/discord/msg/photo.png]',
+    );
+  });
 });
 
 describe('accumulate gate (trigger column)', () => {

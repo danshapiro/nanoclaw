@@ -212,12 +212,17 @@ function formatReplyContext(replyTo: any): string {
 function formatAttachments(attachments: any[] | undefined): string {
   if (!Array.isArray(attachments) || attachments.length === 0) return '';
   const parts = attachments.map((a) => {
-    const name = a.name || a.filename || 'attachment';
-    const type = a.type || 'file';
+    const name = a.originalName || a.name || a.filename || a.safeName || 'attachment';
+    const type = a.contentType || a.mimeType || a.type || 'file';
+    const size = typeof a.sizeBytes === 'number' ? ` - ${a.sizeBytes} bytes` : '';
+    const workspacePath = a.workspacePath || '';
     const localPath = a.localPath ? `/workspace/${a.localPath}` : '';
     const url = a.url || '';
+    if (workspacePath) {
+      return `[${type}: ${escapeXml(name)}${size} - saved to ${escapeXml(workspacePath)}]`;
+    }
     if (localPath) {
-      return `[${type}: ${escapeXml(name)} — saved to ${escapeXml(localPath)}]`;
+      return `[${type}: ${escapeXml(name)}${size} - saved to ${escapeXml(localPath)}]`;
     }
     return url ? `[${type}: ${escapeXml(name)} (${escapeXml(url)})]` : `[${type}: ${escapeXml(name)}]`;
   });
