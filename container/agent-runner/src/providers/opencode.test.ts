@@ -28,6 +28,29 @@ function tmpDir(): string {
   return dir;
 }
 
+function withEnv<T>(env: Record<string, string | undefined>, fn: () => T): T {
+  const previous = new Map<string, string | undefined>();
+  for (const key of Object.keys(env)) {
+    previous.set(key, process.env[key]);
+    if (env[key] === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = env[key];
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  }
+}
+
 describe('OpenCode config', () => {
   it('denies OpenCode native questions while leaving other tools allowed', () => {
     const config = buildOpenCodeConfig({
@@ -105,6 +128,46 @@ describe('OpenCodeProvider stale session handling', () => {
 });
 
 describe('OpenCode file parts', () => {
+  it('does not override built-in OpenCode Go provider auth wiring', () => {
+    const config = withEnv(
+      {
+        OPENCODE_PROVIDER: 'opencode-go',
+        OPENCODE_MODEL: 'opencode-go/qwen3.6-plus',
+        OPENCODE_SMALL_MODEL: 'opencode-go/deepseek-v4-flash',
+        OPENCODE_API_KEY: 'secret-key',
+      },
+      () => buildOpenCodeConfig({ mcpServers: undefined }),
+    );
+
+    expect(config).toMatchObject({
+      model: 'opencode-go/qwen3.6-plus',
+      small_model: 'opencode-go/deepseek-v4-flash',
+      enabled_providers: ['opencode-go'],
+    });
+    expect(config).not.toHaveProperty('provider');
+  });
+
+  it('keeps explicit apiKey config for custom providers', () => {
+    const config = withEnv(
+      {
+        OPENCODE_PROVIDER: 'custom-provider',
+        OPENCODE_API_KEY: 'secret-key',
+        OPENCODE_MODEL: undefined,
+        OPENCODE_SMALL_MODEL: undefined,
+      },
+      () => buildOpenCodeConfig({ mcpServers: undefined }),
+    );
+
+    expect(config).toMatchObject({
+      enabled_providers: ['custom-provider'],
+      provider: {
+        'custom-provider': {
+          options: { apiKey: 'secret-key' },
+        },
+      },
+    });
+  });
+
   it('builds text followed by escaped file parts', () => {
     const parts = buildOpenCodePromptParts('What is in the picture?', [
       {

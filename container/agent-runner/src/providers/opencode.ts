@@ -113,6 +113,8 @@ function wrapPromptWithContext(text: string, systemInstructions?: string): strin
   return out;
 }
 
+const BUILTIN_AUTH_PROVIDERS = new Set(['anthropic', 'opencode', 'opencode-go', 'opencode-zen']);
+
 export function buildOpenCodeConfig(options: ProviderOptions): Record<string, unknown> {
   const provider = process.env.OPENCODE_PROVIDER || 'anthropic';
   const model = process.env.OPENCODE_MODEL;
@@ -120,7 +122,7 @@ export function buildOpenCodeConfig(options: ProviderOptions): Record<string, un
   const apiKey = process.env.OPENCODE_API_KEY || 'placeholder';
 
   const providerOptions: Record<string, unknown> =
-    provider === 'anthropic'
+    BUILTIN_AUTH_PROVIDERS.has(provider)
       ? {}
       : {
           [provider]: {
@@ -150,7 +152,7 @@ export function buildOpenCodeConfig(options: ProviderOptions): Record<string, un
     },
     autoupdate: false,
     snapshot: false,
-    provider: providerOptions,
+    ...(Object.keys(providerOptions).length > 0 ? { provider: providerOptions } : {}),
     instructions,
     mcp,
   };
