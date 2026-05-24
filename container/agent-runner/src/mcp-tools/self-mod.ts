@@ -13,6 +13,7 @@
  * the host side (defense in depth).
  */
 import { writeMessageOut } from '../db/messages-out.js';
+import { evaluateInstallPackagesRequest } from './install-policy.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
@@ -47,6 +48,12 @@ export const installPackages: McpToolDefinition = {
         apt: { type: 'array', items: { type: 'string' }, description: 'apt packages to install (names only, no version specs or flags)' },
         npm: { type: 'array', items: { type: 'string' }, description: 'npm packages to install globally (names only, no version specs)' },
         reason: { type: 'string', description: 'Why these packages are needed' },
+        purpose: {
+          type: 'string',
+          enum: ['general_capability', 'deployed_skill_dependency'],
+          description:
+            'Classify why this install is needed. Use deployed_skill_dependency when a currently installed skill or helper appears to need it; those requests are rejected as deployment errors.',
+        },
       },
     },
   },
@@ -61,6 +68,10 @@ export const installPackages: McpToolDefinition = {
     const invalidNpm = npm.find((p) => !NPM_RE.test(p));
     if (invalidNpm) return err(`Invalid npm package name: "${invalidNpm}". No version specs or shell characters.`);
 
+    const purpose = args.purpose as string | undefined;
+    const policy = evaluateInstallPackagesRequest({ apt, npm, reason: (args.reason as string) || '', purpose });
+    if (!policy.allowed) return err(policy.message ?? 'install_packages failed: request rejected by policy.');
+
     const requestId = generateId();
     writeMessageOut({
       id: requestId,
@@ -70,6 +81,7 @@ export const installPackages: McpToolDefinition = {
         apt,
         npm,
         reason: (args.reason as string) || '',
+        purpose: purpose || 'general_capability',
       }),
     });
 

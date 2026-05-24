@@ -16,6 +16,8 @@ Use `/home/node/.claude/skills/` or `/app/skills/` to read the skills available 
 
 If the user asks you to change a skill, first check for `/workspace/local-skills/skills/<skill-name>/`. When that directory exists, make the change there and commit it in `/workspace/local-skills`; later sessions will see the updated skill. If there is no matching directory there, the skill is managed by the runtime or host and should be treated as read-only unless the user specifically asks to change the underlying NanoClaw deployment.
 
+Installed skill dependencies are already deployed by NanoClaw. Before asking to install packages for a skill, check `/app/skills/.bin/<helper>`, the skill's `scripts/` directory, or documented runtime shims such as `/usr/local/bin/gws`. Do not use `install_packages`, language toolchain installs, global npm installs, `go install`, `npx` installers, or container rebuilds to satisfy a dependency for a skill that is already installed. If a helper is missing, report a NanoClaw deployment error.
+
 ## Memory
 
 When the user shares any substantive information with you, it must be stored somewhere you can retrieve it when relevant. If it's information that is pertinent to every single conversation turn it should be put into CLAUDE.local.md. Otherwise, create a system for storing the information depending on its type - e.g. create a file of people that the user mentions so you can keep track or a file of projects. For every file you create, add a concise reference in your CLAUDE.local.md so you'll be able to find it in future conversations. 

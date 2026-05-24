@@ -16,6 +16,7 @@ import { getAgentGroup } from '../../db/agent-groups.js';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
 import { notifyAgent, requestApproval } from '../approvals/index.js';
+import { evaluateInstallPackagesRequest } from './install-policy.js';
 
 const RESERVED_NPM_PACKAGES = new Map<string, string>([
   ['@googleworkspace/cli', 'NanoClaw agents use the GWS proxy shim; the direct Google Workspace CLI is not allowed.'],
@@ -31,6 +32,7 @@ export async function handleInstallPackages(content: Record<string, unknown>, se
   const apt = (content.apt as string[]) || [];
   const npm = (content.npm as string[]) || [];
   const reason = (content.reason as string) || '';
+  const purpose = content.purpose as string | undefined;
 
   const APT_RE = /^[a-z0-9][a-z0-9._+-]*$/;
   const NPM_RE = /^(@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/;
@@ -61,13 +63,19 @@ export async function handleInstallPackages(content: Record<string, unknown>, se
     log.warn('install_packages: reserved npm package rejected', { pkg: reservedNpm });
     return;
   }
+  const policy = evaluateInstallPackagesRequest({ reason, purpose });
+  if (!policy.allowed) {
+    notifyAgent(session, policy.message ?? 'install_packages failed: request rejected by policy.');
+    log.warn('install_packages: deployed skill dependency request rejected', { apt, npm, purpose, reason });
+    return;
+  }
 
   const packageList = [...apt.map((p) => `apt: ${p}`), ...npm.map((p) => `npm: ${p}`)].join(', ');
   await requestApproval({
     session,
     agentName: agentGroup.name,
     action: 'install_packages',
-    payload: { apt, npm, reason },
+    payload: { apt, npm, reason, purpose: purpose || 'general_capability' },
     title: 'Install Packages Request',
     question: `Agent "${agentGroup.name}" is attempting to install a package + rebuild container:\n${packageList}${reason ? `\nReason: ${reason}` : ''}`,
   });

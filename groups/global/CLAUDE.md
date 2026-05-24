@@ -115,6 +115,8 @@ request_rebuild({ reason: "Apply ffmpeg + transformers" })
 - `pnpm install` in `/workspace/agent/` persists on disk (it's mounted) but isn't on the global PATH — use it for project-level dependencies
 - `install_packages` is for system tools (ffmpeg, imagemagick) and global npm packages that need to be on PATH
 
+Do not use `install_packages`, `apt`, global npm installs, `go install`, `npx` installers, or container rebuilds to satisfy dependencies for skills that are already installed. Installed skill helpers are deployment-owned. Check `/app/skills/.bin/<helper>`, `/app/skills/<skill>/scripts/`, or documented runtime shims such as `/usr/local/bin/gws`; if the helper is missing, report a NanoClaw deployment error.
+
 ### MCP Servers
 
 Use **`add_mcp_server`** to add an MCP server to your configuration, then **`request_rebuild`** to apply. Browse available servers at https://mcp.so — it's a curated directory of high-quality MCP servers. Most Node.js servers run via `pnpm dlx`, e.g.:

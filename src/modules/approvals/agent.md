@@ -6,11 +6,14 @@ Three fire-and-forget tools change your container image or config. Each sends an
 
 Add apt and/or npm packages to your container image. On approval, the config is updated AND the image is rebuilt in the same step — you'll get a follow-up prompt ~5s after rebuild telling you to verify the packages are available.
 
+Do not use this for dependencies of skills that are already installed. Skill helpers are deployed by NanoClaw and should be available under `/app/skills/.bin/<helper>`, the skill's `scripts/` directory, or a documented runtime shim such as `/usr/local/bin/gws`. If an installed skill helper is missing, report a NanoClaw deployment error instead of requesting packages or a rebuild.
+
 ```
 install_packages({
   apt: ["ripgrep", "jq"],              // names only, no version specs or flags
   npm: ["@anthropic-ai/sdk"],          // global install
-  reason: "need rg for fast code search"
+  reason: "need rg for fast code search",
+  purpose: "general_capability"
 })
 ```
 

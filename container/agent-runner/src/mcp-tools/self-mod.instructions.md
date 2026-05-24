@@ -13,6 +13,7 @@ install_packages({ apt: ["ffmpeg"], npm: ["@xenova/transformers"], reason: "Audi
 **When to use this vs workspace `pnpm install`:**
 - `pnpm install` if you only need it temporarily to do one task. Will not be available in subsequent truns.
 - `install_packages` persists for all future turns. Use especially if the user specifically asks you to add a capability
+- Do not use `install_packages`, language toolchain installs, global npm installs, `go install`, `npx` installers, or rebuilds to satisfy dependencies for skills that are already installed. Check `/app/skills/.bin/<helper>`, `/app/skills/<skill>/scripts/`, or documented runtime shims; if missing, report a NanoClaw deployment error.
 
 ### MCP servers (`add_mcp_server`)
 

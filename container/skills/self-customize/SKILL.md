@@ -17,6 +17,8 @@ You can modify your own environment. Different kinds of changes have different w
 - **Your source code or Dockerfile** → Delegate to a builder agent via `create_agent` (see below).
 - **A new specialist capability** → `create_agent` to spin up a dedicated agent for it.
 
+Installed skill dependencies are not self-customization. Check `/app/skills/.bin/<helper>`, `/app/skills/<skill>/scripts/`, or documented runtime shims such as `/usr/local/bin/gws`. If a helper for an installed skill is missing, report a NanoClaw deployment error instead of using `install_packages` or rebuilding.
+
 ## Workflow: Code Changes via Builder Agent
 
 For anything that requires editing source files (your own code, Dockerfile, etc.), **do not edit directly** — delegate to a builder agent. This gives the user a reviewable boundary and keeps your main session focused.

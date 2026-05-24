@@ -56,4 +56,53 @@ describe('handleInstallPackages', () => {
     expect(notifyAgent).toHaveBeenCalledWith(testSession, expect.stringContaining('GWS proxy shim'));
     expect(requestApproval).not.toHaveBeenCalled();
   });
+
+  it('rejects package installs for deployed skill dependencies before approval', async () => {
+    await handleInstallPackages(
+      { apt: ['golang-go'], reason: 'Install Go to use flight-goat CLI for Wisconsin flights' },
+      testSession,
+    );
+
+    expect(notifyAgent).toHaveBeenCalledWith(testSession, expect.stringContaining('installed skill dependencies'));
+    expect(requestApproval).not.toHaveBeenCalled();
+  });
+
+  it('rejects variant deployed skill dependency wording', async () => {
+    await handleInstallPackages({ apt: ['golang-go'], reason: 'install Go so pp-flight-goat can run' }, testSession);
+
+    expect(notifyAgent).toHaveBeenCalledWith(testSession, expect.stringContaining('installed skill dependencies'));
+    expect(requestApproval).not.toHaveBeenCalled();
+  });
+
+  it('rejects explicit deployed skill dependency purpose even with terse reason', async () => {
+    await handleInstallPackages(
+      { apt: ['golang-go'], reason: 'needed', purpose: 'deployed_skill_dependency' },
+      testSession,
+    );
+
+    expect(notifyAgent).toHaveBeenCalledWith(testSession, expect.stringContaining('installed skill dependencies'));
+    expect(requestApproval).not.toHaveBeenCalled();
+  });
+
+  it('allows explicit user-requested general capability installs', async () => {
+    await handleInstallPackages(
+      {
+        apt: ['golang-go'],
+        reason: 'User asked me to add Go for compiling a personal project CLI',
+        purpose: 'general_capability',
+      },
+      testSession,
+    );
+
+    expect(notifyAgent).not.toHaveBeenCalled();
+    expect(requestApproval).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'install_packages',
+        payload: expect.objectContaining({
+          apt: ['golang-go'],
+          purpose: 'general_capability',
+        }),
+      }),
+    );
+  });
 });
