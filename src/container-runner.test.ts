@@ -480,7 +480,7 @@ describe('session wake lifecycle', () => {
 
       const args = harness.spawnMock.mock.calls[0][1];
       expect(args).toContain(
-        'PATH=/app/skills/.bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin',
+        'PATH=/app/skills/.bin:/pnpm/bin:/pnpm:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin',
       );
     } finally {
       harness.close();

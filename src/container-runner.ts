@@ -67,7 +67,7 @@ const activeContainers = new Map<string, { process: ChildProcess; containerName:
 const activeMcpBridges = new Map<string, AgentMcpBridge[]>();
 const containerExitWaiters = new Map<string, Set<() => void>>();
 const CONTAINER_SKILLS_BIN = '/app/skills/.bin';
-const AGENT_CONTAINER_PATH = `${CONTAINER_SKILLS_BIN}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin`;
+const AGENT_CONTAINER_PATH = `${CONTAINER_SKILLS_BIN}:/pnpm/bin:/pnpm:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin`;
 
 /**
  * In-flight wake promises, keyed by session id. Deduplicates concurrent
