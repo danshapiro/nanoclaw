@@ -50,13 +50,18 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         ca-certificates \
         curl \
         ffmpeg \
+        file \
         git \
         jq \
+        less \
         python3 \
         python3-jsonschema \
         python3-pip \
+        ripgrep \
         tini \
+        tree \
         unzip \
+        zip \
     && if [ "$INSTALL_CJK_FONTS" = "true" ]; then \
         apt-get install -y --no-install-recommends fonts-noto-cjk; \
        fi \
