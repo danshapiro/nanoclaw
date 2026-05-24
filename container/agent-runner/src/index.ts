@@ -32,18 +32,16 @@ import { buildSystemPromptAddendum } from './destinations.js';
 import './providers/index.js';
 import { createProvider, type ProviderName } from './providers/factory.js';
 import { runPollLoop } from './poll-loop.js';
+import { ensureAgentRunnerPath } from './runtime-path.js';
 
 function log(msg: string): void {
   console.error(`[agent-runner] ${msg}`);
 }
 
 const CWD = '/workspace/agent';
-const SKILLS_BIN = '/app/skills/.bin';
 
 async function main(): Promise<void> {
-  if (!process.env.PATH?.split(':').includes(SKILLS_BIN)) {
-    process.env.PATH = `${SKILLS_BIN}:${process.env.PATH || ''}`;
-  }
+  ensureAgentRunnerPath();
 
   const config = loadConfig();
   const providerName = config.provider.toLowerCase() as ProviderName;
