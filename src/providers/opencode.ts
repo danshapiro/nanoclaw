@@ -1,11 +1,29 @@
 import fs from 'fs';
 import path from 'path';
 
+import { readEnvFile } from '../env.js';
 import { registerProviderContainerConfig } from './provider-container-registry.js';
 import { requireYenteHostEnv, YENTE_LOCAL_PROXY_HOSTNAMES } from '../yente/service-env.js';
 
+const OPENCODE_HOST_ENV_KEYS = [
+  'ONECLI_URL',
+  'ONECLI_API_KEY',
+  'ONECLI_GATEWAY_URL',
+  'GWS_PROXY_URL',
+  'MSGVAULT_PROXY_URL',
+  'FAMILIAR_PROXY_URL',
+  'NYNE_PROXY_URL',
+  'NO_PROXY',
+  'no_proxy',
+  'OPENCODE_PROVIDER',
+  'OPENCODE_MODEL',
+  'OPENCODE_SMALL_MODEL',
+  'OPENCODE_API_KEY',
+] as const;
+
 registerProviderContainerConfig('opencode', ({ hostEnv, sessionDir }) => {
-  const yente = requireYenteHostEnv(hostEnv);
+  const mergedHostEnv = { ...readEnvFile([...OPENCODE_HOST_ENV_KEYS]), ...hostEnv };
+  const yente = requireYenteHostEnv(mergedHostEnv);
   const opencodeXdgDir = path.join(sessionDir, 'opencode-xdg');
   fs.mkdirSync(opencodeXdgDir, { recursive: true });
 
@@ -26,10 +44,10 @@ registerProviderContainerConfig('opencode', ({ hostEnv, sessionDir }) => {
       // Without this XDG_DATA_HOME mount, a resumed continuation can only
       // point at state that was deleted with a previous container filesystem.
       XDG_DATA_HOME: '/opencode-xdg',
-      OPENCODE_PROVIDER: hostEnv.OPENCODE_PROVIDER ?? 'opencode-go',
-      OPENCODE_MODEL: hostEnv.OPENCODE_MODEL ?? 'opencode-go/deepseek-v4-pro',
-      OPENCODE_SMALL_MODEL: hostEnv.OPENCODE_SMALL_MODEL ?? 'opencode-go/deepseek-v4-flash',
-      OPENCODE_API_KEY: hostEnv.OPENCODE_API_KEY ?? '',
+      OPENCODE_PROVIDER: mergedHostEnv.OPENCODE_PROVIDER ?? 'opencode-go',
+      OPENCODE_MODEL: mergedHostEnv.OPENCODE_MODEL ?? 'opencode-go/deepseek-v4-pro',
+      OPENCODE_SMALL_MODEL: mergedHostEnv.OPENCODE_SMALL_MODEL ?? 'opencode-go/deepseek-v4-flash',
+      OPENCODE_API_KEY: mergedHostEnv.OPENCODE_API_KEY ?? '',
     },
     extraHosts: YENTE_LOCAL_PROXY_HOSTNAMES,
   };

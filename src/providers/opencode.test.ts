@@ -42,4 +42,47 @@ describe('opencode provider container config', () => {
       fs.rmSync(sessionDir, { recursive: true, force: true });
     }
   });
+
+  it('loads OpenCode and proxy host env from the release .env when systemd does not export it', () => {
+    const cwd = process.cwd();
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-opencode-env-'));
+    const sessionDir = path.join(root, 'session');
+    fs.mkdirSync(sessionDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(root, '.env'),
+      [
+        'ONECLI_URL=http://onecli.local',
+        'ONECLI_API_KEY=secret',
+        'ONECLI_GATEWAY_URL=http://onecli-gateway.local',
+        'GWS_PROXY_URL=http://yente-gws-proxy.local:8083',
+        'MSGVAULT_PROXY_URL=http://yente-msgvault-proxy.local:8084',
+        'FAMILIAR_PROXY_URL=http://yente-familiar-proxy.local:8081',
+        'NYNE_PROXY_URL=http://yente-nyne-proxy.local:8082',
+        'OPENCODE_PROVIDER=opencode-go',
+        'OPENCODE_MODEL=opencode-go/test-model',
+        'OPENCODE_SMALL_MODEL=opencode-go/test-small',
+        'OPENCODE_API_KEY=opencode-secret',
+        '',
+      ].join('\n'),
+    );
+
+    try {
+      process.chdir(root);
+      const config = getProviderContainerConfig('opencode');
+      const contribution = config!({
+        sessionDir,
+        agentGroupId: 'ag-main',
+        hostEnv: {},
+      });
+
+      expect(contribution.env?.GWS_PROXY_URL).toBe('http://yente-gws-proxy.local:8083');
+      expect(contribution.env?.OPENCODE_PROVIDER).toBe('opencode-go');
+      expect(contribution.env?.OPENCODE_MODEL).toBe('opencode-go/test-model');
+      expect(contribution.env?.OPENCODE_SMALL_MODEL).toBe('opencode-go/test-small');
+      expect(contribution.env?.OPENCODE_API_KEY).toBe('opencode-secret');
+    } finally {
+      process.chdir(cwd);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
