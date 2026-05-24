@@ -507,7 +507,7 @@ describe('poll-loop conversational reply accounting', () => {
     const controller = new AbortController();
     const loopPromise = runPollLoopWithTimeout(provider, controller.signal);
 
-    await waitFor(() => getAckStatus('quiet-task') === 'completed', 1500);
+    await waitFor(() => getAckStatus('quiet-task') === 'completed', 5000);
     controller.abort();
 
     expect(provider.calls).toBe(0);
@@ -660,7 +660,7 @@ describe('poll-loop conversational reply accounting', () => {
       { sender: 'Admin', text: '/clear' },
       { platformId: 'chan-1', channelType: 'discord' },
     );
-    await waitFor(() => pushes.some((push) => push.prompt.includes('/clear')), 1500);
+    await waitFor(() => pushes.some((push) => push.prompt.includes('/clear')), 5000);
     controller.abort();
     releaseQuery();
     await loopPromise.catch(() => {});

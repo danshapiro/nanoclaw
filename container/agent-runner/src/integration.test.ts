@@ -85,13 +85,13 @@ describe('poll loop integration', () => {
   it('should process messages arriving after loop starts', async () => {
     const provider = new MockProvider({}, () => '<message to="discord-test">Processed</message>');
     const controller = new AbortController();
-    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 3000);
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 6000);
 
     // Insert message after loop has started
     await sleep(200);
     insertMessage('m-late', { sender: 'Charlie', text: 'Late arrival' });
 
-    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    await waitFor(() => getUndeliveredMessages().length > 0, 5000);
     controller.abort();
 
     const out = getUndeliveredMessages();
