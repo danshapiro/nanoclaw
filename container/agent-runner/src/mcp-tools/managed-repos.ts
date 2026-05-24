@@ -24,7 +24,7 @@ export const applyManagedRepos: McpToolDefinition = {
   tool: {
     name: 'apply_managed_repos',
     description:
-      'Ask the host to reconcile /workspace/portable-skills/repos/manifest.json into /workspace/repos and applied group context. Main agent only; fire-and-forget.',
+      'Ask the host to reconcile /workspace/local-skills/repos/manifest.json into /workspace/repos and applied group context. Main agent only; fire-and-forget.',
     inputSchema: {
       type: 'object' as const,
       properties: {},

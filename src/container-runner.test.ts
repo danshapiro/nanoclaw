@@ -11,7 +11,7 @@ import {
   assertNoReservedAgentCommandCollisionsShell,
   buildManagedReposIpcMount,
   buildManagedReposMounts,
-  buildPortableSkillsMount,
+  buildLocalSkillsMount,
   resolveAgentImageForRun,
   resolveProviderName,
 } from './container-runner.js';
@@ -558,7 +558,7 @@ describe('session wake lifecycle', () => {
   });
 });
 
-describe('portable skills mount', () => {
+describe('local skills mount', () => {
   const baseGroup: AgentGroup = {
     id: 'ag-main',
     name: 'Yente',
@@ -567,28 +567,28 @@ describe('portable skills mount', () => {
     created_at: '2026-04-25T00:00:00.000Z',
   };
 
-  it('mounts the writable portable skills root for any agent group', () => {
+  it('mounts the writable local skills root for any agent group', () => {
     expect(
-      buildPortableSkillsMount(baseGroup, {
-        NANOCLAW_WRITABLE_SKILLS_DIR: '/srv/nanoclaw/shared/repos/portable-skills',
+      buildLocalSkillsMount(baseGroup, {
+        NANOCLAW_WRITABLE_SKILLS_DIR: '/srv/nanoclaw/shared/repos/local-skills',
       }),
     ).toEqual({
-      hostPath: '/srv/nanoclaw/shared/repos/portable-skills',
-      containerPath: '/workspace/portable-skills',
+      hostPath: '/srv/nanoclaw/shared/repos/local-skills',
+      containerPath: '/workspace/local-skills',
       readonly: false,
     });
   });
 
-  it('uses the same portable authoring mount for non-main groups', () => {
+  it('uses the same local skill authoring mount for non-main groups', () => {
     const researchGroup: AgentGroup = { ...baseGroup, id: 'ag-research', folder: 'research', name: 'Research' };
 
     expect(
-      buildPortableSkillsMount(researchGroup, {
-        NANOCLAW_WRITABLE_SKILLS_DIR: '/srv/nanoclaw/shared/repos/portable-skills',
+      buildLocalSkillsMount(researchGroup, {
+        NANOCLAW_WRITABLE_SKILLS_DIR: '/srv/nanoclaw/shared/repos/local-skills',
       }),
     ).toEqual({
-      hostPath: '/srv/nanoclaw/shared/repos/portable-skills',
-      containerPath: '/workspace/portable-skills',
+      hostPath: '/srv/nanoclaw/shared/repos/local-skills',
+      containerPath: '/workspace/local-skills',
       readonly: false,
     });
   });

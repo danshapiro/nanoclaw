@@ -26,9 +26,9 @@ Always emit these checks in this order:
 
 1. `skill_named_invocation`
 2. `allowed_tool_surface`
-3. `portable_repo_visible`
-4. `portable_repo_writable`
-5. `portable_repo_git_ok`
+3. `local_skills_repo_visible`
+4. `local_skills_repo_writable`
+5. `local_skills_repo_git_ok`
 6. `settings_json_valid`
 7. `tool_bash_roundtrip`
 8. `tool_read_write_edit`
@@ -55,7 +55,7 @@ Claude-only tools are absent: `WebSearch`, `ToolSearch`, `NotebookEdit`,
 ## Scratch Paths
 
 - Use `/workspace/agent/full-qa-pass/` for temporary files.
-- Use `/workspace/portable-skills/.qa/` for the writable git probe.
+- Use `/workspace/local-skills/.qa/` for the writable git probe.
 - Clean both paths before finishing, even after failures.
 
 ## Procedure
@@ -114,11 +114,11 @@ If a provider-required family is missing, mark this check failed. If only
 Claude-only families are absent in the OpenCode profile, emit
 `CHECK allowed_tool_surface PASS opencode profile; Claude-only tools absent as expected`.
 
-### 3. Portable Repo Checks
+### 3. Local Skills Repo Checks
 
-- `portable_repo_visible`: verify `/workspace/portable-skills` exists.
-- `portable_repo_writable`: create and remove a temporary file under `/workspace/portable-skills/.qa/`.
-- `portable_repo_git_ok`: verify `/workspace/portable-skills` is a git working tree and ends clean after the probe.
+- `local_skills_repo_visible`: verify `/workspace/local-skills` exists.
+- `local_skills_repo_writable`: create and remove a temporary file under `/workspace/local-skills/.qa/`.
+- `local_skills_repo_git_ok`: verify `/workspace/local-skills` is a git working tree and ends clean after the probe.
 
 ### 4. Settings Validation
 
@@ -183,8 +183,8 @@ If `gws` is not present, omit this check entirely.
 Before returning:
 
 - remove `/workspace/agent/full-qa-pass/` contents created by this run;
-- remove `/workspace/portable-skills/.qa/` contents created by this run;
-- ensure `/workspace/portable-skills` is not left dirty by the probe.
+- remove `/workspace/local-skills/.qa/` contents created by this run;
+- ensure `/workspace/local-skills` is not left dirty by the probe.
 
 ## Final Line
 

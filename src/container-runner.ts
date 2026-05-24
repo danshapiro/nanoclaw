@@ -625,9 +625,9 @@ function buildMounts(
     // Shared skills — read-only, symlinks in .claude-shared/skills/ point here.
     mounts.push({ hostPath: managedSkills.root, containerPath: '/app/skills', readonly: true });
 
-    const portableSkillsMount = buildPortableSkillsMount(agentGroup);
-    if (portableSkillsMount) {
-      mounts.push(portableSkillsMount);
+    const localSkillsMount = buildLocalSkillsMount(agentGroup);
+    if (localSkillsMount) {
+      mounts.push(localSkillsMount);
     }
 
     mounts.push(...buildManagedReposMounts(agentGroup));
@@ -655,7 +655,7 @@ function buildMounts(
   }
 }
 
-export function buildPortableSkillsMount(
+export function buildLocalSkillsMount(
   _agentGroup: Pick<AgentGroup, 'folder'>,
   env: NodeJS.ProcessEnv = process.env,
 ): VolumeMount | null {
@@ -663,7 +663,7 @@ export function buildPortableSkillsMount(
   if (!writableDir) return null;
   return {
     hostPath: writableDir,
-    containerPath: '/workspace/portable-skills',
+    containerPath: '/workspace/local-skills',
     readonly: false,
   };
 }

@@ -38,8 +38,13 @@ function log(msg: string): void {
 }
 
 const CWD = '/workspace/agent';
+const SKILLS_BIN = '/app/skills/.bin';
 
 async function main(): Promise<void> {
+  if (!process.env.PATH?.split(':').includes(SKILLS_BIN)) {
+    process.env.PATH = `${SKILLS_BIN}:${process.env.PATH || ''}`;
+  }
+
   const config = loadConfig();
   const providerName = config.provider.toLowerCase() as ProviderName;
 

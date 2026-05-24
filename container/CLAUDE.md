@@ -14,7 +14,7 @@ The file `CLAUDE.local.md` in your workspace is your per-group memory. Record th
 
 Use `/home/node/.claude/skills/` or `/app/skills/` to read the skills available in this session. Treat those paths as runtime views, not source directories to edit.
 
-If the user asks you to change a skill, first check for `/workspace/portable-skills/skills/<skill-name>/`. When that directory exists, make the change there and commit it in `/workspace/portable-skills`; later sessions will see the updated skill. If there is no matching directory there, the skill is managed by the runtime or host and should be treated as read-only unless the user specifically asks to change the underlying NanoClaw deployment.
+If the user asks you to change a skill, first check for `/workspace/local-skills/skills/<skill-name>/`. When that directory exists, make the change there and commit it in `/workspace/local-skills`; later sessions will see the updated skill. If there is no matching directory there, the skill is managed by the runtime or host and should be treated as read-only unless the user specifically asks to change the underlying NanoClaw deployment.
 
 ## Memory
 

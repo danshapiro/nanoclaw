@@ -7,7 +7,7 @@ export interface ManagedSkill {
   name: string;
   sourcePath: string;
   mergedPath: string;
-  sourceKind: 'bundled' | 'managed' | 'portable';
+  sourceKind: 'bundled' | 'managed' | 'local';
 }
 
 export interface ManagedSkillRoot {
@@ -143,11 +143,11 @@ export function syncManagedSkillSymlinks(args: {
 function collectSkillRootSources(projectRoot: string, env: NodeJS.ProcessEnv): SkillRootSource[] {
   const sources: SkillRootSource[] = [];
 
-  // Portable sources are added before managed so the realpath dedup
-  // classifies overlapping roots as portable.
+  // Local sources are added before managed so the realpath dedup
+  // classifies overlapping roots as local.
   const writableSkillsDir = env.NANOCLAW_WRITABLE_SKILLS_DIR?.trim();
   if (writableSkillsDir) {
-    sources.push({ kind: 'portable', root: path.join(writableSkillsDir, 'skills') });
+    sources.push({ kind: 'local', root: path.join(writableSkillsDir, 'skills') });
   }
 
   sources.push({ kind: 'bundled', root: path.join(projectRoot, 'container', 'skills') });
@@ -172,8 +172,8 @@ function assertSkillRootExists(source: SkillRootSource): void {
   if (source.kind === 'bundled') {
     throw new Error(`Bundled skills root does not exist: ${source.root}`);
   }
-  if (source.kind === 'portable') {
-    throw new Error(`Configured portable skills root does not exist: ${source.root}`);
+  if (source.kind === 'local') {
+    throw new Error(`Configured local skills root does not exist: ${source.root}`);
   }
   throw new Error(`Configured managed skills root does not exist: ${source.root}`);
 }

@@ -41,7 +41,7 @@ private_key, .secret
 
 **Shared Workspace Mounts:**
 
-Every agent group gets the same shared project surfaces: managed repos at `/workspace/repos`, portable skill authoring at `/workspace/portable-skills`, and managed-repo IPC at `/workspace/ipc`. Release source and host configuration remain outside the container; agents only see explicit bind mounts.
+Every agent group gets the same shared project surfaces: managed repos at `/workspace/repos`, local skill authoring at `/workspace/local-skills`, and managed-repo IPC at `/workspace/ipc`. Release source and host configuration remain outside the container; agents only see explicit bind mounts.
 
 ### 3. Session Isolation
 
@@ -93,7 +93,7 @@ Yente agents use `GWS_PROXY_URL` and the `/usr/local/bin/gws` shim for Google Wo
 | Group folder | `/workspace/agent` (rw) |
 | Global memory | `/workspace/global` (ro) |
 | Managed project repos | `/workspace/repos` and `/workspace/extra/repos` (rw) |
-| Portable skill checkout | `/workspace/portable-skills` (rw) |
+| Local skill checkout | `/workspace/local-skills` (rw) |
 | Managed-repo IPC | `/workspace/ipc` (rw) |
 | Additional mounts | Configurable; read-only unless explicitly allowed read-write |
 | Network access | Unrestricted |

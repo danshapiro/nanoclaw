@@ -3,7 +3,7 @@
 Every agent group has managed project repos at `/workspace/repos/<repo-id>`.
 Status is recorded at `/workspace/repos/.managed/status.json`.
 
-When you change `/workspace/portable-skills/repos/manifest.json` or committed prompt/config state inside `/workspace/repos/yente-context`, call:
+When you change `/workspace/local-skills/repos/manifest.json` or committed prompt/config state inside `/workspace/repos/yente-context`, call:
 
 ```js
 mcp__nanoclaw__apply_managed_repos({})

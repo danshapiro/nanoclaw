@@ -12,7 +12,7 @@ Generate a concise, read-only status report for the current agent environment.
 Gather the following information without changing state:
 
 1. Timestamp, working directory, and channel context.
-2. Visible workspace mounts under `/workspace`, including `/workspace/agent`, `/workspace/repos`, `/workspace/portable-skills`, `/workspace/ipc`, and `/workspace/extra` when present.
+2. Visible workspace mounts under `/workspace`, including `/workspace/agent`, `/workspace/repos`, `/workspace/local-skills`, `/workspace/ipc`, and `/workspace/extra` when present.
 3. Tool families available in the current environment.
 4. Container utility versions when available.
 5. Scheduled task snapshot through `mcp__nanoclaw__list_tasks`.
@@ -34,7 +34,7 @@ Session:
 Workspace:
 - Agent folder: <summary>
 - Managed repos: <summary>
-- Portable authoring: <summary>
+- Local skill authoring: <summary>
 - Extra mounts: <summary>
 - IPC: <summary>
 
