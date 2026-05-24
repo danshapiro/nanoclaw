@@ -5,6 +5,7 @@ import path from 'path';
 import { describe, it, expect, afterEach } from 'bun:test';
 
 import {
+  buildOpenCodeConfig,
   buildOpenCodePromptParts,
   isStaleSessionError,
   nextMeaningfulOpenCodeEvent,
@@ -26,6 +27,39 @@ function tmpDir(): string {
   tmpRoots.push(dir);
   return dir;
 }
+
+describe('OpenCode config', () => {
+  it('denies OpenCode native questions while leaving other tools allowed', () => {
+    const config = buildOpenCodeConfig({
+      mcpServers: {
+        nanoclaw: {
+          command: 'node',
+          args: ['/app/src/mcp-tools/index.js'],
+          env: {
+            SESSION_INBOUND_DB_PATH: '/workspace/inbound.db',
+            SESSION_OUTBOUND_DB_PATH: '/workspace/outbound.db',
+          },
+        },
+      },
+    });
+
+    expect(config.permission).toEqual({
+      '*': 'allow',
+      question: 'deny',
+    });
+    expect(config.mcp).toEqual({
+      nanoclaw: {
+        type: 'local',
+        command: ['node', '/app/src/mcp-tools/index.js'],
+        environment: {
+          SESSION_INBOUND_DB_PATH: '/workspace/inbound.db',
+          SESSION_OUTBOUND_DB_PATH: '/workspace/outbound.db',
+        },
+        enabled: true,
+      },
+    });
+  });
+});
 
 describe('OpenCodeProvider stale session handling', () => {
   it('classifies missing OpenCode sessions as stale continuations', () => {

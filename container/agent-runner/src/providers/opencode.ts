@@ -113,7 +113,7 @@ function wrapPromptWithContext(text: string, systemInstructions?: string): strin
   return out;
 }
 
-function buildOpenCodeConfig(options: ProviderOptions): Record<string, unknown> {
+export function buildOpenCodeConfig(options: ProviderOptions): Record<string, unknown> {
   const provider = process.env.OPENCODE_PROVIDER || 'anthropic';
   const model = process.env.OPENCODE_MODEL;
   const smallModel = process.env.OPENCODE_SMALL_MODEL;
@@ -144,7 +144,10 @@ function buildOpenCodeConfig(options: ProviderOptions): Record<string, unknown> 
     ...(model ? { model } : {}),
     ...(smallModel ? { small_model: smallModel } : {}),
     enabled_providers: [provider],
-    permission: 'allow',
+    permission: {
+      '*': 'allow',
+      question: 'deny',
+    },
     autoupdate: false,
     snapshot: false,
     provider: providerOptions,
