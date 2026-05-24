@@ -69,6 +69,14 @@ describe('agent container Dockerfile', () => {
     expect(dockerfile).toContain('python3-jsonschema');
   });
 
+  it('includes approved baseline Unix tools for agent workspace handling', () => {
+    const dockerfile = fs.readFileSync(path.join(process.cwd(), 'container', 'Dockerfile'), 'utf8');
+
+    for (const pkg of ['ripgrep', 'file', 'less', 'tree', 'zip']) {
+      expect(dockerfile).toMatch(new RegExp(`^\\s*${pkg}\\s*(\\\\)?$`, 'm'));
+    }
+  });
+
   it('installs the GWS proxy shim instead of the real Google Workspace CLI', () => {
     const dockerfile = fs.readFileSync(path.join(process.cwd(), 'container', 'Dockerfile'), 'utf8');
 
