@@ -470,6 +470,23 @@ describe('session wake lifecycle', () => {
     }
   });
 
+  it('exposes skill-local helper bins on the base container PATH', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      const wake = harness.containerRunner.wakeContainer(harness.session);
+      await harness.oneCliStarted.promise;
+      harness.oneCliRelease.resolve();
+      await wake;
+
+      const args = harness.spawnMock.mock.calls[0][1];
+      expect(args).toContain(
+        'PATH=/app/skills/.bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin',
+      );
+    } finally {
+      harness.close();
+    }
+  });
+
   it('stops the active container for a superseded session asynchronously', async () => {
     const harness = await loadContainerRunnerHarness();
     try {

@@ -66,6 +66,8 @@ const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
 const activeContainers = new Map<string, { process: ChildProcess; containerName: string }>();
 const activeMcpBridges = new Map<string, AgentMcpBridge[]>();
 const containerExitWaiters = new Map<string, Set<() => void>>();
+const CONTAINER_SKILLS_BIN = '/app/skills/.bin';
+const AGENT_CONTAINER_PATH = `${CONTAINER_SKILLS_BIN}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin`;
 
 /**
  * In-flight wake promises, keyed by session id. Deduplicates concurrent
@@ -788,6 +790,7 @@ async function buildContainerArgs(
   // Environment — only vars read by code we don't own.
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
   args.push('-e', `TZ=${TIMEZONE}`);
+  args.push('-e', `PATH=${AGENT_CONTAINER_PATH}`);
 
   // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
   if (providerContribution.env) {
