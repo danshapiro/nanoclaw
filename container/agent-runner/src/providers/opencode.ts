@@ -1,10 +1,24 @@
 import { spawn, type ChildProcess } from 'child_process';
+import fs from 'fs/promises';
+import os from 'os';
+import path from 'path';
+import { pathToFileURL } from 'url';
 
 import { createOpencodeClient, type OpencodeClient } from '@opencode-ai/sdk';
 
 import { registerProvider } from './provider-registry.js';
-import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
+import {
+  normalizeQueryTurnInput,
+  type AgentProvider,
+  type AgentQuery,
+  type ProviderEvent,
+  type ProviderOptions,
+  type QueryAttachment,
+  type QueryInput,
+  type QueryTurnInput,
+} from './types.js';
 import { mcpServersToOpenCodeConfig } from './mcp-to-opencode.js';
+import { sniffImageMime } from '../attachments.js';
 
 function log(msg: string): void {
   console.error(`[opencode-provider] ${msg}`);
@@ -214,6 +228,17 @@ function sessionErrorMessage(props: { error?: unknown }): string {
 
 type SessionClient = Pick<OpencodeClient['session'], 'create' | 'promptAsync'>;
 
+type OpenCodePromptPart =
+  | { type: 'text'; text: string }
+  | { type: 'file'; mime: string; url: string; filename?: string };
+
+interface StagedAttachment {
+  path: string;
+  filename: string;
+  mime: string;
+  sizeBytes: number;
+}
+
 async function createSession(client: SessionClient): Promise<string> {
   const created = await client.create();
   if (created.error) {
@@ -227,10 +252,11 @@ async function createSession(client: SessionClient): Promise<string> {
 export async function promptSession(
   client: SessionClient,
   preferredSessionId: string | undefined,
-  text: string,
+  input: string | OpenCodePromptPart[],
 ): Promise<{ sessionId: string; recoveredFromStale: boolean }> {
   let sessionId = preferredSessionId;
   let recoveredFromStale = false;
+  const parts = typeof input === 'string' ? buildOpenCodePromptParts(input) : input;
 
   for (let attempt = 0; attempt < 2; attempt++) {
     if (!sessionId) {
@@ -240,7 +266,7 @@ export async function promptSession(
     try {
       const promptRes = await client.promptAsync({
         path: { id: sessionId },
-        body: { parts: [{ type: 'text', text }] },
+        body: { parts },
       });
       if (!promptRes.error) {
         return { sessionId, recoveredFromStale };
@@ -266,6 +292,121 @@ export async function promptSession(
   }
 
   throw new Error('OpenCode promptAsync: stale session recovery exhausted');
+}
+
+export async function stageOpenCodeAttachments(attachments: QueryAttachment[]): Promise<StagedAttachment[]> {
+  if (attachments.length === 0) return [];
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'nanoclaw-opencode-files-'));
+  const staged: StagedAttachment[] = [];
+  try {
+    for (const [index, attachment] of attachments.entries()) {
+      const filename = safeStageFilename(index, attachment.filename);
+      const stagedPath = path.join(dir, filename);
+      await fs.copyFile(attachment.path, stagedPath);
+      const stat = await fs.stat(stagedPath);
+      if (!stat.isFile() || stat.size <= 0 || stat.size !== attachment.sizeBytes) {
+        throw new Error(`Staged attachment validation failed for ${attachment.filename}`);
+      }
+      const header = await readHeader(stagedPath);
+      const sniffed = sniffImageMime(header);
+      if (sniffed && sniffed !== attachment.mime) {
+        throw new Error(`Staged attachment MIME mismatch for ${attachment.filename}`);
+      }
+      staged.push({
+        path: stagedPath,
+        filename: attachment.filename,
+        mime: attachment.mime,
+        sizeBytes: stat.size,
+      });
+    }
+    return staged;
+  } catch (err) {
+    await cleanupStagedAttachments(staged, dir);
+    throw err;
+  }
+}
+
+export function buildOpenCodePromptParts(
+  text: string,
+  attachments: StagedAttachment[] = [],
+): OpenCodePromptPart[] {
+  return [
+    { type: 'text', text },
+    ...attachments.map((staged) => ({
+      type: 'file' as const,
+      mime: staged.mime,
+      url: pathToFileURL(staged.path).href,
+      filename: staged.filename,
+    })),
+  ];
+}
+
+async function cleanupStagedAttachments(staged: StagedAttachment[], stagedDir?: string): Promise<void> {
+  const dirs = new Set<string>();
+  for (const item of staged) {
+    dirs.add(path.dirname(item.path));
+    try {
+      await fs.rm(item.path, { force: true });
+    } catch (err) {
+      log(
+        JSON.stringify({
+          severity: 'warn',
+          event: 'opencode_attachment_cleanup_failed',
+          filename: item.filename,
+          error: err instanceof Error ? err.message : String(err),
+        }),
+      );
+    }
+  }
+  if (stagedDir) dirs.add(stagedDir);
+  for (const dir of dirs) {
+    try {
+      await fs.rm(dir, { recursive: true, force: true });
+    } catch (err) {
+      log(
+        JSON.stringify({
+          severity: 'warn',
+          event: 'opencode_attachment_dir_cleanup_failed',
+          error: err instanceof Error ? err.message : String(err),
+        }),
+      );
+    }
+  }
+}
+
+async function readHeader(filePath: string): Promise<Buffer> {
+  const fh = await fs.open(filePath, 'r');
+  try {
+    const buf = Buffer.alloc(16);
+    const read = await fh.read(buf, 0, buf.length, 0);
+    return buf.subarray(0, read.bytesRead);
+  } finally {
+    await fh.close();
+  }
+}
+
+function safeStageFilename(index: number, filename: string): string {
+  const base = path.basename(filename).replace(/[/\\\0]/g, '-').trim() || 'attachment';
+  return `${index + 1}-${base}`;
+}
+
+function wrapTurnWithContext(turn: QueryTurnInput, systemInstructions?: string): QueryTurnInput {
+  return {
+    ...turn,
+    prompt: wrapPromptWithContext(turn.prompt, systemInstructions),
+  };
+}
+
+function summarizeMimes(attachments: QueryAttachment[]): Record<string, number> {
+  const summary: Record<string, number> = {};
+  for (const attachment of attachments) {
+    summary[attachment.mime] = (summary[attachment.mime] ?? 0) + 1;
+  }
+  return summary;
+}
+
+function extractRunId(text: string): string | undefined {
+  return text.match(/\b(?:filepart-[a-z-]+-\d{10,}|smoke-\d{10,}-\d+)\b/)?.[0];
 }
 
 export async function nextOpenCodeEvent<T>(
@@ -335,13 +476,13 @@ export class OpenCodeProvider implements AgentProvider {
       this.activeSessionId = undefined;
     }
 
-    const pending: string[] = [];
+    const pending: QueryTurnInput[] = [];
     let waiting: (() => void) | null = null;
     let ended = false;
     let aborted = false;
 
     const systemInstructions = input.systemContext?.instructions;
-    pending.push(wrapPromptWithContext(input.prompt, systemInstructions));
+    pending.push(wrapTurnWithContext(input, systemInstructions));
 
     const kick = (): void => {
       waiting?.();
@@ -366,8 +507,22 @@ export class OpenCodeProvider implements AgentProvider {
         if (aborted) return;
         if (pending.length === 0 && ended) return;
 
-        const text = pending.shift()!;
-        const prompted = await promptSession(client.session, self.activeSessionId, text);
+        const turn = pending.shift()!;
+        const staged = await stageOpenCodeAttachments(turn.attachments ?? []);
+        log(
+          JSON.stringify({
+            severity: 'info',
+            event: 'opencode_file_parts_prepared',
+            file_part_count: staged.length,
+            mime_summary: summarizeMimes(turn.attachments ?? []),
+            run_id: extractRunId(turn.prompt),
+          }),
+        );
+        const prompted = await promptSession(
+          client.session,
+          self.activeSessionId,
+          buildOpenCodePromptParts(turn.prompt, staged),
+        );
         const sessionId = prompted.sessionId;
         self.activeSessionId = sessionId;
 
@@ -384,87 +539,91 @@ export class OpenCodeProvider implements AgentProvider {
           destroySharedRuntime();
         };
 
-        turn: while (true) {
-          if (aborted) return;
+        try {
+          turn: while (true) {
+            if (aborted) return;
 
-          const { value: ev, done } = await nextMeaningfulOpenCodeEvent(
-            stream,
-            sessionId,
-            IDLE_TIMEOUT_MS,
-            handleTimeout,
-          );
-          if (done) {
-            self.activeSessionId = undefined;
-            throw new Error('OpenCode SSE stream ended unexpectedly');
-          }
-
-          yield { type: 'activity' };
-
-          switch (ev.type) {
-            case 'message.updated': {
-              const info = ev.properties.info as { id?: string; role?: string } | undefined;
-              if (info?.id && info?.role) {
-                roleByMessageId.set(info.id, info.role);
-              }
-              break;
+            const { value: ev, done } = await nextMeaningfulOpenCodeEvent(
+              stream,
+              sessionId,
+              IDLE_TIMEOUT_MS,
+              handleTimeout,
+            );
+            if (done) {
+              self.activeSessionId = undefined;
+              throw new Error('OpenCode SSE stream ended unexpectedly');
             }
-            case 'message.part.updated': {
-              const part = ev.properties.part as { type?: string; messageID?: string; text?: string } | undefined;
-              if (part?.type === 'text' && part.messageID && part.text) {
-                partTextByMessageId.set(part.messageID, part.text);
-              }
-              break;
-            }
-            case 'permission.updated': {
-              const perm = ev.properties as { id?: string; sessionID?: string };
-              if (perm.sessionID === sessionId && perm.id) {
-                try {
-                  await client.postSessionIdPermissionsPermissionId({
-                    path: { id: sessionId, permissionID: perm.id },
-                    body: { response: 'always' },
-                  });
-                } catch (err) {
-                  log(`Failed to auto-reply permission: ${err instanceof Error ? err.message : String(err)}`);
+
+            yield { type: 'activity' };
+
+            switch (ev.type) {
+              case 'message.updated': {
+                const info = ev.properties.info as { id?: string; role?: string } | undefined;
+                if (info?.id && info?.role) {
+                  roleByMessageId.set(info.id, info.role);
                 }
+                break;
               }
-              break;
-            }
-            case 'session.status': {
-              const props = ev.properties as {
-                sessionID?: string;
-                status?: { type?: string; attempt?: number; message?: string };
-              };
-              if (props.sessionID !== sessionId) break;
-              const st = props.status;
-              if (
-                st?.type === 'retry' &&
-                typeof st.attempt === 'number' &&
-                st.attempt >= SESSION_STATUS_RETRY_ERROR_AFTER &&
-                st.message
-              ) {
-                self.activeSessionId = undefined;
-                throw new Error(`OpenCode retry limit (${st.attempt}): ${st.message}`);
+              case 'message.part.updated': {
+                const part = ev.properties.part as { type?: string; messageID?: string; text?: string } | undefined;
+                if (part?.type === 'text' && part.messageID && part.text) {
+                  partTextByMessageId.set(part.messageID, part.text);
+                }
+                break;
               }
-              break;
-            }
-            case 'session.error': {
-              const props = ev.properties as { sessionID?: string; error?: unknown };
-              if (props.sessionID === sessionId || props.sessionID === undefined) {
-                self.activeSessionId = undefined;
-                throw new Error(sessionErrorMessage(props));
+              case 'permission.updated': {
+                const perm = ev.properties as { id?: string; sessionID?: string };
+                if (perm.sessionID === sessionId && perm.id) {
+                  try {
+                    await client.postSessionIdPermissionsPermissionId({
+                      path: { id: sessionId, permissionID: perm.id },
+                      body: { response: 'always' },
+                    });
+                  } catch (err) {
+                    log(`Failed to auto-reply permission: ${err instanceof Error ? err.message : String(err)}`);
+                  }
+                }
+                break;
               }
-              break;
-            }
-            case 'session.idle': {
-              const sid = (ev.properties as { sessionID?: string }).sessionID;
-              if (sid === sessionId) {
-                break turn;
+              case 'session.status': {
+                const props = ev.properties as {
+                  sessionID?: string;
+                  status?: { type?: string; attempt?: number; message?: string };
+                };
+                if (props.sessionID !== sessionId) break;
+                const st = props.status;
+                if (
+                  st?.type === 'retry' &&
+                  typeof st.attempt === 'number' &&
+                  st.attempt >= SESSION_STATUS_RETRY_ERROR_AFTER &&
+                  st.message
+                ) {
+                  self.activeSessionId = undefined;
+                  throw new Error(`OpenCode retry limit (${st.attempt}): ${st.message}`);
+                }
+                break;
               }
-              break;
+              case 'session.error': {
+                const props = ev.properties as { sessionID?: string; error?: unknown };
+                if (props.sessionID === sessionId || props.sessionID === undefined) {
+                  self.activeSessionId = undefined;
+                  throw new Error(sessionErrorMessage(props));
+                }
+                break;
+              }
+              case 'session.idle': {
+                const sid = (ev.properties as { sessionID?: string }).sessionID;
+                if (sid === sessionId) {
+                  break turn;
+                }
+                break;
+              }
+              default:
+                break;
             }
-            default:
-              break;
           }
+        } finally {
+          await cleanupStagedAttachments(staged);
         }
 
         let resultText = '';
@@ -478,8 +637,8 @@ export class OpenCodeProvider implements AgentProvider {
     }
 
     return {
-      push: (message: string) => {
-        pending.push(wrapPromptWithContext(message, systemInstructions));
+      push: (message) => {
+        pending.push(wrapTurnWithContext(normalizeQueryTurnInput(message), systemInstructions));
         kick();
       },
       end: () => {

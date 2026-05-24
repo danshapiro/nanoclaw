@@ -1,6 +1,31 @@
-import { describe, it, expect } from 'bun:test';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 
-import { isStaleSessionError, nextMeaningfulOpenCodeEvent, nextOpenCodeEvent, promptSession } from './opencode.js';
+import { describe, it, expect, afterEach } from 'bun:test';
+
+import {
+  buildOpenCodePromptParts,
+  isStaleSessionError,
+  nextMeaningfulOpenCodeEvent,
+  nextOpenCodeEvent,
+  promptSession,
+  stageOpenCodeAttachments,
+} from './opencode.js';
+
+const tmpRoots: string[] = [];
+
+afterEach(() => {
+  for (const root of tmpRoots.splice(0)) {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+function tmpDir(): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-provider-test-'));
+  tmpRoots.push(dir);
+  return dir;
+}
 
 describe('OpenCodeProvider stale session handling', () => {
   it('classifies missing OpenCode sessions as stale continuations', () => {
@@ -42,6 +67,94 @@ describe('OpenCodeProvider stale session handling', () => {
       recoveredFromStale: true,
     });
     expect(promptedIds).toEqual(['stale-session', 'fresh-session']);
+  });
+});
+
+describe('OpenCode file parts', () => {
+  it('builds text followed by escaped file parts', () => {
+    const parts = buildOpenCodePromptParts('What is in the picture?', [
+      {
+        path: '/tmp/Screenshot 2026-05-24 (1)#final.png',
+        filename: 'Screenshot 2026-05-24 (1)#final.png',
+        mime: 'image/png',
+        sizeBytes: 8,
+      },
+    ]);
+
+    expect(parts).toEqual([
+      { type: 'text', text: 'What is in the picture?' },
+      {
+        type: 'file',
+        mime: 'image/png',
+        url: 'file:///tmp/Screenshot%202026-05-24%20(1)%23final.png',
+        filename: 'Screenshot 2026-05-24 (1)#final.png',
+      },
+    ]);
+  });
+
+  it('omits file parts when there are no attachments', () => {
+    expect(buildOpenCodePromptParts('hello')).toEqual([{ type: 'text', text: 'hello' }]);
+  });
+
+  it('passes file parts to promptAsync', async () => {
+    const bodies: unknown[] = [];
+    const client = {
+      create: async () => ({
+        data: { id: 'session-1' },
+        error: undefined,
+        request: {} as Request,
+        response: {} as Response,
+      }),
+      promptAsync: async ({ body }: { body: unknown }) => {
+        bodies.push(body);
+        return {
+          data: true,
+          error: undefined,
+          request: {} as Request,
+          response: {} as Response,
+        };
+      },
+    };
+
+    await promptSession(client, undefined, [
+      { type: 'text', text: 'hello' },
+      { type: 'file', mime: 'image/png', url: 'file:///tmp/image.png', filename: 'image.png' },
+    ]);
+
+    expect(bodies).toEqual([
+      {
+        parts: [
+          { type: 'text', text: 'hello' },
+          { type: 'file', mime: 'image/png', url: 'file:///tmp/image.png', filename: 'image.png' },
+        ],
+      },
+    ]);
+  });
+
+  it('stages bytes to runner-private files and revalidates size and MIME', async () => {
+    const dir = tmpDir();
+    const source = path.join(dir, 'source image.png');
+    fs.writeFileSync(source, Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+
+    const staged = await stageOpenCodeAttachments([
+      { path: source, filename: 'source image.png', mime: 'image/png', sizeBytes: 8 },
+    ]);
+
+    expect(staged).toHaveLength(1);
+    expect(staged[0].path).not.toBe(source);
+    expect(staged[0].path).toContain('nanoclaw-opencode-files-');
+    expect(fs.readFileSync(staged[0].path)).toEqual(fs.readFileSync(source));
+    fs.rmSync(path.dirname(staged[0].path), { recursive: true, force: true });
+  });
+
+  it('rejects staged MIME mismatches', async () => {
+    const dir = tmpDir();
+    const source = path.join(dir, 'source.png');
+    fs.writeFileSync(source, Buffer.from([0xff, 0xd8, 0xff, 0x00]));
+
+    await expect(
+      stageOpenCodeAttachments([{ path: source, filename: 'source.png', mime: 'image/png', sizeBytes: 4 }]),
+    ).rejects.toThrow(/MIME mismatch/);
   });
 });
 
