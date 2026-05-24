@@ -21,6 +21,12 @@ function makeSkill(root: string, name: string): string {
   return skillDir;
 }
 
+function makeExecutable(filePath: string, body = '#!/usr/bin/env bash\nprintf ok\\n'): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, body);
+  fs.chmodSync(filePath, 0o755);
+}
+
 afterEach(() => {
   clearManagedSkillRootCache();
   for (const root of tempRoots.splice(0)) {
@@ -78,6 +84,116 @@ describe('resolveManagedSkillRoot', () => {
     );
     expect(fs.readFileSync(path.join(result.root, 'local-one', 'SKILL.md'), 'utf8')).toBe(
       fs.readFileSync(path.join(localSkill, 'SKILL.md'), 'utf8'),
+    );
+  });
+
+  it('synthesizes .bin helpers from the deploy manifest in the merged root', () => {
+    const projectRoot = makeTempDir();
+    const dataDir = makeTempDir();
+    const managedRoot = makeTempDir();
+
+    makeSkill(path.join(projectRoot, 'container', 'skills'), 'bundled-one');
+    const familiar = makeSkill(managedRoot, 'using-familiar');
+    const flight = makeSkill(managedRoot, 'pp-flight-goat');
+    makeExecutable(path.join(familiar, 'scripts', 'familiar'));
+    makeExecutable(path.join(flight, 'scripts', 'flight-goat-pp-cli'));
+    fs.writeFileSync(
+      path.join(managedRoot, 'skill-runtime-manifest.json'),
+      JSON.stringify({
+        version: 1,
+        skills: [
+          { name: 'using-familiar', skillLocalBins: { familiar: { containerPath: '/app/skills/.bin/familiar' } } },
+          {
+            name: 'pp-flight-goat',
+            skillLocalBins: {
+              'flight-goat-pp-cli': { containerPath: '/app/skills/.bin/flight-goat-pp-cli' },
+            },
+          },
+        ],
+      }),
+    );
+
+    const result = resolveManagedSkillRoot({
+      projectRoot,
+      dataDir,
+      env: { NANOCLAW_MANAGED_SKILLS_DIRS: managedRoot },
+    });
+
+    expect(fs.existsSync(path.join(result.root, 'skill-runtime-manifest.json'))).toBe(true);
+    expect(fs.lstatSync(path.join(result.root, '.bin', 'familiar')).isSymbolicLink()).toBe(true);
+    expect(fs.readlinkSync(path.join(result.root, '.bin', 'familiar'))).toBe('../using-familiar/scripts/familiar');
+    expect(fs.lstatSync(path.join(result.root, '.bin', 'flight-goat-pp-cli')).isSymbolicLink()).toBe(true);
+    expect(fs.readlinkSync(path.join(result.root, '.bin', 'flight-goat-pp-cli'))).toBe(
+      '../pp-flight-goat/scripts/flight-goat-pp-cli',
+    );
+  });
+
+  it('validates writable local skill helper declarations on each merge', () => {
+    const projectRoot = makeTempDir();
+    const dataDir = makeTempDir();
+    const writableRoot = makeTempDir();
+    makeSkill(path.join(projectRoot, 'container', 'skills'), 'bundled-one');
+    const local = makeSkill(path.join(writableRoot, 'skills'), 'local-tool');
+    fs.writeFileSync(
+      path.join(local, 'SKILL.md'),
+      `---\nname: local-tool\nmetadata:\n  openclaw:\n    requires:\n      bins: ["local-tool"]\n---\n# Local Tool\n`,
+    );
+
+    expect(() =>
+      resolveManagedSkillRoot({
+        projectRoot,
+        dataDir,
+        env: { NANOCLAW_WRITABLE_SKILLS_DIR: writableRoot },
+      }),
+    ).toThrow('declares helper "local-tool" but executable script is missing');
+
+    makeExecutable(path.join(local, 'scripts', 'local-tool'));
+    const result = resolveManagedSkillRoot({
+      projectRoot,
+      dataDir,
+      env: { NANOCLAW_WRITABLE_SKILLS_DIR: writableRoot },
+    });
+    expect(fs.lstatSync(path.join(result.root, '.bin', 'local-tool')).isSymbolicLink()).toBe(true);
+  });
+
+  it('treats gws as a runtime shim and base commands outside .bin', () => {
+    const projectRoot = makeTempDir();
+    const dataDir = makeTempDir();
+    const local = makeSkill(path.join(projectRoot, 'container', 'skills'), 'gws-like');
+    fs.writeFileSync(
+      path.join(local, 'SKILL.md'),
+      `---\nname: gws-like\nmetadata:\n  openclaw:\n    requires:\n      bins:\n        - gws\n      baseCommands: ["bash", "node"]\n---\n# GWS Like\n`,
+    );
+
+    const result = resolveManagedSkillRoot({ projectRoot, dataDir });
+
+    expect(fs.existsSync(path.join(result.root, '.bin', 'gws'))).toBe(false);
+    expect(result.skills.find((skill) => skill.name === 'gws-like')?.requirements).toEqual({
+      skillLocalBins: [],
+      runtimeBins: ['gws'],
+      baseCommands: ['bash', 'node'],
+    });
+  });
+
+  it('fails closed for unknown runtime shims and base commands', () => {
+    const projectRoot = makeTempDir();
+    const dataDir = makeTempDir();
+    const skill = makeSkill(path.join(projectRoot, 'container', 'skills'), 'bad-runtime');
+    fs.writeFileSync(
+      path.join(skill, 'SKILL.md'),
+      `---\nname: bad-runtime\nmetadata:\n  openclaw:\n    requires:\n      runtimeBins: ["not-a-shim"]\n---\n# Bad\n`,
+    );
+
+    expect(() => resolveManagedSkillRoot({ projectRoot, dataDir })).toThrow(
+      'Skill "bad-runtime" declares unknown runtime shim "not-a-shim"',
+    );
+
+    fs.writeFileSync(
+      path.join(skill, 'SKILL.md'),
+      `---\nname: bad-runtime\nmetadata:\n  openclaw:\n    requires:\n      baseCommands: ["gcc"]\n---\n# Bad\n`,
+    );
+    expect(() => resolveManagedSkillRoot({ projectRoot, dataDir })).toThrow(
+      'Skill "bad-runtime" declares unknown base runtime command "gcc"',
     );
   });
 

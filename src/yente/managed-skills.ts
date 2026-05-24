@@ -8,6 +8,7 @@ export interface ManagedSkill {
   sourcePath: string;
   mergedPath: string;
   sourceKind: 'bundled' | 'managed' | 'local';
+  requirements: SkillRuntimeRequirements;
 }
 
 export interface ManagedSkillRoot {
@@ -19,6 +20,27 @@ interface SkillRootSource {
   kind: ManagedSkill['sourceKind'];
   root: string;
 }
+
+export interface SkillRuntimeRequirements {
+  skillLocalBins: string[];
+  runtimeBins: string[];
+  baseCommands: string[];
+}
+
+interface RuntimeManifestSkill {
+  name: string;
+  skillLocalBins?: Record<string, unknown>;
+  runtimeBins?: Record<string, unknown>;
+  baseCommands?: Record<string, unknown>;
+}
+
+interface RuntimeManifest {
+  skills?: RuntimeManifestSkill[];
+}
+
+const RUNTIME_SHIM_BINS = new Set(['gws']);
+const BASE_RUNTIME_COMMANDS = new Set(['bash', 'sh', 'node', 'python3', 'agent-browser']);
+const SKILL_RUNTIME_MANIFEST = 'skill-runtime-manifest.json';
 
 let _cleanupRan = false;
 
@@ -53,6 +75,7 @@ export function resolveManagedSkillRoot(args: {
   const env = args.env ?? process.env;
   const sources = collectSkillRootSources(args.projectRoot, env);
   const skillsByName = new Map<string, ManagedSkill>();
+  const manifestBinsBySkill = new Map<string, Set<string>>();
   const seenSourceRoots = new Set<string>();
 
   for (const source of sources) {
@@ -62,6 +85,7 @@ export function resolveManagedSkillRoot(args: {
       continue;
     }
     seenSourceRoots.add(sourceRootKey);
+    collectManifestSkillLocalBins(source.root, manifestBinsBySkill);
     for (const skill of listSkillSourceDirs(source.root)) {
       const existing = skillsByName.get(skill.name);
       if (existing) {
@@ -69,11 +93,16 @@ export function resolveManagedSkillRoot(args: {
           `Duplicate skill name "${skill.name}" from ${skill.sourcePath}; already provided by ${existing.sourcePath}`,
         );
       }
+      const requirements = readSkillRuntimeRequirements(skill.sourcePath);
+      for (const bin of manifestBinsBySkill.get(skill.name) ?? []) {
+        addUnique(requirements.skillLocalBins, bin);
+      }
       skillsByName.set(skill.name, {
         name: skill.name,
         sourcePath: skill.sourcePath,
         mergedPath: '', // set below
         sourceKind: source.kind,
+        requirements,
       });
     }
   }
@@ -88,6 +117,8 @@ export function resolveManagedSkillRoot(args: {
     skill.mergedPath = path.join(root, skill.name);
     fs.cpSync(skill.sourcePath, skill.mergedPath, { recursive: true, dereference: true });
   }
+  copyRuntimeManifests(sources, root);
+  synthesizeSkillBinLinks(root, skills);
 
   return { root, skills };
 }
@@ -193,6 +224,170 @@ function listSkillNames(root: string): string[] {
     .filter((name) => !name.startsWith('.'))
     .filter((name) => isDirectory(path.join(root, name)))
     .sort();
+}
+
+function collectManifestSkillLocalBins(root: string, binsBySkill: Map<string, Set<string>>): void {
+  const manifestPath = path.join(root, SKILL_RUNTIME_MANIFEST);
+  if (!fs.existsSync(manifestPath)) return;
+  const manifest = readRuntimeManifest(manifestPath);
+  for (const skill of manifest.skills ?? []) {
+    if (!skill.name || !skill.skillLocalBins) continue;
+    const bins = Object.keys(skill.skillLocalBins);
+    if (bins.length === 0) continue;
+    const existing = binsBySkill.get(skill.name) ?? new Set<string>();
+    for (const bin of bins) existing.add(bin);
+    binsBySkill.set(skill.name, existing);
+  }
+}
+
+function readRuntimeManifest(manifestPath: string): RuntimeManifest {
+  const raw = fs.readFileSync(manifestPath, 'utf8');
+  const parsed = JSON.parse(raw) as RuntimeManifest;
+  if (!parsed || typeof parsed !== 'object' || (parsed.skills !== undefined && !Array.isArray(parsed.skills))) {
+    throw new Error(`Invalid ${SKILL_RUNTIME_MANIFEST}: ${manifestPath}`);
+  }
+  return parsed;
+}
+
+function copyRuntimeManifests(sources: SkillRootSource[], mergedRoot: string): void {
+  const manifests = sources
+    .map((source) => path.join(source.root, SKILL_RUNTIME_MANIFEST))
+    .filter((file) => fs.existsSync(file));
+  if (manifests.length === 0) return;
+  if (manifests.length > 1) {
+    throw new Error(`Multiple ${SKILL_RUNTIME_MANIFEST} files are not supported in one merged skill root`);
+  }
+  fs.copyFileSync(manifests[0], path.join(mergedRoot, SKILL_RUNTIME_MANIFEST));
+}
+
+function synthesizeSkillBinLinks(root: string, skills: ManagedSkill[]): void {
+  const links = new Map<string, { skill: ManagedSkill; scriptPath: string }>();
+  for (const skill of skills) {
+    validateRuntimeBins(skill);
+    validateBaseCommands(skill);
+    for (const bin of skill.requirements.skillLocalBins) {
+      const scriptPath = path.join(skill.mergedPath, 'scripts', bin);
+      if (!isExecutableFile(scriptPath)) {
+        throw new Error(
+          `Skill "${skill.name}" declares helper "${bin}" but executable script is missing: ${scriptPath}`,
+        );
+      }
+      const existing = links.get(bin);
+      if (existing && existing.scriptPath !== scriptPath) {
+        throw new Error(
+          `Duplicate skill-local helper "${bin}" declared by "${skill.name}" and "${existing.skill.name}"`,
+        );
+      }
+      links.set(bin, { skill, scriptPath });
+    }
+  }
+
+  if (links.size === 0) return;
+  const binDir = path.join(root, '.bin');
+  fs.mkdirSync(binDir, { recursive: true });
+  for (const [bin, link] of [...links.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+    const target = path.relative(binDir, link.scriptPath);
+    fs.symlinkSync(target, path.join(binDir, bin));
+  }
+}
+
+function validateRuntimeBins(skill: ManagedSkill): void {
+  for (const bin of skill.requirements.runtimeBins) {
+    if (!RUNTIME_SHIM_BINS.has(bin)) {
+      throw new Error(`Skill "${skill.name}" declares unknown runtime shim "${bin}"`);
+    }
+  }
+}
+
+function validateBaseCommands(skill: ManagedSkill): void {
+  for (const command of skill.requirements.baseCommands) {
+    if (!BASE_RUNTIME_COMMANDS.has(command)) {
+      throw new Error(`Skill "${skill.name}" declares unknown base runtime command "${command}"`);
+    }
+  }
+}
+
+export function readSkillRuntimeRequirements(skillDir: string): SkillRuntimeRequirements {
+  const skillMd = path.join(skillDir, 'SKILL.md');
+  const requirements: SkillRuntimeRequirements = { skillLocalBins: [], runtimeBins: [], baseCommands: [] };
+  if (!fs.existsSync(skillMd)) return requirements;
+
+  const frontmatter = extractFrontmatter(fs.readFileSync(skillMd, 'utf8'));
+  if (!frontmatter) return requirements;
+
+  for (const bin of readYamlStringList(frontmatter, 'skillLocalBins')) addUnique(requirements.skillLocalBins, bin);
+  for (const bin of readYamlStringList(frontmatter, 'skill_local_bins')) addUnique(requirements.skillLocalBins, bin);
+  for (const bin of readYamlStringList(frontmatter, 'runtimeBins')) addUnique(requirements.runtimeBins, bin);
+  for (const bin of readYamlStringList(frontmatter, 'runtime_bins')) addUnique(requirements.runtimeBins, bin);
+  for (const command of readYamlStringList(frontmatter, 'baseCommands')) addUnique(requirements.baseCommands, command);
+  for (const command of readYamlStringList(frontmatter, 'base_commands')) addUnique(requirements.baseCommands, command);
+  for (const bin of readYamlStringList(frontmatter, 'bins')) {
+    if (RUNTIME_SHIM_BINS.has(bin)) addUnique(requirements.runtimeBins, bin);
+    else addUnique(requirements.skillLocalBins, bin);
+  }
+
+  return requirements;
+}
+
+function extractFrontmatter(body: string): string | null {
+  if (!body.startsWith('---\n')) return null;
+  const end = body.indexOf('\n---', 4);
+  if (end === -1) return null;
+  return body.slice(4, end);
+}
+
+function readYamlStringList(frontmatter: string, key: string): string[] {
+  const lines = frontmatter.split(/\r?\n/);
+  const values: string[] = [];
+  const keyPattern = new RegExp(`^\\s*${escapeRegExp(key)}\\s*:\\s*(.*)$`);
+  for (let i = 0; i < lines.length; i += 1) {
+    const match = lines[i].match(keyPattern);
+    if (!match) continue;
+    const rest = match[1].trim();
+    if (rest.startsWith('[')) {
+      values.push(...parseInlineStringList(rest));
+      continue;
+    }
+    for (let j = i + 1; j < lines.length; j += 1) {
+      const item = lines[j].match(/^\s*-\s*["']?([^"',\]]+)["']?\s*$/);
+      if (item) {
+        values.push(item[1].trim());
+        continue;
+      }
+      if (lines[j].trim() === '') continue;
+      break;
+    }
+  }
+  return values.filter(Boolean);
+}
+
+function parseInlineStringList(value: string): string[] {
+  const match = value.match(/^\[(.*)\]$/);
+  if (!match) return [];
+  return match[1]
+    .split(',')
+    .map((entry) => entry.trim().replace(/^["']|["']$/g, ''))
+    .filter(Boolean);
+}
+
+function addUnique(values: string[], value: string): void {
+  if (!values.includes(value)) values.push(value);
+}
+
+function isExecutableFile(filePath: string): boolean {
+  try {
+    const stat = fs.statSync(filePath);
+    return stat.isFile() && (stat.mode & 0o111) !== 0;
+  } catch (err) {
+    if (err instanceof Error && 'code' in err && err.code === 'ENOENT') {
+      return false;
+    }
+    throw err;
+  }
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function isDirectory(entryPath: string): boolean {
