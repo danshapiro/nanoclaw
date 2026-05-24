@@ -28,9 +28,22 @@ export interface ProviderOptions {
   additionalDirectories?: string[];
 }
 
-export interface QueryInput {
+export interface QueryAttachment {
+  path: string;
+  filename: string;
+  mime: string;
+  sizeBytes: number;
+}
+
+export interface QueryTurnInput {
   /** Initial prompt (already formatted by agent-runner). */
   prompt: string;
+
+  /** Validated files for this provider turn. Providers may ignore them. */
+  attachments?: QueryAttachment[];
+}
+
+export interface QueryInput extends QueryTurnInput {
 
   /**
    * Opaque continuation token from a previous query. The provider decides
@@ -58,7 +71,7 @@ export interface McpServerConfig {
 
 export interface AgentQuery {
   /** Push a follow-up message into the active query. */
-  push(message: string): void;
+  push(input: string | QueryTurnInput): void;
 
   /** Signal that no more input will be sent. */
   end(): void;
