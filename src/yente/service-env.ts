@@ -16,6 +16,7 @@ export const REQUIRED_YENTE_ONECLI_SECRET_NAMES = [
   'NanoClaw Anthropic',
   'NanoClaw OpenAI',
   'NanoClaw Gemini',
+  'NanoClaw OpenCode Go',
   'AssemblyAI',
 ] as const;
 export const ONECLI_MANAGED_PLACEHOLDER = 'onecli-managed';

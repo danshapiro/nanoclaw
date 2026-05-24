@@ -106,6 +106,7 @@ export function insertMessage(
     kind: string;
     timestamp: string;
     platformId: string | null;
+    platformMessageId?: string | null;
     channelType: string | null;
     threadId: string | null;
     content: string;
@@ -119,10 +120,11 @@ export function insertMessage(
   },
 ): void {
   db.prepare(
-    `INSERT INTO messages_in (id, seq, kind, timestamp, status, platform_id, channel_type, thread_id, content, process_after, recurrence, series_id, trigger)
-     VALUES (@id, @seq, @kind, @timestamp, 'pending', @platformId, @channelType, @threadId, @content, @processAfter, @recurrence, @id, @trigger)`,
+    `INSERT INTO messages_in (id, seq, kind, timestamp, status, platform_id, platform_message_id, channel_type, thread_id, content, process_after, recurrence, series_id, trigger)
+     VALUES (@id, @seq, @kind, @timestamp, 'pending', @platformId, @platformMessageId, @channelType, @threadId, @content, @processAfter, @recurrence, @id, @trigger)`,
   ).run({
     ...message,
+    platformMessageId: message.platformMessageId ?? null,
     trigger: message.trigger ?? 1,
     seq: nextEvenSeq(db),
   });
@@ -308,5 +310,18 @@ export function migrateMessagesInTable(db: Database.Database): void {
     // All pre-existing rows got written with the old "every inbound wakes
     // the agent" semantics, so backfill 1 and default 1 for new inserts.
     db.prepare('ALTER TABLE messages_in ADD COLUMN trigger INTEGER NOT NULL DEFAULT 1').run();
+  }
+  if (!cols.has('platform_message_id')) {
+    db.prepare('ALTER TABLE messages_in ADD COLUMN platform_message_id TEXT').run();
+    db.prepare(
+      `UPDATE messages_in
+       SET platform_message_id =
+         CASE
+           WHEN instr(id, ':') > 0 THEN substr(id, 1, instr(id, ':') - 1)
+           ELSE id
+         END
+       WHERE channel_type = 'discord'
+         AND platform_message_id IS NULL`,
+    ).run();
   }
 }

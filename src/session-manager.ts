@@ -252,6 +252,7 @@ export function writeSessionMessage(
     kind: string;
     timestamp: string;
     platformId?: string | null;
+    platformMessageId?: string | null;
     channelType?: string | null;
     threadId?: string | null;
     content: string;
@@ -276,6 +277,7 @@ export function writeSessionMessage(
       kind: message.kind,
       timestamp: message.timestamp,
       platformId: message.platformId ?? null,
+      platformMessageId: message.platformMessageId ?? null,
       channelType: message.channelType ?? null,
       threadId: message.threadId ?? null,
       content,
