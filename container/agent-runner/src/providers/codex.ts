@@ -17,7 +17,14 @@ import fs from 'fs';
 import path from 'path';
 
 import { registerProvider } from './provider-registry.js';
-import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
+import {
+  normalizeQueryTurnInput,
+  type AgentProvider,
+  type AgentQuery,
+  type ProviderEvent,
+  type ProviderOptions,
+  type QueryInput,
+} from './types.js';
 import {
   type AppServer,
   type JsonRpcNotification,
@@ -94,6 +101,10 @@ function composeBaseInstructions(promptAddendum: string | undefined): string | u
   const claudeMd = readAgentAndGlobalClaudeMd();
   const pieces = [claudeMd, promptAddendum].filter((s): s is string => Boolean(s));
   return pieces.length > 0 ? pieces.join('\n\n---\n\n') : undefined;
+}
+
+function log(msg: string): void {
+  console.error(`[codex-provider] ${msg}`);
 }
 
 // ── Provider ────────────────────────────────────────────────────────────────
@@ -186,8 +197,19 @@ export class CodexProvider implements AgentProvider {
     }
 
     return {
-      push: (message: string) => {
-        pending.push(message);
+      push: (message) => {
+        const turn = normalizeQueryTurnInput(message);
+        if (turn.attachments?.length) {
+          log(
+            JSON.stringify({
+              severity: 'info',
+              event: 'provider_attachments_ignored',
+              provider: 'codex',
+              attachment_count: turn.attachments.length,
+            }),
+          );
+        }
+        pending.push(turn.prompt);
         kick();
       },
       end: () => {

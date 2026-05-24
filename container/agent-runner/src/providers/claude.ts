@@ -5,6 +5,7 @@ import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '
 
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
 import { registerProvider } from './provider-registry.js';
+import { normalizeQueryTurnInput } from './types.js';
 import type {
   AgentProvider,
   AgentQuery,
@@ -357,7 +358,20 @@ export class ClaudeProvider implements AgentProvider {
     }
 
     return {
-      push: (msg) => stream.push(msg),
+      push: (msg) => {
+        const turn = normalizeQueryTurnInput(msg);
+        if (turn.attachments?.length) {
+          log(
+            JSON.stringify({
+              severity: 'info',
+              event: 'provider_attachments_ignored',
+              provider: 'claude',
+              attachment_count: turn.attachments.length,
+            }),
+          );
+        }
+        stream.push(turn.prompt);
+      },
       end: () => stream.end(),
       events: translateEvents(),
       abort: () => {

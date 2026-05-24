@@ -83,6 +83,10 @@ export interface AgentQuery {
   abort(): void;
 }
 
+export function normalizeQueryTurnInput(input: string | QueryTurnInput): QueryTurnInput {
+  return typeof input === 'string' ? { prompt: input } : input;
+}
+
 export type ProviderEvent =
   | { type: 'init'; continuation: string }
   | { type: 'result'; text: string | null }

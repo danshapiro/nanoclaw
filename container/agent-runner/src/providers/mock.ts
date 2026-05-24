@@ -1,5 +1,12 @@
 import { registerProvider } from './provider-registry.js';
-import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
+import {
+  normalizeQueryTurnInput,
+  type AgentProvider,
+  type AgentQuery,
+  type ProviderEvent,
+  type ProviderOptions,
+  type QueryInput,
+} from './types.js';
 
 /**
  * Mock provider for testing. Returns canned responses.
@@ -57,8 +64,9 @@ export class MockProvider implements AgentProvider {
     };
 
     return {
-      push(message: string) {
-        pending.push(message);
+      push(message) {
+        const turn = normalizeQueryTurnInput(message);
+        pending.push(turn.prompt);
         waiting?.();
       },
       end() {

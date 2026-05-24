@@ -6,7 +6,7 @@ import { getUndeliveredMessages, writeMessageOut } from './db/messages-out.js';
 import { formatMessages, extractRouting } from './formatter.js';
 import { runPollLoop } from './poll-loop.js';
 import { MockProvider } from './providers/mock.js';
-import type { AgentProvider, AgentQuery, ProviderEvent, QueryInput } from './providers/types.js';
+import type { AgentProvider, AgentQuery, ProviderEvent, QueryInput, QueryTurnInput } from './providers/types.js';
 
 beforeEach(() => {
   initTestSessionDb();
@@ -58,7 +58,7 @@ class ScriptedProvider implements AgentProvider {
   query(input: QueryInput): AgentQuery {
     this.calls++;
     return {
-      push(_message: string) {},
+      push(_message: string | QueryTurnInput) {},
       end() {},
       abort() {},
       events: this.eventFactory(input),
@@ -314,6 +314,159 @@ describe('end-to-end with mock provider', () => {
 });
 
 describe('poll-loop conversational reply accounting', () => {
+  it('passes collected attachments on the initial provider turn', async () => {
+    const filePath = '/workspace/agent/attachments/discord/msg/photo.png';
+    insertMessage(
+      'image-chat',
+      'chat-sdk',
+      {
+        sender: 'User',
+        text: 'What is in the picture?',
+        attachments: [{ workspacePath: filePath, originalName: 'photo.png', contentType: 'image/png', sizeBytes: 8 }],
+      },
+      { platformId: 'chan-1', channelType: 'discord' },
+    );
+
+    const provider = new ScriptedProvider(async function* (input) {
+      expect(input.attachments).toEqual([{ path: filePath, filename: 'photo.png', mime: 'image/png', sizeBytes: 8 }]);
+      yield { type: 'result', text: 'image received' };
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({
+      provider,
+      providerName: 'test',
+      cwd: '/tmp',
+      signal: controller.signal,
+      inspectAttachmentFile: async (candidate) => ({
+        path: candidate,
+        realPath: candidate,
+        filename: 'photo.png',
+        mime: 'image/png',
+        sizeBytes: 8,
+        isRegularFile: true,
+      }),
+    });
+
+    await waitFor(() => getAckStatus('image-chat') === 'completed', 1500);
+    controller.abort();
+    await loopPromise.catch(() => {});
+  });
+
+  it('passes collected attachments on active-query follow-up pushes', async () => {
+    insertMessage('initial-chat', 'chat', { sender: 'User', text: 'first' }, { platformId: 'chan-1' });
+
+    const filePath = '/workspace/agent/tmp/vision-fixture.png';
+    let releaseQuery!: () => void;
+    const queryStarted = deferred();
+    const pushes: QueryTurnInput[] = [];
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query() {
+        queryStarted.resolve();
+        return {
+          push(message) {
+            pushes.push(typeof message === 'string' ? { prompt: message } : message);
+          },
+          end() {
+            releaseQuery?.();
+          },
+          abort() {
+            releaseQuery?.();
+          },
+          events: (async function* () {
+            yield { type: 'init', continuation: 'active-image-query' };
+            await new Promise<void>((resolve) => {
+              releaseQuery = resolve;
+            });
+            yield { type: 'result', text: 'done' };
+          })(),
+        };
+      },
+    };
+
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({
+      provider,
+      providerName: 'test',
+      cwd: '/tmp',
+      signal: controller.signal,
+      inspectAttachmentFile: async (candidate) => ({
+        path: candidate,
+        realPath: candidate,
+        filename: 'vision-fixture.png',
+        mime: 'image/png',
+        sizeBytes: 8,
+        isRegularFile: true,
+      }),
+    });
+
+    await queryStarted.promise;
+    insertMessage('image-follow-up', 'chat', { sender: 'User', text: `Use ${filePath}` }, { platformId: 'chan-1' });
+    await waitFor(() => pushes.some((push) => push.attachments?.length === 1), 1500);
+    controller.abort();
+    releaseQuery();
+    await loopPromise.catch(() => {});
+
+    expect(pushes[0].attachments).toEqual([
+      { path: filePath, filename: 'vision-fixture.png', mime: 'image/png', sizeBytes: 8 },
+    ]);
+  });
+
+  it('leaves attachment-bearing follow-up rows retryable when provider enqueue throws', async () => {
+    insertMessage('initial-chat', 'chat', { sender: 'User', text: 'first' }, { platformId: 'chan-1' });
+
+    const filePath = '/workspace/agent/tmp/vision-fixture.png';
+    const queryStarted = deferred();
+    let releaseQuery!: () => void;
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query() {
+        queryStarted.resolve();
+        return {
+          push() {
+            throw new Error('queue full');
+          },
+          end() {},
+          abort() {
+            releaseQuery?.();
+          },
+          events: (async function* () {
+            yield { type: 'init', continuation: 'throwing-push-query' };
+            await new Promise<void>((resolve) => {
+              releaseQuery = resolve;
+            });
+          })(),
+        };
+      },
+    };
+
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({
+      provider,
+      providerName: 'test',
+      cwd: '/tmp',
+      signal: controller.signal,
+      inspectAttachmentFile: async (candidate) => ({
+        path: candidate,
+        realPath: candidate,
+        filename: 'vision-fixture.png',
+        mime: 'image/png',
+        sizeBytes: 8,
+        isRegularFile: true,
+      }),
+    });
+
+    await queryStarted.promise;
+    insertMessage('image-follow-up', 'chat', { sender: 'User', text: `Use ${filePath}` }, { platformId: 'chan-1' });
+    await waitFor(() => getAckStatus('image-follow-up') === 'processing', 1500);
+    controller.abort();
+    await loopPromise.catch(() => {});
+
+    expect(getAckStatus('image-follow-up')).toBe('processing');
+  });
+
   it('writes an explicit error when a conversational trigger completes without a user-visible response', async () => {
     insertMessage(
       'silent-chat-sdk',
@@ -464,7 +617,7 @@ describe('poll-loop conversational reply accounting', () => {
 
     let releaseQuery!: () => void;
     const queryStarted = deferred();
-    const pushes: string[] = [];
+    const pushes: QueryTurnInput[] = [];
     const provider: AgentProvider = {
       supportsNativeSlashCommands: false,
       isSessionInvalid: () => false,
@@ -473,7 +626,7 @@ describe('poll-loop conversational reply accounting', () => {
         queryStarted.resolve();
         return {
           push(message) {
-            pushes.push(message);
+            pushes.push(typeof message === 'string' ? { prompt: message } : message);
           },
           end() {
             releaseQuery?.();
@@ -507,12 +660,12 @@ describe('poll-loop conversational reply accounting', () => {
       { sender: 'Admin', text: '/clear' },
       { platformId: 'chan-1', channelType: 'discord' },
     );
-    await waitFor(() => pushes.some((prompt) => prompt.includes('/clear')), 1500);
+    await waitFor(() => pushes.some((push) => push.prompt.includes('/clear')), 1500);
     controller.abort();
     releaseQuery();
     await loopPromise.catch(() => {});
 
-    expect(pushes.some((prompt) => prompt.includes('/clear'))).toBe(true);
+    expect(pushes.some((push) => push.prompt.includes('/clear'))).toBe(true);
     expect(getUndeliveredMessages().map((m) => JSON.parse(m.content).text)).not.toContain('Session cleared.');
   });
 

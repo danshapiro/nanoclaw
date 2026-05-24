@@ -3,6 +3,7 @@ import { getPendingMessages, markProcessing, markCompleted, type MessageInRow } 
 import { writeMessageOut } from './db/messages-out.js';
 import { touchHeartbeat, clearStaleProcessingAcks, getOutboundDb } from './db/connection.js';
 import { clearContinuation, migrateLegacyContinuation, setContinuation } from './db/session-state.js';
+import { collectQueryAttachments, type InspectedFile } from './attachments.js';
 import {
   formatMessages,
   extractRouting,
@@ -18,6 +19,10 @@ const HOST_OWNED_COMMANDS = new Set(['/new', '/clear']);
 
 function log(msg: string): void {
   console.error(`[poll-loop] ${msg}`);
+}
+
+function logAttachmentEvent(event: unknown): void {
+  log(JSON.stringify(event));
 }
 
 function generateId(): string {
@@ -36,6 +41,7 @@ export interface PollLoopConfig {
   systemContext?: {
     instructions?: string;
   };
+  inspectAttachmentFile?: (filePath: string) => Promise<InspectedFile | null>;
   signal?: AbortSignal;
 }
 
@@ -128,8 +134,16 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     log(`Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}`);
 
+    const attachments = await collectQueryAttachments({
+      messages: keep,
+      pathReferenceMessages: keep,
+      inspectFile: config.inspectAttachmentFile,
+      log: logAttachmentEvent,
+    });
+
     const query = config.provider.query({
       prompt,
+      attachments,
       continuation,
       cwd: config.cwd,
       systemContext: config.systemContext,
@@ -149,6 +163,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         processingIds,
         config.providerName,
         replyAccounting,
+        config.inspectAttachmentFile,
         config.signal,
       );
       if (result.continuation && result.continuation !== continuation) {
@@ -238,6 +253,7 @@ async function processQuery(
   initialBatchIds: string[],
   providerName: string,
   replyAccounting: ReplyAccounting,
+  inspectAttachmentFile?: (filePath: string) => Promise<InspectedFile | null>,
   signal?: AbortSignal,
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
@@ -271,8 +287,16 @@ async function processQuery(
   // Stream liveness is decided host-side via the heartbeat file + processing
   // claim age (see src/host-sweep.ts); if something is truly stuck, the host
   // will kill the container and messages get reset to pending.
+  let pollingFollowups = false;
   const pollHandle = setInterval(() => {
-    if (done) return;
+    if (done || pollingFollowups) return;
+    pollingFollowups = true;
+    void pollFollowups().finally(() => {
+      pollingFollowups = false;
+    });
+  }, ACTIVE_POLL_INTERVAL_MS);
+
+  async function pollFollowups(): Promise<void> {
 
     // Skip system messages (MCP tool responses).
     // Thread routing is the router's concern — if a message landed in this
@@ -287,12 +311,30 @@ async function processQuery(
       markProcessing(newIds);
 
       const prompt = formatMessages(newMessages);
+      const attachments = await collectQueryAttachments({
+        messages: newMessages,
+        pathReferenceMessages: newMessages,
+        inspectFile: inspectAttachmentFile,
+        log: logAttachmentEvent,
+      });
       log(`Pushing ${newMessages.length} follow-up message(s) into active query`);
-      query.push(prompt);
+      try {
+        query.push({ prompt, attachments });
+      } catch (err) {
+        log(
+          JSON.stringify({
+            severity: 'error',
+            event: 'followup_enqueue_failed',
+            message_count: newMessages.length,
+            error: err instanceof Error ? err.message : String(err),
+          }),
+        );
+        return;
+      }
 
       markCompleted(newIds);
     }
-  }, ACTIVE_POLL_INTERVAL_MS);
+  }
 
   try {
     for await (const event of query.events) {
