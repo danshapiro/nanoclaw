@@ -41,6 +41,9 @@ type FetchLike = (
   init: { method: 'POST'; headers: Record<string, string>; body: string },
 ) => Promise<{ ok: boolean; status: number; text(): Promise<string> }>;
 
+const MAX_ATTACHMENT_DOWNLOAD_BYTES = 10 * 1024 * 1024;
+const ATTACHMENT_DOWNLOAD_TIMEOUT_MS = 15_000;
+
 /** Reply context extracted from a platform's raw message. */
 export interface ReplyContext {
   text: string;
@@ -80,6 +83,105 @@ export interface ChatSdkBridgeConfig {
    * and reactions still target the head of the reply.
    */
   maxTextLength?: number;
+}
+
+type SerializableAttachment = Record<string, unknown>;
+type AttachmentData = Buffer | Uint8Array | ArrayBuffer | string;
+type ChatSdkAttachment = SerializableAttachment & {
+  fetchData?: () => Promise<AttachmentData>;
+};
+
+export async function serializeChatSdkAttachmentForInbound(
+  att: ChatSdkAttachment,
+  serializedAttachment?: SerializableAttachment,
+): Promise<SerializableAttachment> {
+  const entry: SerializableAttachment = {
+    id: att.id,
+    type: att.type,
+    name: att.name,
+    mimeType: att.mimeType,
+    size: att.size,
+    width: att.width,
+    height: att.height,
+  };
+
+  const data = await readChatSdkAttachmentData(att, serializedAttachment);
+  if (data) {
+    entry.data = data.toString('base64');
+  }
+  return entry;
+}
+
+async function readChatSdkAttachmentData(
+  att: ChatSdkAttachment,
+  serializedAttachment?: SerializableAttachment,
+): Promise<Buffer | null> {
+  if (att.fetchData) {
+    return bufferFromAttachmentData(await att.fetchData());
+  }
+
+  const url = attachmentDownloadUrl(att, serializedAttachment);
+  if (!url) return null;
+
+  const declaredSize = typeof att.size === 'number' ? att.size : sizeFromSerializedAttachment(serializedAttachment);
+  if (declaredSize != null && declaredSize > MAX_ATTACHMENT_DOWNLOAD_BYTES) {
+    throw new Error(`Attachment is too large to download: ${declaredSize} bytes`);
+  }
+
+  const response = await fetch(url, {
+    method: 'GET',
+    signal: AbortSignal.timeout(ATTACHMENT_DOWNLOAD_TIMEOUT_MS),
+  });
+  if (!response.ok) {
+    throw new Error(`Attachment download failed with HTTP ${response.status}`);
+  }
+
+  const lengthHeader = response.headers.get('content-length');
+  const contentLength = lengthHeader ? Number.parseInt(lengthHeader, 10) : null;
+  if (contentLength != null && Number.isFinite(contentLength) && contentLength > MAX_ATTACHMENT_DOWNLOAD_BYTES) {
+    throw new Error(`Attachment is too large to download: ${contentLength} bytes`);
+  }
+
+  const buffer = Buffer.from(await response.arrayBuffer());
+  if (buffer.length > MAX_ATTACHMENT_DOWNLOAD_BYTES) {
+    throw new Error(`Attachment is too large to download: ${buffer.length} bytes`);
+  }
+  return buffer;
+}
+
+function bufferFromAttachmentData(data: AttachmentData): Buffer {
+  if (data instanceof ArrayBuffer) return Buffer.from(data);
+  if (ArrayBuffer.isView(data)) return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+  return Buffer.from(data);
+}
+
+function attachmentDownloadUrl(
+  att: SerializableAttachment,
+  serializedAttachment?: SerializableAttachment,
+): string | null {
+  for (const source of [att, serializedAttachment]) {
+    if (!source) continue;
+    for (const key of ['url', 'proxyURL', 'proxyUrl', 'proxy_url']) {
+      const value = source[key];
+      if (typeof value === 'string' && isHttpUrl(value)) return value;
+    }
+  }
+  return null;
+}
+
+function isHttpUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' || url.protocol === 'http:';
+  } catch {
+    return false;
+  }
+}
+
+function sizeFromSerializedAttachment(serializedAttachment?: SerializableAttachment): number | null {
+  if (!serializedAttachment) return null;
+  const value = serializedAttachment.size;
+  return typeof value === 'number' ? value : null;
 }
 
 /**
@@ -144,25 +246,24 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     // Download attachment data before serialization loses fetchData()
     if (message.attachments && message.attachments.length > 0) {
       const enriched = [];
-      for (const att of message.attachments) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const entry: Record<string, any> = {
-          id: (att as unknown as Record<string, unknown>).id,
-          type: att.type,
-          name: att.name,
-          mimeType: att.mimeType,
-          size: att.size,
-          width: (att as unknown as Record<string, unknown>).width,
-          height: (att as unknown as Record<string, unknown>).height,
-        };
-        if (att.fetchData) {
-          try {
-            const buffer = await att.fetchData();
-            entry.data = buffer.toString('base64');
-          } catch (err) {
-            log.warn('Failed to download attachment', { type: att.type, err });
-            entry.error = err instanceof Error ? err.message : String(err);
-          }
+      const serializedAttachments = Array.isArray(serialized.attachments) ? serialized.attachments : [];
+      for (const [index, att] of message.attachments.entries()) {
+        const attachment = att as unknown as ChatSdkAttachment;
+        let entry: SerializableAttachment;
+        try {
+          entry = await serializeChatSdkAttachmentForInbound(attachment, serializedAttachments[index]);
+        } catch (err) {
+          log.warn('Failed to download attachment', { type: attachment.type, err });
+          entry = {
+            id: attachment.id,
+            type: attachment.type,
+            name: attachment.name,
+            mimeType: attachment.mimeType,
+            size: attachment.size,
+            width: attachment.width,
+            height: attachment.height,
+            error: err instanceof Error ? err.message : String(err),
+          };
         }
         enriched.push(entry);
       }

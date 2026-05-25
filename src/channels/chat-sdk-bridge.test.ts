@@ -1,7 +1,47 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import type { ChannelSetup } from './adapter.js';
-import { handleForwardedEvent } from './chat-sdk-bridge.js';
+import { handleForwardedEvent, serializeChatSdkAttachmentForInbound } from './chat-sdk-bridge.js';
+
+describe('Chat SDK bridge attachments', () => {
+  it('downloads attachment data from serialized URLs when fetchData is unavailable', async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(Buffer.from('discord-file'), {
+        status: 200,
+        headers: { 'content-length': '12', 'content-type': 'image/png' },
+      }),
+    );
+    globalThis.fetch = fetchMock;
+
+    try {
+      const entry = await serializeChatSdkAttachmentForInbound(
+        {
+          id: 'att-1',
+          type: 'image',
+          name: 'vision-fixture.png',
+          mimeType: 'image/png',
+          size: 12,
+        },
+        {
+          url: 'https://cdn.discordapp.com/attachments/channel/message/vision-fixture.png',
+        },
+      );
+
+      expect(fetchMock).toHaveBeenCalledWith(
+        'https://cdn.discordapp.com/attachments/channel/message/vision-fixture.png',
+        expect.objectContaining({ method: 'GET' }),
+      );
+      expect(entry).toMatchObject({
+        id: 'att-1',
+        name: 'vision-fixture.png',
+        data: Buffer.from('discord-file').toString('base64'),
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
 
 describe('Chat SDK bridge Discord gateway forwarding', () => {
   it('routes forwarded Discord application commands as host-command inbound messages', async () => {
