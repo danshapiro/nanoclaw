@@ -119,16 +119,11 @@ export function buildOpenCodeConfig(options: ProviderOptions): Record<string, un
   const provider = process.env.OPENCODE_PROVIDER || 'anthropic';
   const model = process.env.OPENCODE_MODEL;
   const smallModel = process.env.OPENCODE_SMALL_MODEL;
-  const apiKey = process.env.OPENCODE_API_KEY || 'placeholder';
+  if (!BUILTIN_AUTH_PROVIDERS.has(provider)) {
+    throw new Error('Custom OpenCode providers are not supported without a OneCLI-managed credential path');
+  }
 
-  const providerOptions: Record<string, unknown> =
-    BUILTIN_AUTH_PROVIDERS.has(provider)
-      ? {}
-      : {
-          [provider]: {
-            options: { apiKey },
-          },
-        };
+  const providerOptions: Record<string, unknown> = {};
 
   const mcp = mcpServersToOpenCodeConfig(options.mcpServers);
 

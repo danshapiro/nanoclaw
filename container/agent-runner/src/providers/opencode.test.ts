@@ -147,25 +147,18 @@ describe('OpenCode file parts', () => {
     expect(config).not.toHaveProperty('provider');
   });
 
-  it('keeps explicit apiKey config for custom providers', () => {
-    const config = withEnv(
-      {
-        OPENCODE_PROVIDER: 'custom-provider',
-        OPENCODE_API_KEY: 'secret-key',
-        OPENCODE_MODEL: undefined,
-        OPENCODE_SMALL_MODEL: undefined,
-      },
-      () => buildOpenCodeConfig({ mcpServers: undefined }),
-    );
-
-    expect(config).toMatchObject({
-      enabled_providers: ['custom-provider'],
-      provider: {
-        'custom-provider': {
-          options: { apiKey: 'secret-key' },
+  it('fails clearly for custom OpenCode providers after raw key removal', () => {
+    expect(() =>
+      withEnv(
+        {
+          OPENCODE_PROVIDER: 'custom-provider',
+          OPENCODE_API_KEY: 'onecli-managed',
+          OPENCODE_MODEL: undefined,
+          OPENCODE_SMALL_MODEL: undefined,
         },
-      },
-    });
+        () => buildOpenCodeConfig({ mcpServers: undefined }),
+      ),
+    ).toThrow('Custom OpenCode providers are not supported without a OneCLI-managed credential path');
   });
 
   it('builds text followed by escaped file parts', () => {
