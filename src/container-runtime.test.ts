@@ -86,6 +86,22 @@ describe('agent container Dockerfile', () => {
     expect(dockerfile).not.toContain('@googleworkspace/cli');
   });
 
+  it('allows postinstall scripts for globally installed CLIs that need runtime binaries', () => {
+    const dockerfile = fs.readFileSync(path.join(process.cwd(), 'container', 'Dockerfile'), 'utf8');
+
+    for (const pkg of ['agent-browser', 'esbuild', '@anthropic-ai/claude-code', 'opencode-ai']) {
+      expect(dockerfile).toContain(`only-built-dependencies[]=${pkg}`);
+    }
+  });
+
+  it('runs and verifies the OpenCode postinstall artifact after the pnpm global install', () => {
+    const dockerfile = fs.readFileSync(path.join(process.cwd(), 'container', 'Dockerfile'), 'utf8');
+
+    expect(dockerfile).toContain("find \"$PNPM_HOME/global\" -path '*/node_modules/opencode-ai'");
+    expect(dockerfile).toContain('node postinstall.mjs');
+    expect(dockerfile).toContain('opencode --version');
+  });
+
   it('does not create a GWS OAuth config path in the agent image', () => {
     const dockerfile = fs.readFileSync(path.join(process.cwd(), 'container', 'Dockerfile'), 'utf8');
 

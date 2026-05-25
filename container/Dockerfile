@@ -101,6 +101,9 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
 #   - @anthropic-ai/claude-code's postinstall downloads the native Claude
 #     binary (linux-arm64 variant on our image). Without the allowlist
 #     the SDK fails at spawn time with "native binary not found".
+#   - opencode-ai's postinstall installs the OpenCode runtime wrapper; pnpm
+#     global install leaves the placeholder shim in place unless we run it
+#     explicitly in the OpenCode layer below.
 ENV PNPM_HOME="/pnpm"
 ENV PATH="${PNPM_HOME}/bin:${PNPM_HOME}:$PATH"
 RUN corepack enable
@@ -109,6 +112,7 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
     echo "only-built-dependencies[]=agent-browser" > /root/.npmrc && \
     echo "only-built-dependencies[]=esbuild" >> /root/.npmrc && \
     echo "only-built-dependencies[]=@anthropic-ai/claude-code" >> /root/.npmrc && \
+    echo "only-built-dependencies[]=opencode-ai" >> /root/.npmrc && \
     printf 'export PNPM_HOME=/pnpm\nexport PATH=/pnpm/bin:/pnpm:$PATH\n' > /etc/profile.d/pnpm-home.sh && \
     export PATH="/pnpm/bin:/pnpm:$PATH" && \
     pnpm install -g "vercel@${VERCEL_VERSION}"
@@ -123,7 +127,12 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
 
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     export PATH="/pnpm/bin:/pnpm:$PATH" && \
-    pnpm install -g "opencode-ai@${OPENCODE_VERSION}"
+    pnpm install -g "opencode-ai@${OPENCODE_VERSION}" && \
+    opencode_pkg="$(find "$PNPM_HOME/global" -path '*/node_modules/opencode-ai' -print -quit)" && \
+    test -n "$opencode_pkg" && \
+    cd "$opencode_pkg" && \
+    node postinstall.mjs && \
+    opencode --version
 
 # ---- GWS policy proxy shim ---------------------------------------------------
 # Agent containers must not include the real Google Workspace CLI or OAuth
