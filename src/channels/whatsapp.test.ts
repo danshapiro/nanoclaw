@@ -8,10 +8,15 @@ import { inboundDbPath, resolveSession, writeSessionMessage } from '../session-m
 
 vi.mock('../config.js', async () => {
   const actual = await vi.importActual('../config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-whatsapp-attachments' };
+  return {
+    ...actual,
+    DATA_DIR: '/tmp/nanoclaw-test-whatsapp-data',
+    GROUPS_DIR: '/tmp/nanoclaw-test-whatsapp-groups',
+  };
 });
 
-const TEST_DIR = '/tmp/nanoclaw-test-whatsapp-attachments';
+const TEST_DATA_DIR = '/tmp/nanoclaw-test-whatsapp-data';
+const TEST_GROUPS_DIR = '/tmp/nanoclaw-test-whatsapp-groups';
 
 function now(): string {
   return new Date().toISOString();
@@ -19,8 +24,10 @@ function now(): string {
 
 describe('WhatsApp attachment contract', () => {
   beforeEach(() => {
-    fs.rmSync(TEST_DIR, { recursive: true, force: true });
-    fs.mkdirSync(TEST_DIR, { recursive: true });
+    for (const dir of [TEST_DATA_DIR, TEST_GROUPS_DIR]) {
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.mkdirSync(dir, { recursive: true });
+    }
     const db = initTestDb();
     runMigrations(db);
     createAgentGroup({
@@ -43,7 +50,9 @@ describe('WhatsApp attachment contract', () => {
 
   afterEach(() => {
     closeDb();
-    fs.rmSync(TEST_DIR, { recursive: true, force: true });
+    for (const dir of [TEST_DATA_DIR, TEST_GROUPS_DIR]) {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('materializes inbound media under the WhatsApp workspace path', () => {
@@ -69,8 +78,7 @@ describe('WhatsApp attachment contract', () => {
     });
 
     const hostPath = path.join(
-      TEST_DIR,
-      'groups',
+      TEST_GROUPS_DIR,
       'whatsapp-agent',
       'attachments',
       'whatsapp',

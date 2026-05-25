@@ -15,7 +15,7 @@ import fs from 'fs';
 import path from 'path';
 
 import type { OutboundFile } from './channels/adapter.js';
-import { DATA_DIR } from './config.js';
+import { DATA_DIR, GROUPS_DIR } from './config.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
 import {
@@ -294,7 +294,7 @@ export function writeSessionMessage(
 
 /**
  * If message content has attachments with base64 `data`, save them to
- * the session's inbox directory and replace with `localPath`.
+ * the agent group's mounted workspace and add prompt metadata.
  */
 function extractAttachmentFiles(
   agentGroupId: string,
@@ -342,7 +342,7 @@ function extractAttachmentFiles(
         throw new Error(`Cannot materialize attachments for unsupported channel ${channelType ?? '(missing)'}`);
       }
       const materialized = materializeAttachmentData({
-        groupsDir: path.join(DATA_DIR, 'groups'),
+        groupsDir: GROUPS_DIR,
         groupFolder: agentGroup.folder,
         channel,
         messageId,

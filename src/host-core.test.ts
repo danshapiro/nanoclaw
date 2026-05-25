@@ -35,22 +35,30 @@ vi.mock('./container-runner.js', () => ({
   killContainer: vi.fn(),
 }));
 
-// Override DATA_DIR for tests
+// Keep session state and mounted group workspaces separate, matching the
+// production v2 layout where `/workspace/agent` maps to GROUPS_DIR.
 vi.mock('./config.js', async () => {
   const actual = await vi.importActual('./config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-host' };
+  return {
+    ...actual,
+    DATA_DIR: '/tmp/nanoclaw-test-host-data',
+    GROUPS_DIR: '/tmp/nanoclaw-test-host-groups',
+  };
 });
 
 function now() {
   return new Date().toISOString();
 }
 
-const TEST_DIR = '/tmp/nanoclaw-test-host';
+const TEST_DATA_DIR = '/tmp/nanoclaw-test-host-data';
+const TEST_GROUPS_DIR = '/tmp/nanoclaw-test-host-groups';
 
 beforeEach(() => {
   // Clean test directory
-  if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
-  fs.mkdirSync(TEST_DIR, { recursive: true });
+  for (const dir of [TEST_DATA_DIR, TEST_GROUPS_DIR]) {
+    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true });
+    fs.mkdirSync(dir, { recursive: true });
+  }
 
   const db = initTestDb();
   runMigrations(db);
@@ -58,7 +66,9 @@ beforeEach(() => {
 
 afterEach(() => {
   closeDb();
-  if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  for (const dir of [TEST_DATA_DIR, TEST_GROUPS_DIR]) {
+    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true });
+  }
 });
 
 describe('session manager', () => {
@@ -189,8 +199,7 @@ describe('session manager', () => {
     });
 
     const expectedHostPath = path.join(
-      TEST_DIR,
-      'groups',
+      TEST_GROUPS_DIR,
       'test-agent',
       'attachments',
       'discord',
@@ -198,6 +207,9 @@ describe('session manager', () => {
       'att-1-screen-shot.png',
     );
     expect(fs.readFileSync(expectedHostPath, 'utf8')).toBe('png-bytes');
+    expect(
+      fs.existsSync(path.join(TEST_DATA_DIR, 'groups', 'test-agent', 'attachments', 'discord', 'msg-attachment')),
+    ).toBe(false);
 
     const db = new Database(inboundDbPath('ag-1', session.id));
     const row = db.prepare('SELECT content FROM messages_in WHERE id = ?').get('msg-attachment') as { content: string };
