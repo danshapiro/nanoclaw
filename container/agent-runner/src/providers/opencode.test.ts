@@ -11,6 +11,7 @@ import {
   nextMeaningfulOpenCodeEvent,
   nextOpenCodeEvent,
   promptSession,
+  splitOpenCodeModel,
   stageOpenCodeAttachments,
 } from './opencode.js';
 
@@ -219,6 +220,58 @@ describe('OpenCode file parts', () => {
         ],
       },
     ]);
+  });
+
+  it('can route file-part prompts to a per-prompt vision model', async () => {
+    const bodies: unknown[] = [];
+    const client = {
+      create: async () => ({
+        data: { id: 'session-1' },
+        error: undefined,
+        request: {} as Request,
+        response: {} as Response,
+      }),
+      promptAsync: async ({ body }: { body: unknown }) => {
+        bodies.push(body);
+        return {
+          data: true,
+          error: undefined,
+          request: {} as Request,
+          response: {} as Response,
+        };
+      },
+    };
+
+    await promptSession(
+      client,
+      undefined,
+      [
+        { type: 'text', text: 'hello' },
+        { type: 'file', mime: 'image/png', url: 'file:///tmp/image.png', filename: 'image.png' },
+      ],
+      splitOpenCodeModel('opencode-go/qwen3.6-plus'),
+    );
+
+    expect(bodies).toEqual([
+      {
+        model: {
+          providerID: 'opencode-go',
+          modelID: 'qwen3.6-plus',
+        },
+        parts: [
+          { type: 'text', text: 'hello' },
+          { type: 'file', mime: 'image/png', url: 'file:///tmp/image.png', filename: 'image.png' },
+        ],
+      },
+    ]);
+  });
+
+  it('parses provider-qualified OpenCode model ids', () => {
+    expect(splitOpenCodeModel('opencode-go/qwen3.6-plus')).toEqual({
+      providerID: 'opencode-go',
+      modelID: 'qwen3.6-plus',
+    });
+    expect(splitOpenCodeModel('qwen3.6-plus')).toBeUndefined();
   });
 
   it('stages bytes to runner-private files and revalidates size and MIME', async () => {

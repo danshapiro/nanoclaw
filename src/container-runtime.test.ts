@@ -97,7 +97,7 @@ describe('agent container Dockerfile', () => {
   it('runs and verifies the OpenCode postinstall artifact after the pnpm global install', () => {
     const dockerfile = fs.readFileSync(path.join(process.cwd(), 'container', 'Dockerfile'), 'utf8');
 
-    expect(dockerfile).toContain("find \"$PNPM_HOME/global\" -path '*/node_modules/opencode-ai'");
+    expect(dockerfile).toContain('find "$PNPM_HOME/global" -path \'*/node_modules/opencode-ai\'');
     expect(dockerfile).toContain('node postinstall.mjs');
     expect(dockerfile).toContain('opencode --version');
   });

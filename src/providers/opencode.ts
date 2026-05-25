@@ -20,6 +20,7 @@ const OPENCODE_HOST_ENV_KEYS = [
   'OPENCODE_PROVIDER',
   'OPENCODE_MODEL',
   'OPENCODE_SMALL_MODEL',
+  'OPENCODE_VISION_MODEL',
 ] as const;
 
 registerProviderContainerConfig('opencode', ({ hostEnv, sessionDir }) => {
@@ -48,6 +49,7 @@ registerProviderContainerConfig('opencode', ({ hostEnv, sessionDir }) => {
       OPENCODE_PROVIDER: mergedHostEnv.OPENCODE_PROVIDER ?? 'opencode-go',
       OPENCODE_MODEL: mergedHostEnv.OPENCODE_MODEL ?? 'opencode-go/deepseek-v4-pro',
       OPENCODE_SMALL_MODEL: mergedHostEnv.OPENCODE_SMALL_MODEL ?? 'opencode-go/deepseek-v4-flash',
+      OPENCODE_VISION_MODEL: mergedHostEnv.OPENCODE_VISION_MODEL ?? 'opencode-go/qwen3.6-plus',
       OPENCODE_API_KEY: OPENCODE_ONECLI_PLACEHOLDER,
     },
     extraHosts: YENTE_LOCAL_PROXY_HOSTNAMES,

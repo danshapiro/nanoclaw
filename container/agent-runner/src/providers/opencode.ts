@@ -231,6 +231,7 @@ type SessionClient = Pick<OpencodeClient['session'], 'create' | 'promptAsync'>;
 type OpenCodePromptPart =
   | { type: 'text'; text: string }
   | { type: 'file'; mime: string; url: string; filename?: string };
+type OpenCodeModelSelection = { providerID: string; modelID: string };
 
 interface StagedAttachment {
   path: string;
@@ -253,6 +254,7 @@ export async function promptSession(
   client: SessionClient,
   preferredSessionId: string | undefined,
   input: string | OpenCodePromptPart[],
+  model?: OpenCodeModelSelection,
 ): Promise<{ sessionId: string; recoveredFromStale: boolean }> {
   let sessionId = preferredSessionId;
   let recoveredFromStale = false;
@@ -266,7 +268,7 @@ export async function promptSession(
     try {
       const promptRes = await client.promptAsync({
         path: { id: sessionId },
-        body: { parts },
+        body: { parts, ...(model ? { model } : {}) },
       });
       if (!promptRes.error) {
         return { sessionId, recoveredFromStale };
@@ -326,10 +328,7 @@ export async function stageOpenCodeAttachments(attachments: QueryAttachment[]): 
   }
 }
 
-export function buildOpenCodePromptParts(
-  text: string,
-  attachments: StagedAttachment[] = [],
-): OpenCodePromptPart[] {
+export function buildOpenCodePromptParts(text: string, attachments: StagedAttachment[] = []): OpenCodePromptPart[] {
   return [
     { type: 'text', text },
     ...attachments.map((staged) => ({
@@ -339,6 +338,21 @@ export function buildOpenCodePromptParts(
       filename: staged.filename,
     })),
   ];
+}
+
+export function splitOpenCodeModel(model: string | undefined): OpenCodeModelSelection | undefined {
+  if (!model) return undefined;
+  const slash = model.indexOf('/');
+  if (slash <= 0 || slash === model.length - 1) return undefined;
+  return {
+    providerID: model.slice(0, slash),
+    modelID: model.slice(slash + 1),
+  };
+}
+
+function modelForAttachments(staged: StagedAttachment[]): OpenCodeModelSelection | undefined {
+  if (staged.length === 0) return undefined;
+  return splitOpenCodeModel(process.env.OPENCODE_VISION_MODEL);
 }
 
 async function cleanupStagedAttachments(staged: StagedAttachment[], stagedDir?: string): Promise<void> {
@@ -386,7 +400,11 @@ async function readHeader(filePath: string): Promise<Buffer> {
 }
 
 function safeStageFilename(index: number, filename: string): string {
-  const base = path.basename(filename).replace(/[/\\\0]/g, '-').trim() || 'attachment';
+  const base =
+    path
+      .basename(filename)
+      .replace(/[/\\\0]/g, '-')
+      .trim() || 'attachment';
   return `${index + 1}-${base}`;
 }
 
@@ -522,6 +540,7 @@ export class OpenCodeProvider implements AgentProvider {
           client.session,
           self.activeSessionId,
           buildOpenCodePromptParts(turn.prompt, staged),
+          modelForAttachments(staged),
         );
         const sessionId = prompted.sessionId;
         self.activeSessionId = sessionId;

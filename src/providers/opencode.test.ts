@@ -61,6 +61,7 @@ describe('opencode provider container config', () => {
         'OPENCODE_PROVIDER=opencode-go',
         'OPENCODE_MODEL=opencode-go/test-model',
         'OPENCODE_SMALL_MODEL=opencode-go/test-small',
+        'OPENCODE_VISION_MODEL=opencode-go/test-vision',
         'OPENCODE_API_KEY=opencode-secret',
         '',
       ].join('\n'),
@@ -79,6 +80,7 @@ describe('opencode provider container config', () => {
       expect(contribution.env?.OPENCODE_PROVIDER).toBe('opencode-go');
       expect(contribution.env?.OPENCODE_MODEL).toBe('opencode-go/test-model');
       expect(contribution.env?.OPENCODE_SMALL_MODEL).toBe('opencode-go/test-small');
+      expect(contribution.env?.OPENCODE_VISION_MODEL).toBe('opencode-go/test-vision');
       expect(contribution.env?.OPENCODE_API_KEY).toBe('onecli-managed');
       expect(contribution.env?.OPENCODE_API_KEY).not.toBe('opencode-secret');
     } finally {
@@ -107,6 +109,7 @@ describe('opencode provider container config', () => {
           OPENCODE_PROVIDER: 'opencode-go',
           OPENCODE_MODEL: 'opencode-go/deepseek-v4-pro',
           OPENCODE_SMALL_MODEL: 'opencode-go/deepseek-v4-flash',
+          OPENCODE_VISION_MODEL: 'opencode-go/qwen3.6-plus',
           OPENCODE_API_KEY: 'raw-live-opencode-key',
         },
       });
@@ -114,6 +117,7 @@ describe('opencode provider container config', () => {
       expect(contribution.env?.OPENCODE_PROVIDER).toBe('opencode-go');
       expect(contribution.env?.OPENCODE_MODEL).toBe('opencode-go/deepseek-v4-pro');
       expect(contribution.env?.OPENCODE_SMALL_MODEL).toBe('opencode-go/deepseek-v4-flash');
+      expect(contribution.env?.OPENCODE_VISION_MODEL).toBe('opencode-go/qwen3.6-plus');
       expect(contribution.env?.OPENCODE_API_KEY).toBe('onecli-managed');
       expect(contribution.env?.OPENCODE_API_KEY).not.toBe('raw-live-opencode-key');
     } finally {
