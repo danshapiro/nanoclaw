@@ -103,6 +103,7 @@ describe('Yente service env contract', () => {
           { id: 'secret-openai', name: 'NanoClaw OpenAI' },
           { id: 'secret-gemini', name: 'NanoClaw Gemini' },
           { id: 'secret-opencode-go', name: 'NanoClaw OpenCode Go' },
+          { id: 'secret-opencode-go-messages', name: 'NanoClaw OpenCode Go Messages' },
           { id: 'secret-assemblyai', name: 'AssemblyAI' },
         ]);
       }
@@ -139,6 +140,7 @@ describe('Yente service env contract', () => {
           'secret-openai',
           'secret-gemini',
           'secret-opencode-go',
+          'secret-opencode-go-messages',
           'secret-assemblyai',
         ],
       }),
@@ -157,6 +159,7 @@ describe('Yente service env contract', () => {
           { id: 'secret-openai', name: 'NanoClaw OpenAI' },
           { id: 'secret-gemini', name: 'NanoClaw Gemini' },
           { id: 'secret-opencode-go', name: 'NanoClaw OpenCode Go' },
+          { id: 'secret-opencode-go-messages', name: 'NanoClaw OpenCode Go Messages' },
           { id: 'secret-assemblyai', name: 'AssemblyAI' },
         ]);
       }
@@ -200,7 +203,7 @@ describe('Yente service env contract', () => {
         fetchImpl,
       }),
     ).rejects.toThrow(
-      'Missing OneCLI secret(s): NanoClaw Anthropic, NanoClaw OpenAI, NanoClaw Gemini, NanoClaw OpenCode Go, AssemblyAI',
+      'Missing OneCLI secret(s): NanoClaw Anthropic, NanoClaw OpenAI, NanoClaw Gemini, NanoClaw OpenCode Go, NanoClaw OpenCode Go Messages, AssemblyAI',
     );
   });
 });
