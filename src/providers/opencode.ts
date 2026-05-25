@@ -5,6 +5,8 @@ import { readEnvFile } from '../env.js';
 import { registerProviderContainerConfig } from './provider-container-registry.js';
 import { requireYenteHostEnv, YENTE_LOCAL_PROXY_HOSTNAMES } from '../yente/service-env.js';
 
+const OPENCODE_ONECLI_PLACEHOLDER = 'onecli-managed';
+
 const OPENCODE_HOST_ENV_KEYS = [
   'ONECLI_URL',
   'ONECLI_API_KEY',
@@ -18,7 +20,6 @@ const OPENCODE_HOST_ENV_KEYS = [
   'OPENCODE_PROVIDER',
   'OPENCODE_MODEL',
   'OPENCODE_SMALL_MODEL',
-  'OPENCODE_API_KEY',
 ] as const;
 
 registerProviderContainerConfig('opencode', ({ hostEnv, sessionDir }) => {
@@ -47,7 +48,7 @@ registerProviderContainerConfig('opencode', ({ hostEnv, sessionDir }) => {
       OPENCODE_PROVIDER: mergedHostEnv.OPENCODE_PROVIDER ?? 'opencode-go',
       OPENCODE_MODEL: mergedHostEnv.OPENCODE_MODEL ?? 'opencode-go/deepseek-v4-pro',
       OPENCODE_SMALL_MODEL: mergedHostEnv.OPENCODE_SMALL_MODEL ?? 'opencode-go/deepseek-v4-flash',
-      OPENCODE_API_KEY: mergedHostEnv.OPENCODE_API_KEY ?? '',
+      OPENCODE_API_KEY: OPENCODE_ONECLI_PLACEHOLDER,
     },
     extraHosts: YENTE_LOCAL_PROXY_HOSTNAMES,
   };

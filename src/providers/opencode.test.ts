@@ -79,10 +79,45 @@ describe('opencode provider container config', () => {
       expect(contribution.env?.OPENCODE_PROVIDER).toBe('opencode-go');
       expect(contribution.env?.OPENCODE_MODEL).toBe('opencode-go/test-model');
       expect(contribution.env?.OPENCODE_SMALL_MODEL).toBe('opencode-go/test-small');
-      expect(contribution.env?.OPENCODE_API_KEY).toBe('opencode-secret');
+      expect(contribution.env?.OPENCODE_API_KEY).toBe('onecli-managed');
+      expect(contribution.env?.OPENCODE_API_KEY).not.toBe('opencode-secret');
     } finally {
       process.chdir(cwd);
       fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not pass a raw OpenCode API key from host env into the container', () => {
+    const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-opencode-session-'));
+    try {
+      const config = getProviderContainerConfig('opencode');
+
+      expect(config).toBeDefined();
+      const contribution = config!({
+        sessionDir,
+        agentGroupId: 'ag-discord-yente-dvora',
+        hostEnv: {
+          ONECLI_URL: 'http://onecli.local',
+          ONECLI_API_KEY: 'onecli-service-key',
+          ONECLI_GATEWAY_URL: 'http://onecli-gateway.local',
+          GWS_PROXY_URL: 'http://yente-gws-proxy.local:8083',
+          MSGVAULT_PROXY_URL: 'http://yente-msgvault-proxy.local:8084',
+          FAMILIAR_PROXY_URL: 'http://yente-familiar-proxy.local:8081',
+          NYNE_PROXY_URL: 'http://yente-nyne-proxy.local:8082',
+          OPENCODE_PROVIDER: 'opencode-go',
+          OPENCODE_MODEL: 'opencode-go/deepseek-v4-pro',
+          OPENCODE_SMALL_MODEL: 'opencode-go/deepseek-v4-flash',
+          OPENCODE_API_KEY: 'raw-live-opencode-key',
+        },
+      });
+
+      expect(contribution.env?.OPENCODE_PROVIDER).toBe('opencode-go');
+      expect(contribution.env?.OPENCODE_MODEL).toBe('opencode-go/deepseek-v4-pro');
+      expect(contribution.env?.OPENCODE_SMALL_MODEL).toBe('opencode-go/deepseek-v4-flash');
+      expect(contribution.env?.OPENCODE_API_KEY).toBe('onecli-managed');
+      expect(contribution.env?.OPENCODE_API_KEY).not.toBe('raw-live-opencode-key');
+    } finally {
+      fs.rmSync(sessionDir, { recursive: true, force: true });
     }
   });
 });
