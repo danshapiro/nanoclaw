@@ -23,10 +23,12 @@ const OPENCODE_HOST_ENV_KEYS = [
   'OPENCODE_VISION_MODEL',
 ] as const;
 
-registerProviderContainerConfig('opencode', ({ hostEnv, sessionDir }) => {
+registerProviderContainerConfig('opencode', ({ hostEnv, sessionDir, groupModel }) => {
   const mergedHostEnv = { ...readEnvFile([...OPENCODE_HOST_ENV_KEYS]), ...hostEnv };
   const yente = requireYenteHostEnv(mergedHostEnv);
   const opencodeXdgDir = path.join(sessionDir, 'opencode-xdg');
+
+  const resolvedModel = groupModel ?? mergedHostEnv.OPENCODE_MODEL ?? 'opencode-go/deepseek-v4-pro';
   fs.mkdirSync(opencodeXdgDir, { recursive: true });
 
   return {
@@ -39,15 +41,9 @@ registerProviderContainerConfig('opencode', ({ hostEnv, sessionDir }) => {
     ],
     env: {
       ...yente.containerEnv,
-      // OpenCode continuation IDs are pointers into OpenCode's local DB,
-      // not self-contained remote thread IDs. NanoClaw persists those IDs in
-      // outbound.db across `docker run --rm` container lifetimes, so the DB
-      // they point at must live in the durable per-session host directory.
-      // Without this XDG_DATA_HOME mount, a resumed continuation can only
-      // point at state that was deleted with a previous container filesystem.
       XDG_DATA_HOME: '/opencode-xdg',
       OPENCODE_PROVIDER: mergedHostEnv.OPENCODE_PROVIDER ?? 'opencode-go',
-      OPENCODE_MODEL: mergedHostEnv.OPENCODE_MODEL ?? 'opencode-go/deepseek-v4-pro',
+      OPENCODE_MODEL: resolvedModel,
       OPENCODE_SMALL_MODEL: mergedHostEnv.OPENCODE_SMALL_MODEL ?? 'opencode-go/deepseek-v4-flash',
       OPENCODE_VISION_MODEL: mergedHostEnv.OPENCODE_VISION_MODEL ?? 'opencode-go/qwen3.6-plus',
       OPENCODE_API_KEY: OPENCODE_ONECLI_PLACEHOLDER,

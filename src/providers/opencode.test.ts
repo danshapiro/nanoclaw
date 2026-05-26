@@ -124,4 +124,59 @@ describe('opencode provider container config', () => {
       fs.rmSync(sessionDir, { recursive: true, force: true });
     }
   });
+
+  it('prefers groupModel over hostEnv OPENCODE_MODEL for per-group override', () => {
+    const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-opencode-session-'));
+    try {
+      const config = getProviderContainerConfig('opencode');
+
+      expect(config).toBeDefined();
+      const contribution = config!({
+        sessionDir,
+        agentGroupId: 'ag-discord-yente-hinda',
+        hostEnv: {
+          ONECLI_URL: 'http://onecli.local',
+          ONECLI_API_KEY: 'secret',
+          ONECLI_GATEWAY_URL: 'http://onecli-gateway.local',
+          GWS_PROXY_URL: 'http://yente-gws-proxy.local:8083',
+          MSGVAULT_PROXY_URL: 'http://yente-msgvault-proxy.local:8084',
+          FAMILIAR_PROXY_URL: 'http://yente-familiar-proxy.local:8081',
+          NYNE_PROXY_URL: 'http://yente-nyne-proxy.local:8082',
+          OPENCODE_MODEL: 'opencode-go/deepseek-v4-pro',
+        },
+        groupModel: 'opencode-go/deepseek-v4-flash',
+      });
+
+      expect(contribution.env?.OPENCODE_MODEL).toBe('opencode-go/deepseek-v4-flash');
+    } finally {
+      fs.rmSync(sessionDir, { recursive: true, force: true });
+    }
+  });
+
+  it('falls back to hostEnv OPENCODE_MODEL when groupModel is not set', () => {
+    const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-opencode-session-'));
+    try {
+      const config = getProviderContainerConfig('opencode');
+
+      expect(config).toBeDefined();
+      const contribution = config!({
+        sessionDir,
+        agentGroupId: 'ag-discord-yente-hinda',
+        hostEnv: {
+          ONECLI_URL: 'http://onecli.local',
+          ONECLI_API_KEY: 'secret',
+          ONECLI_GATEWAY_URL: 'http://onecli-gateway.local',
+          GWS_PROXY_URL: 'http://yente-gws-proxy.local:8083',
+          MSGVAULT_PROXY_URL: 'http://yente-msgvault-proxy.local:8084',
+          FAMILIAR_PROXY_URL: 'http://yente-familiar-proxy.local:8081',
+          NYNE_PROXY_URL: 'http://yente-nyne-proxy.local:8082',
+          OPENCODE_MODEL: 'opencode-go/deepseek-v4-pro',
+        },
+      });
+
+      expect(contribution.env?.OPENCODE_MODEL).toBe('opencode-go/deepseek-v4-pro');
+    } finally {
+      fs.rmSync(sessionDir, { recursive: true, force: true });
+    }
+  });
 });

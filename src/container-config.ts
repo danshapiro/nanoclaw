@@ -53,6 +53,8 @@ export interface ContainerConfig {
   agentGroupId?: string;
   /** Max messages per prompt. Falls back to code default if unset. */
   maxMessagesPerPrompt?: number;
+  /** Per-group model override. When set, overrides the global OPENCODE_MODEL for this group only. */
+  model?: string;
 }
 
 function emptyConfig(): ContainerConfig {
@@ -91,6 +93,7 @@ export function readContainerConfig(folder: string): ContainerConfig {
       additionalMounts: raw.additionalMounts ?? [],
       skills: raw.skills ?? 'all',
       provider: raw.provider,
+      model: raw.model,
       groupName: raw.groupName,
       assistantName: raw.assistantName,
       agentGroupId: raw.agentGroupId,

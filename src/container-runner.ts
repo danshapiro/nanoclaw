@@ -402,6 +402,7 @@ function resolveProviderContribution(
         sessionDir: sessionDir(agentGroup.id, session.id),
         agentGroupId: agentGroup.id,
         hostEnv: process.env,
+        groupModel: containerConfig.model,
       })
     : {};
   return { provider, contribution };
