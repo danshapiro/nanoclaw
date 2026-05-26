@@ -143,6 +143,7 @@ describe('Yente service env contract', () => {
           'secret-opencode-go',
           'secret-opencode-go-messages',
           'secret-assemblyai',
+          'secret-vercel',
         ],
       }),
     );
