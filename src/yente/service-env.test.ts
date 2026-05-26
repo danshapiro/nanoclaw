@@ -60,8 +60,8 @@ describe('Yente service env contract', () => {
       FAMILIAR_API_URL: `http://${YENTE_LOCAL_PROXY_HOSTS.familiar}:8081`,
       NYNE_PROXY_URL: `http://${YENTE_LOCAL_PROXY_HOSTS.nyne}:8082`,
       NYNE_API_URL: `http://${YENTE_LOCAL_PROXY_HOSTS.nyne}:8082`,
-      NO_PROXY: 'localhost,127.0.0.1',
-      no_proxy: 'localhost,127.0.0.1',
+      NO_PROXY: 'localhost,127.0.0.1,registry.npmjs.org',
+      no_proxy: 'localhost,127.0.0.1,registry.npmjs.org',
     });
     expect(result.containerEnv).not.toHaveProperty('GOOGLE_APPLICATION_CREDENTIALS');
     expect(result.containerEnv).not.toHaveProperty('ANTHROPIC_API_KEY');

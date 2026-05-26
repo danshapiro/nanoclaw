@@ -65,7 +65,14 @@ export function requireYenteHostEnv(env: NodeJS.ProcessEnv): {
 }
 
 export function buildNoProxy(env: NodeJS.ProcessEnv): string {
-  const entries = new Set(['localhost', '127.0.0.1']);
+  const entries = new Set([
+    'localhost',
+    '127.0.0.1',
+    // Public registries that don't need MITM credential injection.
+    // Bypassing the proxy prevents fd exhaustion from large concurrent
+    // npm installs during agent-container startup surges.
+    'registry.npmjs.org',
+  ]);
   const mediatedHosts = new Set<string>();
   for (const entry of REQUIRED_YENTE_PROXY_URLS) {
     const url = env[entry.urlEnv]?.trim();
