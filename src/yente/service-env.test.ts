@@ -105,6 +105,7 @@ describe('Yente service env contract', () => {
           { id: 'secret-opencode-go', name: 'NanoClaw OpenCode Go' },
           { id: 'secret-opencode-go-messages', name: 'NanoClaw OpenCode Go Messages' },
           { id: 'secret-assemblyai', name: 'AssemblyAI' },
+          { id: 'secret-vercel', name: 'Vercel' },
         ]);
       }
       if (url.endsWith('/api/agents')) {
@@ -161,6 +162,7 @@ describe('Yente service env contract', () => {
           { id: 'secret-opencode-go', name: 'NanoClaw OpenCode Go' },
           { id: 'secret-opencode-go-messages', name: 'NanoClaw OpenCode Go Messages' },
           { id: 'secret-assemblyai', name: 'AssemblyAI' },
+          { id: 'secret-vercel', name: 'Vercel' },
         ]);
       }
       if (url.endsWith('/api/agents')) {
@@ -203,7 +205,7 @@ describe('Yente service env contract', () => {
         fetchImpl,
       }),
     ).rejects.toThrow(
-      'Missing OneCLI secret(s): NanoClaw Anthropic, NanoClaw OpenAI, NanoClaw Gemini, NanoClaw OpenCode Go, NanoClaw OpenCode Go Messages, AssemblyAI',
+      'Missing OneCLI secret(s): NanoClaw Anthropic, NanoClaw OpenAI, NanoClaw Gemini, NanoClaw OpenCode Go, NanoClaw OpenCode Go Messages, AssemblyAI, Vercel',
     );
   });
 });
