@@ -19,6 +19,7 @@ export const REQUIRED_YENTE_ONECLI_SECRET_NAMES = [
   'NanoClaw OpenCode Go',
   'NanoClaw OpenCode Go Messages',
   'AssemblyAI',
+  'Vercel',
 ] as const;
 export const ONECLI_MANAGED_PLACEHOLDER = 'onecli-managed';
 export const YENTE_LOCAL_PROXY_HOSTS = {
