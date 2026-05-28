@@ -27,6 +27,7 @@ groups/*
 
 # Temp files
 .tmp-*
+.worktrees/
 
 # OS
 .DS_Store
