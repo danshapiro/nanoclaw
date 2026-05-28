@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use trycycle-executing to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Yente must preserve conversation state and user trust when OpenCode is slow, silent, blocked on a native question, or affected by optional MCP/GWS failures, and the original Dvora and Fruma requests must succeed through the Yente injection path.
+**Goal:** Yente must survive slow OpenCode work, silent/failed OpenCode event streams, native OpenCode question stalls, optional Granola bridge failures, and misleading GWS probe audit logs without losing user-facing state; the observed Dvora and Fruma requests must be replayed through local Yente injection and ultimately succeed.
 
-**Architecture:** Split OpenCode liveness into a bounded, session-scoped SSE pump and a provider turn state machine. The pump owns transport health and metadata; the provider turns pump results into `activity`, recoverable `notice`, terminal transport notices, or normal `result` events without treating inactivity as stale session corruption. The poll loop owns user delivery and scoped recovery context: every recoverable interruption is routed to the current user, stored per provider plus route, XML-escaped into the next successful provider prompt, and deleted only after that prompt is accepted. Native OpenCode questions are explicitly rejected/canceled through the OpenCode question path before the turn is released, so follow-up user answers resume the same continuation instead of queuing behind a stuck TUI prompt.
+**Architecture:** Replace the current single `nextMeaningfulOpenCodeEvent()` watchdog with an SDK-compatible OpenCode turn supervisor: one session-scoped event pump owns SSE reading and liveness metadata, while `OpenCodeProvider` owns turn state, notices, native-question cancellation, and runtime lifecycle. The poll loop stores route-scoped recovery context only for terminal recoverable interruptions, injects it only at top-level query start, deletes it only after the provider has accepted that query, and never treats generic transport failures as stale OpenCode continuations. Host liveness is maintained by provider activity ticks during long waits, and long OpenCode tool timeouts are tracked with an active-tool map so one completed tool cannot remove protection for another.
 
 **Tech Stack:** TypeScript, Bun tests for `container/agent-runner`, Vitest for host-side NanoClaw, Go tests for `gws-skill`, SQLite session state, OpenCode SDK 1.15.10 event stream.
 
@@ -12,27 +12,29 @@
 
 ## Scope And Invariants
 
-The requested implementation spans two repositories:
+The implementation spans two repositories because the user asked for the full hardening around the observed failures:
 
-- `/home/dan/code/nanoclaw/.worktrees/yente-opencode-timeout-hardening` owns Yente/OpenCode runtime hardening, poll-loop recovery behavior, optional host-managed MCP bridge degradation, exact local incident replay, and docs.
-- `/home/dan/code/gws-skill` owns the GWS proxy audit-log correction. Do GWS work in a separate worktree under `/home/dan/code/gws-skill/.worktrees/` and commit it separately.
+- `/home/dan/code/nanoclaw/.worktrees/yente-opencode-timeout-hardening` owns OpenCode runtime hardening, poll-loop recovery, local Yente incident replay, optional Granola MCP degradation, and docs.
+- `/home/dan/code/gws-skill` owns the GWS proxy audit-log correction. Do that work in a separate GWS worktree and commit it separately.
 
-Do not mutate the live `shapiroserver2` host or run production deploys in this implementation pass. The required "inject requests into Yente" coverage is local but not fake at the wrong layer: insert the exact failed user messages into the NanoClaw session DB, run `runPollLoop()`, use the real `OpenCodeProvider` with a deterministic OpenCode runtime harness, and assert the outbound Yente-visible result. If production deployment is explicitly requested later, repeat the same prompts through the deployed smoke runner after deploy.
+Do not mutate the live `shapiroserver2` host or run production deploys in this pass. The required "inject requests into Yente" coverage is local: insert rows into the NanoClaw session DB, run `runPollLoop()`, use the real `OpenCodeProvider` with a deterministic OpenCode runtime harness, and assert `messages_out`, `processing_ack`, continuation, and recovery state.
 
 Core invariants:
 
-- OpenCode inactivity is not a stale continuation. `continuation:opencode` is cleared only when OpenCode says that exact session id is missing/invalid.
-- Generic transport failures such as `ECONNRESET`, plain `404`, or "event timeout" are not session-invalid by themselves.
-- Every OpenCode SSE event, including heartbeat/connected events, refreshes host liveness through provider `activity`; heartbeat keeps the container alive but does not count as meaningful model progress.
-- A five-minute meaningful-event gap emits a recoverable inactivity notice and continues waiting. It does not destroy the runtime, clear `activeSessionId`, clear continuation, or mark the turn failed.
-- A no-SSE transport timeout, stream read error, stream end, or absolute turn ceiling is terminal for the current provider query. It emits a recoverable notice, preserves continuation, destroys the shared runtime when needed, settles the initial user batch, and returns from the provider stream.
-- Native OpenCode `question` is an unsupported interaction path for Yente. Reject/cancel it through the OpenCode SDK, emit a recoverable notice with the question text when available, preserve continuation, settle the current user batch, and return so the user's answer can start the next provider turn.
-- Provider recovery context is scoped by provider plus route (`platform_id`, `channel_type`, `thread_id`) inside the session DB. It cannot be consumed by another conversation in a shared session.
-- Recovery context is never interpolated into XML/system markup without escaping.
-- Recovery notices are read non-destructively before a query and deleted only after the provider accepts the prompt by yielding an initial `init`, `activity`, `progress`, or `result` event.
-- `ProviderEvent.error` has explicit behavior: retryable errors are logged/progress-only; non-retryable errors are user-visible, settle the current batch, and are not hidden as "completed without sending".
+- OpenCode SDK 1.15.10 does not expose `client.question.*` or a `question.asked` event. Native-question handling must target the actual SDK surfaces: `message.part.updated` tool parts and `permission.updated` permission replies via `postSessionIdPermissionsPermissionId(...)`.
+- `buildOpenCodeConfig()` must disable the native question tool through OpenCode's tool-availability config, not only through the unrelated `permission.question` key.
+- OpenCode inactivity is not a stale continuation. `continuation:opencode` is cleared only when OpenCode returns a structured or exact missing-session error for the session id being resumed.
+- Generic transport/read failures such as `ECONNRESET`, bare `404`, stream end, "event timeout", or no-SSE transport timeout are not session-invalid by themselves.
+- Every OpenCode event, OpenCode keepalive, and provider wait tick yields provider `activity` so the poll loop touches the heartbeat during long waits. Wait ticks keep the container alive but do not count as meaningful model progress.
+- A meaningful-progress gap emits a soft user-visible notice at a throttled interval and continues waiting. It does not settle the initial batch, destroy the runtime, clear `activeSessionId`, clear continuation, or store recovery context. The notice must not promise that a follow-up can interrupt the active OpenCode turn immediately.
+- A no-SSE transport timeout, stream read error, stream end, queue overflow, or absolute turn ceiling is terminal for the current provider query. It emits a recoverable notice, stores route-scoped recovery context, settles the current batch, preserves continuation when the OpenCode session may still be reusable, destroys the runtime when the transport is no longer trustworthy, and returns from the provider stream.
+- Native OpenCode questions are unsupported in Yente. If a question tool/permission can be denied through the SDK permission API, deny it, emit a recoverable notice, preserve the OpenCode continuation, settle the batch, and return. If the event cannot be denied/canceled, destroy the runtime, clear only the unusable OpenCode continuation, store recovery context, and make the visible notice clear that Yente kept conversation context but restarted the OpenCode side.
+- Recovery context is scoped by provider plus route (`platform_id`, `channel_type`, `thread_id`) inside the session DB. It cannot be consumed by another conversation in a shared session.
+- Recovery context is XML-escaped before prompt injection.
+- Recovery context is injected only into a new top-level `provider.query(...)`, not into `query.push(...)` follow-ups. Delete injected notice ids only after the provider yields `init` for that top-level query.
+- `ProviderEvent.error` behavior is explicit: retryable errors are logged/progress-only; non-retryable errors are user-visible and settle the current batch.
 - Optional MCP degradation is narrow: Granola is optional by backward-compatible default, bridges marked `required: false` are optional, and all other bridges fail closed unless explicitly configured otherwise.
-- Optional MCP unavailability reasons shown to agents are sanitized categories, not raw errors with host paths, uid/gid values, or auth directory details.
+- Optional MCP unavailability reasons shown to agents are sanitized categories, not raw host paths, uid/gid values, or auth directory details.
 - GWS help/schema/auth/version probes remain authenticated but are classified structurally so flag values like `--subject help` cannot bypass policy, rate limits, signatures, or audit semantics for real API calls.
 
 ## File Structure
@@ -41,42 +43,43 @@ Core invariants:
 
 - Create `container/agent-runner/src/providers/opencode-events.ts`
   - Single-reader OpenCode SSE pump.
-  - Session-scoped event filtering.
-  - Bounded/coalesced queues so idle periods cannot accumulate infinite heartbeats.
-  - Result kinds: `event`, `keepalive`, `soft-timeout`, `transport-timeout`, `read-error`, `ended`.
-  - Metadata: configured timeout, elapsed time, last event type/time, last meaningful event type/time.
+  - Session-scoped filtering and liveness snapshots.
+  - Deterministic clock/scheduler injection for tests.
+  - Result kinds: `event`, `keepalive`, `wait-tick`, `soft-timeout`, `transport-timeout`, `read-error`, `ended`, `queue-overflow`.
+  - Bounded queues with a documented overflow policy that never silently drops terminal/session-error/permission/question/final assistant text events.
 
 - Create `container/agent-runner/src/providers/opencode-errors.ts`
-  - Typed `OpenCodeTransportTimeoutError`, `OpenCodeStreamReadError`, and helpers.
-  - Tight stale-session classifier helpers for exact missing-session cases only.
+  - Typed `OpenCodeTransportTimeoutError`, `OpenCodeStreamReadError`, `OpenCodeQueueOverflowError`, and metadata helpers.
+  - Exact missing-session classifier helpers.
 
 - Modify `container/agent-runner/src/providers/opencode.ts`
-  - Use the event pump.
-  - Remove timeout-driven `activeSessionId` clearing and `destroySharedRuntime()`.
-  - Yield `activity` for every keepalive or meaningful event.
-  - Yield recoverable `notice` events for soft inactivity, transport death, stream read errors, absolute turn ceiling, and native question interruptions.
-  - Reject/cancel native `question.asked` events and question tool parts.
-  - Stop auto-approving native question permissions.
-  - Track OpenCode tool starts/stops in `container_state` when tool events expose a declared timeout.
-  - Keep structured JSONL logs with `severity`, `event`, `session_id`, `classification`, and timeout metadata.
+  - Use the event pump and runtime controller.
+  - Disable OpenCode native `question` through tool availability config.
+  - Remove timeout-driven session clearing.
+  - Yield `activity` for event, keepalive, and wait ticks.
+  - Yield recoverable `notice` events for soft inactivity, transport death, stream read errors, queue overflow, absolute turn ceiling, and native-question interruptions.
+  - Deny/cancel native question tool/permission paths through the SDK permission API; restart with recovery context when cancellation is impossible.
+  - Track OpenCode tool starts/stops with an active-tool map and update `container_state` to the running tool with the longest declared timeout.
+  - Use structured JSONL logs with `severity`, `event`, `session_id`, `classification`, and timeout metadata.
 
 - Modify `container/agent-runner/src/providers/types.ts`
   - Add structured `notice` event fields.
+  - Add `activity.source` metadata if useful for tests/logging.
   - Clarify `error` semantics.
 
 - Modify `container/agent-runner/src/db/session-state.ts`
-  - Add scoped recovery notice APIs with generated ids and non-destructive read/delete.
+  - Add scoped recovery-notice APIs with generated ids, non-destructive read, delete-by-id, and malformed-json cleanup.
 
 - Modify `container/agent-runner/src/formatter.ts`
-  - Export `escapeXml()` for recovery prompt injection.
+  - Export the existing XML escape helper for recovery prompt injection.
 
 - Modify `container/agent-runner/src/poll-loop.ts`
-  - Load scoped recovery notices before initial and follow-up prompts.
-  - Delete recovery notices only after provider prompt acceptance.
+  - Load scoped recovery context before top-level `provider.query(...)`.
+  - Delete recovery context only after the provider yields `init` for that query.
   - Dispatch provider notices to `messages_out`.
-  - Store recovery context by provider plus route.
-  - Move provider event handling into `processQuery()` or pass callbacks so notice/error handling can settle the initial batch.
+  - Store recovery context for terminal notices only.
   - Handle non-retryable `ProviderEvent.error` visibly.
+  - Keep follow-up `query.push(...)` behavior simple and do not consume recovery context there.
 
 - Add/modify tests:
   - `container/agent-runner/src/providers/opencode-events.test.ts`
@@ -91,17 +94,18 @@ Core invariants:
   - Honor any positive `container_state.tool_declared_timeout_ms`, not only `current_tool === 'Bash'`.
 
 - Modify `src/host-sweep.test.ts`
-  - Keep existing Bash coverage and add OpenCode tool-state coverage.
+  - Keep existing Bash coverage.
+  - Add OpenCode declared-timeout and no-SSE wait-tick coverage.
 
 - Modify `src/agent-mcp-config.ts`
   - Add `required?: boolean` to bridge config.
-  - Default only `serverName === 'granola'` to optional for backward compatibility; all other omitted values default to required.
+  - Default only `serverName === 'granola'` to optional for backward compatibility.
 
 - Modify `src/container-config.ts`
   - Add sanitized `agentMcpUnavailable?: Record<string, { category: string; updatedAt: string }>` runtime state.
 
 - Modify `src/agent-mcp-bridge.ts`
-  - Export a helper for the bridge auth directory so mount-overlap checks can include failed optional bridges.
+  - Export a helper for bridge auth directories so mount-overlap checks include failed optional bridges.
 
 - Modify `src/container-runner.ts`
   - Degrade optional bridge startup failures.
@@ -128,7 +132,7 @@ Core invariants:
 
 - Modify `docs/agent-runner-details.md`.
 
-## Task 1: OpenCode Event Pump, Transport Errors, And Host Liveness
+## Task 1: SDK-Compatible OpenCode Event Pump And Liveness
 
 **Files:**
 - Create: `container/agent-runner/src/providers/opencode-events.ts`
@@ -138,7 +142,7 @@ Core invariants:
 - Modify: `src/host-sweep.ts`
 - Modify: `src/host-sweep.test.ts`
 
-- [ ] **Step 1: Write failing tests**
+- [ ] **Step 1: Identify or write the failing tests**
 
 In `container/agent-runner/src/providers/opencode.test.ts`, change stale classification coverage:
 
@@ -146,29 +150,19 @@ In `container/agent-runner/src/providers/opencode.test.ts`, change stale classif
 expect(isStaleSessionError(new Error('OpenCode event timeout (300000ms)'))).toBe(false);
 expect(isStaleSessionError(new Error('ECONNRESET while reading OpenCode events'))).toBe(false);
 expect(isStaleSessionError(new Error('HTTP 404 from OpenCode event stream'))).toBe(false);
-expect(isStaleSessionError(new Error('OpenCode promptAsync: session not found'))).toBe(true);
+expect(isStaleSessionError(new Error('OpenCode promptAsync: session ses_old not found'))).toBe(true);
+expect(isStaleSessionError(new Error('NotFoundError'))).toBe(false);
 ```
 
-In `container/agent-runner/src/providers/opencode-events.test.ts`, add tests for:
+In `container/agent-runner/src/providers/opencode-events.test.ts`, add tests using a fake clock/scheduler:
 
-- Keepalive events return `kind: 'keepalive'` and update `lastEventType` without updating `lastMeaningfulEventType`.
-- Soft timeout returns `kind: 'soft-timeout'` while the underlying stream reader remains alive and later returns `session.idle`.
-- No SSE event of any kind before `transportTimeoutMs` returns/throws `OpenCodeTransportTimeoutError` with `sessionId`, `transportTimeoutMs`, `elapsedMs`, `lastEventType`, `lastEventAt`, `lastMeaningfulEventType`, and `lastMeaningfulEventAt`.
-- Stream read exceptions surface as `OpenCodeStreamReadError` with the same metadata, not raw user-facing strings.
-- Events with another session id do not wake the waiter for the active session.
-- Heartbeats while no waiter is active are coalesced, not queued without bound.
-
-Use a deterministic async generator harness:
-
-```typescript
-function deferred<T = void>() {
-  let resolve!: (value: T) => void;
-  const promise = new Promise<T>((r) => {
-    resolve = r;
-  });
-  return { promise, resolve };
-}
-```
+- Keepalive events return `kind: 'keepalive'`, update `lastEventType`, and do not update `lastMeaningfulEventType`.
+- A wait interval with no SSE returns `kind: 'wait-tick'` before `transportTimeoutMs`.
+- Heartbeats for longer than `softTimeoutMs` return one throttled `kind: 'soft-timeout'` while the stream stays alive and later returns `session.idle`.
+- No SSE event before `transportTimeoutMs` returns `kind: 'transport-timeout'` with `sessionId`, `transportTimeoutMs`, `elapsedMs`, `lastEventType`, `lastEventAt`, `lastMeaningfulEventType`, and `lastMeaningfulEventAt`.
+- Stream read exceptions surface as `OpenCodeStreamReadError` with metadata.
+- Events with another session id do not wake the active session waiter.
+- Queue overflow preserves terminal/action-required events and either drops only explicitly droppable low-value events or returns `kind: 'queue-overflow'`; it never silently drops `session.idle`, `session.error`, `permission.updated`, question tool parts, or assistant text parts.
 
 In `src/host-sweep.test.ts`, add:
 
@@ -190,7 +184,7 @@ it('widens stuck tolerance for any active tool with a declared timeout', () => {
 });
 ```
 
-- [ ] **Step 2: Run tests red**
+- [ ] **Step 2: Run tests to verify they fail**
 
 Run:
 
@@ -201,11 +195,11 @@ cd /home/dan/code/nanoclaw/.worktrees/yente-opencode-timeout-hardening
 timeout 120s pnpm exec vitest run src/host-sweep.test.ts
 ```
 
-Expected: FAIL because `opencode-events.ts` does not exist, timeout/transport strings are still stale, and host sweep only honors `Bash`.
+Expected: FAIL because `opencode-events.ts` does not exist, transport strings are still stale-session matches, and host sweep only honors Bash.
 
-- [ ] **Step 3: Implement typed errors**
+- [ ] **Step 3: Implement typed errors and exact stale-session classification**
 
-In `opencode-errors.ts`:
+In `container/agent-runner/src/providers/opencode-errors.ts`:
 
 ```typescript
 export interface OpenCodeLivenessMetadata {
@@ -227,70 +221,53 @@ export class OpenCodeTransportTimeoutError extends Error {
 
 export class OpenCodeStreamReadError extends Error {
   readonly name = 'OpenCodeStreamReadError';
-  constructor(
-    readonly metadata: Omit<OpenCodeLivenessMetadata, 'configuredTimeoutMs'>,
-    readonly cause: unknown,
-  ) {
+  constructor(readonly metadata: Omit<OpenCodeLivenessMetadata, 'configuredTimeoutMs'>, readonly cause: unknown) {
     super(`OpenCode event stream failed for session ${metadata.sessionId}`);
   }
 }
-
-export function isMissingOpenCodeSessionError(err: unknown): boolean {
-  const text = err instanceof Error ? err.message : String(err);
-  return /session.*not found|no conversation found|NotFoundError/i.test(text);
-}
 ```
 
-Update `isStaleSessionError()` in `opencode.ts` to use `isMissingOpenCodeSessionError()` plus any exact OpenCode missing-session response shape found in tests. Do not include `event timeout`, `connection reset`, `ECONNRESET`, or bare `404`.
+Add `isMissingOpenCodeSessionError(err, attemptedSessionId)` that returns true only for missing-session/conversation messages tied to the attempted session id or a structured OpenCode missing-session response from `promptAsync`. Do not match bare `NotFoundError`, bare `404`, `ECONNRESET`, stream errors, or timeout text.
 
 - [ ] **Step 4: Implement the event pump**
 
-In `opencode-events.ts`, implement:
+In `opencode-events.ts`, implement a single-reader pump:
 
 ```typescript
-export type OpenCodeSseEvent = { type?: string; properties: Record<string, unknown> };
-
 export type OpenCodePumpResult<T extends OpenCodeSseEvent> =
   | { kind: 'event'; event: T; metadata: OpenCodeLivenessSnapshot }
   | { kind: 'keepalive'; event: T; metadata: OpenCodeLivenessSnapshot }
+  | { kind: 'wait-tick'; metadata: OpenCodeLivenessSnapshot }
   | { kind: 'soft-timeout'; metadata: OpenCodeLivenessSnapshot & { configuredTimeoutMs: number; elapsedMs: number } }
   | { kind: 'transport-timeout'; error: OpenCodeTransportTimeoutError }
   | { kind: 'read-error'; error: OpenCodeStreamReadError }
+  | { kind: 'queue-overflow'; error: OpenCodeQueueOverflowError }
   | { kind: 'ended'; metadata: OpenCodeLivenessSnapshot };
-
-export interface OpenCodePumpOptions<T extends OpenCodeSseEvent> {
-  isKeepalive: (event: T) => boolean;
-  sessionIdForEvent: (event: T) => string | undefined;
-  maxQueuedEventsPerSession?: number;
-}
 ```
 
-Implementation requirements:
+Requirements:
 
-- Constructor starts exactly one background `readLoop()`.
 - No code outside the pump calls `stream.next()` directly.
-- Keepalives are not appended to unbounded queues; keep only latest keepalive metadata and wake active waiters.
-- Non-keepalive events are queued by session id. Events without session id are delivered only when they are global/transport events; unrelated session events are ignored for the active waiter.
-- `next(sessionId, { softTimeoutMs, transportTimeoutMs, absoluteDeadlineMs })` returns the earliest of a relevant event, keepalive, soft meaningful timeout, transport no-event timeout, absolute deadline, read error, or stream end.
-- `lastEvent*` updates on every SSE event. `lastMeaningfulEvent*` updates only on non-keepalive events for the target session.
-- A read-loop exception wakes all waiters with `kind: 'read-error'`.
-- `close()` calls `stream.return?.(undefined)`, marks the pump closed, and wakes all waiters.
+- `next(sessionId, { softTimeoutMs, transportTimeoutMs, waitTickMs, absoluteDeadlineMs })` returns the earliest relevant event, keepalive, wait tick, soft timeout, transport timeout, absolute deadline, read error, queue overflow, or stream end.
+- Heartbeats are coalesced, not queued without bound.
+- Non-keepalive events are queued by session id.
+- Overflow policy is explicit: preserve non-droppable terminal/action-required/final-text events; if the pump cannot make space safely, return `queue-overflow` as a terminal recoverable interruption.
+- The tests use fake timers or the injected clock. Do not sleep for production durations.
 
 - [ ] **Step 5: Generalize host-sweep declared timeout handling**
 
-In `src/host-sweep.ts`, replace the Bash-only helper with a helper that honors any positive declared timeout:
+Replace the Bash-only helper in `src/host-sweep.ts` with:
 
 ```typescript
 function declaredToolTimeoutMs(containerState: ContainerState | null): number | null {
-  if (!containerState) return null;
-  const timeout = containerState.tool_declared_timeout_ms;
+  const timeout = containerState?.tool_declared_timeout_ms;
   return typeof timeout === 'number' && timeout > 0 ? timeout : null;
 }
 ```
 
-Use it for both the absolute ceiling and claim-stuck tolerance. Update comments from Bash-specific to declared-tool-specific while preserving existing Bash test meaning.
+Use it for both the absolute ceiling and per-claim tolerance. Update comments from Bash-specific to declared-tool-specific.
 
-- [ ] **Step 6: Run tests green**
+- [ ] **Step 6: Run tests and typechecks**
 
 Run:
 
@@ -318,7 +295,7 @@ git add container/agent-runner/src/providers/opencode-events.ts \
 git commit -m "fix: make opencode liveness session scoped"
 ```
 
-## Task 2: Provider Notices And Scoped Recovery Context
+## Task 2: Provider Notices And Route-Scoped Recovery Context
 
 **Files:**
 - Modify: `container/agent-runner/src/providers/types.ts`
@@ -328,9 +305,9 @@ git commit -m "fix: make opencode liveness session scoped"
 - Modify: `container/agent-runner/src/poll-loop.ts`
 - Modify: `container/agent-runner/src/poll-loop.test.ts`
 
-- [ ] **Step 1: Write failing contract tests**
+- [ ] **Step 1: Identify or write the failing tests**
 
-In `providers/types.ts`, plan for this event shape:
+In `providers/types.ts`, plan for:
 
 ```typescript
 export type ProviderNoticeSeverity = 'info' | 'warn' | 'error';
@@ -340,45 +317,30 @@ export type ProviderEvent =
   | { type: 'result'; text: string | null }
   | { type: 'error'; message: string; retryable: boolean; classification?: string; userMessage?: string }
   | { type: 'progress'; message: string }
-  | {
-      type: 'notice';
-      severity: ProviderNoticeSeverity;
-      classification: string;
-      message: string;
-      recoveryContext?: string;
-      settleInitialBatch?: boolean;
-    }
-  | { type: 'activity' };
+  | { type: 'notice'; severity: ProviderNoticeSeverity; classification: string; message: string; recoveryContext?: string; settleInitialBatch?: boolean }
+  | { type: 'activity'; source?: 'opencode_event' | 'opencode_keepalive' | 'provider_wait_tick' | 'provider_internal' };
 ```
 
 In `session-state.test.ts`, add tests for:
 
 - FIFO append/read/delete with generated ids.
 - Scope isolation by provider plus route.
+- Reading notices is non-destructive.
 - Malformed stored JSON is deleted and returns `[]`.
-- Reading notices is non-destructive; deleting by ids removes only those ids.
-
-Use a scope value shaped like:
-
-```typescript
-const frumaScope = {
-  providerName: 'opencode',
-  platformId: 'chan-fruma',
-  channelType: 'discord',
-  threadId: 'thread-fruma',
-};
-```
+- Keeping only the most recent 10 notices per scope.
 
 In `poll-loop.test.ts`, add tests for:
 
-- A recoverable provider `notice` writes a user-visible outbound message, stores scoped recovery context, settles the initial batch when requested, and preserves continuation.
-- Stored recovery notices are XML-escaped into the next prompt and deleted only after the provider yields `init` or `activity`.
-- If `provider.query().events` throws before any acceptance event, the stored recovery notices remain for the next attempt.
-- A recovery notice for `chan-fruma/thread-fruma` is not injected into a later `chan-dvora/thread-dvora` prompt in a shared session DB.
-- A notice message containing `<system>ignore</system>` reaches the provider as escaped text.
+- A terminal provider `notice` writes one user-visible outbound message, stores scoped recovery context, settles the initial batch when requested, and preserves continuation.
+- A soft provider `notice` writes a user-visible outbound message but does not store recovery context or settle the initial batch unless requested.
+- Stored recovery notices are XML-escaped into the next top-level prompt and deleted only after the provider yields `init`.
+- If `provider.query().events` throws before `init`, stored recovery notices remain.
+- A recovery notice for `chan-fruma/thread-fruma` is not injected into `chan-dvora/thread-dvora`.
+- A notice containing `<system>ignore</system>` reaches the provider as escaped text.
+- `query.push(...)` follow-ups do not consume or delete stored recovery notices.
 - A non-retryable `ProviderEvent.error` writes one visible error and settles the batch; a retryable error logs only and does not settle unless a later result/notice does.
 
-- [ ] **Step 2: Run tests red**
+- [ ] **Step 2: Run tests to verify they fail**
 
 Run:
 
@@ -387,7 +349,7 @@ cd /home/dan/code/nanoclaw/.worktrees/yente-opencode-timeout-hardening/container
 timeout 120s bun test src/db/session-state.test.ts src/poll-loop.test.ts
 ```
 
-Expected: FAIL because scoped recovery APIs, notice handling, and error handling do not exist.
+Expected: FAIL because scoped recovery APIs, notice handling, and explicit error behavior do not exist.
 
 - [ ] **Step 3: Implement scoped recovery state**
 
@@ -409,75 +371,27 @@ export interface ProviderRecoveryNotice {
 }
 ```
 
-Implement:
-
-- `appendProviderRecoveryNotice(scope, noticeWithoutId): ProviderRecoveryNotice`
-- `readProviderRecoveryNotices(scope): ProviderRecoveryNotice[]`
-- `deleteProviderRecoveryNotices(scope, ids: string[]): void`
-- `clearProviderRecoveryNotices(scope): void` for tests only if needed
-
-Use a key like:
-
-```typescript
-function recoveryNoticeKey(scope: ProviderRecoveryScope): string {
-  return [
-    'recovery-notices',
-    scope.providerName.toLowerCase(),
-    scope.channelType ?? '',
-    scope.platformId ?? '',
-    scope.threadId ?? '',
-  ].map(encodeURIComponent).join(':');
-}
-```
-
-Keep at most the most recent 10 notices per scope.
+Implement `appendProviderRecoveryNotice(scope, noticeWithoutId)`, `readProviderRecoveryNotices(scope)`, `deleteProviderRecoveryNotices(scope, ids)`, and test-only `clearProviderRecoveryNotices(scope)`. Use a key based on provider name, channel type, platform id, and thread id; encode each segment.
 
 - [ ] **Step 4: Export XML escaping**
 
-In `formatter.ts`, export the existing helper:
-
-```typescript
-export function escapeXml(str: string): string {
-  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
-```
-
-Do not create a second escaping implementation in `poll-loop.ts`.
+Export the existing XML escaping helper from `formatter.ts`. Do not create a second implementation in `poll-loop.ts`.
 
 - [ ] **Step 5: Implement poll-loop notice and recovery handling**
 
 In `poll-loop.ts`:
 
 - Build a recovery scope from `config.providerName` and `extractRouting(messages)`.
-- Before the initial prompt, call `readProviderRecoveryNotices(scope)` but do not delete.
-- Prepend notices with escaped XML:
+- Read recovery notices before top-level `provider.query(...)`.
+- Prepend escaped notices as a `<system>` block.
+- Track `pendingRecoveryNoticeIdsForCurrentQuery`.
+- Delete those ids only after the provider yields `init`.
+- Do not read, inject, or delete recovery notices inside `pollFollowups()` before `query.push(...)`.
+- For `notice`, write `messages_out` with `event.message`; append `event.recoveryContext` only when present; call `settleInitialBatch()` only when `event.settleInitialBatch` is true.
+- For `error`, retryable events log a structured warning; non-retryable events write `event.userMessage ?? "Error: " + event.message` and settle the batch.
+- Keep catch-block provider throws visible, but clear continuation only when `config.provider.isSessionInvalid(err)` is true.
 
-```typescript
-function prependRecoveryNotices(prompt: string, notices: ProviderRecoveryNotice[]): string {
-  if (notices.length === 0) return prompt;
-  const lines = notices.map(
-    (notice) =>
-      `  <event created_at="${escapeXml(notice.createdAt)}" classification="${escapeXml(notice.classification)}">` +
-      `${escapeXml(notice.message)}</event>`,
-  );
-  return `<system>\nPrevious recoverable provider events for this conversation:\n${lines.join('\n')}\nUse this context to explain and resume without losing the thread.\n</system>\n\n${prompt}`;
-}
-```
-
-- Pass the augmented prompt into `provider.query`.
-- Delete the included notice ids only after the provider yields `init`, `activity`, `progress`, or `result`.
-- Apply the same read/prepend/delete-on-accepted logic to follow-up prompts in `pollFollowups()`.
-- Move `handleEvent()` inside `processQuery()` or pass callbacks so `notice` and `error` branches can call `settleInitialBatch()`.
-- For `notice`:
-  - Write a `messages_out` chat row to the current route using `event.message`.
-  - If `event.recoveryContext` is present, append it to the scoped recovery queue.
-  - If `event.settleInitialBatch`, call `settleInitialBatch()`.
-- For `error`:
-  - If `retryable`, log as structured warning and continue.
-  - If non-retryable, write `event.userMessage ?? "Error: " + event.message`, call `settleInitialBatch()`, and continue until the provider stream returns.
-- Keep catch-block provider throws visible, but do not clear continuation unless `config.provider.isSessionInvalid(err)` is true.
-
-- [ ] **Step 6: Run targeted tests green**
+- [ ] **Step 6: Run targeted tests**
 
 Run:
 
@@ -502,31 +416,30 @@ git add container/agent-runner/src/providers/types.ts \
 git commit -m "fix: preserve scoped provider recovery context"
 ```
 
-## Task 3: Wire OpenCode Provider Recovery, Native Questions, And Tool State
+## Task 3: OpenCode Provider Recovery, Native Questions, Runtime Lifecycle, And Tool State
 
 **Files:**
 - Modify: `container/agent-runner/src/providers/opencode.ts`
 - Modify: `container/agent-runner/src/providers/opencode.test.ts`
-- Modify: `container/agent-runner/src/providers/types.ts` if Task 2 uncovered type gaps
-- Modify: `container/agent-runner/src/db/connection.ts` only if a small helper is needed for tests
+- Modify: `container/agent-runner/src/providers/types.ts` if Task 2 uncovers type gaps
+- Modify: `container/agent-runner/src/db/connection.ts` only if a small active-tool helper is needed for tests
 
-- [ ] **Step 1: Write failing provider tests**
+- [ ] **Step 1: Identify or write the failing provider tests**
 
-In `opencode.test.ts`, add tests using a mocked `SharedRuntime`/OpenCode client seam:
+In `opencode.test.ts`, add tests with a mocked runtime controller:
 
-- Soft inactivity after heartbeats yields `activity` and one `notice` with classification `opencode_inactivity`, includes recovery context, does not clear `activeSessionId`, does not call `destroySharedRuntime()`, and later yields the final result when `session.idle` arrives.
-- Heartbeat-only streams yield `activity` before the soft notice often enough that `touchHeartbeat()` callers can keep host liveness fresh.
-- Repeated soft notices are throttled to one per `OPENCODE_INACTIVITY_NOTICE_MS` interval.
-- No-SSE transport timeout yields a terminal `notice` with classification `opencode_transport_timeout`, metadata for configured timeout/elapsed/last event/last meaningful event, keeps continuation, destroys the shared runtime, and returns from the generator without a follow-on raw error.
-- Absolute turn timeout yields classification `opencode_absolute_turn_timeout`, destroys runtime, keeps continuation, and returns.
-- Stream read errors yield classification `opencode_stream_error`, keep continuation, destroy runtime, and return.
-- `question.asked` for the active session calls `client.question.reject()` with a Yente-specific reason, yields classification `opencode_native_question`, includes the question text in both visible message and recovery context, settles the initial batch, and returns.
-- `message.part.updated` question tool parts are handled even when the session id lives on `part.sessionID` instead of `properties.sessionID`.
-- Question or question-permission events for a different session id are ignored.
-- `permission.updated` for the native question permission is denied/rejected, while non-question permission events keep the existing allowed behavior.
-- OpenCode tool running/completed parts call `setContainerToolInFlight()` and `clearContainerToolInFlight()` with declared timeout metadata when available.
+- `buildOpenCodeConfig()` disables the native question tool through the OpenCode tool map for SDK 1.15.10 and does not rely on `permission.question`.
+- Soft inactivity after keepalives/wait ticks yields `activity` and one throttled `notice` with classification `opencode_inactivity`, does not store terminal recovery context, does not clear `activeSessionId`, does not destroy the runtime, and later yields the final result when `session.idle` arrives.
+- Heartbeat-only and no-SSE wait-tick streams yield `activity` before host `CLAIM_STUCK_MS` using reduced env values or fake timers.
+- No-SSE transport timeout yields a terminal `notice` with classification `opencode_transport_timeout`, stores recovery context, keeps reusable continuation, destroys the runtime controller, and returns without a raw error.
+- Absolute turn timeout, stream read error, stream end, and queue overflow each yield one terminal notice, settle the batch, and return.
+- `message.part.updated` question tool parts for the active session are denied through `postSessionIdPermissionsPermissionId(...)` when a permission id is available, yield classification `opencode_native_question`, include the question text, settle the batch, preserve continuation, and return.
+- A question tool part with no permission id and no cancellable handle destroys the runtime, clears only the unusable OpenCode continuation, stores recovery context, and the visible notice does not claim same-session continuation.
+- `permission.updated` for the native question permission is denied/rejected; non-question permission events keep the existing allow behavior.
+- Question/tool/permission events for another session id are ignored.
+- Active tool tracking handles overlap: two running tool parts set the row to the longest declared timeout; when the shorter tool completes, the longer tool remains in `container_state`; the row clears only after all active tracked tools complete.
 
-- [ ] **Step 2: Run tests red**
+- [ ] **Step 2: Run tests to verify they fail**
 
 Run:
 
@@ -535,129 +448,84 @@ cd /home/dan/code/nanoclaw/.worktrees/yente-opencode-timeout-hardening/container
 timeout 120s bun test src/providers/opencode.test.ts
 ```
 
-Expected: FAIL because the provider still uses the old timeout loop and has no native-question handling.
+Expected: FAIL because the provider still uses the old timeout loop, native question config is insufficient, and tool-state tracking does not exist for OpenCode.
 
-- [ ] **Step 3: Add an OpenCode runtime test seam**
+- [ ] **Step 3: Add a runtime controller test seam**
 
-Keep production construction unchanged, but make tests able to inject a runtime:
+Keep production construction unchanged, but make tests inject a runtime controller:
 
 ```typescript
-type OpenCodeRuntimeFactory = (options: ProviderOptions) => Promise<SharedRuntime>;
+interface OpenCodeRuntimeController {
+  proc?: ChildProcess;
+  client: OpencodeClient;
+  pump: OpenCodeEventPump<OpenCodeSseEvent>;
+  destroy(reason: string): void;
+}
+
+type OpenCodeRuntimeFactory = (options: ProviderOptions) => Promise<OpenCodeRuntimeController>;
 
 export class OpenCodeProvider implements AgentProvider {
-  constructor(options: ProviderOptions = {}, runtimeFactory: OpenCodeRuntimeFactory = ensureSharedRuntime) {
-    this.options = options;
-    this.runtimeFactory = runtimeFactory;
-  }
+  constructor(options: ProviderOptions = {}, runtimeFactory: OpenCodeRuntimeFactory = ensureSharedRuntime) {}
 }
 ```
 
-Do not expose this through provider registry; registry still calls `new OpenCodeProvider(opts)`.
+Production `ensureSharedRuntime()` returns the shared controller. `destroySharedRuntime()` delegates through the controller, and provider code calls `rt.destroy(reason)` so injected runtimes are cleaned up and testable.
 
-- [ ] **Step 4: Replace timeout loop with pump-driven turn state**
+- [ ] **Step 4: Replace the provider timeout loop with pump-driven turn state**
 
-In `ensureSharedRuntime()`, create the pump:
+Use env-configurable defaults:
 
-```typescript
-const pump = new OpenCodeEventPump(stream, {
-  isKeepalive: isOpenCodeKeepaliveEvent,
-  sessionIdForEvent: sessionIdForOpenCodeEvent,
-  maxQueuedEventsPerSession: 500,
-});
-```
+- `OPENCODE_INACTIVITY_NOTICE_MS`, default `300_000`
+- `OPENCODE_INACTIVITY_NOTICE_REPEAT_MS`, default `300_000`
+- `OPENCODE_TRANSPORT_TIMEOUT_MS`, default `900_000`
+- `OPENCODE_WAIT_TICK_MS`, default `15_000`
+- `OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS`, default `21_600_000`
 
-Extend `SharedRuntime` with `pump`, and have `destroySharedRuntime()` close it.
+Provider loop behavior:
 
-In the provider event loop:
+- `keepalive`: yield `{ type: 'activity', source: 'opencode_keepalive' }`.
+- `wait-tick`: yield `{ type: 'activity', source: 'provider_wait_tick' }`.
+- `event`: yield `{ type: 'activity', source: 'opencode_event' }`, then process the event.
+- `soft-timeout`: yield `activity`, yield a throttled `notice`, and continue the same turn.
+- `transport-timeout`, `read-error`, `ended`, `queue-overflow`, or absolute deadline: yield one terminal `notice` with `settleInitialBatch: true`, destroy the runtime when transport is untrustworthy, keep continuation only when the session may still be resumed, and `return`.
 
-- Defaults:
-  - `OPENCODE_INACTIVITY_NOTICE_MS`, default `300_000`
-  - `OPENCODE_TRANSPORT_TIMEOUT_MS`, default `900_000`
-  - `OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS`, default `21_600_000`
-  - `OPENCODE_NATIVE_QUESTION_SETTLE_MS`, default `5_000`
-- For `keepalive`: yield `{ type: 'activity' }`.
-- For `event`: yield `{ type: 'activity' }`, then process event.
-- For `soft-timeout`: yield `{ type: 'activity' }`, yield a throttled `notice`, and continue the same turn.
-- For `transport-timeout`, `read-error`, `ended`, or absolute deadline: yield one terminal `notice` with `settleInitialBatch: true`, destroy runtime when the transport is no longer trustworthy, keep `activeSessionId`, and `return`.
-
-Use visible inactivity text like:
+Use soft inactivity visible text like:
 
 ```text
-I stopped receiving useful progress from OpenCode, but I kept the Yente session state. Long work may still be running; reply with extra context or ask me to continue.
+I am still waiting on OpenCode. I kept the Yente session state; long work may still be running.
 ```
 
-Use recovery context like:
+Use terminal transport visible text like:
 
 ```text
-OpenCode inactivity: no meaningful event for 300000ms in session ses_..., last event server.heartbeat at ..., last meaningful message.part.updated at ...
+I stopped receiving events from OpenCode and paused this turn, but I kept the Yente conversation context. Reply to continue and I will resume from the saved context.
 ```
 
 - [ ] **Step 5: Implement session-scoped OpenCode event helpers**
 
-Add helpers in `opencode.ts`:
+Add helpers that inspect `properties.sessionID`, `properties.part.sessionID`, `properties.info.sessionID`, `properties.permission.sessionID`, and any actual SDK 1.15.10 event fields found in generated types or fixtures. Tests must pin the observed shapes for `message.part.updated`, `permission.updated`, `session.idle`, and `session.error`.
 
-```typescript
-function sessionIdForOpenCodeEvent(ev: { type?: string; properties: Record<string, unknown> }): string | undefined {
-  const props = ev.properties as Record<string, unknown>;
-  if (typeof props.sessionID === 'string') return props.sessionID;
-  const part = props.part as Record<string, unknown> | undefined;
-  if (part && typeof part.sessionID === 'string') return part.sessionID;
-  const info = props.info as Record<string, unknown> | undefined;
-  if (info && typeof info.sessionID === 'string') return info.sessionID;
-  const question = props as Record<string, unknown>;
-  if (typeof question.sessionID === 'string') return question.sessionID;
-  return undefined;
-}
-```
+- [ ] **Step 6: Disable and deny native questions through actual SDK surfaces**
 
-Update as needed after inspecting the installed SDK generated types. Tests must prove `message.part.updated` and `question.asked` are session-scoped correctly.
+Update `buildOpenCodeConfig()` to disable the native question tool through the OpenCode `tools` map. Then handle runtime leakage:
 
-- [ ] **Step 6: Reject native questions**
+- Detect question tool parts from `message.part.updated` where the part/tool name is `question` or the tool metadata identifies OpenCode's native question tool.
+- Extract question text from known fields (`text`, `prompt`, `input.question`, `state.input.question`, or JSON fallback).
+- If a permission id is available, deny it with `client.postSessionIdPermissionsPermissionId(...)` using the actual response literal required by SDK 1.15.10, and assert that in tests.
+- If denial succeeds, emit a terminal `opencode_native_question` notice that says the native question was blocked and asks the user to reply through Yente; preserve continuation.
+- If denial is impossible, destroy the runtime, clear the unusable continuation, store recovery context, and make the visible message say Yente will restart the OpenCode side with saved context.
+- Never wait five minutes for a native question stall.
 
-Handle both event paths:
+- [ ] **Step 7: Record overlapping OpenCode tool state safely**
 
-- `question.asked`
-- `message.part.updated` where the part is a running/pending question tool
+Maintain an in-memory `Map<toolPartId, { name: string; declaredTimeoutMs: number | null }>` for active OpenCode tool parts:
 
-Extract the question text from known fields (`text`, `prompt`, `input.question`, `state.input.question`, or JSON fallback). Then:
+- On status `pending` or `running`, add/update the entry and write `container_state` for the active entry with the largest positive declared timeout, or the newest active entry when none has a timeout.
+- Extract `declaredTimeoutMs` from `state.input.timeout`, `input.timeout`, or other observed SDK fields when numeric.
+- On status `completed`, `error`, `failed`, or `aborted`, remove only that part id, then recompute `container_state`; clear it only when the map is empty.
+- Log structured warnings on DB failures and continue.
 
-```typescript
-await rejectOpenCodeQuestion(client, sessionId, questionId, questionText);
-yield {
-  type: 'notice',
-  severity: 'warn',
-  classification: 'opencode_native_question',
-  message: questionText
-    ? `OpenCode tried to ask a native question: ${questionText}\n\nI kept the session state. Reply with the answer and I will continue.`
-    : 'OpenCode tried to ask a native question. I kept the session state. Reply with the answer and I will continue.',
-  recoveryContext: questionText
-    ? `OpenCode native question was blocked and rejected: ${questionText}`
-    : 'OpenCode native question was blocked and rejected.',
-  settleInitialBatch: true,
-};
-return;
-```
-
-`rejectOpenCodeQuestion()` should prefer the SDK `client.question.reject(...)` API. If a question id is not available from a tool-part event, deny the corresponding permission if present, emit the notice, and return. Do not wait five minutes for question stalls.
-
-- [ ] **Step 7: Stop auto-approving question permissions**
-
-Replace unconditional permission `response: 'always'` with:
-
-- Deny/reject permissions whose metadata/tool name is `question`.
-- Auto-approve only the non-question permission events that existing tests already expect.
-- Log structured warnings if permission replies fail, but do not convert the warning to a raw user-visible error unless it blocks the active turn.
-
-- [ ] **Step 8: Record OpenCode tool state**
-
-On tool-part status transitions:
-
-- When status is `pending` or `running`, call `setContainerToolInFlight("OpenCode:" + toolName, declaredTimeoutMs)`.
-- Extract `declaredTimeoutMs` from known fields such as `state.input.timeout` or `input.timeout` when numeric.
-- When status is `completed`, `error`, `failed`, or `aborted`, call `clearContainerToolInFlight()`.
-- Keep this best-effort. Log structured warnings on DB failures and continue.
-
-- [ ] **Step 9: Run targeted tests green**
+- [ ] **Step 8: Run targeted tests**
 
 Run:
 
@@ -669,7 +537,7 @@ timeout 120s bun run typecheck
 
 Expected: all PASS.
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
 cd /home/dan/code/nanoclaw/.worktrees/yente-opencode-timeout-hardening
@@ -681,58 +549,58 @@ git add container/agent-runner/src/providers/opencode.ts \
 git commit -m "fix: recover opencode interruptions without losing state"
 ```
 
-## Task 4: Exact Dvora And Fruma Incident Replay Through Yente Injection
+## Task 4: Exact Dvora, Fruma, And Transport-Failure Replay Through Yente Injection
 
 **Files:**
 - Create: `container/agent-runner/src/opencode-incident-replay.test.ts`
 - Modify: `container/agent-runner/src/poll-loop.test.ts` only if a helper should be shared
 - Modify: `container/agent-runner/src/providers/opencode.ts` only if the runtime test seam needs a small adjustment
 
-- [ ] **Step 1: Write the replay harness**
+- [ ] **Step 1: Write the local Yente injection harness**
 
-Create a deterministic OpenCode runtime harness used with the real `OpenCodeProvider`:
+Create a deterministic runtime harness used with the real `OpenCodeProvider`:
 
 - Fake `client.session.create()` returns known session ids.
-- Fake `client.session.promptAsync()` records prompt parts and returns success for the requested session.
-- Fake `client.question.reject()` records rejected native questions.
-- Fake event stream is an async generator controlled by the test.
-- The test inserts messages into the in-memory NanoClaw session DB and runs `runPollLoop()` with the real provider instance.
+- Fake `client.session.promptAsync()` records prompt parts, continuation, and top-level prompt acceptance.
+- Fake `postSessionIdPermissionsPermissionId(...)` records permission denials/approvals.
+- Fake event pump is controlled by the test and uses tiny env values or fake timers.
+- Tests insert `messages_in`, run `runPollLoop()`, and assert `messages_out`, `processing_ack`, `session_state`, and recorded OpenCode prompts.
 
-Do not use a canned `ScriptedProvider` for these incident replays. These tests must exercise `OpenCodeProvider`, the pump, poll-loop notice handling, scoped recovery state, and continuation retention together.
+Do not use a canned `ScriptedProvider` for these incident replays. These tests must exercise `OpenCodeProvider`, pump outcomes, poll-loop notice handling, scoped recovery state, and continuation retention together.
 
-- [ ] **Step 2: Replay Dvora 5/19 long work**
+- [ ] **Step 2: Replay Dvora's 5/19 long-work continuation**
 
-Insert the prior outbound context exactly:
+Use the observed Dvora text exactly where it is known:
 
 ```text
 Found the 5/19 recording on Drive (2.56 GB). Last summary is 5/12, so 5/19 is the next one. Downloading now.
 ```
 
-Insert the exact user follow-up:
-
 ```text
 Great. Now do the 5/19 summary.
 ```
 
-Harness events:
+Harness sequence:
 
-- `init`/prompt starts session `ses_1a1e72ac7ffe3Ek8fJOiz1Y0lT`.
-- Emit `server.heartbeat` events across more than `OPENCODE_INACTIVITY_NOTICE_MS`.
-- Emit a meaningful assistant text part with `5/19 summary complete`.
-- Emit `session.idle`.
+- Seed OpenCode session `ses_1a1e72ac7ffe3Ek8fJOiz1Y0lT` as the preserved continuation and include the exact prior Yente progress text in the fake session history. Do not rely on an inserted `messages_out` row to become prompt context unless the code explicitly reads it.
+- Inject a pending Dvora trigger that represents the long recording workflow; if the historical inbound wording is recoverable from logs, use it exactly. Otherwise use a test-only wording and assert the exact observed progress and follow-up text.
+- Emit keepalives/wait ticks beyond `OPENCODE_INACTIVITY_NOTICE_MS`.
+- Assert a soft notice is sent instead of `Error: OpenCode event timeout`.
+- While the query is still active, insert the exact follow-up `Great. Now do the 5/19 summary.` and let `pollFollowups()` enqueue it.
+- Emit `session.idle` for the first turn, then assert the provider accepts the queued follow-up using the same continuation.
+- Emit assistant text containing `5/19 summary complete` and `session.idle`.
 
 Assertions:
 
-- The inbound user row is completed.
 - No outbound message contains `Error: OpenCode event timeout`.
-- At least one outbound notice explains preserved state if no prior user-visible result was sent during the wait.
-- `continuation:opencode` remains `ses_1a1e72ac7ffe3Ek8fJOiz1Y0lT`.
+- Continuation remains `ses_1a1e72ac7ffe3Ek8fJOiz1Y0lT`.
+- Both injected user rows are completed.
 - The final user-visible output contains `5/19 summary complete`.
-- The harness proves the provider yielded `activity` for heartbeats before the soft notice.
+- The harness proves heartbeats/wait ticks yielded activity before the soft notice so host sweep would not kill the container.
 
-- [ ] **Step 3: Replay Fruma Gmail draft native question**
+- [ ] **Step 3: Replay Fruma's Gmail draft native-question stall and recovery**
 
-Insert the exact user prompt:
+Insert the exact prompt:
 
 ```text
 Actually create a draft in my gmail
@@ -741,8 +609,8 @@ Actually create a draft in my gmail
 First harness turn:
 
 - Prompt starts/resumes session `ses_1a47da93effeJdpKh0oiDUOP2Q`.
-- Emit `question.asked` for the active session with text asking for Matt Van Horn's email address.
-- Assert `client.question.reject()` was called.
+- Emit a `message.part.updated` question tool part for the active session asking for Matt Van Horn's email address and including a cancellable permission id.
+- Assert `postSessionIdPermissionsPermissionId(...)` was called with the deny/reject response required by SDK 1.15.10.
 - Provider emits a visible native-question notice and returns.
 
 Then insert the user's answer:
@@ -751,28 +619,42 @@ Then insert the user's answer:
 Matt Van Horn's email is matt@example.com.
 ```
 
-Second harness turn assertions before returning a result:
+Second harness turn assertions:
 
 - `input.continuation` is still `ses_1a47da93effeJdpKh0oiDUOP2Q`.
 - The prompt contains escaped recovery context saying the native question was blocked/rejected.
 - The prompt contains the exact user answer.
+- Before final assistant text, the fake OpenCode stream emits a tool part whose command/tool call is the actual GWS draft-create path, such as `gws gmail users drafts create ...` or the current GWS MCP equivalent. The test fails if no draft-create tool event occurs before the final result.
 
-Second harness emits assistant text `Draft created in Gmail.` and `session.idle`.
+Second harness result:
 
-Final assertions:
+- Emit assistant text `Draft created in Gmail.` and `session.idle`.
+- Assert no raw OpenCode timeout appears.
+- Assert both user rows are completed.
+- Assert final output contains `Draft created in Gmail.`
+- Assert recovery rows for the Fruma scope are deleted after the second top-level query yields `init`.
 
-- No raw OpenCode timeout appears.
-- Both user rows are completed.
-- Final output contains `Draft created in Gmail.`
-- Recovery notice rows for the Fruma scope are deleted after the second prompt is accepted.
+- [ ] **Step 4: Replay direct no-SSE transport failure and successful continuation**
 
-- [ ] **Step 4: Replay direct no-SSE transport failure**
+Use a distinct message such as:
 
-Add a third replay using a different exact chat message like `status please`:
+```text
+status please
+```
+
+Harness sequence:
 
 - Prompt starts with a known continuation.
-- The event stream produces no SSE events until `OPENCODE_TRANSPORT_TIMEOUT_MS`.
-- Assert a terminal transport notice is sent, the initial batch completes, continuation is preserved, and the next injected `continue` message receives the scoped recovery context.
+- The pump yields only `wait-tick` activity until `OPENCODE_TRANSPORT_TIMEOUT_MS`, then `transport-timeout`.
+- Assert a terminal transport notice is sent, the initial batch completes, continuation is preserved, and scoped recovery context is stored.
+- Insert `continue`.
+- Assert the next top-level prompt receives escaped recovery context and then emits assistant text `continued after transport pause` plus `session.idle`.
+
+Assertions:
+
+- The second user-visible result is delivered.
+- Recovery context is deleted after the resumed prompt is accepted.
+- No `OpenCode event timeout (...)` string leaks to Discord/Yente output.
 
 - [ ] **Step 5: Run replay tests red**
 
@@ -818,7 +700,7 @@ git commit -m "test: replay yente opencode incidents"
 - Modify: `src/claude-md-compose.ts`
 - Create: `src/claude-md-compose.test.ts`
 
-- [ ] **Step 1: Write failing tests**
+- [ ] **Step 1: Identify or write the failing tests**
 
 In `agent-mcp-config.test.ts`, add:
 
@@ -826,18 +708,18 @@ In `agent-mcp-config.test.ts`, add:
 - A non-Granola bridge defaults to `required: true` when omitted.
 - Explicit `required: true` and `required: false` are preserved.
 
-In `container-runner.test.ts`, add tests that:
+In `container-runner.test.ts`, add:
 
 - An unavailable optional Granola bridge still spawns the container.
 - `container.json` excludes the failed bridge from `mcpServers` and `agentMcpAllowedTools`.
 - `container.json.agentMcpUnavailable.granola.category` is `auth_required`.
-- The generated agent-facing text does not contain raw host paths, uid/gid values, or the raw thrown error.
+- Generated agent-facing text does not contain raw host paths, uid/gid values, or raw thrown errors.
 - A required bridge failure still fails closed and stops already-started bridges.
-- Mount overlap rejection still considers the Granola auth directory even when bridge startup failed before returning an `AgentMcpBridge`.
+- Mount overlap rejection still considers the Granola auth directory even when bridge startup failed.
 
 In `claude-md-compose.test.ts`, assert unavailable-MCP fragments say the bridge is unavailable and tools should not be called, using only sanitized category text.
 
-- [ ] **Step 2: Run tests red**
+- [ ] **Step 2: Run tests to verify they fail**
 
 Run:
 
@@ -850,7 +732,7 @@ Expected: FAIL.
 
 - [ ] **Step 3: Implement narrow bridge optionality**
 
-In `agent-mcp-config.ts`, extend the type:
+In `agent-mcp-config.ts`, add requiredness:
 
 ```typescript
 export type AgentMcpBridgeConfig = {
@@ -865,40 +747,24 @@ export type AgentMcpBridgeConfig = {
 Parse with:
 
 ```typescript
-const required =
-  typeof bridge.required === 'boolean' ? bridge.required : serverName !== 'granola';
+const required = typeof bridge.required === 'boolean' ? bridge.required : serverName !== 'granola';
 ```
 
-Keep `validateMergedConfig()` strict: configured `allowedTools` still must match configured bridge servers. Runtime filtering happens after availability is known.
+Keep static config validation strict; runtime filtering happens after availability is known.
 
 - [ ] **Step 4: Sanitize unavailable bridge reasons**
 
-In `container-runner.ts`, convert raw startup errors to categories:
+Map raw startup errors to:
 
 ```typescript
 type AgentMcpUnavailableCategory = 'auth_required' | 'startup_failed';
-
-function classifyBridgeStartupFailure(err: unknown): AgentMcpUnavailableCategory {
-  const message = err instanceof Error ? err.message : String(err);
-  return /auth required/i.test(message) ? 'auth_required' : 'startup_failed';
-}
 ```
 
-Persist only `{ category, updatedAt }`.
+Persist only `{ category, updatedAt }`; write raw details only to structured host logs.
 
 - [ ] **Step 5: Preserve auth mount protection for failed optional bridges**
 
-In `agent-mcp-bridge.ts`, export:
-
-```typescript
-export function agentMcpBridgeAuthDir(options: {
-  dataDir?: string;
-  agentGroupId: string;
-  serverName: string;
-}): string;
-```
-
-Use the same path resolution as `startAgentMcpBridge()`. In `attachAgentMcpBridges()`, collect auth dirs for all configured bridges before startup and pass them to `rejectAuthOverlappingMounts()` after all ordinary mounts are assembled, even if an optional bridge failed.
+Export `agentMcpBridgeAuthDir(...)` from `agent-mcp-bridge.ts` using the same path resolution as `startAgentMcpBridge()`. In `attachAgentMcpBridges()`, collect auth dirs for all configured bridges before startup and pass them to mount-overlap rejection even if an optional bridge failed.
 
 - [ ] **Step 6: Implement runtime degradation**
 
@@ -906,23 +772,13 @@ In `attachAgentMcpBridges()`:
 
 - Start bridges one at a time.
 - On required bridge failure, stop started bridges and throw.
-- On optional bridge failure, log a structured warning with raw error only in host logs, store sanitized unavailable state, and continue.
-- Call `syncAgentMcpRuntimeConfig()` with started bridges, active allowed tools, and unavailable map.
+- On optional bridge failure, log a structured warning, store sanitized unavailable state, and continue.
+- Sync runtime config with only started bridges and active allowed tools.
 - Filter allowed tools to `mcp__${startedBridge.serverName}__*`.
-- Remove stale unavailable entries when a bridge later starts successfully.
-- Re-compose `CLAUDE.md` after runtime MCP state is written and before mounts are finalized.
+- Remove stale unavailable entries when a bridge later starts.
+- Recompose `CLAUDE.md` after runtime MCP state is written.
 
-In `claude-md-compose.ts`, add a fragment like:
-
-```markdown
-## Unavailable MCP bridge: granola
-
-The `granola` MCP bridge is unavailable for this container run (`auth_required`).
-
-Do not call `mcp__granola__*` tools. If the user asks for Granola-backed work, say Granola is currently unavailable and continue with any non-Granola work you can do.
-```
-
-- [ ] **Step 7: Run targeted tests green**
+- [ ] **Step 7: Run targeted tests**
 
 Run:
 
@@ -962,19 +818,19 @@ git fetch origin
 git worktree add .worktrees/yente-timeout-audit-hardening -b hardening/yente-timeout-audit-hardening origin/main
 ```
 
-Expected: worktree created on a new branch.
+Expected: worktree created on a new branch. Read `/home/dan/code/gws-skill/AGENTS.md` before editing if it exists.
 
-- [ ] **Step 2: Write failing audit and security tests**
+- [ ] **Step 2: Identify or write the failing audit and security tests**
 
 In `proxy_test.go`, add JSON log capture and tests for:
 
-- `gws gmail users drafts create --help` logs `request_class:"help"` and `api_effect:false`, and does not log an API-success `executed` entry.
-- `gws schema gmail users drafts create` or the repo's actual schema-probe syntax logs `request_class:"schema"` and `api_effect:false`.
+- `gws gmail users drafts create --help` logs `request_class:"help"` and `api_effect:false`, and does not log an API-success draft-create entry.
+- The repo's actual schema-probe syntax logs `request_class:"schema"` and `api_effect:false`.
 - `gws auth status` logs `request_class:"local_probe"` and `api_effect:false`.
 - `gws gmail users drafts create --subject help --body schema` remains `request_class:"api"` and still runs policy/signature/rate-limit logic.
 - `gws gmail users drafts send --body auth` is not classified as a local probe.
 
-- [ ] **Step 3: Run tests red**
+- [ ] **Step 3: Run tests to verify they fail**
 
 Run:
 
@@ -1000,31 +856,24 @@ const (
 )
 ```
 
-Implement classification over command structure only:
+Classify command structure only:
 
-- Treat top-level `--help`, `-h`, `help`, `--version`, and `version` as non-API.
-- Treat `auth status` and `auth list` as `local_probe`; do not treat arbitrary flag values containing `auth` as local probes.
-- Treat schema commands only when `schema` appears in the positional command prefix before flags according to the actual GWS CLI syntax.
-- Treat `--help` and `-h` as help flags wherever they appear as flags, but do not inspect the value after flags such as `--subject help`.
-- Return `api` for everything else.
-
-Use the classifier before audit logging:
-
-```go
-requestClass := classifyInvocation(req.Args)
-apiEffect := requestClass == InvocationAPI
-```
+- Top-level `--help`, `-h`, `help`, `--version`, and `version` are non-API.
+- `auth status` and `auth list` are local probes.
+- Schema commands are schema only when `schema` appears in the positional command prefix before flags according to the actual GWS CLI syntax.
+- `--help` and `-h` are help flags wherever they appear as flags, but flag values such as `--subject help` do not affect classification.
+- Everything else is `api`.
 
 For non-API classes:
 
 - Keep HTTP bearer authentication.
 - Execute `gws` so real help/schema/status output is returned.
-- Skip mutation policy checks, signature injection, and send/calendar rate limiting only because the structural classifier proved the command is non-API.
-- Log completion as `local_cli_executed` or `executed` with `api_effect:false`; tests must pin the chosen name.
+- Skip mutation policy checks, signature injection, and send/calendar rate limiting only after structural classification proves the command is non-API.
+- Log completion with `request_class` and `api_effect:false`.
 
-For `api` class, keep existing policy, ownership, signature, rate-limit, execution, and audit behavior, while adding `request_class:"api"` and `api_effect:true`.
+For API class, preserve existing policy/signature/rate-limit/execution behavior while adding `request_class:"api"` and `api_effect:true`.
 
-- [ ] **Step 5: Run GWS tests green**
+- [ ] **Step 5: Run GWS tests**
 
 Run:
 
@@ -1053,12 +902,13 @@ git commit -m "fix: classify gws local probe audit logs"
 Update `docs/agent-runner-details.md`:
 
 - Add `notice` event semantics.
-- State that OpenCode inactivity is recoverable and does not clear continuation.
-- State that heartbeat events refresh host liveness but are not meaningful progress.
-- State that transport death/stream errors/absolute timeout are terminal for the current query but preserve continuation and recovery context.
-- State that native OpenCode `question` is rejected because Yente uses Discord/messages/MCP interaction paths.
+- State that soft OpenCode inactivity is recoverable, visible, non-terminal, and does not clear continuation.
+- State that heartbeat/wait ticks refresh host liveness but are not meaningful progress.
+- State that transport death, stream errors, queue overflow, and absolute timeout are terminal for the current query but preserve user-facing recovery context.
+- State that native OpenCode question is disabled and denied because Yente uses Discord/messages/MCP interaction paths.
 - State that `ProviderEvent.error` retryable/non-retryable behavior is explicit.
-- Document scoped recovery context and deletion-after-acceptance semantics.
+- Document scoped recovery context and top-level deletion-after-`init` semantics.
+- Document that OpenCode tool state can widen host-sweep tolerance for declared timeouts, including overlapping tool tracking.
 
 - [ ] **Step 2: Verify docs references**
 
@@ -1066,7 +916,7 @@ Run:
 
 ```bash
 cd /home/dan/code/nanoclaw/.worktrees/yente-opencode-timeout-hardening
-rg -n "OpenCode event timeout|event timeout|ProviderEvent|progress|notice|agentMcpUnavailable|container_state" docs container src
+rg -n "OpenCode event timeout|event timeout|ProviderEvent|progress|notice|agentMcpUnavailable|container_state|question" docs container src
 ```
 
 Expected:
@@ -1074,6 +924,7 @@ Expected:
 - No docs claim OpenCode event timeout is stale-session behavior.
 - `ProviderEvent` docs include `notice`.
 - `container_state` docs no longer imply only Claude/Bash can widen long-tool tolerance.
+- OpenCode native question docs describe SDK 1.15.10-compatible tool/permission handling, not nonexistent `client.question` APIs.
 
 - [ ] **Step 3: Commit docs**
 
@@ -1126,14 +977,15 @@ Run:
 
 ```bash
 cd /home/dan/code/nanoclaw/.worktrees/yente-opencode-timeout-hardening
-rg -n "event timeout|OpenCode event timeout|destroySharedRuntime\\(|clearContinuation\\(|isSessionInvalid|ECONNRESET|connection reset|\\b404\\b" container/agent-runner/src src docs
+rg -n "client\\.question|question\\.asked|event timeout|OpenCode event timeout|destroySharedRuntime\\(|clearContinuation\\(|isSessionInvalid|ECONNRESET|connection reset|\\b404\\b" container/agent-runner/src src docs
 ```
 
 Expected:
 
+- No production code references nonexistent `client.question` or `question.asked`.
 - Any remaining `OpenCode event timeout` string is in tests asserting it is not stale or not leaked.
 - No OpenCode inactivity path calls `clearContinuation`.
-- `destroySharedRuntime()` is used for abort, explicit runtime replacement, transport death, stream death, or absolute timeout only.
+- Runtime destruction is used for abort, explicit runtime replacement, transport death, stream death, queue overflow, non-cancellable native question, or absolute timeout only.
 - Generic transport/status substrings are not stale-session patterns.
 
 - [ ] **Step 8: Commit verification fixes if needed**
@@ -1150,13 +1002,15 @@ git commit -m "fix: address hardening verification findings"
 
 The implementation is complete only when all of these are true:
 
-- Dvora replay with the exact 5/19 Drive-recording wording is injected through NanoClaw's session DB, runs through `runPollLoop()` plus the real `OpenCodeProvider`, produces no raw timeout error, preserves continuation, and ultimately delivers the summary result.
-- Fruma replay with `Actually create a draft in my gmail` is injected through the same path, rejects the native OpenCode question without waiting five minutes, preserves continuation, accepts the follow-up email answer, and ultimately delivers `Draft created in Gmail.`
-- Direct no-SSE transport failure is visible to the user as a recoverable notice, preserves continuation, stores scoped recovery context, and does not leak `OpenCode event timeout (...)`.
-- OpenCode soft inactivity yields `activity` plus a structured notice, keeps the runtime/session alive, and continues waiting for eventual `session.idle`.
-- Heartbeat-only OpenCode streams keep host liveness fresh without counting as meaningful progress.
-- Native OpenCode `question.asked`, question tool parts, and question permission paths cannot leave OpenCode blocked on a TUI-native question.
-- Recovery notices are route-scoped, XML-escaped, non-destructive until prompt acceptance, and not consumed by another conversation.
+- Dvora replay uses the exact observed `Found the 5/19 recording...` progress text and exact `Great. Now do the 5/19 summary.` follow-up through NanoClaw's session DB and real `OpenCodeProvider`, produces no raw timeout error, preserves usable continuation, and ultimately delivers the summary result.
+- Fruma replay uses the exact `Actually create a draft in my gmail` prompt, denies the native OpenCode question without waiting five minutes, preserves continuation when denial succeeds, accepts the follow-up email answer, proves a GWS draft-create tool/command event occurred, and ultimately delivers `Draft created in Gmail.`
+- Direct no-SSE transport failure is visible as a recoverable notice, preserves user-facing recovery context, keeps host liveness alive until the configured transport timeout, accepts a later `continue`, and delivers a final result.
+- OpenCode soft inactivity yields activity plus a structured notice, keeps the runtime/session alive, and continues waiting for eventual `session.idle`.
+- Heartbeat-only and no-SSE wait periods keep host liveness fresh without counting as meaningful progress.
+- Native OpenCode question tool parts and permission paths cannot leave OpenCode blocked on a TUI-native question; non-cancellable cases restart OpenCode with recovery context instead of falsely promising same-session continuation.
+- Recovery notices are route-scoped, XML-escaped, non-destructive until top-level prompt `init`, and not consumed by follow-up pushes or another conversation.
+- OpenCode stale-session classification is limited to exact missing-session cases and cannot be triggered by generic transport failures.
+- Overlapping OpenCode tool parts cannot clear long-tool host-sweep protection while a longer tool remains active.
 - Optional Granola MCP auth failure does not block container spawn; required bridge failure still fails closed; failed optional bridge auth dirs remain protected from mounts.
 - GWS help/schema/local-probe commands are logged with `api_effect=false`, structural classification cannot be triggered by flag values, and real API commands still go through policy/signature/rate limits.
-- NanoClaw and GWS changes are committed in their respective repos, and all verification commands in Task 7 pass.
+- NanoClaw and GWS changes are committed in their respective repos, and every verification command in Task 7 passes.
