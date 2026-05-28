@@ -4,7 +4,7 @@
 
 **Goal:** Yente must survive slow OpenCode work, OpenCode inactivity/transport failures, native OpenCode question stalls, optional Granola credential failures, and misleading GWS probe audit logs without losing user state; the observed Dvora and Fruma failures must be replayed by injecting the same requests into local Yente and proving they ultimately succeed.
 
-**Architecture:** Tool/proxy boundaries durably record external side effects into an append-only workspace ledger before returning success; the runner and host import that ledger into outbound DB recovery state. Providers emit typed activity, prompt acceptance, side-effect references, continuation, and interruption facts, but the poll loop owns route-scoped recovery, row lifecycle, Yente-authored relays, and fallback notices. OpenCode gets a single-reader SDK 1.15.10-compatible event pump, exact stale-session classification, a separate restricted relay runtime for status messages, SDK-surface probing for native questions, and explicit continuation policy.
+**Architecture:** Tool/proxy boundaries stage side-effect evidence before returning success, but only validated imports into outbound DB recovery state are authoritative. Providers emit typed activity, prompt acceptance, side-effect references, continuation, and interruption facts, but the poll loop owns route-scoped recovery, row lifecycle, Yente-authored relays, and fallback notices. OpenCode gets a single-reader SDK 1.15.10-compatible event pump, exact stale-session classification, a separate restricted relay runtime for status messages, SDK-surface probing for native questions, route-locked status output, and explicit continuation policy.
 
 **Tech Stack:** TypeScript, Bun tests for `container/agent-runner`, Vitest for host-side NanoClaw, Go tests for `gws-skill`, Python/pytest for `summarize-dnd`, SQLite session state, OpenCode SDK 1.15.10 event stream.
 
@@ -18,13 +18,17 @@ This work intentionally spans three repositories because the user's request incl
 - GWS audit-log work happens in a new `/home/dan/code/gws-skill/.worktrees/yente-timeout-audit-hardening` worktree.
 - Dvora summary side-effect marker work happens in a new `/home/dan/code/summarize-dnd/.worktrees/nanoclaw-side-effect-ledger` worktree.
 - Do not mutate the live `shapiroserver2` host or run production deploys.
-- The required "inject requests into Yente" validation is local: insert `messages_in` rows, run `runPollLoop()`, use the real `OpenCodeProvider` against a deterministic OpenCode runtime harness, route Fruma through a local GWS shim/proxy boundary or equivalent repo-native command boundary, and assert `messages_out`, `processing_ack`, `session_state`, `container_state`, provider events, audit records, and durable tool-side effects.
+- The required "inject requests into Yente" validation is local: insert `messages_in` rows, run `runPollLoop()`, use the real `OpenCodeProvider` against a deterministic OpenCode runtime harness whose events match probed SDK fixtures, route Fruma through a local GWS shim/proxy boundary or equivalent repo-native command boundary, and assert `messages_out`, `processing_ack`, `session_state`, `container_state`, provider events, audit records, and validated tool-side effects.
 - Do not create a separate test-plan artifact. The executable replay and failure-mode requirements below are implemented as automated tests in the implementation tasks.
-- Work that does not reach `/exec`, such as `gws auth status`, is not part of the GWS proxy audit fix. Optional local shim audit logging was filed as later work.
+- GWS audit hardening covers observed probe classes that reach `/exec`: help/version probes, schema/introspection probes, and local validation/dry-run probes. Work that does not reach `/exec`, such as `gws auth status`, remains outside the GWS proxy audit fix.
 
 ## Non-Negotiable Acceptance Contracts
 
 A fresh readiness review should start here. The implementation details below may change during execution, but these contracts must not be weakened, replaced by synthetic provider-only checks, or satisfied by assistant text that is not backed by provider events, row lifecycle, recovery state, and tool-side evidence.
+
+### Replay Integrity Contract
+
+Incident replay tests may replace network/model calls with a deterministic runtime, but they must not replace the NanoClaw state machine with a scripted success provider. Final success text is not accepted unless the test has also observed the real `OpenCodeProvider` consume probed SDK-shaped events, emit matching `input-accepted` and input-resolution facts, cross the GWS or Dvora tool boundary, import validated side-effect evidence, preserve route-scoped row lifecycle, and resolve recovery through `runPollLoop()`.
 
 ### Dvora Replay Contract
 
@@ -60,7 +64,7 @@ Actually create a draft in my gmail
 
 - The replay uses session `ses_1a47da93effeJdpKh0oiDUOP2Q`.
 - Before replaying the prompt, search/recover the prior Fruma conversation context that made "Actually create a draft in my gmail" refer to Matt Van Horn. If unavailable, record the evidence boundary in the fixture and provide the minimal context that establishes Matt Van Horn as the intended recipient.
-- The observed GWS help probe occurs before draft creation: `gws gmail users drafts create --help`, which previously produced misleading audit records.
+- The observed GWS help probe occurs before draft creation: `gws gmail users drafts create --help`, which previously produced misleading audit records. If the recovered/probed Fruma path also performs schema/introspection or local validation probes through `/exec`, those probes are included and classified as non-API effects.
 - The replay must cross a local GWS shim/proxy boundary, or an equivalent repo-native command boundary that writes the same audit records. Fabricated provider side-effect events alone are insufficient.
 - Native OpenCode question handling is modeled from a checked SDK surface. The OpenCode implementation task must probe the active root/v2 SDK event and client APIs; production code must handle whichever real event surface is available and statically guard only invented or still-unhandled assumptions. Existing evidence suggests `message.part.updated` carries a `ToolPart.callID` or equivalent part id, while `permission.updated` carries `Permission.callID` and `Permission.id` where available, but the tests must be driven by the probe result instead of a hard-coded belief that `client.question` cannot exist.
 - Yente visibly asks for Matt Van Horn's email before the test injects the answer. The test must fail if the answer is injected before a visible Yente question exists.
@@ -75,16 +79,20 @@ The previous 300s no-meaningful-event condition is a user-visible liveness momen
 - The original OpenCode turn's event stream continues to be read while the relay is running. Relay DB writes are serialized through the poll-loop DB transaction queue and can only append relay attempts or user-visible status output.
 - If the separate relay runtime cannot start, accept the relay prompt, or finish before its deadline, the poll loop sends one sanitized direct fallback and keeps the original turn/recovery state intact.
 - Terminal interruptions such as transport timeout, native-question deadlock, stream end, queue overflow, startup timeout, or prompt-acceptance timeout create a recoverable pause. Because the original turn is no longer usable at that point, the next Yente turn receives the recovery payload as a normal top-level prompt before any direct fallback is sent.
+- Every terminal interruption path must produce either a Yente-authored recovery message or, if recovery query startup/acceptance misses its bounded deadline, one sanitized direct fallback. No terminal path may leave the user unaware that they need to continue or retry.
 
 The implementation must not queue a message into the same busy OpenCode turn and wait for that turn to process it before the user sees anything.
 
 ### Side-Effect And External-Failure Contract
 
-Completed side effects before final assistant output are recovery facts. Gmail draft creation and Dvora summary artifact creation must be recorded at a production data path before the tool returns success to OpenCode:
+Completed side effects before final assistant output are recovery facts. Gmail draft creation and Dvora summary artifact creation must be staged before the tool returns success to OpenCode, then validated into outbound DB before recovery uses them:
 
-- GWS draft creation: the GWS proxy classifies the request and returns audit metadata headers; the NanoClaw `container/shim/gws` writes a sanitized `gmail_draft_created` JSONL ledger entry to `/workspace/side-effects.jsonl` after a successful API-effect response and before printing success to OpenCode.
-- Dvora summary artifact creation: `summarize-dnd` writes a sanitized `dvora_summary_artifact` JSONL ledger entry to `NANOCLAW_SIDE_EFFECT_LEDGER` immediately after writing the summary output files and before returning the stage/full-run success payload.
-- NanoClaw imports the JSONL ledger into an idempotent outbound DB `side_effect_ledger` table during normal provider polling, before recovery writes, and from the host only after the container is verified stopped.
+- NanoClaw sets `NANOCLAW_SIDE_EFFECT_LEDGER=/workspace/side-effects.jsonl`, `NANOCLAW_ACTIVE_INPUT_ID`, and `NANOCLAW_ROUTE_KEY` for the OpenCode/Yente runtime and child tool environment. The host-side path for the same file is derived from `sessionDir(agentGroupId, sessionId)/side-effects.jsonl`; host recovery never imports using the container literal path.
+- GWS draft creation: the GWS proxy classifies the request and returns signed or audit-log-verifiable metadata headers; the NanoClaw `container/shim/gws` writes a sanitized `gmail_draft_created` JSONL entry only after a successful API-effect response and before printing success to OpenCode.
+- Dvora summary artifact creation: `summarize-dnd` writes a sanitized `dvora_summary_artifact` JSONL entry to `NANOCLAW_SIDE_EFFECT_LEDGER` immediately after writing the summary output files and before returning the stage/full-run success payload.
+- NanoClaw treats workspace JSONL as a staging channel, not as authoritative truth. Import validates GWS entries against proxy-signed/audit metadata and validates Dvora entries against actual artifact files under allowed output roots, then writes idempotent outbound DB `side_effect_ledger` rows during normal provider polling before recovery writes, or from the host only after the container is verified stopped.
+- Side-effect recovery kind is separate from GWS `api_effect`. `api_effect` only describes whether a GWS invocation could mutate Google APIs; recovery uses durable kinds such as `gmail_draft_created`, `dvora_recording_cached`, and `dvora_summary_artifact` with operation-specific evidence and replay policy.
+- If an external mutation or artifact write succeeds but the staging ledger append or validation import fails, the tool must not print ordinary success. It returns a structured partial-success/recoverable error with safe evidence, emits structured JSONL, and relies on proxy audit or artifact scan fallback so recovery can tell Yente what already happened without duplicating it.
 
 Provider-observed tool events may reference or enrich these entries but are not the sole source of truth. Terminal failure after a side effect but before final output, host-sweep kill/reset, container crash, provider startup failure, session creation failure, prompt-acceptance failure, and pre-query failure after row claim must all produce durable route-scoped recovery or a user-visible fallback without raw provider errors.
 
@@ -106,8 +114,8 @@ Provider code emits typed facts only. The poll loop owns route-scoped recovery, 
 | Recovery-owned acks | Poll loop plus host sync | Store `processing_ack.status='recovery'` and recovery payload updates in one atomic transaction. Host wake/sync excludes recovery-owned rows from due counts and preserves them on sweep/startup; only `processing` acks are reset as orphan claims. |
 | Inactivity notices | Provider fact, poll-loop action | Provider reports liveness metadata including configured timeout, elapsed time, last event type, and last meaningful-event timestamp; poll loop relays through a separate restricted Yente runtime or sends one sanitized direct fallback without clearing continuation by heuristic. |
 | Continuation clearing | Provider fact, poll-loop storage | Clear only on exact attempted-session missing proof or explicit provider `clear-continuation`; transport errors, bare `404`, `ECONNRESET`, stream end, and event timeout text are not proof. |
-| Side effects | Tool/proxy boundary plus provider fact | Persist sanitized evidence into `/workspace/side-effects.jsonl` before returning external success; import it into outbound DB `side_effect_ledger` before recovery writes. Provider side-effect events reference or enrich that ledger. Retry prompts must tell Yente what already happened and tests must fail on duplicate draft/summary creation. |
-| Recovery relay turns | Poll loop plus separate relay provider | Run only through a separate restricted OpenCode runtime with its own client, event pump, session id, deadline, and status-only MCP allowlist. Relay turns never use the original busy session, never resolve original input rows, and never mutate external systems. Providers without separate-runtime relay support keep the original long turn running and use one direct sanitized fallback after relay setup/deadline failure. |
+| Side effects | Tool/proxy boundary plus validated import | Stage sanitized evidence into `/workspace/side-effects.jsonl` before returning external success, then validate and import it into outbound DB `side_effect_ledger` before recovery writes. Provider side-effect events reference or enrich imported rows only. Retry prompts must tell Yente what already happened and tests must fail on duplicate draft/summary creation. |
+| Recovery relay turns | Poll loop plus separate relay provider | Run only through a separate restricted OpenCode runtime with its own client, event pump, session id, deadline, route-locked `send_message`, status-only MCP allowlist, and native OpenCode mutation/shell tools disabled. Relay turns never use the original busy session, never resolve original input rows, and never mutate external systems. Providers without separate-runtime relay support keep the original long turn running and use one direct sanitized fallback after relay setup/deadline failure. |
 
 The central design rule is ownership separation:
 
@@ -115,24 +123,26 @@ The central design rule is ownership separation:
 - The poll loop owns recovery context. It builds recovery from raw wake rows, route-scoped follow-ups, user-visible progress rows written during the accepted-input window, MCP `send_message` outputs, side-effect ledger entries, provider interruption metadata, and safe tool state.
 - Recovery is not consumed when the provider merely accepts a prompt. It is marked `in_flight` for that `inputId` and resolved only after a successful provider result resolves/supersedes the exact input ids. If the recovery attempt fails, hangs, is interrupted, or the container dies, the original recovery payload remains available and may be enriched, not deleted.
 - Unresolved recovery entries are never pruned by count. Pruning may apply only to entries already `resolved` or `superseded`; pressure from too many unresolved entries must fail closed with structured alerts and user-visible fallback rather than discard state.
-- Host recovery writes obey the existing single-writer invariant for outbound DB. The host may open outbound DB writable for recovery only after it has verified that the container is exited or killed and no runner process can still write the DB.
-- Route identity uses host-stamped messaging metadata, not inference from nullable thread ids. The host writes `messaging_group_id` and `is_group` into `session_routing` and `messages_in`; the container normalizer may collapse null-thread/threaded aliases only when that host data proves the route is a DM/non-group conversation.
+- Host recovery writes obey the existing single-writer invariant for outbound DB. The host may open outbound DB writable for recovery only after it has verified that the container is exited or killed and no runner process can still write the DB. Sweep/startup recovery imports side effects and writes recovery/fallback before any fresh container wake for the same session.
+- Route identity uses host-stamped messaging metadata, not inference from nullable thread ids. The router/session-manager path writes `messaging_group_id` and `is_group` into `session_routing`, `messages_in`, and route-bearing `messages_out`; the container normalizer may collapse null-thread/threaded aliases only when that host data proves the route is a DM/non-group conversation.
 
 ## Hard Invariants
 
 - Native-question handling must be based on a checked active SDK surface, not an assumption that a root/v2 API is absent. Add an SDK compatibility probe that records whether native questions appear as `message.part.updated`/`permission.updated`, `client.question` helpers, `question.*` events, or another exported surface. Implement the real surface in production and statically guard only fake or still-unhandled surfaces.
 - `buildOpenCodeConfig()` must disable the native question tool through OpenCode tool availability, not only through `permission.question`.
+- Relay-mode `buildOpenCodeConfig()` must disable OpenCode native shell/filesystem/edit/web/mutation/question tools as well as MCP mutation tools. The only write tool available to relay mode is a NanoClaw `send_message` variant locked to the original normalized route.
 - `buildOpenCodeConfig()` must raise or disable OpenCode's model-provider request timeout for long Yente turns, for example via `provider.options.timeout`, so NanoClaw's liveness pump is not undercut by a hidden 5-minute provider request timeout. Tests must assert the generated config.
 - OpenCode inactivity, transport errors, bare `404`, `ECONNRESET`, stream end, queue overflow, and "event timeout" text are not stale-session proof. Continuation is cleared only on exact missing-session evidence for the attempted continuation or an explicit provider `clear-continuation` event.
 - Transport timeout preserves continuation unless exact attempted-session missing evidence or an explicit provider `clear-continuation` event is observed.
 - The previous 300s "meaningful event" watchdog becomes a non-terminal inactivity notice, not a raw error and not stale-session handling. On each throttled inactivity notice, the poll loop attempts a bounded Yente-authored status relay only through a separate restricted relay runtime. Relay failure or deadline expiry sends one sanitized direct fallback while the original long turn continues; it does not settle, hide, or clear the original work.
-- No-SSE and heartbeat-only long work must remain state-preserving for longer than the observed Dvora gap. Default no-SSE transport death must be at least 30 minutes, and wait ticks/keepalives must refresh host heartbeat before host sweep can kill the container. The absolute turn ceiling remains bounded and cannot be extended by declared tool timeouts.
+- No-SSE and heartbeat-only long work must remain state-preserving for longer than the observed Dvora gap. Default no-SSE transport death must be at least 30 minutes when no bounded long tool is active; a declared active long tool may continue through wait ticks up to its capped timeout and the absolute turn ceiling. Wait ticks/keepalives must refresh host heartbeat before host sweep can kill the container.
 - Declared tool timeouts are capped by `min(OPENCODE_LONG_TOOL_TIMEOUT_MAX_MS, OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS - elapsedTurnMs - safetyMarginMs)`. A tool cannot widen host-sweep tolerance beyond the configured hard ceiling.
 - Provider events related to a turn must include `inputId` or an explicit correlation to the active input ledger. Top-level prompts and follow-up pushes are considered accepted only after the provider emits `input-accepted` for the matching id. Results must resolve or supersede exact input ids unless the poll loop has a provable one-active-input mapping. All provider implementations and tests must be updated: Claude, Codex, OpenCode, Mock, provider push tests, factory tests where needed, and poll-loop scripted test providers.
 - Provider `error` events cannot be log-only. Remove them from the normal provider event contract or classify them as terminal recoverable interruptions with input correlation, recovery metadata, continuation policy, and fallback handling.
 - User rows are completed only after the accepted input is resolved by a successful provider result or explicit supersession. Accepted-but-unresolved inputs that hit a terminal interruption move into recovery ownership and must not disappear merely because the SDK accepted them.
 - Unaccepted follow-ups have one defined lifecycle. Route-matched unaccepted follow-ups are returned to pending by deleting only transient `processing_ack.status='processing'` rows. Other-route unaccepted rows are always returned to pending and never included in the active route's recovery payload.
 - Accepted-but-unresolved rows use a durable recovery ack/ledger state so they stay hidden from normal pending scans while recovery owns them. They are marked completed only when the recovery attempt succeeds.
+- `processing_ack.status='failed'` is not a recoverable-interruption state. It is reserved for rows with an already-written user-visible terminal fallback and no resumable work; host sync must not silently complete a failed ack that lacks that notice proof.
 - Moving rows into recovery ownership and appending/enriching the recovery payload must be one atomic database transaction. Crash-point tests must prove no accepted row can be stranded without either recovery state or pending visibility.
 - Malformed recovery cleanup is non-destructive for owned work. Before deleting malformed payload JSON, reconstruct from recovery-owned rows and prior progress when possible; if reconstruction is impossible, return owned rows to pending or send a route-scoped fallback notice before clearing recovery ownership.
 - Initial work is split by normalized route when multiple wake-triggering routes are present. Same-route wake-triggering messages are preserved as an ordered `originalTasks` array, not collapsed into one newest task. Other routes remain pending. Accumulated `trigger=0` rows are also partitioned by normalized route before prompt formatting and recovery.
@@ -140,11 +150,12 @@ The central design rule is ownership separation:
 - Recovery prompt injection is XML-escaped and happens only for a new top-level `provider.query(...)`, never for `query.push(...)`.
 - Follow-up polling is disabled or strictly route-filtered during bounded recovery relay turns so unrelated pending messages stay pending. Relay turns must not claim normal user rows; they can only read a route-scoped recovery snapshot and write relay output/attempt metadata.
 - Pre-query failures after rows are claimed are recoverable. Attachment inspection, formatting, pre-task script handling, provider startup, session creation, and prompt acceptance failures must either return unaccepted rows to pending or store route-scoped recovery before settling.
-- Host-sweep kill/reset and container-crash recovery must create a user-visible recovery path. When the host resets active processing rows for an interrupted turn, it first verifies the container is stopped, imports `/workspace/side-effects.jsonl`, then writes a scoped recovery record or a direct fallback notice with enough route and original-task context for the next Yente turn to resume.
-- Side effects that complete before final assistant output must be durable recovery facts written through the concrete JSONL/import path above. For the observed scenarios this means Gmail draft creation and Dvora summary artifact creation are recorded in `side_effect_ledger` with id/path/output evidence so recovery does not duplicate drafts or redo completed summary artifacts.
+- Host-sweep kill/reset and container-crash recovery must create a user-visible recovery path before re-wake. When the host resets active processing rows for an interrupted turn, it first verifies the container is stopped, imports the host path corresponding to `/workspace/side-effects.jsonl`, then writes a scoped recovery record or a direct fallback notice with enough route and original-task context for the next Yente turn to resume.
+- Side effects that complete before final assistant output must become durable recovery facts only after validated import. For the observed scenarios this means Gmail draft creation and Dvora summary artifact creation are recorded in `side_effect_ledger` with verified id/path/output evidence so recovery does not duplicate drafts or redo completed summary artifacts.
 - Optional MCP degradation is narrow. Only expected missing/expired credential classes for Granola, such as "auth required" or "auth expired", may degrade to unavailable optional state. Auth-directory integrity, ownership, symlink, mount-overlap, malformed config, and required bridge failures remain fail-closed.
 - Optional Granola degradation must reach the actual OpenCode prompt/system context that Yente loads, not just host-side config. Tests must assert the sanitized unavailable state appears in the runner files or system-context payload consumed by OpenCode.
-- GWS `/exec` help probes remain subject to the same authentication and admission behavior they have today. The GWS change is audit classification plus response metadata only: classify before request/completion logging, set `request_class` and `api_effect:false`, add response headers for the shim ledger, and do not log help probes as successful Gmail API mutations. Do not add schema command admission, do not change `gws auth status`, and do not bypass policy controls beyond existing behavior.
+- Optional Granola degradation tests must cover the actual bridge auth-stall/startup-abort shape: an auth-required bridge that never becomes ready within its startup deadline degrades only when the failure is categorized as missing/expired credentials, and all integrity or required-bridge failures remain fail-closed.
+- GWS `/exec` help, version, schema/introspection, and local validation/dry-run probes remain subject to the same authentication and admission behavior they have today. The GWS change is audit classification plus response metadata only: classify before request/completion logging, set `request_class` and `api_effect:false`, add response headers for the shim ledger, and do not log probes as successful Gmail API mutations. Do not add schema command admission, do not change `gws auth status`, and do not bypass policy controls beyond existing behavior.
 
 ## File Structure
 
@@ -185,6 +196,7 @@ The central design rule is ownership separation:
 - Modify `container/agent-runner/src/providers/opencode.ts`
   - Use the event pump and a runtime-controller test seam.
   - Probe, disable, and deny native OpenCode question through the real active SDK config/events/permission APIs.
+  - Build relay-mode OpenCode config with native mutation, shell, filesystem, edit, web, and question tools disabled.
   - Raise or disable OpenCode model-provider request timeout in generated config for long Yente turns.
   - Yield activity for event, keepalive, and wait ticks.
   - Yield `notice` for inactivity status relay and typed terminal `interruption` for true terminal conditions, each correlated to the active input ledger and carrying liveness metadata.
@@ -197,6 +209,7 @@ The central design rule is ownership separation:
 - Modify `container/agent-runner/src/providers/mcp-to-opencode.ts` and `container/agent-runner/src/mcp-tools/server.ts`
   - Support a relay-mode MCP allowlist that exposes only `send_message` and explicitly listed read-only status tools.
   - Deny shell, filesystem, GWS, scheduling mutation, self-modification, and external side-effect tools in relay mode.
+  - Route-lock relay `send_message` to the wake-triggering normalized route; ignore or reject any `to` argument that would leave that route.
 
 - Modify `container/agent-runner/src/db/session-state.ts`
   - Add route-scoped recovery APIs with entry status: `pending`, `in_flight`, `resolved`, `superseded`.
@@ -206,8 +219,9 @@ The central design rule is ownership separation:
   - Add explicit continuation-clear helpers that require attempted-continuation metadata.
 
 - Create `container/agent-runner/src/db/side-effects.ts`
-  - Idempotently import `/workspace/side-effects.jsonl` into outbound DB `side_effect_ledger`.
-  - Validate/sanitize known side-effect kinds: `gmail_draft_created`, `dvora_summary_artifact`, and `tool_completed`.
+  - Idempotently import staged `/workspace/side-effects.jsonl` into outbound DB `side_effect_ledger`.
+  - Validate/sanitize known side-effect kinds: `gmail_draft_created`, `dvora_recording_cached`, `dvora_summary_artifact`, and `tool_completed`.
+  - Treat JSONL entries as untrusted hints until GWS proxy metadata/signature or Dvora artifact existence/hash validation succeeds.
   - Expose query helpers for recovery prompt construction and replay tests.
 
 - Modify `container/agent-runner/src/db/messages-in.ts`
@@ -217,6 +231,7 @@ The central design rule is ownership separation:
 
 - Modify `container/agent-runner/src/db/messages-out.ts`
   - Add helpers to harvest route-scoped outbound progress rows and MCP `send_message` outputs written during the accepted-input window for recovery.
+  - Persist `input_id`, `route_key`, `messaging_group_id`, and `is_group` on route-bearing progress/relay rows so recovery can harvest only the active conversation.
 
 - Modify `container/agent-runner/src/db/connection.ts`
   - Add outbound DB `side_effect_ledger` forward-compatible schema.
@@ -228,7 +243,8 @@ The central design rule is ownership separation:
   - Add route normalization helpers or import them from a new focused module if the implementation reads cleaner.
 
 - Modify `container/shim/gws`
-  - Write successful API-effect GWS side effects into `NANOCLAW_SIDE_EFFECT_LEDGER`/`/workspace/side-effects.jsonl` after proxy success metadata is received and before stdout is returned to OpenCode.
+  - Write successful, proxy-verified API-effect GWS side effects into `NANOCLAW_SIDE_EFFECT_LEDGER`/`/workspace/side-effects.jsonl` after proxy success metadata is received and before stdout is returned to OpenCode.
+  - Include `NANOCLAW_ACTIVE_INPUT_ID` and `NANOCLAW_ROUTE_KEY` in staged records; if they are absent, stage an uncorrelated diagnostic record that cannot resolve recovery by itself.
 
 - Modify `container/agent-runner/src/poll-loop.ts`
   - Partition initial batches and accumulated `trigger=0` context by normalized route.
@@ -237,8 +253,10 @@ The central design rule is ownership separation:
   - Resolve successful provider results to exact input ids or fail closed when resolution is ambiguous.
   - Attempt bounded Yente-authored relay for non-terminal inactivity notices only when provider capabilities declare separate-runtime relay support.
   - Restrict relay mode to status/message-only behavior with mutation/side-effect tools denied.
+  - Lock relay output to the active normalized route and serialize relay DB writes with original-turn DB writes.
   - Disable or route-filter follow-up polling during relay.
   - Convert provider throws and non-retryable provider errors into sanitized recoverable interruptions.
+  - Send a Yente-authored terminal recovery message or one sanitized direct fallback when recovery startup/acceptance cannot happen by deadline.
   - Handle pre-query failures under the same recovery/ack lifecycle.
 
 - Create `container/agent-runner/src/opencode-incident-replay.test.ts`
@@ -256,22 +274,31 @@ The central design rule is ownership separation:
 ### NanoClaw Host
 
 - Modify `src/db/schema.ts`
-  - Add forward-compatible host schema columns for `messages_in.messaging_group_id`, `messages_in.is_group`, `session_routing.messaging_group_id`, and `session_routing.is_group`.
-  - Add outbound DB `side_effect_ledger` schema.
+  - Add forward-compatible host schema columns for `messages_in.messaging_group_id`, `messages_in.is_group`, `session_routing.messaging_group_id`, `session_routing.is_group`, and route metadata on outbound `messages_out`.
+  - Add outbound DB `side_effect_ledger` schema and imported-side-effect validation metadata.
 
 - Modify `src/db/session-db.ts`
   - Stamp host route metadata into inbound rows and `session_routing`.
+  - Own host-side migrations for existing session DBs; container migrations are forward-compatible readers, not the primary writer for host-owned inbound schema.
   - Add host due-count/sync helpers that exclude `processing_ack.status='recovery'` without completing or resetting those rows.
   - Add host-only recovery writer/import helpers that open outbound DB writable only after verified container exit.
 
+- Modify `src/router.ts`
+  - Pass `messaging_group_id` and `is_group` from the resolved messaging group into `writeSessionMessage()`.
+
 - Modify `src/session-manager.ts`
   - Pass `messaging_group_id` and `is_group` into session routing and inbound message writes.
+
+- Modify `src/container-config.ts` and `src/container-runner.ts`
+  - Set `NANOCLAW_SIDE_EFFECT_LEDGER=/workspace/side-effects.jsonl` in every Yente/OpenCode runtime environment.
+  - Provide the runner config plumbing that lets poll-loop/provider execution set `NANOCLAW_ACTIVE_INPUT_ID` and `NANOCLAW_ROUTE_KEY` for child tool invocations.
 
 - Modify `src/host-sweep.ts`
   - Honor bounded declared tool timeout for any provider-owned active tool.
   - Clear stale tool rows after kill/reset.
   - Preserve `processing_ack.status='recovery'` rows during wake/sync and exclude them from due counts.
-  - After verified container exit, import side-effect JSONL and write recovery records or user-visible fallback notices before resetting active processing claims when a container dies or is killed.
+  - After verified container exit, import side-effect JSONL from the host session path and write recovery records or user-visible fallback notices before resetting active processing claims when a container dies or is killed.
+  - Run crash/sweep recovery before waking a replacement container for the same session.
 
 - Modify `src/host-sweep.test.ts`
   - Add declared-timeout cap, no-SSE long-work, crash/kill recovery, and stale-tool cleanup coverage.
@@ -308,7 +335,11 @@ The central design rule is ownership separation:
 - Modify: `src/db/schema.ts`
 - Modify: `src/db/session-db.ts`
 - Modify: `src/db/session-db.test.ts`
+- Modify: `src/router.ts`
 - Modify: `src/session-manager.ts`
+- Modify: `src/container-config.ts`
+- Modify: `src/container-runner.ts`
+- Modify: `src/container-runner.test.ts`
 - Modify: `src/host-sweep.ts`
 - Modify: `src/host-sweep.test.ts`
 - Create: `container/agent-runner/src/db/side-effects.ts`
@@ -333,16 +364,20 @@ The central design rule is ownership separation:
 In `src/db/session-db.test.ts`, add host-side tests for:
 
 - `insertMessage()` and `upsertSessionRouting()` persist `messaging_group_id` and `is_group`.
+- `routeInbound()` passes `messaging_group_id` and `is_group` through `writeSessionMessage()` into host-owned `messages_in`, and `writeSessionRouting()` stores the same fields in `session_routing`.
 - Host due-count excludes rows with outbound `processing_ack.status='recovery'` but still counts truly pending rows.
-- `syncProcessingAcks()` preserves recovery-owned rows, syncs `completed`/`failed`, and resets only orphan `processing` rows when asked.
+- `syncProcessingAcks()` preserves recovery-owned rows, syncs `completed`, syncs `failed` only when a terminal user-visible notice id is present, and resets only orphan `processing` rows when asked.
 - Host recovery import opens outbound DB writable only after a verified stopped-container flag; the test must fail if the helper writes while `containerRunning:true`.
-- Host recovery import reads `/workspace/side-effects.jsonl`, imports idempotently into `side_effect_ledger`, then writes scoped recovery/fallback before deleting `processing` claims.
+- Host recovery import reads `sessionDir(...)/side-effects.jsonl`, imports only validated records idempotently into `side_effect_ledger`, then writes scoped recovery/fallback before deleting `processing` claims.
+- Container runtime config propagates `NANOCLAW_SIDE_EFFECT_LEDGER=/workspace/side-effects.jsonl`; poll-loop/provider execution sets `NANOCLAW_ACTIVE_INPUT_ID` and `NANOCLAW_ROUTE_KEY` for the current accepted input.
 
 In `container/agent-runner/src/db/session-state.test.ts`, add container-side tests for:
 
 - `side_effect_ledger` imports known JSONL records idempotently.
 - Invalid or over-detailed side-effect evidence is rejected or sanitized before recovery prompt use.
 - Gmail and Dvora side effects are available to recovery construction before provider-observed tool events.
+- Agent-written or unsigned JSONL cannot become authoritative Gmail recovery evidence unless proxy metadata/signature or proxy audit verification succeeds.
+- Dvora JSONL cannot become authoritative recovery evidence unless the referenced summary artifact exists under an allowed output root and matches the staged hash/size metadata.
 
 In `container/agent-runner/src/poll-loop.test.ts`, add a route-normalization test that proves a null-thread Discord DM and a threaded DM alias normalize together only when `messaging_group_id` matches and `is_group=0`; group routes with different `thread_id` values remain isolated.
 
@@ -368,7 +403,7 @@ await expect(nextEvent(query.events, 'input-accepted')).resolves.toMatchObject({
 await expect(nextEvent(query.events, 'result')).resolves.toMatchObject({
   type: 'result',
   inputId: 'followup-1',
-  resolvedInputIds: ['followup-1'],
+  resolvedInputIds: ['initial-1', 'followup-1'],
 });
 ```
 
@@ -403,6 +438,8 @@ In `messages-in`/`poll-loop` tests, add:
 - Recovery deletion resolves associated row ids to completed.
 - Successful provider result without explicit `resolvedInputIds`/`supersededInputIds` resolves only when the poll loop has exactly one active accepted input; two active inputs without explicit ids is a recoverable implementation error that does not complete rows.
 - Route-scoped outbound progress rows and MCP `send_message` rows written during the accepted-input window are harvested into `priorProgress` before recovery is stored.
+- Outbound progress and relay rows carry `input_id`, `route_key`, `messaging_group_id`, and `is_group`; recovery tests fail if progress from another conversation is harvested.
+- `processing_ack.status='failed'` without a linked user-visible terminal notice is treated as an invalid host-sync state and does not silently complete inbound work.
 
 - [ ] **Step 4: Write failing route and pre-query tests**
 
@@ -426,22 +463,24 @@ Run:
 cd /home/dan/code/nanoclaw/.worktrees/yente-opencode-timeout-hardening/container/agent-runner
 timeout 120s bun test src/providers/push.test.ts src/providers/codex.factory.test.ts src/db/session-state.test.ts src/poll-loop.test.ts
 cd /home/dan/code/nanoclaw/.worktrees/yente-opencode-timeout-hardening
-timeout 120s pnpm exec vitest run src/db/session-db.test.ts src/host-sweep.test.ts
+timeout 120s pnpm exec vitest run src/db/session-db.test.ts src/container-runner.test.ts src/host-sweep.test.ts
 ```
 
 Expected: FAIL because `inputId`, host route metadata, side-effect ledger import, recovery states, route normalization, and durable row lifecycle do not exist.
 
 - [ ] **Step 6: Implement host schema, side-effect ledger, and recovery-visible due counts**
 
-In `src/db/schema.ts`, `src/db/session-db.ts`, `container/agent-runner/src/db/connection.ts`, and `container/agent-runner/src/db/side-effects.ts`:
+In `src/db/schema.ts`, `src/db/session-db.ts`, `src/router.ts`, `src/session-manager.ts`, `src/container-config.ts`, `src/container-runner.ts`, `container/agent-runner/src/db/connection.ts`, and `container/agent-runner/src/db/side-effects.ts`:
 
-- Add nullable `messaging_group_id` and `is_group` columns to inbound `messages_in` and `session_routing`; add forward-compatible `ALTER TABLE` guards in the container connection path.
-- Add outbound `side_effect_ledger(id, source, kind, input_id, route_key, evidence_json, occurred_at, imported_at)` with `id` as the idempotency key.
+- Add nullable `messaging_group_id` and `is_group` columns to inbound `messages_in` and `session_routing`; host `ensureSchema()`/session DB migration owns existing DB upgrades, and the container connection path has read-compatible `ALTER TABLE` guards.
+- Add route metadata columns to outbound `messages_out` where recovery-harvested progress/relay rows are written.
+- Add outbound `side_effect_ledger(id, source, kind, operation, input_id, route_key, evidence_json, validation_json, replay_policy, occurred_at, imported_at)` with `id` as the idempotency key. `kind` is the recovery side-effect kind, not merely `api`/`non_api`.
 - Add host due-count/sync helpers that read outbound `processing_ack` read-only and exclude `status='recovery'` rows from wake counts without completing them.
 - Add host recovery writer/import helpers that require an explicit `containerStopped:true` proof before opening outbound DB writable.
-- Add JSONL importer helpers for `/workspace/side-effects.jsonl`; unknown kinds are retained only as sanitized `tool_completed` entries and never expose raw secrets, paths outside allowed artifact roots, or full email bodies.
+- Add JSONL importer helpers for both the container path and host session path; unknown kinds are retained only as sanitized `tool_completed` entries and never expose raw secrets, paths outside allowed artifact roots, or full email bodies.
+- Add validation hooks: Gmail entries require proxy signature/audit verification; Dvora entries require artifact existence plus hash/size/path validation under an allowed root.
 
-In `src/session-manager.ts`, stamp `messaging_group_id` and `is_group` when writing `session_routing` and host inbound rows.
+In `src/router.ts` and `src/session-manager.ts`, stamp `messaging_group_id` and `is_group` when writing `session_routing` and host inbound rows. In `src/container-config.ts` and `src/container-runner.ts`, make the side-effect ledger path part of every Yente/OpenCode runtime environment.
 
 - [ ] **Step 7: Implement the provider event contract**
 
@@ -500,7 +539,7 @@ export interface ProviderInterruption {
 export interface ProviderSideEffect {
   id: string;
   inputId: string;
-  kind: 'gmail_draft_created' | 'dvora_summary_artifact' | 'tool_completed' | 'other';
+  kind: 'gmail_draft_created' | 'dvora_recording_cached' | 'dvora_summary_artifact' | 'tool_completed' | 'other';
   label: string;
   evidence: Record<string, string | number | boolean | null>;
   occurredAt: string;
@@ -527,6 +566,9 @@ Add recovery types in `session-state.ts`:
 ```typescript
 export interface ProviderRecoveryScope {
   providerName: string;
+  routeKey: string;
+  messagingGroupId: string | null;
+  isGroup: 0 | 1 | null;
   platformId: string | null;
   channelType: string | null;
   threadKey: string | null;
@@ -570,7 +612,7 @@ Log structured JSONL from callers with `severity`, `event`, `message_ids`, `reco
 
 Add one shared route normalizer. Use it for initial batch splitting, recovery scope, follow-up matching, relay routing, and tests. It must:
 
-- Include provider name, channel type, platform id, and a normalized thread key.
+- Include provider name, channel type, platform id, `messaging_group_id`, `is_group`, and a normalized thread key in the route key/scope.
 - Treat known DM null-thread and DM-thread aliases as equal only when `messaging_group_id` and `is_group=0` prove both rows are the same DM route.
 - Treat distinct non-DM thread ids as distinct.
 - Partition accumulated context rows before prompt formatting; never let an unrelated context row choose the active route.
@@ -596,7 +638,7 @@ cd /home/dan/code/nanoclaw/.worktrees/yente-opencode-timeout-hardening/container
 timeout 120s bun test src/providers/push.test.ts src/providers/codex.factory.test.ts src/db/session-state.test.ts src/poll-loop.test.ts
 timeout 120s bun run typecheck
 cd /home/dan/code/nanoclaw/.worktrees/yente-opencode-timeout-hardening
-timeout 120s pnpm exec vitest run src/db/session-db.test.ts src/host-sweep.test.ts
+timeout 120s pnpm exec vitest run src/db/session-db.test.ts src/container-runner.test.ts src/host-sweep.test.ts
 timeout 120s pnpm run typecheck
 ```
 
@@ -607,7 +649,9 @@ Expected: PASS.
 ```bash
 cd /home/dan/code/nanoclaw/.worktrees/yente-opencode-timeout-hardening
 git add src/db/schema.ts src/db/session-db.ts src/db/session-db.test.ts \
-  src/session-manager.ts src/host-sweep.ts src/host-sweep.test.ts \
+  src/router.ts src/session-manager.ts src/container-config.ts \
+  src/container-runner.ts src/container-runner.test.ts \
+  src/host-sweep.ts src/host-sweep.test.ts \
   container/agent-runner/src/db/side-effects.ts \
   container/agent-runner/src/providers/types.ts \
   container/agent-runner/src/providers/claude.ts \
@@ -671,9 +715,11 @@ In `host-sweep.test.ts`, add:
 
 - Any provider-owned active tool with a positive declared timeout widens claim tolerance.
 - Declared timeout is capped under the absolute hard-death ceiling.
+- A declared active long tool can keep no-SSE/heartbeat-only work alive beyond the default 30-minute transport timeout, up to its capped timeout and never beyond the absolute turn ceiling.
 - Host heartbeat stays fresh during wait ticks.
 - Host kill/reset clears stale OpenCode tool state and writes route-scoped recovery/fallback for processing rows only after the container is verified stopped.
-- Host kill/reset imports `/workspace/side-effects.jsonl` before writing recovery, and the test fails if outbound DB is opened writable while the container may still be running.
+- Host kill/reset imports the host session path for `/workspace/side-effects.jsonl` before writing recovery, and the test fails if outbound DB is opened writable while the container may still be running.
+- Host kill/reset writes recovery/fallback before any replacement wake; the test must fail if `wakeContainer()` runs before side-effect import and recovery write complete.
 - Host wake/sync ignores `processing_ack.status='recovery'` rows as due work and preserves them while resetting only orphan `processing` rows.
 
 - [ ] **Step 3: Run tests red**
@@ -716,7 +762,7 @@ No production code outside this pump should call `stream.next()` directly.
 
 - [ ] **Step 6: Implement host-sweep bounded declared-timeout handling**
 
-Replace Bash-only timeout handling with provider/tool-generic declared timeout handling. Cap every declared timeout under the hard ceiling. After host kill/reset, verify the container is stopped, import side-effect JSONL, clear provider-owned tool rows, and write a recovery record or fallback notice for active processing rows before resetting them. Preserve recovery-owned acks during host sync/startup, and ensure recovery-owned rows do not trigger duplicate container wakes.
+Replace Bash-only timeout handling with provider/tool-generic declared timeout handling. Cap every declared timeout under the hard ceiling. Treat the default transport timeout as a no-active-long-tool limit; active long tools continue on wait ticks until their capped deadline or the absolute turn ceiling. After host kill/reset, verify the container is stopped, import side-effect JSONL from the host session path, clear provider-owned tool rows, and write a recovery record or fallback notice for active processing rows before resetting them or waking a replacement container. Preserve recovery-owned acks during host sync/startup, and ensure recovery-owned rows do not trigger duplicate container wakes.
 
 - [ ] **Step 7: Run tests green**
 
@@ -763,12 +809,14 @@ git commit -m "fix: make opencode liveness recoverable"
 In `opencode.test.ts`, add mocked runtime-controller tests for:
 
 - `buildOpenCodeConfig()` disables native `question` through OpenCode tool availability for SDK 1.15.10.
+- Relay-mode `buildOpenCodeConfig()` disables native OpenCode shell, filesystem, edit, web, mutation, and question tools; a test must fail if a relay runtime can invoke native shell or file mutation.
 - `buildOpenCodeConfig()` raises or disables OpenCode model-provider request timeout through `provider.options.timeout` or the active SDK/config equivalent.
 - SDK-surface probe fixtures cover the active root/v2 exports: when native questions appear as `message.part.updated`/`permission.updated`, `client.question`, or `question.*` events, production code handles that surface; any unhandled invented surface fails a static guard.
 - Runtime startup, session creation, top-level prompt acceptance, and follow-up prompt acceptance yield wait-tick activity and fail as typed interruptions if deadlines expire.
 - Inactivity notices yield `notice` with relay text and liveness metadata, do not clear continuation, do not destroy the runtime, and do not settle user rows by themselves.
 - Inactivity notices can start a separate restricted relay runtime without pausing reads from the original event pump.
 - If the separate relay runtime cannot start, accept the prompt, or finish by deadline, the original long turn remains active and the poll loop sends one sanitized direct fallback.
+- Terminal interruptions start a recovery query when possible; if recovery query startup or prompt acceptance misses its deadline, one sanitized direct fallback is written so the user is not left silent.
 - No-SSE wait ticks/keepalives beyond 16 minutes keep heartbeat alive and do not produce `OpenCode event timeout`.
 - Transport timeout at the configured longer deadline yields terminal `opencode_transport_timeout`, preserves continuation unless exact attempted-session missing proof or explicit clear-continuation is observed, clears active tool state, stores side-effect evidence, and returns without raw error.
 - Absolute timeout, stream read error, stream end, queue overflow, `session.error`, startup timeout, prompt-acceptance timeout, and retry exhaustion each yield one typed terminal interruption and clear active tool state.
@@ -776,7 +824,8 @@ In `opencode.test.ts`, add mocked runtime-controller tests for:
 - Cancellable native question waits only for bounded reuse proof; it preserves continuation only after `session.idle` or equivalent SDK acknowledgement.
 - Non-cancellable native question or denial without reuse proof destroys runtime, emits `clear-continuation`, and stores restart-capable recovery metadata.
 - Question/tool/permission events for other session ids are ignored.
-- GWS draft-create and Dvora summary tool completions first persist durable side-effect ledger entries at the local tool/proxy boundary, then emit provider `side-effect` references before final assistant text.
+- GWS draft-create and Dvora summary tool completions first stage side-effect evidence at the local tool/proxy boundary, validate/import it into `side_effect_ledger`, then emit provider `side-effect` references before final assistant text.
+- Unsigned or unvalidated staged side-effect entries are not emitted as provider `side-effect` references and cannot satisfy recovery assertions.
 - Terminal failure after side effect but before final result includes the side-effect ledger evidence in the interruption seed.
 - Overlapping tool parts keep the longest bounded declared timeout active until all longer tools complete.
 - Startup clears stale OpenCode tool state left by a prior crash.
@@ -789,9 +838,9 @@ In `poll-loop.test.ts`, add:
 - Providers without declared separate-runtime relay support never run a concurrent relay; the poll loop sends one direct sanitized fallback for non-terminal inactivity and uses terminal recovery only for terminal interruptions.
 - Relay mode passes an explicit `relayDeadlineMs` and `toolPolicy:'status_only'`.
 - Relay mode creates a fresh OpenCode runtime with a fresh session id, no continuation, no shared `activeSessionId`, no shared event stream, and an MCP allowlist containing only `send_message` plus any read-only status tools explicitly listed in the test fixture.
-- Relay output is routed to the wake-triggering route.
+- Relay output is routed to the wake-triggering route through a route-locked `send_message`; a relay attempt with a different `to` destination is rejected and does not write `messages_out`.
 - Normal follow-up polling is disabled or route-filtered during relay.
-- Mutation and side-effect tools are denied during relay mode; only status/message tools can run.
+- MCP mutation/side-effect tools and OpenCode native shell/filesystem/edit/web/question tools are denied during relay mode; only route-locked status/message tools can run.
 - If relay prompt is accepted but then fails/hangs/interrupts, the original turn and recovery payload remain unresolved and direct fallback is sent only after bounded relay failure.
 - Terminal interruption relay uses the same recovery lifecycle and does not delete recovery on `input-accepted`.
 - Direct fallback is emitted only once and only after relay acceptance/result failure or relay deadline expiry.
@@ -830,11 +879,16 @@ Add a separate relay construction path:
 
 ```typescript
 interface OpenCodeRelayRuntimeFactory {
-  createRelayRuntime(options: ProviderOptions, policy: { allowedTools: string[]; deadlineMs: number }): Promise<OpenCodeRuntimeController>;
+  createRelayRuntime(options: ProviderOptions, policy: {
+    allowedTools: string[];
+    deniedNativeTools: string[];
+    routeKey: string;
+    deadlineMs: number;
+  }): Promise<OpenCodeRuntimeController>;
 }
 ```
 
-The relay runtime must build a separate OpenCode config key, separate process/client/event pump, no continuation, and a tool policy that filters MCP tools at the NanoClaw MCP server boundary. Do not multiplex relay events through the original OpenCode SSE stream.
+The relay runtime must build a separate OpenCode config key, separate process/client/event pump, no continuation, and a tool policy that filters MCP tools at the NanoClaw MCP server boundary and disables native OpenCode mutation tools. Do not multiplex relay events through the original OpenCode SSE stream.
 
 - [ ] **Step 5: Implement pump-driven OpenCode turn state**
 
@@ -859,6 +913,8 @@ relay: {
   mode: 'separate-runtime',
   deadlineMs: OPENCODE_RELAY_DEADLINE_MS,
   allowedTools: ['send_message'],
+  deniedNativeTools: ['shell', 'filesystem', 'edit', 'web', 'question'],
+  routeLocked: true,
 }
 ```
 
@@ -880,7 +936,7 @@ Import safe side-effect evidence first from the JSONL/tool boundary, then enrich
 - Dvora summary artifact: summarize-dnd run id, recording id/path, output artifact path/id, summary completion marker.
 - Generic tool completion: tool name, call id, sanitized status/output snippet.
 
-On terminal interruption after a side effect but before assistant result, emit a recovery seed with the durable side-effect ledger. The poll loop must include this in the next recovery prompt so the agent can report existing work rather than duplicating it.
+On terminal interruption after a side effect but before assistant result, emit a recovery seed with the validated imported side-effect ledger. The poll loop must include this in the next recovery prompt so the agent can report existing work rather than duplicating it. If external success happened but validation/import is still pending or failed, emit a partial-success interruption that points to safe audit/artifact evidence and does not allow ordinary success output.
 
 - [ ] **Step 8: Implement active tool tracking**
 
@@ -919,6 +975,9 @@ git commit -m "fix: recover opencode interruptions through yente"
 - Modify: `container/shim/gws`
 - Modify: `container/agent-runner/src/db/side-effects.ts`
 - Modify: `container/agent-runner/src/db/session-state.test.ts`
+- Modify: `src/gws-shim.test.ts`
+- Modify: `src/container-config.ts`
+- Modify: `src/container-runner.ts`
 - Create worktree: `/home/dan/code/gws-skill/.worktrees/yente-timeout-audit-hardening`
 - Modify: `/home/dan/code/gws-skill/.worktrees/yente-timeout-audit-hardening/proxy.go`
 - Modify: `/home/dan/code/gws-skill/.worktrees/yente-timeout-audit-hardening/proxy_test.go`
@@ -949,21 +1008,25 @@ In `proxy_test.go`, capture JSON request and completion logs plus response heade
 
 - `/exec` with args `["gmail","users","drafts","create","--help"]` logs `request_class:"help"` and `api_effect:false` in request, denial, execution, or completion records.
 - The same help request does not log API-success semantics for `method:"users.drafts.create"`.
-- The response includes an audit/request id, `X-GWS-Request-Class: help`, and `X-GWS-Api-Effect: false` when the request reaches the response path.
+- The response includes an audit/request id, `X-GWS-Request-Class: help`, `X-GWS-Api-Effect: false`, and `X-GWS-Operation-Succeeded` when the request reaches the response path.
+- `/exec` schema/introspection probes such as `["gmail","users","drafts","create","schema"]` or the repo's actual schema flag log `request_class:"schema"` and `api_effect:false` without changing admission behavior.
+- `/exec` local validation/dry-run probes such as `["gmail","users","drafts","create","--validate"]` or the repo's actual dry-run flag log `request_class:"local_validation"` and `api_effect:false` without changing admission behavior.
 - `["gmail","users","drafts","create","--subject","help","--body","schema"]` remains `request_class:"api"` and `api_effect:true`.
 - `["gmail","users","drafts","send","--body","auth"]` remains API.
 - Existing authentication, admission, policy, signature, and rate-limit behavior is unchanged. A help-looking command that was denied before may still be denied; only the audit classification changes.
 
-Do not add `gws auth status` expectations because the shim handles that locally through `/health`, not `/exec`. Do not add schema-probe expectations or schema command admission as part of this task; if a real schema path is discovered while implementing, file that as later work unless it is required by the observed Fruma replay.
+Do not add `gws auth status` expectations because the shim handles that locally through `/health`, not `/exec`. Do not add schema command admission as part of this task; classify schema/local-validation probes only on paths that already reach request logging.
 
 - [ ] **Step 3: Write failing GWS shim ledger tests**
 
 In NanoClaw tests or a focused shell test, run `container/shim/gws` against a fake proxy and assert:
 
-- A successful API-effect draft-create response with `X-GWS-Api-Effect: true`, `X-GWS-Request-Class: api`, and an audit id appends one sanitized `gmail_draft_created` JSONL record before stdout is emitted.
+- A successful API-effect draft-create response with `X-GWS-Api-Effect: true`, `X-GWS-Operation-Succeeded: true`, `X-GWS-Request-Class: api`, valid signed/audit-verifiable metadata, and an audit id appends one sanitized `gmail_draft_created` JSONL record before stdout is emitted.
 - A help response with `X-GWS-Api-Effect: false` appends no side-effect record.
-- A denied or failed command appends no side-effect record.
-- The JSONL record contains command class, audit id, sanitized args, optional draft id parsed from stdout when present, and no raw authorization header or full email body.
+- A schema/local-validation response with `X-GWS-Api-Effect: false` appends no side-effect record.
+- A denied, failed, unsigned, or unverifiable command appends no authoritative side-effect record.
+- If the proxy reports API success but the shim cannot append the staged JSONL, the shim emits a structured partial-success error instead of ordinary stdout success.
+- The JSONL record contains command class, audit id, input id, route key, sanitized args, optional draft id parsed from stdout when present, and no raw authorization header or full email body.
 
 - [ ] **Step 4: Write failing summarize-dnd ledger tests**
 
@@ -973,6 +1036,7 @@ In `/home/dan/code/summarize-dnd/.worktrees/nanoclaw-side-effect-ledger/tests/te
 - The record includes a stable id, stage/run id, recording or source path, short/long summary artifact paths when available, and no transcript body.
 - Re-running the same stage with the same output paths produces the same idempotency key, so NanoClaw imports only one ledger row.
 - If the stage fails before output files exist, no success side-effect record is written.
+- If output files exist but ledger append fails, the stage returns a structured partial-success error with safe artifact paths instead of ordinary stage success.
 
 - [ ] **Step 5: Run tests red**
 
@@ -985,6 +1049,8 @@ cd /home/dan/code/summarize-dnd/.worktrees/nanoclaw-side-effect-ledger
 timeout 120s .venv-wsl/bin/python -m pytest tests/test_stage_status.py
 cd /home/dan/code/nanoclaw/.worktrees/yente-opencode-timeout-hardening/container/agent-runner
 timeout 120s bun test src/db/session-state.test.ts
+cd /home/dan/code/nanoclaw/.worktrees/yente-opencode-timeout-hardening
+timeout 120s pnpm exec vitest run src/gws-shim.test.ts src/container-runner.test.ts
 ```
 
 Expected: FAIL.
@@ -999,12 +1065,16 @@ type InvocationClass string
 const (
 	InvocationAPI  InvocationClass = "api"
 	InvocationHelp InvocationClass = "help"
+	InvocationSchema InvocationClass = "schema"
+	InvocationLocalValidation InvocationClass = "local_validation"
 )
 ```
 
 Classify command structure before request logging:
 
 - `--help`, `-h`, `help`, `--version`, and `version` in positional/flag structure as help/version.
+- Schema/introspection commands or flags that already reach `/exec` as schema.
+- Local validation/dry-run commands or flags that already reach `/exec` as local validation.
 - Flag values such as `--subject help` or `--body schema` must not affect classification.
 - For non-API invocations, set `api_effect:false` and avoid API-success wording even if the method parser also returns `users.drafts.create`.
 
@@ -1013,16 +1083,18 @@ Add response metadata headers where a response is written:
 - `X-GWS-Audit-Id`
 - `X-GWS-Request-Class`
 - `X-GWS-Api-Effect`
+- `X-GWS-Operation-Succeeded`
+- Signed/audit-verifiable side-effect metadata for successful API-effect mutations, or enough audit id data for NanoClaw to verify against proxy logs.
 
 Do not broaden execution behavior. Keep existing authentication, admission, policy, signature, and rate-limit paths exactly as they are unless an existing test already proves a non-API probe was allowed before this change.
 
 - [ ] **Step 7: Implement NanoClaw GWS shim ledger writing**
 
-In `container/shim/gws`, preserve the existing behavior and append JSONL only after HTTP 200 with `X-GWS-Api-Effect: true`. Write to `${NANOCLAW_SIDE_EFFECT_LEDGER:-/workspace/side-effects.jsonl}` using an atomic append. Sanitize args by preserving method/resource and redacting long body fields.
+In `container/shim/gws`, preserve the existing behavior and append JSONL only after HTTP 200 with `X-GWS-Api-Effect: true`, `X-GWS-Operation-Succeeded: true`, and valid signed/audit-verifiable metadata. Write to `${NANOCLAW_SIDE_EFFECT_LEDGER:-/workspace/side-effects.jsonl}` using an atomic append. Sanitize args by preserving method/resource and redacting long body fields. If an API mutation succeeds but the append fails, emit a recoverable partial-success error with audit id and no raw body instead of normal stdout success.
 
 - [ ] **Step 8: Implement summarize-dnd ledger writing**
 
-In `summary_writer.py`, add a small helper that appends JSONL when `NANOCLAW_SIDE_EFFECT_LEDGER` is set. Call it after summary output files are written for stage and full-run paths. Use structured JSONL with ASCII-safe JSON, stable idempotency keys, severity where logging is involved, and no transcript/full-summary body.
+In `summary_writer.py`, add a small helper that appends JSONL when `NANOCLAW_SIDE_EFFECT_LEDGER` is set. Call it after summary output files are written for stage and full-run paths. Use structured JSONL with ASCII-safe JSON, stable idempotency keys, severity where logging is involved, and no transcript/full-summary body. If the append fails after output files exist, return a structured partial-success error that includes safe artifact paths so NanoClaw can recover without rerunning the summary.
 
 - [ ] **Step 9: Run tests green**
 
@@ -1036,6 +1108,8 @@ timeout 120s .venv-wsl/bin/python -m pytest tests/test_stage_status.py
 cd /home/dan/code/nanoclaw/.worktrees/yente-opencode-timeout-hardening/container/agent-runner
 timeout 120s bun test src/db/session-state.test.ts
 timeout 120s bun run typecheck
+cd /home/dan/code/nanoclaw/.worktrees/yente-opencode-timeout-hardening
+timeout 120s pnpm exec vitest run src/gws-shim.test.ts src/container-runner.test.ts
 ```
 
 Expected: PASS.
@@ -1050,7 +1124,9 @@ cd /home/dan/code/summarize-dnd/.worktrees/nanoclaw-side-effect-ledger
 git add summary_writer.py tests/test_stage_status.py
 git commit -m "fix: record nanoclaw summary side effects"
 cd /home/dan/code/nanoclaw/.worktrees/yente-opencode-timeout-hardening
-git add container/shim/gws container/agent-runner/src/db/side-effects.ts container/agent-runner/src/db/session-state.test.ts
+git add container/shim/gws container/agent-runner/src/db/side-effects.ts \
+  container/agent-runner/src/db/session-state.test.ts \
+  src/gws-shim.test.ts src/container-config.ts src/container-runner.ts
 git commit -m "fix: import tool side effect ledgers"
 ```
 
@@ -1075,6 +1151,7 @@ Add tests for:
 - Non-Granola bridges default required.
 - Explicit required/optional config is preserved.
 - Granola auth-required or auth-expired unavailability still spawns the container with Granola omitted.
+- A Granola bridge that stalls at startup waiting for auth until the bridge startup deadline is classified as optional `auth_required`/`auth_expired` only when the captured stderr/status matches known credential prompts; an unclassified stall remains a startup failure.
 - Container config records `agentMcpUnavailable.granola.category` as `auth_required` or `auth_expired`.
 - Agent-facing unavailable text is sanitized and contains no host paths, uid/gid values, or raw thrown errors.
 - The sanitized Granola unavailable state appears in the actual runner file or OpenCode system-context payload loaded by the local OpenCode provider, not only in host-side config objects.
@@ -1136,16 +1213,17 @@ Write the Dvora, Fruma, side-effect, and terminal-taxonomy replay assertions in 
 
 The harness must use the real `OpenCodeProvider`, not a canned `ScriptedProvider` or success-text-only scripted provider. It must provide:
 
-- Fake OpenCode SDK client and runtime controller.
-- Fake event pump controlled by the test.
+- Fake OpenCode SDK client and runtime controller whose emitted events are generated from the SDK-surface probe fixtures, not hand-invented provider-only shapes.
+- Fake event pump controlled by the test, while production event parsing, input acceptance, interruption classification, relay handling, and side-effect import code remain real.
 - Known session ids.
 - Recorded prompt parts, `inputId`, continuation, prompt acceptance, and result input resolution.
 - Recorded permission denials.
 - Local GWS shim/proxy boundary from Task 4 that records Fruma help probes and draft creation audit records.
-- Local summarize-dnd side-effect boundary from Task 4 or an equivalent test fixture that writes the same `dvora_summary_artifact` JSONL ledger records.
-- Durable side-effect ledger entries imported into outbound DB before final assistant text.
+- Local summarize-dnd side-effect boundary from Task 4 or an equivalent test fixture that writes the same `dvora_summary_artifact` JSONL ledger records and actual allowed-root artifact files.
+- Validated side-effect ledger entries imported into outbound DB before final assistant text.
 - Local `messages_in` injection plus `runPollLoop()` assertions for `messages_out`, `processing_ack`, `session_state`, `container_state`, provider prompt acceptance, relay attempts, route metadata, and side-effect ledger.
 - Test failures when user-visible success appears without matching provider `input-accepted`, input resolution, recovery-state, ack-lifecycle, route-scoped progress, and side-effect evidence.
+- A guard that rejects final assistant success if the tool boundary did not create the corresponding draft, download/cache marker, or summary artifact evidence.
 
 - [ ] **Step 2: Recover the exact Dvora original trigger if available**
 
@@ -1156,6 +1234,7 @@ Search local session DBs, retained logs, and incident artifacts for the original
 Inject the recovered trigger or evidence-boundary substitute. The first OpenCode turn must:
 
 - Start/resume `ses_1a1e72ac7ffe3Ek8fJOiz1Y0lT`.
+- Model the Drive recording as a local fixture with `recording_date=2026-05-19`, size metadata matching the observed 2.56 GB recording, and a download/cache marker written through the Dvora boundary. The test need not download a multi-GB file, but it must fail if the workflow jumps straight to summary success without the recording-selection/download stage evidence.
 - Emit the exact observed progress line through user-visible output, not seeded history:
 
 ```text
@@ -1181,7 +1260,7 @@ Drive the second historical failure path by starting or attempting session `ses_
 - Recovery context includes the first turn's exact progress line and any unresolved accepted inputs.
 - The second old timeout path is also converted into long-work liveness or recovery/relay, not a raw `Error: OpenCode event timeout`.
 - The eventual successful resumed turn emits a Dvora summary tool side effect for the 5/19 recording before final assistant text.
-- The Dvora summary side effect is written through the summarize-dnd JSONL ledger and imported into `side_effect_ledger` before final assistant text.
+- The Dvora summary side effect is written through the summarize-dnd JSONL ledger, validated against the local artifact file, and imported into `side_effect_ledger` before final assistant text.
 - The side effect is not repeated on retry.
 - The final user-visible output contains `5/19 summary complete`.
 - Both observed session ids appear in the harness assertions so the original sequence was actually replayed.
@@ -1203,6 +1282,7 @@ The first harness turn must:
 - Start/resume `ses_1a47da93effeJdpKh0oiDUOP2Q`.
 - Invoke the local GWS shim/proxy boundary for the actual observed help probe before the native question: `gws gmail users drafts create --help`.
 - Assert the resulting GWS audit records are classified as non-API help with `api_effect:false`, not draft creation.
+- If the probed Fruma execution performs schema/introspection or local-validation probes, assert those records are classified as non-API with `api_effect:false` before any draft creation side effect.
 - Emit the probed SDK-native question surface asking for Matt Van Horn's email address. If the probe says this is `message.part.updated` plus `permission.updated`, carry `ToolPart.callID` or equivalent part id and matching `Permission.callID`/`Permission.id`; if the SDK exposes a `client.question` or `question.*` surface, use that real surface instead.
 - Assert the provider correlates the tool/question and permission/cancel events by call id/permission id or the discovered equivalent and denies/cancels through the real exported API when a cancellable permission exists.
 - Emit a Yente-visible outbound question asking for Matt Van Horn's email before the test injects the answer; the test must fail if the answer row is inserted first.
@@ -1220,6 +1300,7 @@ The second harness turn must:
 - Include escaped recovery context saying the native question was blocked.
 - Include the exact email answer.
 - Invoke the local GWS shim/proxy boundary for actual draft creation and assert a draft-create audit record with `api_effect:true` and a `gmail_draft_created` side-effect ledger entry before final assistant text.
+- Assert the Gmail draft side-effect entry is validated by proxy signature/audit metadata before recovery or final success can use it.
 - Emit final assistant text `Draft created in Gmail.`
 - Complete both user rows only after successful result.
 - Resolve Fruma recovery only after the successful result, not after prompt acceptance.
@@ -1243,6 +1324,7 @@ Add two cases:
 Assertions:
 
 - Recovery includes durable side-effect evidence imported from JSONL.
+- Recovery ignores unvalidated staged JSONL and uses only imported `side_effect_ledger` rows or safe partial-success audit/artifact evidence.
 - The resumed prompt tells Yente the side effect already happened.
 - The harness fails if the draft or summary side effect is repeated.
 - The final user-visible answer reports the existing draft/summary instead of duplicating work.
@@ -1256,6 +1338,7 @@ Each case must assert:
 - Recovery has original task text, accepted/unresolved input rows, side effects, and continuation policy.
 - Transport timeout preserves continuation unless exact attempted-session missing proof or explicit provider clear-continuation was observed.
 - Raw provider error text is not written to user output.
+- Terminal recovery startup/acceptance failure produces one sanitized direct fallback so the user is not left with no visible path forward.
 - OpenCode active tool state is cleared.
 - A later `continue` or exact domain follow-up succeeds through the real OpenCode harness.
 
@@ -1305,14 +1388,15 @@ Update `docs/agent-runner-details.md` to document:
 - Provider metadata ownership versus poll-loop recovery ownership.
 - Recovery lifecycle: `pending`, `in_flight`, `resolved`, `superseded`.
 - Recovery deletion only after successful result/explicit supersession, not prompt acceptance, relay notice, or fallback notice.
-- Recovery-owned ack host sync semantics, atomic recovery transactions, unresolved-entry pressure behavior, and non-destructive malformed recovery cleanup.
-- Route normalization, route-scoped recovery, accumulated context partitioning, same-route multi-trigger preservation, and null-thread DM alias handling.
+- Recovery-owned ack host sync semantics, `failed` ack notice-proof semantics, atomic recovery transactions, unresolved-entry pressure behavior, and non-destructive malformed recovery cleanup.
+- Route normalization, host-stamped `messaging_group_id`/`is_group`, route-scoped recovery, accumulated context partitioning, same-route multi-trigger preservation, route-bearing `messages_out`, and null-thread DM alias handling.
 - Follow-up row lifecycle and accepted-but-unresolved recovery ownership.
 - Inactivity relay capability detection, separate relay runtime ownership, relay deadline, status-only relay tool policy, and direct fallback limits.
+- Relay-mode native OpenCode tool denial and route-locked `send_message` behavior.
 - OpenCode native question disable/deny behavior using the probed SDK 1.15.10 surface.
 - Long-work heartbeat/wait tick behavior, no-SSE transport timeout, absolute turn ceiling, and declared-tool timeout caps.
 - OpenCode model-provider request timeout configuration.
-- Side-effect ledger semantics at the tool/proxy boundary for recovery after Gmail draft or summary artifact completion.
+- Side-effect staging/import semantics at the tool/proxy boundary for recovery after Gmail draft or summary artifact completion, including host-path import, validation rules, and partial-success behavior when external mutation succeeds but staging/import fails.
 - Optional Granola credential degradation limits and OpenCode prompt-context visibility.
 
 - [ ] **Step 2: Run targeted verification**
@@ -1324,7 +1408,7 @@ cd /home/dan/code/nanoclaw/.worktrees/yente-opencode-timeout-hardening/container
 timeout 180s bun test src/providers/opencode.test.ts src/providers/opencode-events.test.ts src/db/session-state.test.ts src/poll-loop.test.ts src/opencode-incident-replay.test.ts src/providers/push.test.ts src/providers/codex.factory.test.ts
 timeout 120s bun run typecheck
 cd /home/dan/code/nanoclaw/.worktrees/yente-opencode-timeout-hardening
-timeout 180s pnpm exec vitest run src/db/session-db.test.ts src/host-sweep.test.ts src/agent-mcp-config.test.ts src/agent-mcp-bridge.test.ts src/container-runner.test.ts src/claude-md-compose.test.ts
+timeout 180s pnpm exec vitest run src/db/session-db.test.ts src/host-sweep.test.ts src/gws-shim.test.ts src/agent-mcp-config.test.ts src/agent-mcp-bridge.test.ts src/container-runner.test.ts src/claude-md-compose.test.ts
 timeout 120s pnpm run typecheck
 ```
 
@@ -1393,21 +1477,25 @@ git commit -m "docs: document recoverable provider interruptions"
 
 Implementation is complete only when all of these are true:
 
-- Dvora replay uses the recovered exact original inbound request when available, otherwise documents the evidence boundary, injects the transcript-known progress and follow-up through local Yente, harvests the progress from user-visible output, includes both observed session ids `ses_1a1e72ac7ffe3Ek8fJOiz1Y0lT` and `ses_19757b6f7ffeYulTtPz3gteQ84`, emits no raw OpenCode timeout, preserves or clears continuation only according to proof, records the 5/19 summary side effect at the tool boundary, and ultimately delivers the summary result.
-- Fruma replay recovers or minimally fixtures the prior Matt Van Horn context, injects `Actually create a draft in my gmail`, crosses a local GWS shim/proxy boundary for the observed `gws gmail users drafts create --help` probe before the native question, visibly asks for Matt Van Horn's email before the answer is injected, creates a Gmail draft side effect and audit record before final output, emits no raw timeout, and ultimately delivers `Draft created in Gmail.`
+- Dvora replay uses the recovered exact original inbound request when available, otherwise documents the evidence boundary, injects the transcript-known progress and follow-up through local Yente, harvests the progress from user-visible output, includes both observed session ids `ses_1a1e72ac7ffe3Ek8fJOiz1Y0lT` and `ses_19757b6f7ffeYulTtPz3gteQ84`, models the 5/19 recording selection/download/cache evidence, emits no raw OpenCode timeout, preserves or clears continuation only according to proof, validates the 5/19 summary side effect at the tool boundary, and ultimately delivers the summary result.
+- Fruma replay recovers or minimally fixtures the prior Matt Van Horn context, injects `Actually create a draft in my gmail`, crosses a local GWS shim/proxy boundary for the observed `gws gmail users drafts create --help` probe before the native question, classifies any schema/local-validation probes as non-API, visibly asks for Matt Van Horn's email before the answer is injected, creates and validates a Gmail draft side effect and audit record before final output, emits no raw timeout, and ultimately delivers `Draft created in Gmail.`
 - Non-cancellable native-question replay clears the unusable continuation, restarts from recovery, and succeeds without claiming same-session continuation.
 - Direct no-SSE/heartbeat-only long work exceeds the observed 16-minute window in tests while remaining state-preserving and host-alive; terminal transport failure at the configured longer deadline recovers successfully and preserves continuation absent exact missing-session proof.
 - Inactivity notices carry concrete liveness metadata and are relayed by Yente through the separate restricted relay runtime when available, or produce one sanitized direct fallback while the original long turn continues; they never clear continuation by stale-session heuristic.
+- Terminal interruption paths either produce a Yente-authored recovery message or one sanitized direct fallback after bounded recovery startup/acceptance failure; no path silently strands the user.
 - Recovery context is route-scoped, XML-escaped, retained through failed accepted recovery attempts, never pruned while unresolved, and deleted only after successful result or explicit supersession.
 - Recovery ownership transitions and payload writes are atomic; host wake/sync excludes recovery-owned rows from due counts and preserves them across startup/sweep.
 - Initial batches with multiple wake-triggering routes are split; same-route multi-trigger tasks are stored and resumed in order; accumulated `trigger=0` context is partitioned by route before prompt/recovery formatting.
+- Host-stamped `messaging_group_id` and `is_group` are wired from ingress through `messages_in`, `session_routing`, `messages_out`, recovery scope, and relay routing.
 - Follow-up rows are completed only after successful result or explicit supersession; unaccepted route-matched rows are returned to pending and do not get hidden or duplicated; accepted-unresolved rows remain recovery-owned until resolved.
+- `processing_ack.status='failed'` is never used for recoverable interruptions and cannot be host-synced to completion without proof that a user-visible terminal fallback was written.
 - Pre-query, provider startup, prompt acceptance, stream, queue, absolute-timeout, session.error, host-kill, and container-crash paths all produce resumable recovery or a user-visible fallback without raw provider errors.
-- Side effects completed before a provider failure are persisted through the concrete GWS shim/proxy and summarize-dnd JSONL data paths, carried into recovery, and not duplicated in Gmail draft and Dvora summary tests.
+- Side effects completed before a provider failure are staged through the concrete GWS shim/proxy and summarize-dnd JSONL data paths, validated into `side_effect_ledger`, carried into recovery, and not duplicated in Gmail draft and Dvora summary tests. Agent-writable staged JSONL alone is never authoritative.
 - OpenCode native question handling uses the actual probed SDK 1.15.10 surface, not fake `question.asked` assumptions.
 - OpenCode stale-session classification is limited to exact attempted-session missing cases.
 - OpenCode model-provider request timeout is raised/disabled so long turns are governed by NanoClaw liveness instead of a hidden 5-minute abort.
 - Declared tool timeouts cannot exceed the hard-death ceiling, and overlapping tool tracking cannot clear long-tool protection while a longer tool remains active.
 - Optional Granola credential failure no longer prevents container spawn, while auth-directory security and required bridge failures still fail closed, and the sanitized unavailable state reaches OpenCode/Yente prompt context.
-- GWS probe logs classify request and completion records before logging with `api_effect:false` and do not broaden allowed behavior.
+- Optional Granola auth-stall/startup-abort is covered by tests and degrades only for known credential failures.
+- GWS probe logs classify request and completion records before logging with `api_effect:false`, cover help/version/schema/local-validation probes that reach `/exec`, and do not broaden allowed behavior.
 - NanoClaw, GWS, and summarize-dnd changes are committed in their respective repos, and every verification command in Task 7 passes.
