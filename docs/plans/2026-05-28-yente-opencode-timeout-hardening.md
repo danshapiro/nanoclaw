@@ -18,6 +18,81 @@ This work intentionally spans two repositories because the user's request includ
 - GWS audit-log work happens in a new `/home/dan/code/gws-skill/.worktrees/yente-timeout-audit-hardening` worktree.
 - Do not mutate the live `shapiroserver2` host or run production deploys.
 - The required "inject requests into Yente" validation is local: insert `messages_in` rows, run `runPollLoop()`, use the real `OpenCodeProvider` against a deterministic OpenCode runtime harness, and assert `messages_out`, `processing_ack`, `session_state`, `container_state`, provider events, and tool side effects.
+- Do not create a separate test-plan artifact. The executable replay and failure-mode requirements below are implemented as automated tests in the implementation tasks.
+
+## Non-Negotiable Acceptance Contracts
+
+A fresh readiness review should start here. The implementation details below may change during execution, but these contracts must not be weakened, replaced by synthetic provider-only checks, or satisfied by assistant text that is not backed by provider events, row lifecycle, recovery state, and tool-side evidence.
+
+### Dvora Replay Contract
+
+Automated local Yente injection must model both observed Dvora failures as one user-visible recovery sequence:
+
+- The first failure path uses session `ses_1a1e72ac7ffe3Ek8fJOiz1Y0lT`.
+- The replay emits the observed progress message through Yente-visible output, not seeded hidden history:
+
+```text
+Found the 5/19 recording on Drive (2.56 GB). Last summary is 5/12, so 5/19 is the next one. Downloading now.
+```
+
+- The old 300s meaningful-event timeout point produces a Yente-visible relay or terminal recoverable pause. It never clears continuation by stale-session heuristic, never marks the user turn done as a raw error, and never writes `OpenCode event timeout` to user output.
+- If the exact inbound request before the progress message can be recovered from local logs or artifacts, use it as the fixture and cite that evidence in a test comment. If it cannot be recovered, state that evidence boundary in the fixture and use the transcript-provided progress line plus follow-up as the minimum exact replay. Implementation must not block on unavailable logs.
+- The later follow-up is injected exactly:
+
+```text
+Great. Now do the 5/19 summary.
+```
+
+- The second historical path uses session `ses_19757b6f7ffeYulTtPz3gteQ84` and must also avoid raw timeout output and state loss.
+- Final success is through Yente: the replay proves the original task, progress, continuation or restart recovery context, follow-up row, and Dvora summary side effect survive until the 5/19 summary is delivered.
+
+### Fruma Replay Contract
+
+Automated local Yente injection must model the May 24 Fruma Gmail draft failure:
+
+- The initial user row is exactly:
+
+```text
+Actually create a draft in my gmail
+```
+
+- The replay uses session `ses_1a47da93effeJdpKh0oiDUOP2Q`.
+- GWS help/schema probe events occur before draft creation, including a `gws gmail users drafts create --help`-style probe that previously produced misleading audit records.
+- Native OpenCode question handling is modeled with SDK 1.15.10 event shapes: `message.part.updated` carries a `ToolPart.callID` or equivalent part id, while `permission.updated` carries `Permission.callID` and `Permission.id` where available. Tests must correlate those fields; no fake `question.asked` API may appear in production code or acceptance fixtures.
+- Yente visibly asks for Matt Van Horn's email before the test injects the answer. The test must fail if the answer is injected before a visible Yente question exists.
+- The injected answer allows Gmail draft creation to complete. The test must assert tool-side draft creation evidence, not only final assistant text.
+- GWS probe audit records are classified as non-API probes with `api_effect:false`, while the actual draft creation remains an API effect. This is audit classification only; command admission, authentication, policy, signature, and rate-limit behavior are not broadened.
+
+### Inactivity Visibility Contract
+
+The previous 300s no-meaningful-event condition is a user-visible recovery moment, not hidden context and not a host-authored raw error. It must be implemented as either:
+
+- a bounded Yente-authored relay turn that is independent of the busy OpenCode turn becoming available; or
+- a terminal recoverable pause that gives Yente enough recovery context to tell the user how to continue before any direct host fallback is sent.
+
+The implementation must not queue a message into the same busy OpenCode turn and wait for that turn to process it before the user sees anything.
+
+### Side-Effect And External-Failure Contract
+
+Completed side effects before final assistant output are recovery facts. Gmail draft creation and Dvora summary artifact creation must be recorded with enough sanitized evidence to prevent duplicate work on retry. Terminal failure after a side effect but before final output, host-sweep kill/reset, container crash, provider startup failure, session creation failure, prompt-acceptance failure, and pre-query failure after row claim must all produce durable route-scoped recovery or a user-visible fallback without raw provider errors.
+
+## State Lifecycle Contract
+
+Provider code emits typed facts only. The poll loop owns route-scoped recovery, message-row lifecycle, relay/fallback behavior, and recovery resolution. The required transitions are:
+
+| State source | Owner | Required transition |
+| --- | --- | --- |
+| Raw wake rows | Poll loop | Split by normalized route before claim; same-route triggers become ordered `originalTasks`; other routes remain pending. |
+| Top-level and follow-up prompts | Poll loop plus provider fact | Generate `inputId`; treat prompt as accepted only after provider `input-accepted` for that exact id. |
+| Accepted but unresolved rows | Poll loop | Move to recovery-owned ledger/ack on terminal interruption; complete only after successful result or explicit supersession. |
+| Unaccepted route-matched follow-ups | Poll loop | Return to pending or store in recovery with message ids; never hide behind stale `processing` acks. |
+| Unaccepted other-route rows | Poll loop | Return to pending and exclude from the active route's recovery payload. |
+| Recovery entries | Poll loop | Store from raw rows, progress, follow-ups, accepted/unresolved inputs, side effects, provider interruption metadata, and safe tool state; do not delete on prompt acceptance. |
+| Recovery `in_flight` entries | Poll loop | Retain until successful result, explicit supersession with an enriched replacement, or explicit completed recovery outcome; enrich on relay/retry failure. |
+| Inactivity notices | Provider fact, poll-loop action | Provider reports liveness metadata; poll loop relays through Yente or terminal recoverable pause without clearing continuation by heuristic. |
+| Continuation clearing | Provider fact, poll-loop storage | Clear only on exact attempted-session missing proof or explicit provider `clear-continuation`; transport errors, bare `404`, `ECONNRESET`, stream end, and event timeout text are not proof. |
+| Side effects | Provider fact, poll-loop recovery | Persist sanitized evidence before final result; retry prompts must tell Yente what already happened and tests must fail on duplicate draft/summary creation. |
+| Recovery relay turns | Poll loop | Disable normal all-session follow-up polling or route-filter it strictly so unrelated conversations remain pending. |
 
 The central design rule is ownership separation:
 
@@ -657,9 +732,11 @@ git commit -m "fix: recover opencode interruptions through yente"
 - Modify: `container/agent-runner/src/poll-loop.test.ts` only if a shared helper is needed
 - Modify: `container/agent-runner/src/providers/opencode.ts` only if the runtime test seam needs a small adjustment
 
-- [ ] **Step 1: Build the incident replay harness**
+- [ ] **Step 1: Build the incident replay harness and encode acceptance contracts first**
 
-The harness must use the real `OpenCodeProvider`, not a canned `ScriptedProvider`. It should provide:
+Before adding Task 4 support code, write the Dvora, Fruma, side-effect, and terminal-taxonomy replay assertions in this file so the exact incident contracts fail for concrete reasons. The executor may keep this file uncommitted until Step 10 if intermediate task commits must keep the suite green, but the assertions must be written before implementation details are adjusted for them.
+
+The harness must use the real `OpenCodeProvider`, not a canned `ScriptedProvider` or success-text-only scripted provider. It should provide:
 
 - Fake OpenCode SDK client and runtime controller.
 - Fake event pump controlled by the test.
@@ -668,6 +745,7 @@ The harness must use the real `OpenCodeProvider`, not a canned `ScriptedProvider
 - Recorded permission denials.
 - Recorded tool side effects that must occur before final assistant text.
 - Local `messages_in` injection plus `runPollLoop()` assertions for `messages_out`, `processing_ack`, `session_state`, `container_state`, provider prompt acceptance, relay attempts, and side-effect ledger.
+- Test failures when user-visible success appears without matching provider `input-accepted`, recovery-state, ack-lifecycle, and side-effect evidence.
 
 - [ ] **Step 2: Recover the exact Dvora original trigger if available**
 
@@ -718,9 +796,9 @@ The first harness turn must:
 - Start/resume `ses_1a47da93effeJdpKh0oiDUOP2Q`.
 - Emit GWS help/schema probe tool events before the native question, including a `gws gmail users drafts create --help`-style probe.
 - Assert those probe side effects/audit records are classified as non-API probes, not draft creation.
-- Emit `message.part.updated` question tool and matching `permission.updated` events asking for Matt Van Horn's email address.
-- Assert the provider denies the native question through `postSessionIdPermissionsPermissionId(...)`.
-- Emit a Yente-visible outbound question asking for Matt Van Horn's email before the test injects the answer.
+- Emit a `message.part.updated` question tool carrying `ToolPart.callID` or equivalent part id plus matching `permission.updated` events carrying `Permission.callID` and `Permission.id` where available, asking for Matt Van Horn's email address.
+- Assert the provider correlates the tool and permission events by call id/permission id and denies the native question through `postSessionIdPermissionsPermissionId(...)` when a cancellable permission exists.
+- Emit a Yente-visible outbound question asking for Matt Van Horn's email before the test injects the answer; the test must fail if the answer row is inserted first.
 - Return without any raw OpenCode timeout.
 
 Then inject:
