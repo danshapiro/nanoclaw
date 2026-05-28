@@ -4,7 +4,7 @@
 
 **Goal:** Yente must survive slow OpenCode work, silent/failed OpenCode event streams, native OpenCode question stalls, optional Granola bridge failures, and misleading GWS probe audit logs without losing user-facing state; the observed Dvora and Fruma requests must be replayed through local Yente injection and ultimately succeed.
 
-**Architecture:** Replace the current single `nextMeaningfulOpenCodeEvent()` watchdog with an SDK-compatible OpenCode turn supervisor: one session-scoped event pump owns SSE reading and liveness metadata, while `OpenCodeProvider` owns turn state, interruption classification, native-question cancellation, and runtime lifecycle. The poll loop treats provider interruptions as agent-visible recovery input first: Yente receives timeout/interruption context as a synthetic message and relays it when the provider can accept a recovery turn; direct host-authored user messages are bounded fallbacks only when relay acceptance fails. Recovery context is scoped to the wake-triggering route, includes the original user task and unaccepted follow-ups, is injected only at top-level query start, and is deleted only after provider prompt acceptance. Host liveness is maintained by provider activity ticks during long waits, and long OpenCode tool timeouts are tracked with an active-tool map so one completed tool cannot remove protection for another.
+**Architecture:** Replace the current single `nextMeaningfulOpenCodeEvent()` watchdog with an SDK-compatible OpenCode turn supervisor: one session-scoped event pump owns SSE reading and liveness metadata, while `OpenCodeProvider` owns turn state, interruption classification, native-question cancellation, and runtime lifecycle. The poll loop treats terminal provider interruptions as agent-visible recovery input first: Yente receives timeout/interruption context on a bounded recovery turn when the provider can accept one, and direct host-authored user messages are bounded fallbacks only when relay acceptance fails. Recovery context is scoped to the wake-triggering route, includes the original user task, route-matched unaccepted follow-ups, observed user-visible progress, and safe tool state, is injected only at top-level query start, and is deleted only after the provider accepts that exact top-level input id. Host liveness is maintained by provider activity ticks during long waits, and long OpenCode tool timeouts are tracked with an active-tool map so one completed tool cannot remove protection for another.
 
 **Tech Stack:** TypeScript, Bun tests for `container/agent-runner`, Vitest for host-side NanoClaw, Go tests for `gws-skill`, SQLite session state, OpenCode SDK 1.15.10 event stream.
 
@@ -26,14 +26,14 @@ Core invariants:
 - OpenCode inactivity is not a stale continuation. `continuation:opencode` is cleared only when OpenCode returns a structured or exact missing-session error for the specific session id being resumed; every continuation invalidation check receives the attempted continuation/session id and generic transport failures cannot clear it.
 - Generic transport/read failures such as `ECONNRESET`, bare `404`, stream end, "event timeout", or no-SSE transport timeout are not session-invalid by themselves.
 - Every OpenCode event, OpenCode keepalive, and provider wait tick yields provider `activity` so the poll loop touches the heartbeat during long waits. Wait ticks keep the container alive but do not count as meaningful model progress.
-- A meaningful-progress gap creates an agent-visible inactivity observation at a throttled interval and continues waiting. The normal path is not a host-authored direct user message: the observation is queued into the active OpenCode turn, or stored for the next accepted top-level recovery turn, so Yente sees the timeout context and can relay it. It does not settle the initial batch, destroy the runtime, clear `activeSessionId`, clear continuation, or store terminal recovery context. If the provider cannot accept the relay before a terminal interruption, the terminal recovery path carries the observation forward and may send a direct fallback only after bounded relay acceptance fails.
-- A no-SSE transport timeout, stream read error, stream end, queue overflow, absolute turn ceiling, OpenCode `session.error`, prompt/startup acceptance timeout, or retry-limit exhaustion is terminal for the current provider query. It emits a typed interruption with agent-visible recovery text, stores resumable route-scoped recovery context, settles the current batch, preserves continuation only when the OpenCode session is proven reusable, destroys the runtime when the transport is no longer trustworthy, clears persisted OpenCode tool state, and returns from the provider stream.
+- A meaningful-progress gap creates an agent-visible inactivity observation at a throttled interval and continues waiting. The observation is recorded out-of-band in poll-loop/provider turn state; it is never delivered by `query.push(...)` into a still-busy OpenCode turn. It does not settle the initial batch, destroy the runtime, clear `activeSessionId`, clear continuation, or store terminal recovery context by itself. If a terminal interruption happens later, the mandatory terminal recovery payload carries the soft observation forward so Yente sees it on the next accepted top-level recovery turn; a direct fallback is allowed only after bounded relay acceptance fails.
+- A no-SSE transport timeout, stream read error, stream end, queue overflow, absolute turn ceiling, OpenCode `session.error`, prompt/startup acceptance timeout, or retry-limit exhaustion is terminal for the current provider query. It emits a typed interruption with agent-visible recovery text, stores mandatory resumable route-scoped recovery context, settles the current batch without the generic "agent completed without sending" error while recovery relay/fallback is pending, preserves continuation only when the OpenCode session is positively proven reusable, destroys the runtime when the transport is no longer trustworthy, clears persisted OpenCode tool state, and returns from the provider stream. A no-SSE transport timeout has no reuse proof by definition, so it clears the OpenCode continuation and restarts from saved recovery context.
 - Native OpenCode questions are unsupported in Yente. If a question tool/permission can be denied through the SDK permission API, deny it and wait for proof that the interrupted OpenCode turn is reusable (`session.idle` or an equivalent SDK acknowledgement) before preserving the OpenCode continuation. If denial cannot be sent, or reuse proof does not arrive before the cancellation grace timeout, destroy the runtime, clear only the unusable OpenCode continuation through an explicit provider event, store restart-capable recovery context, and make the agent-visible recovery text clear that Yente kept conversation context but restarted the OpenCode side.
-- Recovery context is scoped by provider plus the wake-triggering route (`platform_id`, `channel_type`, `thread_id`) inside the session DB, not by the first accumulated context row. It cannot be consumed by another conversation in a shared session.
+- Recovery context is scoped by provider plus the wake-triggering route (`platform_id`, `channel_type`, `thread_id`) inside the session DB, not by the first accumulated context row. It cannot be consumed by another conversation in a shared session. Every recovery notice, relay result, direct fallback, and no-output settlement message is routed through that wake-triggering route.
 - Recovery context is XML-escaped before prompt injection.
-- Recovery context is injected only into a new top-level `provider.query(...)`, not into `query.push(...)` follow-ups. Delete injected recovery ids only after the provider yields prompt-accepted `init` for that top-level query.
-- Recovery context always includes enough to restart work without an OpenCode continuation: the original wake-triggering user task, known prior progress, terminal classification, continuation policy, pending/unaccepted follow-up text, and any safe tool-side state summary. Restart-style recovery tests must pass with continuation cleared.
-- Follow-up rows are not marked completed merely because `query.push(...)` accepted them into an in-process queue. They are completed only after the provider emits a follow-up prompt-accepted event, includes them in a completed result, or explicitly classifies them as superseded; terminal interruptions before provider acceptance reset them to pending or store them in recovery context so they are not lost.
+- Recovery context is injected only into a new top-level `provider.query(...)`, not into `query.push(...)` follow-ups. Delete injected recovery ids only after the provider yields `input-accepted` for the exact generated top-level `inputId` that received them.
+- Recovery context always includes enough to restart work without an OpenCode continuation: the original wake-triggering user task from raw message rows, route-scoped user-visible progress emitted during the interrupted turn, terminal classification, continuation policy, route-matched pending/unaccepted follow-up text, soft inactivity observations, and any safe tool-side state summary. Restart-style recovery tests must pass with continuation cleared.
+- Follow-up rows are not marked completed merely because `query.push(...)` accepted them into an in-process queue. Poll loop assigns every initial query and follow-up push a generated `inputId`, passes that id into the provider API, and completes user rows only after the provider emits `input-accepted` for the same id, includes them in a completed result, or explicitly classifies them as superseded. Terminal interruptions before provider acceptance delete the container-owned `processing_ack` rows for route-matched unaccepted follow-ups or store those follow-ups in route-scoped recovery context; follow-ups for other routes stay pending and are not included in the recovery payload.
 - `ProviderEvent.error` behavior is explicit: retryable errors are logged/progress-only; non-retryable errors are converted to typed interruptions or user-visible relay/fallback handling and settle the current batch without leaking raw provider error text.
 - Optional MCP degradation is narrow: Granola is optional by backward-compatible default, bridges marked `required: false` are optional, and all other bridges fail closed unless explicitly configured otherwise.
 - Optional MCP unavailability reasons shown to agents are sanitized categories, not raw host paths, uid/gid values, or auth directory details.
@@ -66,6 +66,7 @@ Core invariants:
 
 - Modify `container/agent-runner/src/providers/types.ts`
   - Add structured interruption, agent-visible recovery, explicit continuation-clear, and follow-up prompt-accepted event fields.
+  - Add `inputId` to top-level `QueryInput` and pushed `QueryTurnInput` so provider acceptance can be correlated to poll-loop rows.
   - Add `activity.source` metadata if useful for tests/logging.
   - Clarify `error` semantics.
   - Change continuation invalidation to receive attempted continuation metadata.
@@ -77,8 +78,11 @@ Core invariants:
   - Add scoped recovery-context APIs with generated ids, original-task/restart metadata, non-destructive read, delete-by-id, and malformed-json cleanup.
   - Add explicit continuation-clear helper usage only through typed provider decisions.
 
+- Modify `container/agent-runner/src/db/connection.ts`
+  - Add startup-safe helper(s) for clearing stale `container_state` tool rows after prior container crashes.
+
 - Modify `container/agent-runner/src/db/messages-in.ts`
-  - Add a small helper for returning unaccepted follow-up rows from `processing` to `pending` when a terminal interruption happens before provider prompt acceptance.
+  - Add a small helper for deleting transient `processing_ack` rows for unaccepted follow-ups so they become visible to `getPendingMessages()` again when a terminal interruption happens before provider prompt acceptance.
 
 - Modify `container/agent-runner/src/formatter.ts`
   - Export the existing XML escape helper for recovery prompt injection.
@@ -86,12 +90,15 @@ Core invariants:
 - Modify `container/agent-runner/src/poll-loop.ts`
   - Build recovery scope from the wake-triggering message in the batch.
   - Load scoped recovery context before top-level `provider.query(...)`.
-  - Delete recovery context only after the provider yields prompt-accepted `init` for that query.
+  - Delete recovery context only after the provider yields `input-accepted` for the generated top-level `inputId` that carried it.
   - Route provider interruptions through Yente-visible relay first and use direct `messages_out` fallback only after bounded relay acceptance fails.
-  - Store recovery context for terminal interruptions and for unrelayed soft observations that become terminal.
+  - Store mandatory poll-loop-authored recovery context for terminal interruptions, enriched from the wake-triggering raw rows, route-scoped outbound progress emitted during the interrupted turn, unrelayed soft observations, route-matched unaccepted follow-ups, and safe active tool state.
   - Keep follow-up message rows pending until provider prompt acceptance, not local enqueue.
   - Handle non-retryable `ProviderEvent.error` visibly.
   - Keep follow-up `query.push(...)` from consuming recovery context, while adding explicit provider-acceptance accounting for completion.
+
+- Modify `container/agent-runner/src/index.ts`
+  - Clear stale persisted OpenCode tool state at startup before entering the poll loop, so a prior crash cannot leave host-sweep tolerance widened forever.
 
 - Add/modify tests:
   - `container/agent-runner/src/providers/opencode-events.test.ts`
@@ -104,10 +111,11 @@ Core invariants:
 
 - Modify `src/host-sweep.ts`
   - Honor any positive `container_state.tool_declared_timeout_ms`, not only `current_tool === 'Bash'`.
+  - Clear stale `container_state` tool rows after host kill/reset cleanup, when the container-owned writer is gone.
 
 - Modify `src/host-sweep.test.ts`
   - Keep existing Bash coverage.
-  - Add OpenCode declared-timeout and no-SSE wait-tick coverage.
+  - Add OpenCode declared-timeout, no-SSE wait-tick, and kill/reset stale-tool cleanup coverage.
 
 - Modify `src/agent-mcp-config.ts`
   - Add `required?: boolean` to bridge config.
@@ -159,11 +167,12 @@ Core invariants:
 In `container/agent-runner/src/providers/opencode.test.ts`, change stale classification coverage:
 
 ```typescript
-expect(isStaleSessionError(new Error('OpenCode event timeout (300000ms)'))).toBe(false);
-expect(isStaleSessionError(new Error('ECONNRESET while reading OpenCode events'))).toBe(false);
-expect(isStaleSessionError(new Error('HTTP 404 from OpenCode event stream'))).toBe(false);
-expect(isStaleSessionError(new Error('OpenCode promptAsync: session ses_old not found'))).toBe(true);
-expect(isStaleSessionError(new Error('NotFoundError'))).toBe(false);
+expect(isMissingOpenCodeSessionError(new Error('OpenCode event timeout (300000ms)'), 'ses_old')).toBe(false);
+expect(isMissingOpenCodeSessionError(new Error('ECONNRESET while reading OpenCode events'), 'ses_old')).toBe(false);
+expect(isMissingOpenCodeSessionError(new Error('HTTP 404 from OpenCode event stream'), 'ses_old')).toBe(false);
+expect(isMissingOpenCodeSessionError(new Error('OpenCode promptAsync: session ses_old not found'), 'ses_old')).toBe(true);
+expect(isMissingOpenCodeSessionError(new Error('OpenCode promptAsync: session ses_other not found'), 'ses_old')).toBe(false);
+expect(isMissingOpenCodeSessionError(new Error('NotFoundError'), 'ses_old')).toBe(false);
 ```
 
 In `container/agent-runner/src/providers/opencode-events.test.ts`, add tests using a fake clock/scheduler:
@@ -197,6 +206,8 @@ it('widens stuck tolerance for any active tool with a declared timeout', () => {
 });
 ```
 
+Also add host cleanup coverage: after `enforceRunningContainerSla()` kills for `kill-ceiling` or `kill-claim`, the writable outbound DB has `container_state.current_tool`, `tool_declared_timeout_ms`, and `tool_started_at` cleared before the next sweep.
+
 - [ ] **Step 2: Run tests to verify they fail**
 
 Run:
@@ -208,7 +219,7 @@ cd /home/dan/code/nanoclaw/.worktrees/yente-opencode-timeout-hardening
 timeout 120s pnpm exec vitest run src/host-sweep.test.ts
 ```
 
-Expected: FAIL because `opencode-events.ts` does not exist, transport strings are still stale-session matches, and host sweep only honors Bash.
+Expected: FAIL because `opencode-events.ts` does not exist, transport strings are still incorrectly classified without attempted-session context, and host sweep only honors Bash.
 
 - [ ] **Step 3: Implement typed errors and exact stale-session classification**
 
@@ -281,6 +292,8 @@ function declaredToolTimeoutMs(containerState: ContainerState | null): number | 
 
 Use it for both the absolute ceiling and per-claim tolerance. Update comments from Bash-specific to declared-tool-specific.
 
+After host-side `killContainer(...)` and `resetStuckProcessingRows(...)` complete, clear the writable outbound DB `container_state` row because no live container writer remains and any tool state is stale. Use the same helper for both `kill-ceiling` and `kill-claim` paths.
+
 - [ ] **Step 6: Run tests and typechecks**
 
 Run:
@@ -334,6 +347,8 @@ export interface ProviderRecoveryPayload {
   originalUserTask: string;
   agentMessage: string;
   priorProgress?: string;
+  softObservations?: string[];
+  toolStateSummary?: string;
   pendingFollowups?: string[];
   continuationPolicy: ProviderContinuationPolicy;
   attemptedContinuation?: string;
@@ -346,8 +361,27 @@ export interface ProviderInterruption {
   settleInitialBatch: boolean;
   agentMessage: string;
   fallbackUserMessage: string;
-  recovery?: ProviderRecoveryPayload;
+  recoverySeed?: Partial<ProviderRecoveryPayload>;
   continuationPolicy: ProviderContinuationPolicy;
+}
+
+export interface QueryTurnInput {
+  inputId: string;
+  prompt: string;
+  attachments?: QueryAttachment[];
+}
+
+export interface QueryInput extends QueryTurnInput {
+  continuation?: string;
+  cwd: string;
+  systemContext?: { instructions?: string };
+}
+
+export interface AgentQuery {
+  push(input: QueryTurnInput): void;
+  end(): void;
+  events: AsyncIterable<ProviderEvent>;
+  abort(): void;
 }
 
 export type ProviderEvent =
@@ -374,21 +408,28 @@ In `session-state.test.ts`, add tests for:
 - Reading recovery entries is non-destructive.
 - Malformed stored JSON is deleted and returns `[]`.
 - Keeping only the most recent 10 recovery entries per scope.
-- Stored recovery payloads include `originalUserTask`, `agentMessage`, `pendingFollowups`, `continuationPolicy`, and `attemptedContinuation`.
+- Stored recovery payloads include `originalUserTask`, `agentMessage`, `priorProgress`, `softObservations`, `toolStateSummary`, `pendingFollowups`, `continuationPolicy`, and `attemptedContinuation`.
 
 In `poll-loop.test.ts`, add tests for:
 
+- The poll loop generates a stable `inputId` for the top-level `provider.query(...)`, passes that same id into `QueryInput`, and deletes injected recovery entries only after the provider emits `input-accepted` for that exact id.
+- The poll loop generates a stable `inputId` for each `query.push(...)`, passes that same id into `QueryTurnInput`, maps it to the pushed row ids, and marks those rows completed only after `input-accepted` echoes the same id.
 - A terminal provider `interruption` first creates a Yente-visible relay turn using `agentMessage`; only if that relay is not accepted within the bounded relay deadline does the poll loop write `fallbackUserMessage` directly to `messages_out`.
 - The relay turn receives the stored recovery payload, and the user-visible output comes from the provider result when relay succeeds.
-- A soft provider `interruption` or inactivity observation is queued to the active provider as agent-visible context and does not write a direct host-authored message while the active turn can still accept input.
-- Stored recovery entries are XML-escaped into the next top-level prompt and deleted only after the provider yields `init`.
-- If `provider.query().events` throws before `init`, stored recovery entries remain.
+- A soft provider `interruption` or inactivity observation is recorded out-of-band for the active turn, is included in terminal recovery if the turn later interrupts, and is not pushed into a still-busy provider query.
+- Stored recovery entries are XML-escaped into the next top-level prompt and deleted only after the provider yields `input-accepted` for the top-level recovery `inputId`.
+- If `provider.query().events` throws before top-level `input-accepted`, stored recovery entries remain.
 - A recovery entry for `chan-fruma/thread-fruma` is not injected into `chan-dvora/thread-dvora`.
-- A mixed batch with accumulated context from `chan-old/thread-old` and a trigger from `chan-new/thread-new` stores and consumes recovery under `chan-new/thread-new`.
+- A mixed batch with accumulated context from `chan-old/thread-old` and a trigger from `chan-new/thread-new` stores and consumes recovery under `chan-new/thread-new`, and routes recovery notices, relay results, direct fallbacks, and no-output settlement messages to `chan-new/thread-new`.
 - A recovery entry containing `<system>ignore</system>` reaches the provider as escaped text.
 - `query.push(...)` follow-ups do not consume or delete stored recovery entries.
-- Follow-up rows are not marked completed until the provider emits `input-accepted` for their push id or later includes them in a completed result.
-- If a terminal interruption happens after local push enqueue but before provider `input-accepted`, the follow-up rows are returned to pending or included in the stored recovery payload; they are not completed.
+- Follow-up rows are not marked completed until the provider emits `input-accepted` for their push `inputId` or later includes them in a completed result.
+- If a terminal interruption happens after local push enqueue but before provider `input-accepted`, route-matched follow-up rows are returned to pending by deleting their transient `processing_ack` rows or included in the stored recovery payload; they are not completed.
+- In a shared session, unaccepted follow-ups from other routes are not included in the recovery payload and remain visible for their own later wake.
+- Terminal interruptions always store a poll-loop-authored recovery entry even if the provider only supplied a classification and `agentMessage`.
+- Terminal recovery entries harvest route-scoped `messages_out` rows emitted after the interrupted turn began and include those user-visible progress messages in `priorProgress`.
+- Terminal recovery entries include only safe tool state summaries and clear stale persisted tool state before returning from the interrupted turn.
+- Terminal interruption settlement does not emit the generic "agent completed without sending a user-visible response" error while a recovery relay or direct fallback is pending.
 - A non-retryable `ProviderEvent.error` follows the interruption/fallback contract and settles the batch; a retryable error logs only and does not settle unless a later result/interruption does.
 - A `clear-continuation` event clears only the attempted provider continuation and leaves unrelated provider continuations intact.
 
@@ -421,6 +462,8 @@ export interface ProviderRecoveryEntry {
   agentMessage: string;
   originalUserTask: string;
   priorProgress?: string;
+  softObservations: string[];
+  toolStateSummary?: string;
   pendingFollowups: string[];
   continuationPolicy: 'preserve' | 'clear' | 'unknown';
   attemptedContinuation?: string;
@@ -428,11 +471,13 @@ export interface ProviderRecoveryEntry {
 }
 ```
 
-Implement `appendProviderRecoveryEntry(scope, entryWithoutId)`, `readProviderRecoveryEntries(scope)`, `deleteProviderRecoveryEntries(scope, ids)`, and test-only `clearProviderRecoveryEntries(scope)`. Use a key based on provider name, channel type, platform id, and thread id; encode each segment. Build scope from the wake-triggering row, defined as the newest retained row with `trigger === 1` after pre-task gating, falling back only when no trigger remains.
+Implement `appendProviderRecoveryEntry(scope, entryWithoutId)`, `readProviderRecoveryEntries(scope)`, `deleteProviderRecoveryEntries(scope, ids)`, and test-only `clearProviderRecoveryEntries(scope)`. Use a key based on provider name, channel type, platform id, and thread id; encode each segment. Build scope from the wake-triggering row, defined as the newest retained row with `trigger === 1` after pre-task gating, falling back only when no trigger remains. Recovery append must be callable from the poll loop with raw `MessageInRow` data so terminal recovery does not depend on provider-owned context.
 
 - [ ] **Step 4: Add follow-up acceptance accounting helpers**
 
-In `db/messages-in.ts`, add a narrow helper such as `markPendingForRetry(ids, reason)` for rows that were moved to `processing` but never accepted by the provider. It must increment no retry counters by itself, preserve `process_after` unless the caller supplies one, and log structured JSONL from the caller with `severity`, `event`, `message_ids`, and `reason`.
+In `db/messages-in.ts`, add a narrow helper such as `returnProcessingToPending(ids, reason)` for rows that were moved to `processing` but never accepted by the provider. Because the container cannot write `inbound.db`, "return to pending" means deleting only transient `processing_ack` rows whose `status = 'processing'`; `getPendingMessages()` must then see the still-pending inbound rows again. The helper must not delete `completed` or `failed` ack rows, must not increment retry counters, must leave inbound `process_after` unchanged, and must log structured JSONL from the caller with `severity`, `event`, `message_ids`, `deleted_ack_count`, and `reason`.
+
+Add a two-DB test proving this behavior end to end: create pending rows in the read-only-style inbound DB, mark them processing in outbound `processing_ack`, call the helper, and assert `getPendingMessages()` returns them again. Add a second test proving completed/failed ack rows remain hidden.
 
 - [ ] **Step 5: Export XML escaping**
 
@@ -442,19 +487,23 @@ Export the existing XML escaping helper from `formatter.ts`. Do not create a sec
 
 In `poll-loop.ts`:
 
-- Build a recovery scope from `config.providerName` and the wake-triggering row, not from `extractRouting(messages)` if accumulated context rows precede the trigger.
+- Build a recovery scope and recovery routing context from `config.providerName` and the wake-triggering row, not from `extractRouting(messages)` if accumulated context rows precede the trigger.
 - Read recovery entries before top-level `provider.query(...)`.
 - Prepend escaped recovery entries as a `<system>` block.
+- Generate an `inputId` for the top-level prompt, include it in `QueryInput`, and track it as the only id allowed to delete the injected recovery entries.
 - Track `pendingRecoveryEntryIdsForCurrentQuery`.
-- Delete those ids only after the provider yields prompt-accepted `init`.
-- Track a generated `inputId` for each follow-up push and map it to message ids.
+- Delete those ids only after the provider yields `input-accepted` for the generated top-level `inputId`.
+- Track a generated `inputId` for each follow-up push, include it in `QueryTurnInput`, and map it to message ids.
 - Do not read, inject, or delete recovery entries inside `pollFollowups()` before `query.push(...)`.
-- For `interruption`, append `event.recovery` when present; call `settleInitialBatch()` only when `event.settleInitialBatch` is true; if `event.terminal` and unaccepted follow-up ids exist, return them to pending and include their prompt text in the recovery payload.
-- For recoverable interruptions, attempt a bounded Yente-visible relay query using `agentMessage` and the stored recovery payload. If that relay yields `init` and `result`, dispatch the provider result normally. If relay acceptance fails or times out, write exactly one fallback message using `event.fallbackUserMessage`.
-- For soft inactivity observations while a query is active, push `agentMessage` as a provider-internal follow-up with an `inputId`; do not mark any user row completed for this synthetic input.
+- Snapshot the current highest outbound `messages_out.seq` for the recovery route before starting the provider turn; on terminal interruption, read later route-matched outbound rows and summarize their user-visible text into `priorProgress`.
+- On terminal interruption, build and append a complete `ProviderRecoveryEntry` in the poll loop from raw wake-triggering rows, provider `recoverySeed`, soft observations, route-scoped outbound progress, route-matched unaccepted follow-ups, and safe tool-state summary. Do this even when `event.recoverySeed` is missing.
+- For route-matched unaccepted follow-ups, either include their prompt text in the recovery payload or call `returnProcessingToPending(...)`. For unaccepted follow-ups from other routes, always call `returnProcessingToPending(...)` and never include them in this recovery payload.
+- For `interruption`, call `settleInitialBatch({ suppressMissingVisibleReply: event.terminal })` only after recovery relay or direct fallback has been selected, so the generic no-output error cannot race ahead of recovery.
+- For terminal recoverable interruptions, attempt a bounded Yente-visible relay query using `agentMessage` and the stored recovery payload. If that relay yields `input-accepted` for its generated top-level `inputId` and then `result`, dispatch the provider result normally to the wake-triggering route. If relay acceptance fails or times out, write exactly one fallback message using `event.fallbackUserMessage` to the wake-triggering route.
+- For soft inactivity observations while a query is active, record `agentMessage` in out-of-band turn state keyed by the recovery route. Do not push it into the busy provider query and do not mark any user row completed for this synthetic observation.
 - For `error`, retryable events log a structured warning; non-retryable events are converted into the same interruption relay/fallback path using a sanitized `userMessage` when present, never raw provider text.
 - For `clear-continuation`, clear only `config.providerName` when `event.attemptedContinuation` matches the current continuation or when no current continuation exists.
-- Keep catch-block provider throws visible, but clear continuation only when `config.provider.isSessionInvalid(err, { attemptedContinuation: continuation })` is true.
+- Catch-block provider throws become the same typed terminal interruption/fallback path with sanitized user text and structured raw logs; clear continuation only when `config.provider.isSessionInvalid(err, { attemptedContinuation: continuation })` is true.
 
 - [ ] **Step 7: Run targeted tests**
 
@@ -489,7 +538,8 @@ git commit -m "fix: preserve scoped provider recovery context"
 - Modify: `container/agent-runner/src/providers/opencode.ts`
 - Modify: `container/agent-runner/src/providers/opencode.test.ts`
 - Modify: `container/agent-runner/src/providers/types.ts` if Task 2 uncovers type gaps
-- Modify: `container/agent-runner/src/db/connection.ts` only if a small active-tool helper is needed for tests
+- Modify: `container/agent-runner/src/db/connection.ts`
+- Modify: `container/agent-runner/src/index.ts`
 
 - [ ] **Step 1: Identify or write the failing provider tests**
 
@@ -497,10 +547,10 @@ In `opencode.test.ts`, add tests with a mocked runtime controller:
 
 - `buildOpenCodeConfig()` disables the native question tool through the OpenCode tool map for SDK 1.15.10 and does not rely on `permission.question`.
 - Soft inactivity after keepalives/wait ticks yields `activity` and one throttled agent-visible observation with classification `opencode_inactivity`, does not store terminal recovery context, does not clear `activeSessionId`, does not destroy the runtime, and later yields the final result when `session.idle` arrives.
-- Soft inactivity also yields or schedules an agent-visible inactivity observation that can be accepted by the active query as an internal follow-up; the test must assert the observation is available to Yente and is not only a direct outbound host notice.
+- Soft inactivity also yields or records an agent-visible inactivity observation in out-of-band turn state; the test must assert it is available for later terminal recovery/top-level relay and is not pushed into a still-busy provider query or sent only as a direct outbound host notice.
 - Hung runtime startup, hung `session.create()`, and hung initial `promptAsync()` each yield activity while waiting, then a typed terminal interruption with recovery context and no raw provider error.
 - Heartbeat-only and no-SSE wait-tick streams yield `activity` before host `CLAIM_STUCK_MS` using reduced env values or fake timers.
-- No-SSE transport timeout yields a terminal `interruption` with classification `opencode_transport_timeout`, stores recovery context, keeps reusable continuation only when justified by metadata, destroys the runtime controller, and returns without a raw error.
+- No-SSE transport timeout yields a terminal `interruption` with classification `opencode_transport_timeout`, stores recovery context, clears the OpenCode continuation because no reuse proof was observed, destroys the runtime controller, and returns without a raw error.
 - Absolute turn timeout, stream read error, stream end, queue overflow, `session.error`, and retry-limit exhaustion each yield one terminal interruption, settle the batch, store resumable recovery context, clear active tool state, and return without leaking raw errors.
 - `message.part.updated` question tool parts for the active session are denied through `postSessionIdPermissionsPermissionId(...)` when a permission id is available, then wait for `session.idle` or an SDK acknowledgement proving the session can accept a new prompt before preserving continuation. The resulting interruption includes classification `opencode_native_question`, includes the question text, settles the batch, preserves continuation only after reuse proof, and returns.
 - If the native-question denial is sent but reuse proof does not arrive before `OPENCODE_NATIVE_QUESTION_CANCEL_GRACE_MS`, the provider destroys the runtime, yields `clear-continuation`, stores restart-capable recovery context, and does not claim same-session continuation.
@@ -509,6 +559,8 @@ In `opencode.test.ts`, add tests with a mocked runtime controller:
 - Question/tool/permission events for another session id are ignored.
 - Active tool tracking handles overlap: two running tool parts set the row to the longest declared timeout; when the shorter tool completes, the longer tool remains in `container_state`; the row clears only after all active tracked tools complete.
 - Every terminal interruption path clears in-memory and persisted OpenCode tool state, and a host-sweep decision immediately after interruption no longer gets widened by the stale long-tool timeout.
+- Container startup clears stale persisted OpenCode tool state before polling messages, so a prior crash cannot preserve a long declared timeout.
+- Host kill/reset cleanup clears stale persisted OpenCode tool state after killing a stuck container.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -545,7 +597,9 @@ export class OpenCodeProvider implements AgentProvider {
 
 Production `ensureSharedRuntime()` returns the shared controller. `destroySharedRuntime()` delegates through the controller, and provider code calls `rt.destroy(reason)` so injected runtimes are cleaned up and testable.
 
-Wrap runtime startup, session creation, top-level prompt acceptance, and follow-up prompt acceptance with the same deadline-aware helper used for event waits. Each wait must yield provider `activity` at `OPENCODE_WAIT_TICK_MS`, emit a throttled agent-visible progress observation at `OPENCODE_INACTIVITY_NOTICE_MS`, and classify deadline failures as typed terminal interruptions.
+Wrap runtime startup, session creation, top-level prompt acceptance, and follow-up prompt acceptance with the same deadline-aware helper used for event waits. Each wait must yield provider `activity` at `OPENCODE_WAIT_TICK_MS`, record a throttled agent-visible inactivity observation at `OPENCODE_INACTIVITY_NOTICE_MS`, and classify deadline failures as typed terminal interruptions.
+
+Every call to `prompt(...)` receives a `QueryTurnInput` containing the poll-loop generated `inputId`; providers emit `input-accepted` only after the SDK has accepted that exact prompt/follow-up. Do not synthesize acceptance from local enqueue.
 
 - [ ] **Step 4: Replace the provider timeout loop with pump-driven turn state**
 
@@ -562,8 +616,8 @@ Provider loop behavior:
 - `keepalive`: yield `{ type: 'activity', source: 'opencode_keepalive' }`.
 - `wait-tick`: yield `{ type: 'activity', source: 'provider_wait_tick' }`.
 - `event`: yield `{ type: 'activity', source: 'opencode_event' }`, then process the event.
-- `soft-timeout`: yield `activity`, schedule or yield a throttled agent-visible observation, and continue the same turn.
-- `transport-timeout`, `read-error`, `ended`, `queue-overflow`, `session.error`, retry-limit exhaustion, or `absolute-timeout`: yield one terminal `interruption` with `settleInitialBatch: true`, destroy the runtime when transport is untrustworthy, keep continuation only when the session may still be resumed, clear active OpenCode tool state, and `return`.
+- `soft-timeout`: yield `activity`, record a throttled agent-visible observation for out-of-band recovery/relay, and continue the same turn without calling `query.push(...)`.
+- `transport-timeout`, `read-error`, `ended`, `queue-overflow`, `session.error`, retry-limit exhaustion, or `absolute-timeout`: yield one terminal `interruption` with `settleInitialBatch: true`, destroy the runtime when transport is untrustworthy, keep continuation only when positive reuse proof was observed for the attempted session, clear active OpenCode tool state, and `return`.
 
 Use soft inactivity agent text like:
 
@@ -602,6 +656,7 @@ Maintain an in-memory `Map<toolPartId, { name: string; declaredTimeoutMs: number
 - On status `completed`, `error`, `failed`, or `aborted`, remove only that part id, then recompute `container_state`; clear it only when the map is empty.
 - Log structured warnings on DB failures and continue.
 - On every terminal interruption path, run the same cleanup helper that clears the active-tool map and writes a null/empty tool state to `container_state`. Add tests for transport timeout, stream read error, session.error, native-question restart, and absolute timeout cleanup.
+- On agent-runner startup, call a `clearStaleOpenCodeToolStateOnStartup()` helper before `runPollLoop(...)`. It should clear only provider-owned OpenCode tool state, not unrelated future provider state, and should log structured JSONL on failure without blocking startup.
 
 - [ ] **Step 8: Run targeted tests**
 
@@ -623,7 +678,8 @@ git add container/agent-runner/src/providers/opencode.ts \
   container/agent-runner/src/providers/opencode.test.ts \
   container/agent-runner/src/providers/opencode-events.ts \
   container/agent-runner/src/providers/opencode-errors.ts \
-  container/agent-runner/src/db/connection.ts
+  container/agent-runner/src/db/connection.ts \
+  container/agent-runner/src/index.ts
 git commit -m "fix: recover opencode interruptions without losing state"
 ```
 
@@ -640,7 +696,7 @@ Create a deterministic runtime harness used with the real `OpenCodeProvider`:
 
 - Fake `client.session.create()` returns known session ids.
 - Fake `client.session.promptAsync()` records prompt parts, continuation, and top-level prompt acceptance.
-- Fake prompt acceptance records an `inputId` so the poll-loop can prove initial and follow-up rows are completed only after provider acceptance.
+- Fake prompt acceptance records the exact `inputId` passed from the poll loop so tests can prove initial and follow-up rows are completed only after provider acceptance of the same id.
 - Fake `postSessionIdPermissionsPermissionId(...)` records permission denials/approvals.
 - Fake event pump is controlled by the test and uses tiny env values or fake timers.
 - Fake tool events must record side effects before final assistant text: Dvora summary generation and Fruma Gmail draft creation are not allowed to pass by emitting canned assistant success text alone.
@@ -650,7 +706,7 @@ Do not use a canned `ScriptedProvider` for these incident replays. These tests m
 
 - [ ] **Step 2: Recover and codify Dvora's exact original inbound request**
 
-Before writing the replay test, recover the original Dvora user request from local session DBs, retained logs, or incident artifacts. Store it in the replay test fixture with a source comment naming the artifact used. Do not substitute a generic test-only prompt. If the exact inbound request cannot be recovered from available local artifacts, stop the implementation with a blocker rather than weakening the user's "repeat the failed scenarios precisely" requirement.
+Before writing the replay test, attempt to recover the original Dvora user request from local session DBs, retained logs, or incident artifacts. Store it in the replay test fixture with a source comment naming the artifact used when recovered. If the preceding trigger cannot be recovered from available local artifacts, document that evidence boundary in the fixture and use the transcript-provided observed progress plus follow-up as the minimum exact replay: the first injected Dvora turn must cause Yente to emit the exact observed progress line, then interruption/recovery must accept the exact follow-up `Great. Now do the 5/19 summary.` and complete. Do not block implementation solely because the earlier trigger is unavailable.
 
 - [ ] **Step 3: Replay Dvora's 5/19 long-work continuation**
 
@@ -666,10 +722,15 @@ Great. Now do the 5/19 summary.
 
 Harness sequence:
 
-- Seed OpenCode session `ses_1a1e72ac7ffe3Ek8fJOiz1Y0lT` as the preserved continuation and include the exact prior Yente progress text in the fake session history. Do not rely on an inserted `messages_out` row to become prompt context unless the code explicitly reads it.
-- Inject a pending Dvora trigger using the recovered exact original inbound request.
-- Emit keepalives/wait ticks beyond `OPENCODE_INACTIVITY_NOTICE_MS`.
-- Assert the soft inactivity observation is available to Yente as agent-visible context instead of only as a direct host notice, and no `Error: OpenCode event timeout` is sent.
+- Inject a pending Dvora trigger using the recovered exact original inbound request when available. If the exact original trigger could not be recovered, inject a fixture trigger whose source comment says it is an evidence-boundary substitute and whose first OpenCode turn emits the exact transcript progress line below before timing out.
+- The first OpenCode turn must emit a route-scoped user-visible progress message with the exact text:
+
+```text
+Found the 5/19 recording on Drive (2.56 GB). Last summary is 5/12, so 5/19 is the next one. Downloading now.
+```
+
+- Emit keepalives/wait ticks beyond `OPENCODE_INACTIVITY_NOTICE_MS`, then continue to the same timeout/recovery path that produced the original bad outcome without seeding the progress as prior history.
+- Assert the soft inactivity observation is recorded out-of-band for terminal recovery instead of only as a direct host notice, and no `Error: OpenCode event timeout` is sent.
 - While the query is still active, insert the exact follow-up `Great. Now do the 5/19 summary.` and let `pollFollowups()` enqueue it.
 - Emit `session.idle` for the first turn, then assert the provider emits `input-accepted` for the queued follow-up using the same continuation before that row is marked completed.
 - Emit a tool part/command event representing the actual summary path used by this Yente install, such as the current Summarize D&D helper or skill command, with a fixture recording id/path for the 5/19 audio. The test must fail if final assistant text appears before this summary side effect.
@@ -678,9 +739,10 @@ Harness sequence:
 Assertions:
 
 - No outbound message contains `Error: OpenCode event timeout`.
-- Continuation remains `ses_1a1e72ac7ffe3Ek8fJOiz1Y0lT`.
+- Continuation remains `ses_1a1e72ac7ffe3Ek8fJOiz1Y0lT` if the first long-work path remains reusable; if the harness drives a terminal no-reuse timeout, recovery context must include the observed progress line and restart successfully from a cleared continuation.
 - Both injected user rows are completed.
 - The follow-up row is not completed until the provider accepts the follow-up prompt.
+- If recovery context is used, `priorProgress` includes the exact observed progress line harvested from `messages_out`, not from seeded fake history.
 - The summary tool-side side effect was recorded with the 5/19 fixture id/path and occurred before the final output.
 - The final user-visible output contains `5/19 summary complete`.
 - The harness proves heartbeats/wait ticks yielded activity before the soft inactivity observation so host sweep would not kill the container.
@@ -720,7 +782,7 @@ Second harness result:
 - Assert no raw OpenCode timeout appears.
 - Assert both user rows are completed.
 - Assert final output contains `Draft created in Gmail.`
-- Assert recovery rows for the Fruma scope are deleted after the second top-level query yields `init`.
+- Assert recovery rows for the Fruma scope are deleted after the second top-level query yields `input-accepted` for the recovery `inputId`.
 
 - [ ] **Step 5: Replay non-cancellable native-question restart with continuation cleared**
 
@@ -734,7 +796,7 @@ Assertions:
 - The next top-level prompt starts a new OpenCode session, receives escaped restart recovery context, emits a GWS draft-create tool side effect, and ultimately delivers `Draft created in Gmail.`
 - No message claims same-session continuation after the OpenCode continuation was cleared.
 
-- [ ] **Step 6: Replay direct no-SSE transport failure and successful continuation**
+- [ ] **Step 6: Replay direct no-SSE transport failure and successful recovery**
 
 Use a distinct message such as:
 
@@ -746,14 +808,14 @@ Harness sequence:
 
 - Prompt starts with a known continuation.
 - The pump yields only `wait-tick` activity until `OPENCODE_TRANSPORT_TIMEOUT_MS`, then `transport-timeout`.
-- Assert a terminal transport interruption is emitted, the initial batch completes, continuation is preserved, and scoped recovery context is stored.
+- Assert a terminal transport interruption is emitted, the initial batch completes without the generic no-output error, the OpenCode continuation is cleared because no-SSE produced no reuse proof, and scoped recovery context is stored with `continuationPolicy: "clear"` or the equivalent explicit restart policy.
 - Insert `continue`.
-- Assert the next top-level prompt receives escaped recovery context and then emits assistant text `continued after transport pause` plus `session.idle`.
+- Assert the next top-level prompt starts a new OpenCode session, receives escaped recovery context, emits assistant text `continued after transport pause`, yields `input-accepted` for the recovery `inputId`, then `session.idle`.
 
 Assertions:
 
 - The second user-visible result is delivered.
-- Recovery context is deleted after the resumed prompt is accepted.
+- Recovery context is deleted after the resumed prompt is accepted with the matching `inputId`.
 - No `OpenCode event timeout (...)` string leaks to Discord/Yente output.
 
 - [ ] **Step 7: Replay terminal interruption taxonomy**
@@ -1020,7 +1082,7 @@ Update `docs/agent-runner-details.md`:
 - State that transport death, stream errors, queue overflow, session.error, retry-limit exhaustion, startup/prompt acceptance timeout, and absolute timeout are terminal for the current query but preserve user-facing recovery context.
 - State that native OpenCode question is disabled and denied because Yente uses Discord/messages/MCP interaction paths.
 - State that `ProviderEvent.error` retryable/non-retryable behavior is explicit.
-- Document scoped recovery context, wake-triggering-route scoping, original-task restart payloads, and top-level deletion-after-`init` semantics.
+- Document scoped recovery context, wake-triggering-route scoping, original-task restart payloads, and deletion only after matching top-level `input-accepted` semantics.
 - Document that follow-up messages are completed only after provider prompt acceptance or explicit supersession, not local enqueue.
 - Document that OpenCode tool state can widen host-sweep tolerance for declared timeouts, including overlapping tool tracking.
 
@@ -1118,14 +1180,14 @@ git commit -m "fix: address hardening verification findings"
 
 The implementation is complete only when all of these are true:
 
-- Dvora replay uses the recovered exact original inbound request, exact observed `Found the 5/19 recording...` progress text, and exact `Great. Now do the 5/19 summary.` follow-up through NanoClaw's session DB and real `OpenCodeProvider`; it produces no raw timeout error, preserves usable continuation, proves the summary tool-side side effect occurred, and ultimately delivers the summary result.
+- Dvora replay uses the recovered exact original inbound request when available, otherwise documents the evidence boundary and uses the transcript-provided progress/follow-up as the minimum exact replay; it injects the trigger through NanoClaw's session DB and real `OpenCodeProvider`, emits the exact observed `Found the 5/19 recording...` progress text before the interruption path, accepts the exact `Great. Now do the 5/19 summary.` follow-up, produces no raw timeout error, preserves usable continuation only when reuse is proved, proves the summary tool-side side effect occurred, and ultimately delivers the summary result.
 - Fruma replay uses the exact `Actually create a draft in my gmail` prompt, denies the native OpenCode question without waiting five minutes, preserves continuation only after reuse proof, accepts the follow-up email answer, proves a GWS draft-create tool/command side effect occurred, and ultimately delivers `Draft created in Gmail.`
 - Non-cancellable native-question replay clears the unusable OpenCode continuation, restarts from recovery context that includes the original Gmail draft task, proves the GWS draft-create side effect, and does not claim same-session continuation.
-- Direct no-SSE transport failure is visible as a recoverable interruption, preserves user-facing recovery context, keeps host liveness alive until the configured transport timeout, accepts a later `continue`, and delivers a final result.
-- OpenCode soft inactivity yields activity plus Yente-visible agent context, keeps the runtime/session alive, and continues waiting for eventual `session.idle`.
+- Direct no-SSE transport failure is visible as a recoverable interruption, clears the unproven OpenCode continuation, preserves user-facing recovery context, keeps host liveness alive until the configured transport timeout, accepts a later `continue`, and delivers a final result from a new OpenCode session.
+- OpenCode soft inactivity yields activity plus out-of-band Yente-visible recovery context, keeps the runtime/session alive, and continues waiting for eventual `session.idle`.
 - Heartbeat-only and no-SSE wait periods keep host liveness fresh without counting as meaningful progress.
 - Native OpenCode question tool parts and permission paths cannot leave OpenCode blocked on a TUI-native question; non-cancellable cases restart OpenCode with recovery context instead of falsely promising same-session continuation.
-- Recovery contexts are route-scoped, XML-escaped, non-destructive until top-level prompt `init`, and not consumed by follow-up pushes or another conversation.
+- Recovery contexts are route-scoped, XML-escaped, non-destructive until matching top-level `input-accepted`, and not consumed by follow-up pushes or another conversation.
 - Follow-up user rows are not completed until provider prompt acceptance or explicit supersession; terminal interruptions before acceptance keep them pending or store them in recovery.
 - OpenCode stale-session classification is limited to exact missing-session cases and cannot be triggered by generic transport failures.
 - Overlapping OpenCode tool parts cannot clear long-tool host-sweep protection while a longer tool remains active.
