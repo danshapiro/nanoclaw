@@ -106,9 +106,9 @@ Provider-observed tool events may reference or enrich these entries but are not 
 
 Validation must work on BOTH sides of the mount: the container importer (during normal provider polling) and the host importer (during sweep/crash recovery). The agent runs in the container, and per the NanoClaw rules the container/agent must never hold GWS secrets. A symmetric HMAC is therefore unusable (the verifier would need the signing secret, which would let the agent forge). The mechanism is **asymmetric Ed25519 signing**:
 
-- The `gws-proxy` holds the Ed25519 **private** key, loaded from a root-owned file referenced by `GWS_SIDE_EFFECT_SIGN_KEY_FILE` (provisioned under the existing gitignored `/srv/nanoclaw/secrets/` path; see Task 0). On a successful API-effect mutation the proxy computes a detached signature over a canonical JSON payload `{ audit_id, service, method, request_class, api_effect, operation_succeeded, occurred_at, result_digest }` and returns it plus the `X-GWS-*` headers. `audit_id` is a proxy-generated unique id; `result_digest` is a hash of the response/parsed draft id.
+- The `gws-proxy` holds the Ed25519 **private** key, loaded from a root-owned file referenced by `GWS_SIDE_EFFECT_SIGN_KEY_FILE` (provisioned under the canonical host runtime secrets directory `/srv/nanoclaw/shared/secrets/` and bind-mounted read-only into the `gws-proxy` container; see Task 0). On a successful API-effect mutation the proxy computes a detached signature over a canonical JSON payload `{ audit_id, service, method, request_class, api_effect, operation_succeeded, occurred_at, result_digest }` and returns it plus the `X-GWS-*` headers. `audit_id` is a proxy-generated unique id; `result_digest` is a hash of the response/parsed draft id.
 - The Ed25519 **public** key is distributed to both the container (read-only, safe — verification grants no forging power) and the host, via `GWS_SIDE_EFFECT_VERIFY_KEY` / a mounted public-key file. The agent cannot fabricate a valid `gmail_draft_created` entry because it lacks the private key.
-- Importers (`container/agent-runner/src/db/side-effects.ts` and the host helper) accept a `gmail_draft_created` row as authoritative only if the Ed25519 signature verifies over the staged canonical payload. `inputId`/`routeKey` are NanoClaw correlation hints stapled by the shim, not part of the signed payload; a wrong correlation only mis-routes a *real* draft's recovery, it can never fabricate a draft. Idempotency key = `audit_id`, so replaying a genuine past signature is an idempotent no-op, not a new draft.
+- Importers (the container `container/agent-runner/src/db/side-effects.ts` and the host `src/db/session-db.ts` recovery/import helpers) accept a `gmail_draft_created` row as authoritative only if the Ed25519 signature verifies over the staged canonical payload. Both sides call the pure DB-free verifier (`side-effects-verify.ts`), which exists as a re-exported container module and a byte-equivalent host copy rather than a single cross-project import — the host TS project (`rootDir:"./src"`) cannot include `container/agent-runner/src/**` and must not pull in `bun:sqlite`. `inputId`/`routeKey` are NanoClaw correlation hints stapled by the shim, not part of the signed payload; a wrong correlation only mis-routes a *real* draft's recovery, it can never fabricate a draft. Idempotency key = `audit_id`, so replaying a genuine past signature is an idempotent no-op, not a new draft.
 - `summarize-dnd` artifacts need no key: validation is artifact existence + hash/size under an allowed output root. The signing mechanism is GWS-only.
 - The feature degrades safely when keys are absent (e.g. dev, or pre-deploy): the proxy emits classification headers but no signature, and the importer treats unsigned `gmail_draft_created` JSONL as an unvalidated hint only — never authoritative — so the security invariant "agent-writable staged JSONL is never authoritative" holds with or without the key. Side-effect recovery for Gmail is simply inactive (falls back to safe partial-success/audit evidence) until the keypair is provisioned.
 
@@ -189,7 +189,7 @@ The central design rule is ownership separation:
 
 - Create `container/agent-runner/src/providers/opencode-errors.ts`
   - Typed OpenCode interruption errors and metadata helpers.
-  - Exact attempted-session missing-session classifier.
+  - Exact attempted-session missing-session classifier `isMissingOpenCodeSessionError(err, attemptedSessionId)`. This is a DIAGNOSTIC / TRIGGER predicate only — a verbatim match of the attempted id in error text may TRIGGER running the positive existence check, but the classifier is NEVER itself authoritative to clear continuation. The only authoritative clears are (a) explicit provider `clear-continuation`, (b) a positive existence check proving the session is gone, or (c) the bounded zombie path.
 
 - Modify `container/agent-runner/src/providers/types.ts`
   - Add `inputId` to `QueryInput` and `QueryTurnInput`.
@@ -239,7 +239,7 @@ The central design rule is ownership separation:
 - Create `container/agent-runner/src/db/side-effects.ts`
   - Idempotently import staged `/workspace/side-effects.jsonl` into outbound DB `side_effect_ledger` (idempotency key = `audit_id` for GWS, stable artifact/run key for `summarize-dnd`).
   - Validate/sanitize known side-effect kinds: `gmail_draft_created`, `summarize_dnd_recording_cached`, `summarize_dnd_summary_artifact`, and `tool_completed`.
-  - Treat JSONL entries as untrusted hints until validation succeeds: `gmail_draft_created` requires a valid **Ed25519** signature over the proxy's canonical payload, verified with the **public** key (the `verifyGwsSideEffectSignature(payload, signature, publicKey)` helper, added in **Task 4B** — Task 1 creates this module with the fail-closed default that unsigned Gmail entries are never authoritative); `summarize-dnd` entries require artifact existence + hash/size under an allowed output root (validated in Task 1). The Ed25519 verification logic is reused by the host import helper.
+  - Treat JSONL entries as untrusted hints until validation succeeds: `gmail_draft_created` requires a valid **Ed25519** signature over the proxy's canonical payload, verified with the **public** key (the `verifyGwsSideEffectSignature(payload, signature, publicKey)` helper, added in **Task 4B** — Task 1 creates this module with the fail-closed default that unsigned Gmail entries are never authoritative); `summarize-dnd` entries require artifact existence + hash/size under an allowed output root (validated in Task 1). The pure Ed25519 verification + canonical-JSON serialization logic lives in a DB-free module `container/agent-runner/src/db/side-effects-verify.ts` (no `bun:sqlite`, no DB import — only the Node/Bun built-in `crypto`), which `side-effects.ts` re-exports. It is NOT imported across the project boundary: the host and the container are separate TypeScript projects (host `tsconfig.json` is `rootDir:"./src"` / `include:["src/**/*"]`; the container project is `types:["bun"]` and `connection.ts` imports `bun:sqlite`), so a host helper cannot import the container `side-effects.ts` without pulling in `bun:sqlite` and the container outbound-DB layer. The pure helper is therefore duplicated as a byte-equivalent host copy at `src/db/side-effects-verify.ts` (see NanoClaw Host), with a shared cross-check test (Task 4B) asserting both copies verify/reject the same signature vectors.
   - When no verify key is configured, leave `gmail_draft_created` entries as unvalidated hints (never authoritative) so the build is green and the feature is inactive rather than insecure.
   - Expose query helpers for recovery prompt construction and replay tests.
 
@@ -263,7 +263,7 @@ The central design rule is ownership separation:
   - Add route normalization helpers or import them from a new focused module if the implementation reads cleaner.
 
 - Modify `container/shim/gws`
-  - On a successful API-effect response (`X-GWS-Api-Effect: true`, `X-GWS-Operation-Succeeded: true`), append a sanitized `gmail_draft_created` JSONL record carrying the proxy's Ed25519 signature + canonical payload to `${NANOCLAW_SIDE_EFFECT_LEDGER:-/workspace/side-effects.jsonl}` via a true atomic append — `O_APPEND` (POSIX guarantees atomicity for a single write under `PIPE_BUF`) or `flock` — NOT temp+rename. Temp+rename replaces the whole file and would clobber lines written concurrently by other tool processes (other shim invocations, `summarize-dnd`, the relay's tools). Append after the response is received and before stdout is returned to OpenCode. The shim does not verify the signature.
+  - On a successful API-effect response (`X-GWS-Api-Effect: true`, `X-GWS-Operation-Succeeded: true`), append a sanitized `gmail_draft_created` JSONL record carrying the proxy's Ed25519 signature + canonical payload to `${NANOCLAW_SIDE_EFFECT_LEDGER:-/workspace/side-effects.jsonl}` via a true atomic append — open with `O_APPEND` so each `write(2)` is positioned at end-of-file before it writes (POSIX repositions the offset atomically per write, so concurrent appenders never clobber each other), and emit the whole JSONL record in a SINGLE `write(2)` call (or hold `flock` for the append) so one record is never interleaved with another's bytes — NOT temp+rename. Temp+rename replaces the whole file and would clobber lines written concurrently by other tool processes (other shim invocations, `summarize-dnd`, the relay's tools). Append after the response is received and before stdout is returned to OpenCode. The shim does not verify the signature.
   - Read `inputId`/`routeKey` from `/workspace/.active-input.json` at invocation time (not from process env, which is stale across follow-ups) and staple them into the record as correlation hints; if the file is absent or stale-by-timestamp, stage an uncorrelated diagnostic record that cannot resolve recovery by itself.
 
 - Modify `container/agent-runner/src/poll-loop.ts`
@@ -300,11 +300,14 @@ The central design rule is ownership separation:
   - Add forward-compatible host schema columns for `messages_in.messaging_group_id`, `messages_in.is_group`, `session_routing.messaging_group_id`, `session_routing.is_group`, and route metadata on outbound `messages_out`.
   - Add outbound DB `side_effect_ledger` schema and imported-side-effect validation metadata.
 
+- Create `src/db/side-effects-verify.ts`
+  - Host copy of the pure, DB-free Ed25519 verification + canonical-JSON serialization logic (Node built-in `crypto`; no `better-sqlite3`/DB import). Byte-equivalent to `container/agent-runner/src/db/side-effects-verify.ts`. This is a deliberate duplication, NOT a cross-project import: the host TS project (`tsconfig.json` `rootDir:"./src"`, `include:["src/**/*"]`) cannot include `container/agent-runner/src/**`, and the container `side-effects.ts`/`connection.ts` pull in `bun:sqlite`, which does not resolve under the host's Node/Vitest runtime. A shared cross-check test (Task 4B) feeds both copies the same signed/forged/tampered vectors and asserts identical verify/reject results so the two copies cannot drift.
+
 - Modify `src/db/session-db.ts`
   - Stamp host route metadata into inbound rows and `session_routing`.
   - Own host-side migrations for existing session DBs; container migrations are forward-compatible readers, not the primary writer for host-owned inbound schema.
   - Add host due-count/sync helpers that exclude `processing_ack.status='recovery'` without completing or resetting those rows.
-  - Add host-only recovery writer/import helpers that open outbound DB writable only after verified container exit.
+  - Add host-only recovery writer/import helpers that open outbound DB writable only after verified container exit; the Gmail side-effect import path verifies `gmail_draft_created` entries via the host copy `src/db/side-effects-verify.ts` (never by importing the container module).
 
 - Modify `src/router.ts`
   - Pass `messaging_group_id` and `is_group` from the resolved messaging group into `writeSessionMessage()`.
@@ -418,10 +421,11 @@ Record the exact dependency set and interpreter path in a short note (and, if th
 
 Task 4B's `gmail_draft_created` recovery evidence is trusted via Ed25519 (see "Side-Effect Trust Mechanism"). Generation/installation of the keypair is an operator/deploy action, out of scope for local TDD, but record it so the feature is shippable:
 
-- Generate an Ed25519 keypair; install the **private** key root-owned under `/srv/nanoclaw/secrets/` (already gitignored and excluded from the gitleaks scan), referenced to the proxy via `GWS_SIDE_EFFECT_SIGN_KEY_FILE`.
+- Generate an Ed25519 keypair; install the **private** key as a root-owned file under the canonical host runtime secrets directory `/srv/nanoclaw/shared/secrets/` (the `root:nanoclaw 0750` dir that already holds `onecli-api-key`/`discord-bot-token`; not committed to this repo), referenced to the proxy via `GWS_SIDE_EFFECT_SIGN_KEY_FILE`. (Do NOT use `/srv/nanoclaw/secrets/`; that is the repo-relative gitignored/gitleaks-excluded deploy-key directory in the shapiroserver2 working tree, not the host runtime secrets path.)
 - Distribute the **public** key to the host and into the container (read-only mount / `GWS_SIDE_EFFECT_VERIFY_KEY`); never place the private key in the container or any agent-facing env.
-- Provision `GWS_AUDIT_STORE` (a root-owned, host-readable append-only JSONL path) for the proxy so crash-window discovery can wire; if unset, that discovery path is inactive and the no-duplication guarantee degrades to "no duplication when the tool process survives to append."
-- Local tests use ephemeral test keypairs generated in-process; they must NOT depend on the production key. With no key present the importer treats unsigned `gmail_draft_created` JSONL as an unvalidated hint only, so the build is green and the feature is simply inactive until the key is provisioned in production.
+- Provision `GWS_AUDIT_STORE` (a root-owned, host-readable append-only JSONL path on the host) for the proxy so crash-window discovery can wire; if unset, that discovery path is inactive and the no-duplication guarantee degrades to "no duplication when the tool process survives to append."
+- **Deploy prerequisite — `gws-proxy` compose volume mounts (deploy-time edit, not a host mutation here).** The signed channel is NOT deployable until the `gws-proxy` Docker service mounts the two new host paths into the container; today `srv/gws-proxy/docker-compose.yml` mounts only `./config.yaml:ro`, `./keys.yaml:ro`, and `/srv/gws-proxy/gws-config`, so the proxy can neither read the private signing key nor write a host-readable audit store. As part of deploying this feature (a normal `srv/gws-proxy/docker-compose.yml` change applied via the standard deploy flow — do NOT mutate the live host as part of local TDD), add: (a) a read-only mount of the private signing key file from `/srv/nanoclaw/shared/secrets/` to the in-container path named by `GWS_SIDE_EFFECT_SIGN_KEY_FILE`, and (b) a writable mount of a root-owned host directory to the in-container parent of `GWS_AUDIT_STORE`, so the co-located NanoClaw host can read that JSONL directly. Set `GWS_SIDE_EFFECT_SIGN_KEY_FILE` and `GWS_AUDIT_STORE` (and `GWS_SIDE_EFFECT_VERIFY_KEY` for the host/container verify path) in the proxy's deploy env to the in-container paths. Until these mounts exist the proxy starts with the feature inactive (per Step 6 gating: it emits classification headers only, logs one warning, and produces no signatures or audit entries), and side effects stay unsigned/undiscovered rather than failing the proxy.
+- Local tests use ephemeral test keypairs generated in-process; they must NOT depend on the production key. With no key present the importer treats unsigned `gmail_draft_created` JSONL as an unvalidated hint only, so the build is green and the feature is simply inactive until the key is provisioned and the `gws-proxy` mounts exist in production.
 
 ## Task 1: Schema, Provider Contract, Input Ledger, And Route-Scoped Recovery
 
@@ -809,7 +813,7 @@ expect(isMissingOpenCodeSessionError(new Error('OpenCode promptAsync: session se
 expect(isMissingOpenCodeSessionError(new Error('OpenCode promptAsync: session ses_other not found'), 'ses_old')).toBe(false);
 ```
 
-`isMissingOpenCodeSessionError` is only valid proof when the attempted id appears verbatim. In SDK 1.15.10 the missing-session error is a `NotFoundError` whose `data.message` is free-form and may NOT carry the id, so the string classifier alone cannot prove a dead session (false-negative). Add a positive-existence-check seam and a bounded zombie path, and test them:
+`isMissingOpenCodeSessionError` is a DIAGNOSTIC / TRIGGER predicate only, never an authoritative clear. Even when the attempted id appears verbatim it may only TRIGGER the positive existence check; it does not itself clear continuation. In SDK 1.15.10 the missing-session error is a `NotFoundError` whose `data.message` is free-form and may NOT carry the id, so the string classifier alone cannot prove a dead session (false-negative) — and per the Hard Invariants string matching is never authoritative proof in either direction. The unit test above is retained because the predicate itself is valid (a verbatim attempted-id match is a legitimate trigger signal), but its ROLE is trigger-only: the AUTHORITATIVE clear must be exactly (a) an explicit provider `clear-continuation`, (b) the positive existence check returning not-found, or (c) the bounded zombie path. Add a positive-existence-check seam and a bounded zombie path, and test them:
 
 ```typescript
 // Positive existence check is the authoritative proof source (probe-discovered API).
@@ -873,7 +877,7 @@ Expected: FAIL.
 
 - [ ] **Step 4: Implement typed OpenCode errors and classifier**
 
-Create `opencode-errors.ts` with liveness metadata, typed errors for transport timeout, absolute timeout, stream read error, stream end, and queue overflow, plus `isMissingOpenCodeSessionError(err, attemptedSessionId)`. The classifier must require attempted session context and must not match generic transport/read/timeout strings. Typed errors must preserve continuation by default; only exact attempted-session missing proof or explicit provider clear-continuation metadata may clear it.
+Create `opencode-errors.ts` with liveness metadata, typed errors for transport timeout, absolute timeout, stream read error, stream end, and queue overflow, plus `isMissingOpenCodeSessionError(err, attemptedSessionId)`. The classifier must require attempted session context and must not match generic transport/read/timeout strings. It is a DIAGNOSTIC / TRIGGER predicate only — a verbatim attempted-id match may TRIGGER the positive existence check but is never itself an authoritative clear. Typed errors must preserve continuation by default; the only authoritative clears are (a) an explicit provider `clear-continuation`, (b) a positive existence check proving the attempted session is gone, or (c) the bounded zombie path — never a string match on error text.
 
 - [ ] **Step 5: Implement the event pump**
 
@@ -933,6 +937,7 @@ git commit -m "fix: make opencode liveness recoverable"
 ## Task 3: OpenCode Provider Runtime, Native Questions, Relays, And Side Effects
 
 **Files:**
+- Modify: `src/providers/opencode.ts` (host-side container-config registration — forward new operator-configurable `OPENCODE_*` knobs into the per-session container)
 - Modify: `container/agent-runner/src/providers/opencode.ts`
 - Modify: `container/agent-runner/src/providers/opencode.test.ts`
 - Create: `container/agent-runner/src/providers/opencode-sdk-surface.ts`
@@ -961,7 +966,7 @@ In `opencode.test.ts`, add mocked runtime-controller tests for:
 - If the separate relay runtime cannot start, accept the prompt, or finish by deadline, the original long turn remains active and the poll loop sends one sanitized direct fallback.
 - Terminal interruptions start a recovery query when possible; if recovery query startup or prompt acceptance misses its deadline, one sanitized direct fallback is written so the user is not left silent.
 - No-SSE wait ticks/keepalives beyond 16 minutes keep heartbeat alive and do not produce `OpenCode event timeout`.
-- Transport timeout at the configured longer deadline yields terminal `opencode_transport_timeout`, preserves continuation unless exact attempted-session missing proof or explicit clear-continuation is observed, clears active tool state, stores side-effect evidence, and returns without raw error.
+- Transport timeout at the configured longer deadline yields terminal `opencode_transport_timeout`, preserves continuation unless a positive existence check proves the attempted session is gone, an explicit provider `clear-continuation` is observed, or the bounded zombie limit is reached (the string classifier may trigger the existence check but never clears on its own), clears active tool state, stores side-effect evidence, and returns without raw error.
 - Absolute timeout, stream read error, stream end, queue overflow, `session.error`, startup timeout, prompt-acceptance timeout, and retry exhaustion each yield one typed terminal interruption and clear active tool state.
 - `message.part.updated` tool parts with native question and matching `permission.updated` events are correlated by `callID`/permission id and denied through `postSessionIdPermissionsPermissionId(...)`.
 - Cancellable native question waits only for bounded reuse proof; it preserves continuation only after `session.idle` or equivalent SDK acknowledgement.
@@ -1051,6 +1056,8 @@ Use env-configurable defaults:
 - `OPENCODE_CONTINUATION_FAILURE_LIMIT=3` (consecutive terminal interruptions on one continuation before the zombie path clears it with user-visible restart)
 - `OPENCODE_MODEL_PROVIDER_TIMEOUT_MS=21600000` (a large positive ms value = absolute turn ceiling), applied under the active provider name (`provider[OPENCODE_PROVIDER].options.timeout`), to avoid a hidden 5-minute request abort. The disable sentinel `0` is forbidden (it means 0 ms = immediate abort); to fully disable, the config emits `timeout: false` (the SDK's documented sentinel), never `0`.
 
+These defaults are applied in-container, but the host does NOT forward them today, so any operator override set in the host `.env` is silently dropped and the container always falls back to the in-container default. Forward the overrides: in the host-side container-config registration `src/providers/opencode.ts`, append every new `OPENCODE_*` knob above (`OPENCODE_INACTIVITY_NOTICE_MS`, `OPENCODE_INACTIVITY_NOTICE_REPEAT_MS`, `OPENCODE_TRANSPORT_TIMEOUT_MS`, `OPENCODE_WAIT_TICK_MS`, `OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS`, `OPENCODE_NATIVE_QUESTION_CANCEL_GRACE_MS`, `OPENCODE_LONG_TOOL_TIMEOUT_MAX_MS`, `OPENCODE_RELAY_DEADLINE_MS`, `OPENCODE_CONTINUATION_FAILURE_LIMIT`, `OPENCODE_MODEL_PROVIDER_TIMEOUT_MS`) to `OPENCODE_HOST_ENV_KEYS`, and pass each present override through the returned `env` map (omit unset keys so the in-container default still applies). Add a host-side test asserting that when one of these keys is set in `hostEnv`, the registered config fn includes it in `env`, and that an unset key is not emitted (so the in-container default is preserved).
+
 For every `inactivity-notice`, yield `activity` then `notice` with agent-facing wording and liveness metadata. Do not push the notice into the busy OpenCode turn. The poll loop will relay it only through an isolated bounded relay query when provider capabilities say that is safe.
 
 Provider capabilities for OpenCode must declare relay support only when the separate relay runtime factory and MCP allowlist are available:
@@ -1116,7 +1123,8 @@ git add container/agent-runner/src/providers/opencode.ts \
   container/agent-runner/src/db/connection.ts \
   container/agent-runner/src/index.ts \
   container/agent-runner/src/poll-loop.ts \
-  container/agent-runner/src/poll-loop.test.ts
+  container/agent-runner/src/poll-loop.test.ts \
+  src/providers/opencode.ts
 git commit -m "fix: recover opencode interruptions through yente"
 ```
 
@@ -1285,7 +1293,7 @@ In `summary_writer.py`, factor the summary-write + ledger-append into ONE helper
 
 - [ ] **Step 9: Implement side-effects.ts import + discovery**
 
-In `container/agent-runner/src/db/side-effects.ts`, add `verifyGwsSideEffectSignature(payload, signature, publicKey)` (Ed25519 verify via Bun/Node `crypto`) reused by the host import helper, import `gmail_draft_created` as authoritative only on valid signature (idempotency key `audit_id`), import `summarize_dnd_summary_artifact` only on artifact existence + hash/size under an allowed root, and add the crash-window discovery paths (read the proxy's `GWS_AUDIT_STORE` JSONL directly for an orphan draft-create matching the active `input_id`/`route_key`/time window; artifact-root scan for an orphan summary). With no public key, leave Gmail entries as unvalidated hints; with `GWS_AUDIT_STORE` unset, discovery is inactive and the guarantee degrades to "no duplication when the tool process survives to append."
+Add `verifyGwsSideEffectSignature(payload, signature, publicKey)` (Ed25519 verify via Node/Bun built-in `crypto`, plus the canonical-JSON serializer) in the pure DB-free module `container/agent-runner/src/db/side-effects-verify.ts`, re-exported by `container/agent-runner/src/db/side-effects.ts`. Mirror the SAME pure logic into the host copy `src/db/side-effects-verify.ts` (byte-equivalent; do not import the container file — the host TS project cannot include `container/agent-runner/src/**` and must not pull in `bun:sqlite`) and call it from the host `src/db/session-db.ts` import path. Add a shared cross-check test that runs identical signed/forged/tampered vectors through both copies and asserts matching verify/reject results. In `container/agent-runner/src/db/side-effects.ts`, import `gmail_draft_created` as authoritative only on valid signature (idempotency key `audit_id`), import `summarize_dnd_summary_artifact` only on artifact existence + hash/size under an allowed root, and add the crash-window discovery paths (read the proxy's `GWS_AUDIT_STORE` JSONL directly for an orphan draft-create matching the active `input_id`/`route_key`/time window; artifact-root scan for an orphan summary). With no public key, leave Gmail entries as unvalidated hints; with `GWS_AUDIT_STORE` unset, discovery is inactive and the guarantee degrades to "no duplication when the tool process survives to append."
 
 - [ ] **Step 10: Run tests green**
 
@@ -1526,7 +1534,7 @@ Add table-driven cases for no-SSE transport timeout, stream read error, stream e
 Each case must assert:
 
 - Recovery has original task text, accepted/unresolved input rows, side effects, and continuation policy.
-- Transport timeout preserves continuation unless exact attempted-session missing proof or explicit provider clear-continuation was observed.
+- Transport timeout preserves continuation unless a positive existence check proves the attempted session is gone, an explicit provider `clear-continuation` was observed, or the bounded zombie limit was reached (a string-classifier match may trigger the existence check but is never the authoritative clear).
 - Raw provider error text is not written to user output.
 - Terminal recovery startup/acceptance failure produces one sanitized direct fallback so the user is not left with no visible path forward.
 - OpenCode active tool state is cleared.
@@ -1541,7 +1549,7 @@ cd /home/dan/code/nanoclaw/.worktrees/yente-opencode-timeout-hardening/container
 timeout 120s bun test src/opencode-incident-replay.test.ts
 ```
 
-Expected: FAIL until Tasks 1-4 are wired.
+Expected: FAIL. Task 6 runs after Tasks 1-4 have already been wired, so this is not red because the production features are missing. It is red because the replay harness and its acceptance assertions in `opencode-incident-replay.test.ts` are still being authored (Steps 1-9): the file does not yet exist or its contracts are incomplete. As the harness comes up, it exercises the already-built Task 1-4 machinery through the real `OpenCodeProvider` and may EXPOSE latent defects in that machinery. When it does, do not patch them here — return to the owning task, fix the defect with a focused test, rerun that task's verification, and commit there, per the verification contract in Task 7 Step 7. This step is green-eligible only once the harness and all its assertions are complete and any exposed Task 1-4 defects have been fixed in their owning tasks.
 
 - [ ] **Step 11: Run replay tests green**
 
@@ -1552,7 +1560,7 @@ cd /home/dan/code/nanoclaw/.worktrees/yente-opencode-timeout-hardening/container
 timeout 180s bun test src/opencode-incident-replay.test.ts src/providers/opencode.test.ts src/poll-loop.test.ts src/db/session-state.test.ts
 ```
 
-Expected: PASS.
+Expected: PASS. Green here means the replay harness is fully authored, every acceptance assertion from Steps 1-9 is in place, and any latent Task 1-4 defects the harness exposed have been fixed in their owning tasks (with the prior tasks' suites still passing). There is no new production feature to wire between Step 10 and this step — the only work is completing the harness and routing any exposed defects back to their owning task per Task 7 Step 7.
 
 - [ ] **Step 12: Commit**
 
@@ -1626,12 +1634,17 @@ Run:
 
 ```bash
 cd /home/dan/code/gws-skill/.worktrees/yente-timeout-audit-hardening
+# gws-skill README "Validation" section declares these two scripts as the repo's gate.
+# test-repo-smoke.sh supersedes the bare `go test ./...` (it runs it, then a local docker build),
+# so run it instead of a standalone `go test`. test-skill-bundle.sh is a pure local manifest/bundle check.
 timeout 120s go test ./...
+timeout 300s bash tests/test-repo-smoke.sh   # runs `go test ./...` + a local `docker build`; needs Docker, no live GWS creds/network
+timeout 120s bash tests/test-skill-bundle.sh # local manifest/skill-bundle validation; needs `jq`, no creds/network
 cd /home/dan/code/summarize-dnd/.worktrees/nanoclaw-side-effect-ledger
 timeout 120s .venv-wsl/bin/python -m pytest
 ```
 
-Expected: PASS.
+Expected: PASS. The live GWS suite (`live_test.go`, `//go:build live`) is excluded from these commands and is not part of this local gate, since it requires the `live` build tag and real credentials/network.
 
 - [ ] **Step 5: Run static guards**
 
@@ -1695,7 +1708,7 @@ Implementation is complete only when all of these are true:
 - Dvora replay uses the recovered exact original inbound request when available, otherwise documents the evidence boundary, injects the transcript-known progress and follow-up through local Yente, harvests the progress from user-visible output, includes both observed session ids `ses_1a1e72ac7ffe3Ek8fJOiz1Y0lT` and `ses_19757b6f7ffeYulTtPz3gteQ84`, models the 5/19 recording selection/download/cache evidence, emits no raw OpenCode timeout, preserves or clears continuation only according to proof, validates the generic `summarize-dnd` 5/19 summary side effect at the tool boundary, and ultimately delivers the summary result.
 - Fruma replay recovers or minimally fixtures the prior Matt Van Horn context, injects `Actually create a draft in my gmail`, crosses a local GWS shim/proxy boundary for the observed `gws gmail users drafts create --help` probe before the native question, classifies any schema/local-validation probes as non-API, visibly asks for Matt Van Horn's email before the answer is injected, creates and validates a Gmail draft side effect and audit record before final output, emits no raw timeout, and ultimately delivers `Draft created in Gmail.`
 - Non-cancellable native-question replay clears the unusable continuation, restarts from recovery, and succeeds without claiming same-session continuation.
-- Direct no-SSE/heartbeat-only long work exceeds the observed 16-minute window in tests while remaining state-preserving and host-alive; terminal transport failure at the configured longer deadline recovers successfully and preserves continuation absent exact missing-session proof.
+- Direct no-SSE/heartbeat-only long work exceeds the observed 16-minute window in tests while remaining state-preserving and host-alive; terminal transport failure at the configured longer deadline recovers successfully and preserves continuation unless a positive existence check proves the attempted session is gone, an explicit provider `clear-continuation` is observed, or the bounded zombie limit is reached (a string-classifier match may trigger the existence check but never clears on its own).
 - Inactivity notices carry concrete liveness metadata and are relayed by Yente through the separate restricted relay runtime when available, or produce one sanitized direct fallback while the original long turn continues; they never clear continuation by stale-session heuristic.
 - Terminal interruption paths either produce a Yente-authored recovery message or one sanitized direct fallback after bounded recovery startup/acceptance failure; no path silently strands the user.
 - Recovery context is route-scoped, XML-escaped, retained through failed accepted recovery attempts, never pruned while unresolved, and deleted only after successful result or explicit supersession.
