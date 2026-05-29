@@ -108,7 +108,7 @@ Validation must work on BOTH sides of the mount: the container importer (during 
 
 - The `gws-proxy` holds the Ed25519 **private** key, loaded from a root-owned file referenced by `GWS_SIDE_EFFECT_SIGN_KEY_FILE` (provisioned under the canonical host runtime secrets directory `/srv/nanoclaw/shared/secrets/` and bind-mounted read-only into the `gws-proxy` container; see Task 0). On a successful API-effect mutation the proxy computes a detached signature over a canonical JSON payload `{ audit_id, service, method, request_class, api_effect, operation_succeeded, occurred_at, result_digest }` and returns it plus the `X-GWS-*` headers. `audit_id` is a proxy-generated unique id; `result_digest` is a hash of the response/parsed draft id.
 - The Ed25519 **public** key is distributed to both the container (read-only, safe — verification grants no forging power) and the host, via `GWS_SIDE_EFFECT_VERIFY_KEY` / a mounted public-key file. The agent cannot fabricate a valid `gmail_draft_created` entry because it lacks the private key.
-- Importers (the container `container/agent-runner/src/db/side-effects.ts` and the host `src/db/session-db.ts` recovery/import helpers) accept a `gmail_draft_created` row as authoritative only if the Ed25519 signature verifies over the staged canonical payload. Both sides call the pure DB-free verifier (`side-effects-verify.ts`), which exists as a re-exported container module and a byte-equivalent host copy rather than a single cross-project import — the host TS project (`rootDir:"./src"`) cannot include `container/agent-runner/src/**` and must not pull in `bun:sqlite`. `inputId`/`routeKey` are NanoClaw correlation hints stapled by the shim, not part of the signed payload; a wrong correlation only mis-routes a *real* draft's recovery, it can never fabricate a draft. Idempotency key = `audit_id`, so replaying a genuine past signature is an idempotent no-op, not a new draft.
+- Importers (the container `container/agent-runner/src/db/side-effects.ts` and the host `src/db/session-db.ts` recovery/import helpers) accept a `gmail_draft_created` row as authoritative only if the Ed25519 signature verifies over the staged canonical payload. Both sides call the pure DB-free verifier (`side-effects-verify.ts`), which exists as a re-exported container module and a byte-equivalent host copy rather than a single cross-project import — the host TS project (`rootDir:"./src"`) cannot include `container/agent-runner/src/**` and must not pull in `bun:sqlite`. `inputId`/`routeKey` are NanoClaw correlation hints stapled by the shim, not part of the signed payload; a wrong correlation only mis-routes a *real* draft's recovery, it can never fabricate a draft. Idempotency key = `audit_id`, so replaying a genuine past signature is an idempotent no-op, not a new draft. Cross-conversation isolation does not rest on the hint: `.active-input.json` is written by the **poll loop** (the trusted in-container writer), not by the agent, and it carries the poll loop's host-authoritative route for the single normalized route active in this turn (other routes stay pending — see the State Lifecycle Contract), so `routeKey` cannot be cross-route mis-stamped mid-turn. Recovery additionally harvests `side_effect_ledger` rows only under the active route's host-stamped identity (`messaging_group_id`/`is_group`); a ledger row whose `route_key` does not match the active route's host metadata is never surfaced into another conversation. So the residual from a bad hint is bounded to *delayed same-route recovery*, never a draft leaked across conversations.
 - `summarize-dnd` artifacts need no key: validation is artifact existence + hash/size under an allowed output root. The signing mechanism is GWS-only.
 - The feature degrades safely when keys are absent (e.g. dev, or pre-deploy): the proxy emits classification headers but no signature, and the importer treats unsigned `gmail_draft_created` JSONL as an unvalidated hint only — never authoritative — so the security invariant "agent-writable staged JSONL is never authoritative" holds with or without the key. Side-effect recovery for Gmail is simply inactive (falls back to safe partial-success/audit evidence) until the keypair is provisioned.
 
@@ -440,6 +440,7 @@ Task 4B's `gmail_draft_created` recovery evidence is trusted via Ed25519 (see "S
 - Modify: `src/container-runner.test.ts`
 - Modify: `src/modules/scheduling/db.ts`
 - Create: `container/agent-runner/src/db/side-effects.ts`
+- Create: `container/agent-runner/src/db/side-effects-verify.ts` (fail-closed stub: canonical-JSON serializer + a `verifyGwsSideEffectSignature` that returns "unvalidated" until the real Ed25519 verify lands in Task 4B; re-exported by `side-effects.ts`)
 - Modify: `container/agent-runner/src/providers/types.ts`
 - Modify: `container/agent-runner/src/providers/claude.ts`
 - Modify: `container/agent-runner/src/providers/codex.ts`
@@ -770,6 +771,7 @@ git add src/db/schema.ts src/db/session-db.ts src/db/session-db.test.ts \
   src/container-config.ts \
   src/container-runner.ts src/container-runner.test.ts \
   container/agent-runner/src/db/side-effects.ts \
+  container/agent-runner/src/db/side-effects-verify.ts \
   container/agent-runner/src/providers/types.ts \
   container/agent-runner/src/providers/claude.ts \
   container/agent-runner/src/providers/codex.ts \
@@ -1037,7 +1039,7 @@ interface OpenCodeRelayRuntimeFactory {
 }
 ```
 
-This seam necessarily replaces the current module-global singleton. Today `opencode.ts` keeps `sharedRuntime`/`sharedConfigKey`/`ensureSharedRuntime`/`destroySharedRuntime` and a single `activeSessionId` at module scope; a naive relay reusing `ensureSharedRuntime` would collide on `runtimeConfigKey` (relay differs only in denied tools) and return the SAME runtime/stream, and a timeout/abort during the relay window would call the global `destroySharedRuntime()` and kill BOTH turns. Refactor that module-global state into per-instance `OpenCodeRuntimeController` state with `destroy(reason)` targeting one specific runtime, and make `runtimeConfigKey` distinguish relay-vs-normal so the relay never lands on the original runtime.
+This seam necessarily replaces the current module-global singleton. Today `opencode.ts` keeps `sharedRuntime`/`sharedConfigKey`/`sharedInit`/`ensureSharedRuntime`/`destroySharedRuntime` at module scope (the active session id is NOT module-global — it is a per-instance `private activeSessionId` field on the `OpenCodeProvider` class); a naive relay reusing `ensureSharedRuntime` would collide on `runtimeConfigKey` (relay differs only in denied tools) and return the SAME runtime/stream, and a timeout/abort during the relay window would call the global `destroySharedRuntime()` and kill BOTH turns. Refactor that module-global state into per-instance `OpenCodeRuntimeController` state with `destroy(reason)` targeting one specific runtime, and make `runtimeConfigKey` distinguish relay-vs-normal so the relay never lands on the original runtime.
 
 The relay runtime must build a separate OpenCode config key, a separate process/client/event pump, no continuation, and a tool policy enforced at the NanoClaw MCP server boundary plus disabled native OpenCode mutation tools. Concretely, since `index.ts` launches ONE shared MCP-server subprocess per turn, the relay `OpenCodeRuntimeController` must launch its OWN NanoClaw MCP-server subprocess with `NANOCLAW_RELAY_MODE=1` and `NANOCLAW_RELAY_ROUTE_KEY=<route>` in its env; `mcp-tools/server.ts` reads those to build a `send_message`-only, route-locked tool map for that instance. The concurrent original turn keeps its full-tool MCP server; the relay's MCP server exposes only route-locked status tools. Do not multiplex relay events through the original OpenCode SSE stream, and do not share one MCP server between the two turns.
 
@@ -1191,11 +1193,15 @@ Classify command structure before request logging (in `handleExec`, right after 
 
 Generate a unique `audit_id` per request (used in logs and headers; reused by Task 4B). Add classification response headers where a response is written: `X-GWS-Audit-Id`, `X-GWS-Request-Class`, `X-GWS-Api-Effect`, `X-GWS-Operation-Succeeded`. Do NOT broaden execution: keep authentication, `checker.Check`, the calendar-ownership guard, `InjectSignature`, the rate limiter, and `ExecGWS` exactly as they are. (Cryptographic side-effect signing is Task 4B, not here.)
 
-- [ ] **Step 5: Run tests green**
+- [ ] **Step 5: Run tests green (and the gws-skill repo validation gate)**
+
+Because Task 4A is independently shippable and `gws-skill` has no `AGENTS.md`, its README "Validation" section is the owning-repo gate — run it here, not only at Task 7 Step 4, so a 4A-only ship is validated by its own repo's gate:
 
 ```bash
 cd /home/dan/code/gws-skill/.worktrees/yente-timeout-audit-hardening
 timeout 120s go test ./...
+timeout 300s bash tests/test-repo-smoke.sh   # runs `go test ./...` + a local `docker build`; needs Docker, no live GWS creds/network
+timeout 120s bash tests/test-skill-bundle.sh # local manifest/skill-bundle validation; needs `jq`, no creds/network
 ```
 
 Expected: PASS.
@@ -1217,6 +1223,11 @@ Depends on Task 4A (audit id + headers) and Task 1 (`side_effect_ledger` schema 
 - Modify: `/home/dan/code/gws-skill/.worktrees/yente-timeout-audit-hardening/proxy_test.go`
 - Modify: `container/shim/gws`
 - Modify: `container/agent-runner/src/db/side-effects.ts`
+- Modify: `container/agent-runner/src/db/side-effects-verify.ts` (implement the real Ed25519 verify; Task 1 created the fail-closed stub)
+- Create: `src/db/side-effects-verify.ts` (byte-equivalent host copy of the pure verifier)
+- Modify: `src/db/session-db.ts` (host import path calls the host verifier; host-only `GWS_AUDIT_STORE` discovery)
+- Create: `src/db/side-effects-verify.test.ts` (host half of the shared signed/forged/tampered cross-check; the container half lives in `session-state.test.ts`)
+- Modify: `src/db/session-db.test.ts` (host audit-store discovery + verifier-wiring tests)
 - Modify: `container/agent-runner/src/db/session-state.test.ts`
 - Modify: `src/gws-shim.test.ts`
 - Modify: `/home/dan/code/summarize-dnd/.worktrees/nanoclaw-side-effect-ledger/summary_writer.py`
@@ -1255,12 +1266,12 @@ In `tests/test_stage_status.py`, set `NANOCLAW_SIDE_EFFECT_LEDGER` to a temp pat
 
 - [ ] **Step 4: Write failing side-effects.ts import + discovery tests**
 
-In `session-state.test.ts` / a focused `side-effects.ts` test:
+In `session-state.test.ts` / a focused `side-effects.ts` test (container-side import + validation), plus host `src/db/session-db.test.ts` for the host-only GWS audit-store discovery:
 
 - `gmail_draft_created` import is authoritative ONLY when the Ed25519 signature verifies against the staged canonical payload with a configured public key; a forged/tampered signature or a missing key leaves it an unvalidated hint.
 - Idempotency key = `audit_id`; replaying a genuine signed entry imports one row, not two.
 - `summarize_dnd_summary_artifact` import is authoritative only when the artifact exists under an allowed output root and matches the staged hash/size.
-- Crash-window discovery: given a proxy audit-store fixture with a completed `drafts.create` for an input id but NO JSONL entry, recovery discovers it via the audit-store query and does NOT duplicate the draft; given an allowed-root artifact with no ledger reference, recovery discovers the summary by artifact scan.
+- Crash-window discovery — the GWS audit-store path is **host-only** (the agent container cannot read `GWS_AUDIT_STORE`): in `src/db/session-db.test.ts`, given a proxy audit-store fixture with a completed `drafts.create` for an input id but NO JSONL entry, host recovery discovers it via the audit-store query and does NOT duplicate the draft. The artifact-scan discovery runs on both sides: given an allowed-root artifact with no ledger reference, recovery discovers the summary by artifact scan.
 
 - [ ] **Step 5: Run tests red**
 
@@ -1272,7 +1283,7 @@ timeout 120s .venv-wsl/bin/python -m pytest tests/test_stage_status.py
 cd /home/dan/code/nanoclaw/.worktrees/yente-opencode-timeout-hardening/container/agent-runner
 timeout 120s bun test src/db/session-state.test.ts
 cd /home/dan/code/nanoclaw/.worktrees/yente-opencode-timeout-hardening
-timeout 120s pnpm exec vitest run src/gws-shim.test.ts
+timeout 120s pnpm exec vitest run src/gws-shim.test.ts src/db/side-effects-verify.test.ts src/db/session-db.test.ts
 ```
 
 Expected: FAIL.
@@ -1293,7 +1304,7 @@ In `summary_writer.py`, factor the summary-write + ledger-append into ONE helper
 
 - [ ] **Step 9: Implement side-effects.ts import + discovery**
 
-Add `verifyGwsSideEffectSignature(payload, signature, publicKey)` (Ed25519 verify via Node/Bun built-in `crypto`, plus the canonical-JSON serializer) in the pure DB-free module `container/agent-runner/src/db/side-effects-verify.ts`, re-exported by `container/agent-runner/src/db/side-effects.ts`. Mirror the SAME pure logic into the host copy `src/db/side-effects-verify.ts` (byte-equivalent; do not import the container file — the host TS project cannot include `container/agent-runner/src/**` and must not pull in `bun:sqlite`) and call it from the host `src/db/session-db.ts` import path. Add a shared cross-check test that runs identical signed/forged/tampered vectors through both copies and asserts matching verify/reject results. In `container/agent-runner/src/db/side-effects.ts`, import `gmail_draft_created` as authoritative only on valid signature (idempotency key `audit_id`), import `summarize_dnd_summary_artifact` only on artifact existence + hash/size under an allowed root, and add the crash-window discovery paths (read the proxy's `GWS_AUDIT_STORE` JSONL directly for an orphan draft-create matching the active `input_id`/`route_key`/time window; artifact-root scan for an orphan summary). With no public key, leave Gmail entries as unvalidated hints; with `GWS_AUDIT_STORE` unset, discovery is inactive and the guarantee degrades to "no duplication when the tool process survives to append."
+Add `verifyGwsSideEffectSignature(payload, signature, publicKey)` (Ed25519 verify via Node/Bun built-in `crypto`, plus the canonical-JSON serializer) in the pure DB-free module `container/agent-runner/src/db/side-effects-verify.ts`, re-exported by `container/agent-runner/src/db/side-effects.ts`. Mirror the SAME pure logic into the host copy `src/db/side-effects-verify.ts` (byte-equivalent; do not import the container file — the host TS project cannot include `container/agent-runner/src/**` and must not pull in `bun:sqlite`) and call it from the host `src/db/session-db.ts` import path. Add a shared cross-check test that runs identical signed/forged/tampered vectors through both copies and asserts matching verify/reject results. In `container/agent-runner/src/db/side-effects.ts`, import `gmail_draft_created` as authoritative only on valid signature (idempotency key `audit_id`), import `summarize_dnd_summary_artifact` only on artifact existence + hash/size under an allowed root, and add the artifact-root orphan-summary scan (allowed roots are reachable both in-container and on the host). The GWS `GWS_AUDIT_STORE` crash-window discovery (read the proxy's audit-store JSONL directly for an orphan draft-create matching the active `input_id`/`route_key`/time window) is **host-only**: `GWS_AUDIT_STORE` is a root-owned host/proxy file that is NOT mounted into the agent container (consistent with the host-direct-read described in the Side-Effect contract and Step 6), so this read lives in the host import path (`src/db/session-db.ts`, called from `src/host-sweep.ts` recovery), never in the container `side-effects.ts`. With no public key, leave Gmail entries as unvalidated hints; with `GWS_AUDIT_STORE` unset, discovery is inactive and the guarantee degrades to "no duplication when the tool process survives to append."
 
 - [ ] **Step 10: Run tests green**
 
@@ -1306,7 +1317,7 @@ cd /home/dan/code/nanoclaw/.worktrees/yente-opencode-timeout-hardening/container
 timeout 120s bun test src/db/session-state.test.ts
 timeout 120s bun run typecheck
 cd /home/dan/code/nanoclaw/.worktrees/yente-opencode-timeout-hardening
-timeout 120s pnpm exec vitest run src/gws-shim.test.ts
+timeout 120s pnpm exec vitest run src/gws-shim.test.ts src/db/side-effects-verify.test.ts src/db/session-db.test.ts
 ```
 
 Expected: PASS.
@@ -1322,6 +1333,9 @@ git add summary_writer.py tests/test_stage_status.py
 git commit -m "fix: record nanoclaw summary side effects"
 cd /home/dan/code/nanoclaw/.worktrees/yente-opencode-timeout-hardening
 git add container/shim/gws container/agent-runner/src/db/side-effects.ts \
+  container/agent-runner/src/db/side-effects-verify.ts \
+  src/db/side-effects-verify.ts src/db/side-effects-verify.test.ts \
+  src/db/session-db.ts src/db/session-db.test.ts \
   container/agent-runner/src/db/session-state.test.ts \
   src/gws-shim.test.ts
 git commit -m "fix: import signed tool side effect ledgers"
@@ -1652,18 +1666,23 @@ Run:
 
 ```bash
 cd /home/dan/code/nanoclaw/.worktrees/yente-opencode-timeout-hardening
+# Guard helper: PASS only when rg finds NO matches (exit 1). A real match (exit 0) OR an rg
+# error / bad path / bad glob (exit >=2) FAILS the guard. Bare `! rg ...` wrongly passes on exit 2,
+# silently masking a broken guard (e.g. a renamed/missing path). Each `no_match` below is a hard
+# assertion; the trailing two `rg` lines are informational call-site listings for manual review.
+no_match() { local out rc; out="$(rg -n "$@")"; rc=$?; if [ "$rc" -eq 1 ]; then return 0; fi; if [ "$rc" -eq 0 ]; then printf '%s\n' "$out" >&2; echo "guard FAILED: unexpected matches above" >&2; return 1; fi; echo "guard ERROR: rg exited $rc (search/path/glob problem)" >&2; return 1; }
 # question.asked is a REAL v2 SDK 1.15.10 event; the SDK-surface/event layer is allowed to dispatch on it.
 # This guard only forbids it leaking into general provider/poll-loop logic, so it shares the SDK-surface carve-out.
-! rg -n "question\\.asked" container/agent-runner/src src --glob '!**/*.test.ts' --glob '!**/opencode-events.ts' --glob '!**/opencode-sdk-surface.ts'
-! rg -n "client\\.question" container/agent-runner/src src --glob '!**/*.test.ts' --glob '!**/opencode-events.ts' --glob '!**/opencode-sdk-surface.ts'
-! rg -n "OpenCode event timeout|event timeout" container/agent-runner/src/providers/opencode.ts container/agent-runner/src/poll-loop.ts --glob '!**/*.test.ts' --glob '!**/fixtures/**'
+no_match -n "question\\.asked" container/agent-runner/src src --glob '!**/*.test.ts' --glob '!**/opencode-events.ts' --glob '!**/opencode-sdk-surface.ts'
+no_match -n "client\\.question" container/agent-runner/src src --glob '!**/*.test.ts' --glob '!**/opencode-events.ts' --glob '!**/opencode-sdk-surface.ts'
+no_match -n "OpenCode event timeout|event timeout" container/agent-runner/src/providers/opencode.ts container/agent-runner/src/poll-loop.ts --glob '!**/*.test.ts' --glob '!**/fixtures/**'
 # Token-based content check, NOT an identifier ban: a narrow constant named STALE_SESSION_RE is fine (claude.ts:269
 # contains none of these tokens); this fails opencode.ts's old broad regex and any classifier matching generic transport/timeout.
-! rg -n "ECONNRESET|connection reset|\\b404\\b|NotFoundError|event timeout" container/agent-runner/src/providers/opencode.ts container/agent-runner/src/providers/codex.ts container/agent-runner/src/poll-loop.ts --glob '!**/*.test.ts' --glob '!**/fixtures/**'
+no_match -n "ECONNRESET|connection reset|\\b404\\b|NotFoundError|event timeout" container/agent-runner/src/providers/opencode.ts container/agent-runner/src/providers/codex.ts container/agent-runner/src/poll-loop.ts --glob '!**/*.test.ts' --glob '!**/fixtures/**'
 # The pump owns all timers via the injected clock/scheduler — no global timers, no Date.now.
-! rg -n "setTimeout\\(|setInterval\\(|Date\\.now\\(" container/agent-runner/src/providers/opencode-events.ts
+no_match -n "setTimeout\\(|setInterval\\(|Date\\.now\\(" container/agent-runner/src/providers/opencode-events.ts
 # Single-reader pump: stream.next() lives only inside the pump.
-! rg -n "stream\\.next\\(" container/agent-runner/src --glob '!**/opencode-events.ts' --glob '!**/*.test.ts'
+no_match -n "stream\\.next\\(" container/agent-runner/src --glob '!**/opencode-events.ts' --glob '!**/*.test.ts'
 rg -n "isSessionInvalid\\(" container/agent-runner/src --glob '!**/*.test.ts'
 rg -n "clearContinuation\\(" container/agent-runner/src --glob '!**/*.test.ts'
 ```
@@ -1675,6 +1694,7 @@ Expected:
 - The pump uses only the injected clock/scheduler (no `setTimeout`/`setInterval`/`Date.now`), so the long-timeout tests stay deterministic.
 - `stream.next(` appears only inside `opencode-events.ts`.
 - Every production `isSessionInvalid(` call passes attempted-continuation metadata; production `clearContinuation(` appears only in typed continuation-clear, positive-existence, or zombie-limit paths.
+- Each `no_match` guard fails on a real match AND on any `rg` error (exit ≥2, e.g. a renamed/missing path or bad glob), so a broken guard is never silently treated as "no matches"; only the two trailing `rg` lines are informational call-site listings.
 
 - [ ] **Step 6: Run production smoke ship blocker**
 
