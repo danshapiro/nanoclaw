@@ -98,6 +98,17 @@ describe('OpenCodeProvider stale session handling', () => {
     expect(isStaleSessionError(new Error('rate limit exceeded'))).toBe(false);
   });
 
+  it('Hard-Invariant-151 regression: transport-class errors are NOT stale-session proof', () => {
+    // These previously matched STALE_SESSION_RE and caused the Dvora false-positive.
+    expect(isStaleSessionError(new Error('ECONNRESET while reading'))).toBe(false);
+    expect(isStaleSessionError(new Error('HTTP 404 from stream'))).toBe(false);
+    expect(isStaleSessionError(new Error('connection reset by peer'))).toBe(false);
+    expect(isStaleSessionError(new Error('NotFoundError: unrelated lookup failed'))).toBe(false);
+    // Genuine missing-session signals must still match.
+    expect(isStaleSessionError(new Error('session ses_x not found'))).toBe(true);
+    expect(isStaleSessionError(new Error('no conversation found'))).toBe(true);
+  });
+
   it('retries prompt_async once with a fresh session when the persisted session is stale', async () => {
     const promptedIds: string[] = [];
     const client = {

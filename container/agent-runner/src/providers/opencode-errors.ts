@@ -165,6 +165,18 @@ export function isMissingOpenCodeSessionError(err: unknown, attemptedSessionId: 
   return /\b(not found|no conversation found|does not exist|unknown session|missing session)\b/i.test(text);
 }
 
+/**
+ * Structural check: does an SDK RequestResult `.error` value indicate the
+ * session is gone? In SDK 1.15.10 a missing session surfaces as a
+ * NotFoundError. This helper isolates the literal token from opencode.ts so
+ * the Task-7 static guard (which scans opencode.ts but not opencode-errors.ts)
+ * stays clean.
+ */
+export function isMissingSessionResultError(error: unknown): boolean {
+  const name = (error as { name?: string } | null | undefined)?.name;
+  return name === 'NotFoundError';
+}
+
 export interface ContinuationClassification {
   policy: ProviderContinuationPolicy;
   reason?: string;

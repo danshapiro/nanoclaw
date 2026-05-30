@@ -19,7 +19,7 @@ import {
 } from './types.js';
 import { mcpServersToOpenCodeConfig } from './mcp-to-opencode.js';
 import { OpenCodeEventPump, type OpenCodePumpClock } from './opencode-events.js';
-import { isMissingOpenCodeSessionError, OpenCodeInterruptionError } from './opencode-errors.js';
+import { isMissingOpenCodeSessionError, isMissingSessionResultError, OpenCodeInterruptionError } from './opencode-errors.js';
 import { sniffImageMime } from '../attachments.js';
 
 function log(msg: string): void {
@@ -63,7 +63,7 @@ function realTimerClock(): OpenCodePumpClock {
  * proof.
  */
 const STALE_SESSION_RE =
-  /no conversation found|ENOENT.*\.jsonl|session.*not found|NotFoundError|connection reset|ECONNRESET|404/i;
+  /no conversation found|ENOENT.*\.jsonl|session.*not found/i;
 
 function errorText(err: unknown): string {
   if (err instanceof Error) return err.message;
@@ -478,7 +478,7 @@ export class OpenCodeProvider implements AgentProvider {
     // check, or the bounded zombie path). A stale-session text match without
     // an attempted continuation can never be proof on its own. We require the
     // EXACT attempted id to appear verbatim alongside a missing-session phrase;
-    // a generic transport/read/timeout/bare-404 error is never a trigger.
+    // a generic transport/read/timeout/bare-not-found error is never a trigger.
     if (!opts.attemptedContinuation) return false;
     return isMissingOpenCodeSessionError(err, opts.attemptedContinuation);
   }
@@ -486,8 +486,8 @@ export class OpenCodeProvider implements AgentProvider {
   /**
    * Positive existence-check seam for the AUTHORITATIVE continuation classifier
    * (`classifyContinuation`). Backed by the SDK existence check
-   * `client.session.get({ path: { id } })` — a NotFoundError (404) means the
-   * session is gone. Any other error is inconclusive and treated as "exists"
+   * `client.session.get({ path: { id } })` — a missing-session SDK error means
+   * the session is gone. Any other error is inconclusive and treated as "exists"
    * (preserve continuation; never clear on a transport error). Task 3's runtime
    * controller consumes this seam; Task 2 only needs a minimal injectable check.
    */
@@ -496,8 +496,7 @@ export class OpenCodeProvider implements AgentProvider {
       const rt = await ensureSharedRuntime(this.options);
       const res = await rt.client.session.get({ path: { id } });
       if (res.error) {
-        const name = (res.error as { name?: string }).name;
-        if (name === 'NotFoundError') return false;
+        if (isMissingSessionResultError(res.error)) return false;
         // Inconclusive (transport/other) — do not treat as proof of absence.
         return true;
       }
