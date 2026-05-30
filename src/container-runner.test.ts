@@ -772,3 +772,27 @@ describe('GWS proxy mediation boundary', () => {
     }
   });
 });
+
+describe('side-effect ledger container env', () => {
+  function runnerSource(): string {
+    return fs.readFileSync(path.join(process.cwd(), 'src', 'container-runner.ts'), 'utf8');
+  }
+
+  it('sets the static side-effect ledger path in the container env', () => {
+    expect(runnerSource()).toContain('NANOCLAW_SIDE_EFFECT_LEDGER=/workspace/side-effects.jsonl');
+  });
+
+  it('injects the Ed25519 public verify key but never the private signing key', () => {
+    const source = runnerSource();
+    // Public verify key is mounted/injected.
+    expect(source).toContain('GWS_SIDE_EFFECT_VERIFY_KEY');
+    // The private signing key must never be referenced in the agent container.
+    expect(source).not.toContain('GWS_SIDE_EFFECT_SIGN_KEY_FILE');
+  });
+
+  it('does not pass per-input correlation as process env (it is the .active-input.json file)', () => {
+    const source = runnerSource();
+    expect(source).not.toContain('NANOCLAW_ACTIVE_INPUT_ID');
+    expect(source).not.toContain('NANOCLAW_ROUTE_KEY=');
+  });
+});

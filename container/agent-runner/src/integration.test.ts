@@ -5,6 +5,7 @@ import { getUndeliveredMessages } from './db/messages-out.js';
 import { getPendingMessages } from './db/messages-in.js';
 import { MockProvider } from './providers/mock.js';
 import { runPollLoop } from './poll-loop.js';
+import type { AgentProvider, AgentQuery, ProviderEvent, QueryInput, QueryTurnInput } from './providers/types.js';
 
 beforeEach(() => {
   initTestSessionDb();
@@ -99,10 +100,54 @@ describe('poll loop integration', () => {
 
     await loopPromise.catch(() => {});
   });
+
+  it('completes the input row only after a result that resolves its inputId', async () => {
+    insertMessage(
+      'm-resolve',
+      { sender: 'Alice', text: 'resolve me' },
+      { platformId: 'chan-1', channelType: 'discord' },
+    );
+
+    let capturedInputId: string | undefined;
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query(input: QueryInput): AgentQuery {
+        capturedInputId = input.inputId;
+        const events: AsyncIterable<ProviderEvent> = (async function* () {
+          yield { type: 'init', continuation: 'resolve-session' };
+          yield { type: 'input-accepted', inputId: input.inputId, scope: 'initial' };
+          yield {
+            type: 'result',
+            text: '<message to="discord-test">resolved</message>',
+            inputId: input.inputId,
+            resolvedInputIds: [input.inputId!],
+          };
+        })();
+        return {
+          push(_m: string | QueryTurnInput) {},
+          end() {},
+          abort() {},
+          events,
+        };
+      },
+    };
+
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
+
+    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    controller.abort();
+
+    expect(typeof capturedInputId).toBe('string');
+    expect(getPendingMessages()).toHaveLength(0);
+
+    await loopPromise.catch(() => {});
+  });
 });
 
 // Helper: run poll loop until aborted or timeout
-async function runPollLoopWithTimeout(provider: MockProvider, signal: AbortSignal, timeoutMs: number): Promise<void> {
+async function runPollLoopWithTimeout(provider: AgentProvider, signal: AbortSignal, timeoutMs: number): Promise<void> {
   return Promise.race([
     runPollLoop({
       provider,

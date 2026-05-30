@@ -481,6 +481,11 @@ async function deliverToAgent(
     threadId: deliveryAddr.threadId,
     content: event.message.content,
     trigger: wake ? 1 : 0,
+    // Host-stamped route identity from the resolved messaging group. Lets the
+    // container normalizer collapse DM aliases safely and isolate distinct
+    // group threads, without inferring from nullable thread ids.
+    messagingGroupId: mg.id,
+    isGroup: mg.is_group === 1 ? 1 : 0,
   });
 
   log.info('Message routed', {

@@ -29,6 +29,11 @@ export interface WriteMessageOut {
   platform_id?: string | null;
   channel_type?: string | null;
   thread_id?: string | null;
+  /** Route metadata so recovery can harvest only the active conversation. */
+  input_id?: string | null;
+  route_key?: string | null;
+  messaging_group_id?: string | null;
+  is_group?: 0 | 1 | null;
   content: string;
 }
 
@@ -62,8 +67,8 @@ export function writeMessageOut(msg: WriteMessageOut): number {
   // in the JS object keys (better-sqlite3 auto-stripped it, bun:sqlite does not).
   outbound
     .prepare(
-      `INSERT INTO messages_out (id, seq, in_reply_to, timestamp, deliver_after, recurrence, kind, platform_id, channel_type, thread_id, content)
-     VALUES ($id, $seq, $in_reply_to, datetime('now'), $deliver_after, $recurrence, $kind, $platform_id, $channel_type, $thread_id, $content)`,
+      `INSERT INTO messages_out (id, seq, in_reply_to, timestamp, deliver_after, recurrence, kind, platform_id, channel_type, thread_id, input_id, route_key, messaging_group_id, is_group, content)
+     VALUES ($id, $seq, $in_reply_to, datetime('now'), $deliver_after, $recurrence, $kind, $platform_id, $channel_type, $thread_id, $input_id, $route_key, $messaging_group_id, $is_group, $content)`,
     )
     .run({
       $id: msg.id,
@@ -75,10 +80,47 @@ export function writeMessageOut(msg: WriteMessageOut): number {
       $platform_id: msg.platform_id ?? null,
       $channel_type: msg.channel_type ?? null,
       $thread_id: msg.thread_id ?? null,
+      $input_id: msg.input_id ?? null,
+      $route_key: msg.route_key ?? null,
+      $messaging_group_id: msg.messaging_group_id ?? null,
+      $is_group: msg.is_group ?? null,
       $content: msg.content,
     });
 
   return nextSeq;
+}
+
+export interface HarvestedProgress {
+  messageOutId: string;
+  text: string;
+  source: 'provider_progress' | 'mcp_send_message' | 'relay';
+  timestamp: string;
+}
+
+/**
+ * Harvest route-scoped outbound progress / MCP send_message / relay rows
+ * written during the accepted-input window, for recovery `priorProgress`.
+ * ONLY rows whose `route_key` matches the active route are returned, so
+ * progress from another conversation in a shared session is never harvested.
+ */
+export function harvestRouteScopedProgress(routeKey: string): HarvestedProgress[] {
+  const rows = getOutboundDb()
+    .prepare(
+      `SELECT id, content, timestamp FROM messages_out
+       WHERE route_key = $route_key AND kind <> 'system'
+       ORDER BY timestamp ASC`,
+    )
+    .all({ $route_key: routeKey }) as Array<{ id: string; content: string; timestamp: string }>;
+  return rows.map((r) => {
+    let text = '';
+    try {
+      const parsed = JSON.parse(r.content) as { text?: string };
+      text = typeof parsed.text === 'string' ? parsed.text : r.content;
+    } catch {
+      text = r.content;
+    }
+    return { messageOutId: r.id, text, source: 'provider_progress' as const, timestamp: r.timestamp };
+  });
 }
 
 /**

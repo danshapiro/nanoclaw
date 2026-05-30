@@ -74,8 +74,52 @@ export function getOutboundDb(): Database {
         updated_at               TEXT NOT NULL
       );
     `);
+    // side_effect_ledger: validated, imported side effects. The host
+    // src/db/schema.ts is the authoritative creator, but a container opening an
+    // old-schema outbound.db must self-migrate (create-on-demand) so recovery
+    // and import work without a formal migration pass.
+    _outbound.exec(`
+      CREATE TABLE IF NOT EXISTS side_effect_ledger (
+        id              TEXT PRIMARY KEY,
+        source          TEXT NOT NULL,
+        kind            TEXT NOT NULL,
+        operation       TEXT,
+        input_id        TEXT,
+        route_key       TEXT,
+        evidence_json   TEXT NOT NULL,
+        validation_json TEXT NOT NULL,
+        replay_policy   TEXT,
+        occurred_at     TEXT,
+        imported_at     TEXT NOT NULL
+      );
+    `);
+    ensureOutboundRouteColumns(_outbound);
   }
   return _outbound;
+}
+
+/**
+ * Read-compatible ALTER guards so a container opening an OLD-schema outbound.db
+ * self-migrates the route metadata on `messages_out` and the
+ * `notice_message_out_id` column on `processing_ack`. The host
+ * `src/db/schema.ts` owns the authoritative column definitions; these guards
+ * only catch pre-existing files that predate those additions.
+ */
+function ensureOutboundRouteColumns(db: Database): void {
+  const outCols = new Set(
+    (db.prepare("PRAGMA table_info('messages_out')").all() as Array<{ name: string }>).map((c) => c.name),
+  );
+  if (!outCols.has('input_id')) db.exec('ALTER TABLE messages_out ADD COLUMN input_id TEXT');
+  if (!outCols.has('route_key')) db.exec('ALTER TABLE messages_out ADD COLUMN route_key TEXT');
+  if (!outCols.has('messaging_group_id')) db.exec('ALTER TABLE messages_out ADD COLUMN messaging_group_id TEXT');
+  if (!outCols.has('is_group')) db.exec('ALTER TABLE messages_out ADD COLUMN is_group INTEGER');
+
+  const ackCols = new Set(
+    (db.prepare("PRAGMA table_info('processing_ack')").all() as Array<{ name: string }>).map((c) => c.name),
+  );
+  if (!ackCols.has('notice_message_out_id')) {
+    db.exec('ALTER TABLE processing_ack ADD COLUMN notice_message_out_id TEXT');
+  }
 }
 
 /**
@@ -162,6 +206,8 @@ export function initTestSessionDb(): { inbound: Database; outbound: Database } {
       platform_message_id TEXT,
       channel_type   TEXT,
       thread_id      TEXT,
+      messaging_group_id TEXT,
+      is_group       INTEGER,
       content        TEXT NOT NULL
     );
     CREATE TABLE delivered (
@@ -194,12 +240,17 @@ export function initTestSessionDb(): { inbound: Database; outbound: Database } {
       platform_id    TEXT,
       channel_type   TEXT,
       thread_id      TEXT,
+      input_id       TEXT,
+      route_key      TEXT,
+      messaging_group_id TEXT,
+      is_group       INTEGER,
       content        TEXT NOT NULL
     );
     CREATE TABLE processing_ack (
       message_id     TEXT PRIMARY KEY,
       status         TEXT NOT NULL,
-      status_changed TEXT NOT NULL
+      status_changed TEXT NOT NULL,
+      notice_message_out_id TEXT
     );
     CREATE TABLE session_state (
       key        TEXT PRIMARY KEY,
@@ -212,6 +263,19 @@ export function initTestSessionDb(): { inbound: Database; outbound: Database } {
       tool_declared_timeout_ms INTEGER,
       tool_started_at          TEXT,
       updated_at               TEXT NOT NULL
+    );
+    CREATE TABLE side_effect_ledger (
+      id              TEXT PRIMARY KEY,
+      source          TEXT NOT NULL,
+      kind            TEXT NOT NULL,
+      operation       TEXT,
+      input_id        TEXT,
+      route_key       TEXT,
+      evidence_json   TEXT NOT NULL,
+      validation_json TEXT NOT NULL,
+      replay_policy   TEXT,
+      occurred_at     TEXT,
+      imported_at     TEXT NOT NULL
     );
   `);
 

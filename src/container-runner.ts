@@ -793,6 +793,24 @@ async function buildContainerArgs(
   args.push('-e', `TZ=${TIMEZONE}`);
   args.push('-e', `PATH=${AGENT_CONTAINER_PATH}`);
 
+  // Side-effect ledger: the static staging path the GWS shim and summarize-dnd
+  // append validated-side-effect evidence to. Per-input correlation is NOT an
+  // env var (a long-lived child can't see follow-up updates); it is the
+  // /workspace/.active-input.json file the poll loop writes on each
+  // input-accepted. We only need /workspace writable by the poll loop and
+  // readable by tools, which the workspace mount already provides.
+  args.push('-e', 'NANOCLAW_SIDE_EFFECT_LEDGER=/workspace/side-effects.jsonl');
+
+  // Ed25519 PUBLIC verify key only — verification grants no forging power, so
+  // it is safe in the agent container. The private signing key lives only in
+  // the gws-proxy container and is NEVER injected here. When unset (dev /
+  // pre-deploy) Gmail side-effect recovery is simply inactive (staged entries
+  // stay unvalidated hints).
+  const sideEffectVerifyKey = process.env.GWS_SIDE_EFFECT_VERIFY_KEY?.trim();
+  if (sideEffectVerifyKey) {
+    args.push('-e', `GWS_SIDE_EFFECT_VERIFY_KEY=${sideEffectVerifyKey}`);
+  }
+
   // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
   if (providerContribution.env) {
     for (const [key, value] of Object.entries(providerContribution.env)) {

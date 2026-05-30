@@ -1,5 +1,13 @@
+import fs from 'fs';
+
 import { findByName, getAllDestinations, type DestinationEntry } from './destinations.js';
-import { getPendingMessages, markProcessing, markCompleted, type MessageInRow } from './db/messages-in.js';
+import {
+  getPendingMessages,
+  markProcessing,
+  markCompleted,
+  returnProcessingToPending,
+  type MessageInRow,
+} from './db/messages-in.js';
 import { writeMessageOut } from './db/messages-out.js';
 import { touchHeartbeat, clearStaleProcessingAcks, getOutboundDb } from './db/connection.js';
 import { clearContinuation, migrateLegacyContinuation, setContinuation } from './db/session-state.js';
@@ -8,6 +16,7 @@ import {
   formatMessages,
   extractRouting,
   categorizeMessage,
+  normalizeRoute,
   stripInternalTags,
   type RoutingContext,
 } from './formatter.js';
@@ -16,6 +25,7 @@ import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
 const HOST_OWNED_COMMANDS = new Set(['/new', '/clear']);
+const ACTIVE_INPUT_PATH = '/workspace/.active-input.json';
 
 function log(msg: string): void {
   console.error(`[poll-loop] ${msg}`);
@@ -27,6 +37,40 @@ function logAttachmentEvent(event: unknown): void {
 
 function generateId(): string {
   return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+let inputCounter = 0;
+function generateInputId(scope: string): string {
+  inputCounter += 1;
+  return `in-${scope}-${Date.now()}-${inputCounter}-${Math.random().toString(36).slice(2, 6)}`;
+}
+
+/** Normalized route key for a message row, using host-stamped metadata. */
+function routeKeyForMessage(providerName: string, m: MessageInRow): string {
+  return normalizeRoute(providerName, {
+    platformId: m.platform_id,
+    channelType: m.channel_type,
+    threadId: m.thread_id,
+    messagingGroupId: m.messaging_group_id ?? null,
+    isGroup: (m.is_group as 0 | 1 | null) ?? null,
+  }).routeKey;
+}
+
+/**
+ * Atomically write the currently-accepted input correlation to
+ * /workspace/.active-input.json (temp+rename) so the GWS shim and summarize-dnd
+ * stamp the CURRENT input's correlation at tool-invocation time. Per-input
+ * correlation must be a file (a long-lived tool child can't see env updates
+ * across follow-ups). Silently no-ops when /workspace is absent (test DBs).
+ */
+function writeActiveInput(inputId: string, routeKey: string): void {
+  try {
+    const tmp = `${ACTIVE_INPUT_PATH}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({ inputId, routeKey, updatedAt: new Date().toISOString() }));
+    fs.renameSync(tmp, ACTIVE_INPUT_PATH);
+  } catch {
+    // /workspace may not exist (in-memory test DBs) — non-fatal.
+  }
 }
 
 export interface PollLoopConfig {
@@ -100,21 +144,47 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       continue;
     }
 
-    const ids = messages.map((m) => m.id);
+    // Split by normalized route BEFORE claiming. The active route is the route
+    // of the most-recent wake-triggering (trigger=1) row. Only that route's rows
+    // are claimed/processed this wake; rows on other routes stay pending and are
+    // never folded into the active route's prompt or recovery. Accumulated
+    // trigger=0 context is partitioned the same way (a context row never chooses
+    // the active route).
+    const triggerRows = messages.filter((m) => m.trigger === 1);
+    const activeRouteKey = routeKeyForMessage(config.providerName, triggerRows[triggerRows.length - 1]);
+    const activeRouteMessages = messages.filter((m) => routeKeyForMessage(config.providerName, m) === activeRouteKey);
+    const otherRouteCount = messages.length - activeRouteMessages.length;
+    if (otherRouteCount > 0) {
+      log(
+        JSON.stringify({
+          severity: 'info',
+          event: 'route_split',
+          active_route: activeRouteKey,
+          active_rows: activeRouteMessages.length,
+          deferred_other_route_rows: otherRouteCount,
+        }),
+      );
+    }
+    const activeMessages = activeRouteMessages;
+
+    const ids = activeMessages.map((m) => m.id);
+    // Generate a top-level inputId for this wake's prompt. Acceptance is tracked
+    // when the provider emits input-accepted for this id.
+    const topLevelInputId = generateInputId('initial');
     markProcessing(ids);
 
-    const routing = extractRouting(messages);
+    const routing = extractRouting(activeMessages);
 
     // Pre-task scripts: for any task rows with a `script`, run it before the
     // provider call. Scripts returning wakeAgent=false (or erroring) gate
     // their own task row only — surviving messages still go to the agent.
     // Without the scheduling module, the marker block is empty, `keep`
     // falls back to `messages`, and no gating happens.
-    let keep: MessageInRow[] = messages;
+    let keep: MessageInRow[] = activeMessages;
     let skipped: string[] = [];
     // MODULE-HOOK:scheduling-pre-task:start
     const { applyPreTaskScripts } = await import('./scheduling/task-script.js');
-    const preTask = await applyPreTaskScripts(messages);
+    const preTask = await applyPreTaskScripts(activeMessages);
     keep = preTask.keep;
     skipped = preTask.skipped;
     if (skipped.length > 0) {
@@ -124,24 +194,49 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // MODULE-HOOK:scheduling-pre-task:end
 
     if (keep.length === 0) {
-      log(`All ${messages.length} message(s) gated by script, skipping query`);
+      log(`All ${activeMessages.length} message(s) gated by script, skipping query`);
       continue;
     }
 
-    // Format messages: passthrough commands get raw text (only if the
-    // provider natively handles slash commands), others get XML.
-    const prompt = formatMessagesWithCommands(keep, config.provider.supportsNativeSlashCommands);
+    // Pre-query failures after rows are claimed are recoverable: a throw in
+    // attachment inspection / formatting / pre-task handling must return the
+    // claimed rows to pending (delete their transient 'processing' acks) rather
+    // than writing a raw provider error. Wrap the pre-query setup so a failure
+    // here is treated under the same recoverable lifecycle.
+    let prompt: string;
+    let attachments: Awaited<ReturnType<typeof collectQueryAttachments>>;
+    try {
+      // Format messages: passthrough commands get raw text (only if the
+      // provider natively handles slash commands), others get XML.
+      prompt = formatMessagesWithCommands(keep, config.provider.supportsNativeSlashCommands);
 
-    log(`Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}`);
+      log(`Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}`);
 
-    const attachments = await collectQueryAttachments({
-      messages: keep,
-      pathReferenceMessages: keep,
-      inspectFile: config.inspectAttachmentFile,
-      log: logAttachmentEvent,
-    });
+      attachments = await collectQueryAttachments({
+        messages: keep,
+        pathReferenceMessages: keep,
+        inspectFile: config.inspectAttachmentFile,
+        log: logAttachmentEvent,
+      });
+    } catch (preErr) {
+      const preMsg = preErr instanceof Error ? preErr.message : String(preErr);
+      log(
+        JSON.stringify({
+          severity: 'warn',
+          event: 'pre_query_failure_returned_to_pending',
+          route_key: activeRouteKey,
+          message_ids: ids,
+          error: preMsg,
+        }),
+      );
+      // Return claimed rows to pending; the next wake retries them.
+      returnProcessingToPending(ids, 'pre_query_failure');
+      await sleep(POLL_INTERVAL_MS, config.signal);
+      continue;
+    }
 
     const query = config.provider.query({
+      inputId: topLevelInputId,
       prompt,
       attachments,
       continuation,
@@ -163,6 +258,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         processingIds,
         config.providerName,
         replyAccounting,
+        { topLevelInputId, activeRouteKey },
         config.inspectAttachmentFile,
         config.signal,
       );
@@ -183,7 +279,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         clearContinuation(config.providerName);
       }
 
-      // Write error response so the user knows something went wrong
+      // Provider throw is a sanitized recoverable interruption. Write a
+      // user-visible fallback so the user knows to retry, then settle the
+      // claimed rows (the provider never resolved their inputId).
       writeMessageOut({
         id: generateId(),
         kind: 'chat',
@@ -192,12 +290,11 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         thread_id: routing.threadId,
         content: JSON.stringify({ text: `Error: ${errMsg}` }),
       });
+      // The claimed rows have a written user-visible fallback; complete them so
+      // they don't loop forever (the existing provider-throw contract).
+      markCompleted(processingIds);
     }
-
-    // Ensure completed even if processQuery ended without a result event
-    // (e.g. stream closed unexpectedly).
-    markCompleted(processingIds);
-    log(`Completed ${ids.length} message(s)`);
+    log(`Completed wake for route ${activeRouteKey} (${ids.length} active row(s))`);
   }
 }
 
@@ -247,12 +344,21 @@ interface ReplyAccounting {
   outboundNonSystemCountBefore: number;
 }
 
+interface InputLedgerEntry {
+  inputId: string;
+  messageIds: string[];
+  /** queued → accepted → resolved, or returned (unaccepted, sent back to pending). */
+  state: 'queued' | 'accepted' | 'resolved' | 'returned' | 'recovery_owned';
+  scope: 'initial' | 'followup';
+}
+
 async function processQuery(
   query: AgentQuery,
   routing: RoutingContext,
   initialBatchIds: string[],
   providerName: string,
   replyAccounting: ReplyAccounting,
+  ledgerCtx: { topLevelInputId: string; activeRouteKey: string },
   inspectAttachmentFile?: (filePath: string) => Promise<InspectedFile | null>,
   signal?: AbortSignal,
 ): Promise<QueryResult> {
@@ -261,32 +367,83 @@ async function processQuery(
   let initialBatchSettled = false;
   const abortQuery = () => query.abort();
 
+  // Input ledger: every prompt the poll loop sends is tracked by inputId. A
+  // prompt is `accepted` only after the provider emits input-accepted for it,
+  // and `resolved` only after a successful result resolves/supersedes it.
+  const ledger = new Map<string, InputLedgerEntry>();
+  ledger.set(ledgerCtx.topLevelInputId, {
+    inputId: ledgerCtx.topLevelInputId,
+    messageIds: [...initialBatchIds],
+    state: 'queued',
+    scope: 'initial',
+  });
+
   if (signal?.aborted) {
     abortQuery();
   } else {
     signal?.addEventListener('abort', abortQuery, { once: true });
   }
 
-  function settleInitialBatch(): void {
+  function onInputAccepted(inputId: string): void {
+    const entry = ledger.get(inputId);
+    if (!entry) return;
+    entry.state = 'accepted';
+    // Stamp the current accepted input for tool-time side-effect correlation.
+    writeActiveInput(inputId, ledgerCtx.activeRouteKey);
+  }
+
+  /**
+   * Resolve a result to exact input ids. If the provider declared
+   * resolvedInputIds, use them. Otherwise apply the one-active-input rule:
+   * resolve only when exactly one active (unresolved) input exists — the result
+   * is unambiguous proof that single input was processed. Two active inputs
+   * with no explicit ids is a recoverable implementation error that does NOT
+   * complete rows (ambiguous success must never complete the wrong row).
+   */
+  function resolveResult(declared: string[]): string[] {
+    if (declared.length > 0) return declared;
+    const active = [...ledger.values()].filter((e) => e.state === 'queued' || e.state === 'accepted');
+    if (active.length === 1) return [active[0].inputId];
+    if (active.length > 1) {
+      log(
+        JSON.stringify({
+          severity: 'error',
+          event: 'ambiguous_result_resolution',
+          active_inputs: active.map((e) => e.inputId),
+        }),
+      );
+    }
+    return [];
+  }
+
+  function completeResolved(inputIds: string[]): void {
+    const idsToComplete: string[] = [];
+    for (const inputId of inputIds) {
+      const entry = ledger.get(inputId);
+      if (!entry || entry.state === 'resolved') continue;
+      entry.state = 'resolved';
+      idsToComplete.push(...entry.messageIds);
+    }
+    if (idsToComplete.length > 0) markCompleted(idsToComplete);
+  }
+
+  function settleInitialBatch(resolvedAtLeastOne: boolean): void {
     if (initialBatchSettled) return;
     initialBatchSettled = true;
 
     if (
+      resolvedAtLeastOne &&
       replyAccounting.requiresUserVisibleReply &&
       countOutboundNonSystemMessages() <= replyAccounting.outboundNonSystemCountBefore
     ) {
       writeMissingVisibleReplyError(routing);
     }
-
-    markCompleted(initialBatchIds);
   }
 
-  // Concurrent polling: push follow-ups into the active query as they arrive.
-  // We do NOT force-end the stream on silence — keeping the query open is
-  // strictly cheaper than close+reopen (no cold prompt cache, no reconnect).
-  // Stream liveness is decided host-side via the heartbeat file + processing
-  // claim age (see src/host-sweep.ts); if something is truly stuck, the host
-  // will kill the container and messages get reset to pending.
+  // Concurrent polling: push route-matched follow-ups into the active query as
+  // they arrive. Other-route rows are NOT claimed here — they stay pending and
+  // are handled on their own wake (route splitting). We keep the query open
+  // rather than close+reopen (no cold prompt cache, no reconnect).
   let pollingFollowups = false;
   const pollHandle = setInterval(() => {
     if (done || pollingFollowups) return;
@@ -297,45 +454,48 @@ async function processQuery(
   }, ACTIVE_POLL_INTERVAL_MS);
 
   async function pollFollowups(): Promise<void> {
+    // Only claim follow-ups on the ACTIVE route. Rows on other routes remain
+    // pending and are excluded from this turn (route splitting also applies to
+    // follow-ups, not just the initial batch).
+    const candidates = getPendingMessages().filter((m) => m.kind !== 'system');
+    const newMessages = candidates.filter((m) => routeKeyForMessage(providerName, m) === ledgerCtx.activeRouteKey);
+    if (newMessages.length === 0) return;
 
-    // Skip system messages (MCP tool responses).
-    // Thread routing is the router's concern — if a message landed in this
-    // session, the agent should see it. Per-thread sessions already isolate
-    // threads into separate containers; shared sessions intentionally merge
-    // everything. Filtering on thread_id here caused deadlocks when the
-    // initial batch and follow-ups had mismatched thread_ids (e.g. a
-    // host-generated welcome trigger with null thread vs a Discord DM reply).
-    const newMessages = getPendingMessages().filter((m) => m.kind !== 'system');
-    if (newMessages.length > 0) {
-      const newIds = newMessages.map((m) => m.id);
-      markProcessing(newIds);
+    const newIds = newMessages.map((m) => m.id);
+    const followupInputId = generateInputId('followup');
+    markProcessing(newIds);
 
-      const prompt = formatMessages(newMessages);
-      const attachments = await collectQueryAttachments({
-        messages: newMessages,
-        pathReferenceMessages: newMessages,
-        inspectFile: inspectAttachmentFile,
-        log: logAttachmentEvent,
-      });
-      log(`Pushing ${newMessages.length} follow-up message(s) into active query`);
-      try {
-        query.push({ prompt, attachments });
-      } catch (err) {
-        log(
-          JSON.stringify({
-            severity: 'error',
-            event: 'followup_enqueue_failed',
-            message_count: newMessages.length,
-            error: err instanceof Error ? err.message : String(err),
-          }),
-        );
-        return;
-      }
-
-      markCompleted(newIds);
+    const prompt = formatMessages(newMessages);
+    const attachments = await collectQueryAttachments({
+      messages: newMessages,
+      pathReferenceMessages: newMessages,
+      inspectFile: inspectAttachmentFile,
+      log: logAttachmentEvent,
+    });
+    log(`Pushing ${newMessages.length} follow-up message(s) into active query (input ${followupInputId})`);
+    try {
+      query.push({ inputId: followupInputId, prompt, attachments });
+    } catch (err) {
+      log(
+        JSON.stringify({
+          severity: 'error',
+          event: 'followup_enqueue_failed',
+          message_count: newMessages.length,
+          error: err instanceof Error ? err.message : String(err),
+        }),
+      );
+      // Enqueue failed — do NOT register a ledger entry (so terminal handling
+      // never returns it to pending) and leave the rows in 'processing'. The
+      // throwing-push contract keeps them retryable via host sweep / next wake.
+      return;
     }
+    // Registered only on a SUCCESSFUL push. The row is completed only when the
+    // provider resolves followupInputId via a result; if never accepted by the
+    // turn's end it is returned to pending.
+    ledger.set(followupInputId, { inputId: followupInputId, messageIds: newIds, state: 'queued', scope: 'followup' });
   }
 
+  let resolvedAtLeastOne = false;
   try {
     for await (const event of query.events) {
       handleEvent(event, routing);
@@ -344,32 +504,49 @@ async function processQuery(
       if (event.type === 'init') {
         queryContinuation = event.continuation;
         // Persist immediately so a mid-turn container crash still lets the
-        // next wake resume the conversation. Without this, the session id
-        // was only written after the full stream completed — if the
-        // container died between `init` and `result`, the SDK session was
-        // effectively orphaned and the next message started a blank
-        // Claude session with no prior context.
+        // next wake resume the conversation.
         setContinuation(providerName, event.continuation);
+      } else if (event.type === 'input-accepted') {
+        onInputAccepted(event.inputId);
       } else if (event.type === 'result') {
-        // A result — with or without text — means the turn is done. Mark
-        // the initial batch completed now so the host sweep doesn't see
-        // stale 'processing' claims while the query stays open for
-        // follow-up pushes. Dispatch text first so reply accounting can see
-        // direct result responses as well as MCP send_message rows.
+        // A result — with or without text — means a turn segment is done.
+        // Dispatch text first so reply accounting sees direct result text and
+        // MCP send_message rows. Then resolve the exact input ids and complete
+        // only those rows.
         if (event.text) {
           dispatchResultText(event.text, routing);
         }
-        settleInitialBatch();
+        const resolved = resolveResult(event.resolvedInputIds ?? []);
+        if (resolved.length > 0) {
+          completeResolved(resolved);
+          resolvedAtLeastOne = true;
+        }
+        settleInitialBatch(resolvedAtLeastOne);
       }
     }
 
-    // If a provider stream ends without a result event, complete the batch
-    // with the same reply accounting instead of silently accepting the turn.
-    settleInitialBatch();
+    // Stream ended. Settle reply accounting for the initial batch.
+    settleInitialBatch(resolvedAtLeastOne);
   } finally {
     done = true;
     clearInterval(pollHandle);
     signal?.removeEventListener('abort', abortQuery);
+
+    // Terminal handling for un-resolved ledger entries. Accepted-but-unresolved
+    // rows would be moved to recovery ownership (handled fully once the
+    // recovery payload is built — see Task 2/3 wiring); for Task 1 the
+    // load-bearing invariant proven here is that UNACCEPTED claimed rows are
+    // returned to pending rather than stranded in 'processing'.
+    for (const entry of ledger.values()) {
+      if (entry.state === 'queued') {
+        // Never accepted by the provider before the turn ended → return to
+        // pending so a later wake retries them (route-matched and other-route
+        // rows alike are returned to pending; other-route rows were never
+        // claimed here).
+        returnProcessingToPending(entry.messageIds, 'unaccepted_at_terminal');
+        entry.state = 'returned';
+      }
+    }
   }
 
   return { continuation: queryContinuation };
@@ -405,13 +582,43 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
     case 'init':
       log(`Session: ${event.continuation}`);
       break;
+    case 'input-accepted':
+      log(`Input accepted: ${event.inputId} (${event.scope})`);
+      break;
     case 'result':
       log(`Result: ${event.text ? event.text.slice(0, 200) : '(empty)'}`);
       break;
-    case 'error':
+    case 'notice':
+      // Non-terminal liveness/quota/retry signal — the turn continues. Full
+      // relay/fallback handling for inactivity notices lands in Task 3; here we
+      // log it with input correlation so it's never silently dropped.
       log(
-        `Error: ${event.message} (retryable: ${event.retryable}${event.classification ? `, ${event.classification}` : ''})`,
+        JSON.stringify({
+          severity: event.severity,
+          event: 'provider_notice',
+          input_id: event.inputId,
+          classification: event.classification,
+          relay_recommended: event.relayRecommended,
+        }),
       );
+      break;
+    case 'interruption':
+      // Typed terminal/recoverable interruption. Full recovery storage lands in
+      // Task 2/3; here we log it with input correlation and continuation policy
+      // so the terminal path is never a raw, uncorrelated error.
+      log(
+        JSON.stringify({
+          severity: event.severity,
+          event: 'provider_interruption',
+          input_id: event.inputId,
+          classification: event.classification,
+          terminal: event.terminal,
+          continuation_policy: event.continuationPolicy,
+        }),
+      );
+      break;
+    case 'clear-continuation':
+      log(`Clear-continuation requested: ${event.reason} (input ${event.inputId})`);
       break;
     case 'progress':
       log(`Progress: ${event.message}`);

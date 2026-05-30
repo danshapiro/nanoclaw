@@ -26,9 +26,14 @@ export function insertTask(
     content: string;
   },
 ): void {
+  // Scheduled task rows intentionally leave messaging_group_id/is_group NULL:
+  // a scheduling insert has no resolved messaging-group context. Per the
+  // fail-safe route rule, NULL route metadata is never collapsed onto another
+  // route (only matched metadata is), so a task follow-up is treated as its own
+  // distinct route — a missed merge at worst, never a cross-conversation leak.
   db.prepare(
-    `INSERT INTO messages_in (id, seq, timestamp, status, tries, process_after, recurrence, kind, platform_id, channel_type, thread_id, content, series_id)
-     VALUES (@id, @seq, datetime('now'), 'pending', 0, @processAfter, @recurrence, 'task', @platformId, @channelType, @threadId, @content, @id)`,
+    `INSERT INTO messages_in (id, seq, timestamp, status, tries, process_after, recurrence, kind, platform_id, channel_type, thread_id, messaging_group_id, is_group, content, series_id)
+     VALUES (@id, @seq, datetime('now'), 'pending', 0, @processAfter, @recurrence, 'task', @platformId, @channelType, @threadId, NULL, NULL, @content, @id)`,
   ).run({
     ...task,
     seq: nextEvenSeq(db),

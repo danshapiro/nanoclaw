@@ -1,9 +1,15 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './db/connection.js';
-import { getPendingMessages, markCompleted } from './db/messages-in.js';
+import {
+  getPendingMessages,
+  markCompleted,
+  markRecoveryOwned,
+  markRecoveryCompleted,
+  returnProcessingToPending,
+} from './db/messages-in.js';
 import { getUndeliveredMessages, writeMessageOut } from './db/messages-out.js';
-import { formatMessages, extractRouting } from './formatter.js';
+import { formatMessages, extractRouting, normalizeRoute } from './formatter.js';
 import { runPollLoop } from './poll-loop.js';
 import { MockProvider } from './providers/mock.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, QueryInput, QueryTurnInput } from './providers/types.js';
@@ -26,12 +32,14 @@ function insertMessage(
     platformId?: string;
     channelType?: string;
     threadId?: string;
+    messagingGroupId?: string | null;
+    isGroup?: 0 | 1 | null;
   },
 ) {
   getInboundDb()
     .prepare(
-      `INSERT INTO messages_in (id, kind, timestamp, status, process_after, trigger, platform_id, channel_type, thread_id, content)
-     VALUES (?, ?, datetime('now'), 'pending', ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO messages_in (id, kind, timestamp, status, process_after, trigger, platform_id, channel_type, thread_id, messaging_group_id, is_group, content)
+     VALUES (?, ?, datetime('now'), 'pending', ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       id,
@@ -41,6 +49,8 @@ function insertMessage(
       opts?.platformId ?? null,
       opts?.channelType ?? null,
       opts?.threadId ?? null,
+      opts?.messagingGroupId ?? null,
+      opts?.isGroup ?? null,
       JSON.stringify(content),
     );
 }
@@ -51,17 +61,46 @@ class ScriptedProvider implements AgentProvider {
 
   constructor(private readonly eventFactory: (input: QueryInput) => AsyncIterable<ProviderEvent>) {}
 
-  isSessionInvalid(_err: unknown): boolean {
+  isSessionInvalid(_err: unknown, _opts: { attemptedContinuation?: string } = {}): boolean {
     return false;
   }
 
   query(input: QueryInput): AgentQuery {
     this.calls++;
+    const eventFactory = this.eventFactory;
+    // Adapt the scripted event stream to the input-accepted/result-resolution
+    // contract: emit input-accepted for the initial input, and stamp any
+    // `result` that didn't declare resolution with this single active input id.
+    const adapted: AsyncIterable<ProviderEvent> = {
+      async *[Symbol.asyncIterator]() {
+        let acceptedEmitted = false;
+        for await (const ev of eventFactory(input)) {
+          if (ev.type === 'init' && !acceptedEmitted) {
+            yield ev;
+            yield { type: 'input-accepted', inputId: input.inputId, scope: 'initial' };
+            acceptedEmitted = true;
+            continue;
+          }
+          if (ev.type === 'result') {
+            if (!acceptedEmitted) {
+              yield { type: 'input-accepted', inputId: input.inputId, scope: 'initial' };
+              acceptedEmitted = true;
+            }
+            const declared = (ev as { resolvedInputIds?: string[] }).resolvedInputIds;
+            yield declared
+              ? ev
+              : { ...ev, inputId: input.inputId, resolvedInputIds: [input.inputId] };
+            continue;
+          }
+          yield ev;
+        }
+      },
+    };
     return {
       push(_message: string | QueryTurnInput) {},
       end() {},
       abort() {},
-      events: this.eventFactory(input),
+      events: adapted,
     };
   }
 }
@@ -704,6 +743,232 @@ describe('poll-loop conversational reply accounting', () => {
     expect(JSON.parse(getUndeliveredMessages()[0].content).text).toBe('provider saw host-owned commands as text');
   });
 });
+
+describe('route normalization', () => {
+  it('collapses a null-thread DM and a threaded DM alias to the same route only when DM metadata matches', () => {
+    const nullThreadDm = normalizeRoute('opencode', {
+      platformId: 'chan-1',
+      channelType: 'discord',
+      threadId: null,
+      messagingGroupId: 'mg-dm-1',
+      isGroup: 0,
+    });
+    const threadedDmAlias = normalizeRoute('opencode', {
+      platformId: 'chan-1',
+      channelType: 'discord',
+      threadId: 'dm-thread-xyz',
+      messagingGroupId: 'mg-dm-1',
+      isGroup: 0,
+    });
+    expect(nullThreadDm.routeKey).toBe(threadedDmAlias.routeKey);
+    expect(nullThreadDm.isGroup).toBe(0);
+  });
+
+  it('keeps distinct group-channel threads isolated', () => {
+    const t1 = normalizeRoute('opencode', {
+      platformId: 'chan-2',
+      channelType: 'discord',
+      threadId: 'thread-A',
+      messagingGroupId: 'mg-group-1',
+      isGroup: 1,
+    });
+    const t2 = normalizeRoute('opencode', {
+      platformId: 'chan-2',
+      channelType: 'discord',
+      threadId: 'thread-B',
+      messagingGroupId: 'mg-group-1',
+      isGroup: 1,
+    });
+    expect(t1.routeKey).not.toBe(t2.routeKey);
+  });
+
+  it('treats a row lacking host route metadata as its own distinct route (never collapsible)', () => {
+    const noMeta = normalizeRoute('opencode', {
+      platformId: 'chan-1',
+      channelType: 'discord',
+      threadId: null,
+      messagingGroupId: null,
+      isGroup: null,
+    });
+    const realDm = normalizeRoute('opencode', {
+      platformId: 'chan-1',
+      channelType: 'discord',
+      threadId: 'dm-thread-xyz',
+      messagingGroupId: 'mg-dm-1',
+      isGroup: 0,
+    });
+    // The metadata-less row must NOT collapse onto the real DM route.
+    expect(noMeta.routeKey).not.toBe(realDm.routeKey);
+  });
+});
+
+describe('messages-in recovery ack lifecycle', () => {
+  function ackStatus(id: string): string | null {
+    const row = getOutboundDb().prepare('SELECT status FROM processing_ack WHERE message_id = ?').get(id) as
+      | { status: string }
+      | undefined;
+    return row?.status ?? null;
+  }
+
+  it('returnProcessingToPending deletes only processing acks', () => {
+    getOutboundDb()
+      .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('p1', 'processing', datetime('now'))")
+      .run();
+    getOutboundDb()
+      .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('r1', 'recovery', datetime('now'))")
+      .run();
+
+    returnProcessingToPending(['p1', 'r1'], 'unaccepted-followup');
+    expect(ackStatus('p1')).toBeNull(); // processing deleted → pending again
+    expect(ackStatus('r1')).toBe('recovery'); // recovery preserved
+  });
+
+  it('markRecoveryOwned moves rows to recovery and markRecoveryCompleted completes them', () => {
+    getOutboundDb()
+      .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m1', 'processing', datetime('now'))")
+      .run();
+    markRecoveryOwned(['m1'], 'rec-1');
+    expect(ackStatus('m1')).toBe('recovery');
+
+    markRecoveryCompleted(['m1'], 'rec-1');
+    expect(ackStatus('m1')).toBe('completed');
+  });
+});
+
+describe('poll-loop input ledger and recovery (route-scoped)', () => {
+  it('returns unaccepted route-matched follow-up rows to pending on terminal interruption before input-accepted', async () => {
+    insertMessage('initial-dm', 'chat', { sender: 'User', text: 'start' }, {
+      platformId: 'chan-1',
+      channelType: 'discord',
+      messagingGroupId: 'mg-dm-1',
+      isGroup: 0,
+    });
+
+    let releaseQuery!: () => void;
+    const queryStarted = deferred();
+    // Capture the structured return-to-pending event so we can assert the
+    // unaccepted follow-up was returned to pending rather than stranded in
+    // 'processing'. (Once returned, a later wake legitimately re-claims it, so
+    // polling the live ack status would race the re-claim.)
+    const returnedToPending = new Set<string>();
+    const origError = console.error;
+    console.error = (...args: unknown[]) => {
+      const line = typeof args[0] === 'string' ? args[0] : '';
+      if (line.includes('return_processing_to_pending')) {
+        const m = /(\{.*"return_processing_to_pending".*\})/.exec(line);
+        if (m) {
+          try {
+            const ev = JSON.parse(m[1]) as { event: string; message_ids: string[] };
+            for (const id of ev.message_ids) returnedToPending.add(id);
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+      origError(...(args as []));
+    };
+
+    let pushedFollowup = false;
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query(input) {
+        queryStarted.resolve();
+        return {
+          push() {
+            // never accepts the follow-up — no input-accepted emitted for it
+            pushedFollowup = true;
+            // Once the follow-up has been pushed (and claimed as processing),
+            // end the turn so we can assert it is returned to pending.
+            releaseQuery?.();
+          },
+          end() {
+            releaseQuery?.();
+          },
+          abort() {
+            releaseQuery?.();
+          },
+          events: (async function* () {
+            yield { type: 'init', continuation: 'sess-x' };
+            yield { type: 'input-accepted', inputId: (input as QueryInput).inputId, scope: 'initial' };
+            await new Promise<void>((resolve) => {
+              releaseQuery = resolve;
+            });
+            // terminal interruption: stream ends without resolving the follow-up
+          })(),
+        };
+      },
+    };
+
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+    try {
+      await queryStarted.promise;
+      insertMessage('followup-dm', 'chat', { sender: 'User', text: 'and also this' }, {
+        platformId: 'chan-1',
+        channelType: 'discord',
+        messagingGroupId: 'mg-dm-1',
+        isGroup: 0,
+      });
+
+      // The unaccepted follow-up must be returned to pending on terminal turn end.
+      await waitFor(() => pushedFollowup && returnedToPending.has('followup-dm'), 3000);
+      controller.abort();
+      await loopPromise.catch(() => {});
+    } finally {
+      console.error = origError;
+    }
+
+    expect(returnedToPending.has('followup-dm')).toBe(true);
+  });
+});
+
+describe('poll-loop initial route splitting', () => {
+  it('splits multiple wake-triggering routes: only the active route is claimed, other routes stay pending', async () => {
+    // Two distinct DM routes both wake-eligible in the same scan.
+    insertMessage('routeA-1', 'chat', { sender: 'A', text: 'route A task' }, {
+      platformId: 'chan-A',
+      channelType: 'discord',
+      messagingGroupId: 'mg-A',
+      isGroup: 0,
+    });
+    insertMessage('routeB-1', 'chat', { sender: 'B', text: 'route B task' }, {
+      platformId: 'chan-B',
+      channelType: 'discord',
+      messagingGroupId: 'mg-B',
+      isGroup: 0,
+    });
+
+    const seenPrompts: string[] = [];
+    const provider = new ScriptedProvider(async function* (input) {
+      seenPrompts.push(input.prompt);
+      yield { type: 'init', continuation: 'sess-split' };
+      yield { type: 'input-accepted', inputId: input.inputId, scope: 'initial' };
+      yield { type: 'result', text: 'done', inputId: input.inputId, resolvedInputIds: [input.inputId!] };
+    });
+
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+    await waitFor(() => seenPrompts.length >= 1, 2000);
+    // The first claimed query must contain exactly one route's task, not both.
+    const firstPrompt = seenPrompts[0];
+    const hasA = firstPrompt.includes('route A task');
+    const hasB = firstPrompt.includes('route B task');
+    expect(hasA !== hasB).toBe(true); // exactly one route, not both
+
+    controller.abort();
+    await loopPromise.catch(() => {});
+  });
+});
+
+function ackStatusOf(messageId: string): string | null {
+  const row = getOutboundDb().prepare('SELECT status FROM processing_ack WHERE message_id = ?').get(messageId) as
+    | { status: string }
+    | undefined;
+  return row?.status ?? null;
+}
 
 function deferred(): { promise: Promise<void>; resolve: () => void } {
   let resolve!: () => void;

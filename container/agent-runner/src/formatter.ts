@@ -250,3 +250,77 @@ function escapeXml(str: string): string {
 export function stripInternalTags(text: string): string {
   return text.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
 }
+
+/**
+ * Export the XML escape helper so other modules (recovery prompt injection in
+ * the poll loop) can XML-escape untrusted recovery text without re-implementing
+ * the entity rules.
+ */
+export function escapeXmlText(str: string): string {
+  return escapeXml(str);
+}
+
+// ── Route normalization (Task 1 Step 10) ─────────────────────────────────────
+
+export interface RouteInput {
+  platformId: string | null;
+  channelType: string | null;
+  threadId: string | null;
+  messagingGroupId: string | null;
+  isGroup: 0 | 1 | null;
+}
+
+export interface NormalizedRoute {
+  routeKey: string;
+  providerName: string;
+  platformId: string | null;
+  channelType: string | null;
+  messagingGroupId: string | null;
+  isGroup: 0 | 1 | null;
+  /** Normalized thread identity used in the route key. */
+  threadKey: string | null;
+}
+
+/**
+ * Normalize a row's routing identity into a stable route key/scope.
+ *
+ * The collapse rule is POSITIVE-ONLY and driven by host-stamped metadata, never
+ * by guessing from nullable thread ids:
+ *  - A DM (`isGroup===0`) with a known `messagingGroupId` normalizes its thread
+ *    identity to `dm:<messagingGroupId>`, so a null-thread DM and a threaded DM
+ *    alias collapse to the SAME route.
+ *  - A group route (`isGroup===1`) keeps its distinct `thread_id`, so different
+ *    group threads stay isolated.
+ *  - A row LACKING host metadata (`messagingGroupId` null, or `isGroup` null) is
+ *    NEVER collapsible: it gets a unique, self-identifying thread key so it can
+ *    only ever match itself. The worst case is a missed merge, never a
+ *    cross-conversation leak.
+ */
+export function normalizeRoute(providerName: string, input: RouteInput): NormalizedRoute {
+  const platformId = input.platformId;
+  const channelType = input.channelType;
+
+  let threadKey: string;
+  if (input.messagingGroupId != null && input.isGroup === 0) {
+    // Confirmed DM: collapse all thread aliases to one DM route.
+    threadKey = `dm:${input.messagingGroupId}`;
+  } else if (input.messagingGroupId != null && input.isGroup === 1) {
+    // Confirmed group route: distinct threads stay isolated.
+    threadKey = `grp:${input.messagingGroupId}:${input.threadId ?? 'main'}`;
+  } else {
+    // No host metadata → non-collapsible. Encode thread_id plus a marker so it
+    // can never equal a metadata-bearing route key.
+    threadKey = `nometa:${channelType ?? ''}:${platformId ?? ''}:${input.threadId ?? 'null'}`;
+  }
+
+  const routeKey = `${providerName}|${channelType ?? ''}|${platformId ?? ''}|${threadKey}`;
+  return {
+    routeKey,
+    providerName,
+    platformId,
+    channelType,
+    messagingGroupId: input.messagingGroupId,
+    isGroup: input.isGroup,
+    threadKey,
+  };
+}

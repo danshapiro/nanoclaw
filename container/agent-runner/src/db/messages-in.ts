@@ -25,6 +25,9 @@ export interface MessageInRow {
   platform_message_id: string | null;
   channel_type: string | null;
   thread_id: string | null;
+  /** Host-stamped route identity (nullable; null is never collapsible). */
+  messaging_group_id: string | null;
+  is_group: number | null;
   content: string;
 }
 
@@ -109,6 +112,74 @@ export function markFailed(id: string): void {
       "INSERT OR REPLACE INTO processing_ack (message_id, status, status_changed) VALUES (?, 'failed', datetime('now'))",
     )
     .run(id);
+}
+
+function logAckEvent(event: Record<string, unknown>): void {
+  console.error(JSON.stringify(event));
+}
+
+/**
+ * Return route-matched unaccepted rows to pending by deleting ONLY their
+ * transient `processing_ack.status='processing'` rows. Never touches
+ * `recovery`/`completed`/`failed` acks — recovery-owned work stays hidden from
+ * normal pending scans until recovery resolves it.
+ */
+export function returnProcessingToPending(ids: string[], reason: string): void {
+  if (ids.length === 0) return;
+  const db = getOutboundDb();
+  const stmt = db.prepare("DELETE FROM processing_ack WHERE message_id = $id AND status = 'processing'");
+  db.transaction(() => {
+    for (const id of ids) stmt.run({ $id: id });
+  })();
+  logAckEvent({ severity: 'info', event: 'return_processing_to_pending', message_ids: ids, reason });
+}
+
+/**
+ * Move accepted-but-unresolved rows into `processing_ack.status='recovery'` so
+ * they stay hidden from normal due/pending scans while recovery owns them.
+ */
+export function markRecoveryOwned(ids: string[], recoveryId: string): void {
+  if (ids.length === 0) return;
+  const db = getOutboundDb();
+  const stmt = db.prepare(
+    "INSERT OR REPLACE INTO processing_ack (message_id, status, status_changed) VALUES ($id, 'recovery', datetime('now'))",
+  );
+  db.transaction(() => {
+    for (const id of ids) stmt.run({ $id: id });
+  })();
+  logAckEvent({ severity: 'info', event: 'mark_recovery_owned', message_ids: ids, recovery_id: recoveryId });
+}
+
+/**
+ * Transition recovery-owned rows to `completed` after a successful recovery
+ * result. Only acts on rows currently in `recovery` status.
+ */
+export function markRecoveryCompleted(ids: string[], recoveryId: string): void {
+  if (ids.length === 0) return;
+  const db = getOutboundDb();
+  const stmt = db.prepare(
+    "UPDATE processing_ack SET status = 'completed', status_changed = datetime('now') WHERE message_id = $id AND status = 'recovery'",
+  );
+  db.transaction(() => {
+    for (const id of ids) stmt.run({ $id: id });
+  })();
+  logAckEvent({ severity: 'info', event: 'mark_recovery_completed', message_ids: ids, recovery_id: recoveryId });
+}
+
+/**
+ * Delete recovery acks ONLY after the rows have been returned to pending,
+ * completed, or covered by a replacement recovery/fallback. The caller asserts
+ * which disposition applied via `reason`; this deletes the recovery ack rows
+ * so they no longer hide the underlying inbound rows.
+ */
+export function clearRecoveryOwnership(ids: string[], recoveryId: string, reason: string): void {
+  if (ids.length === 0) return;
+  const db = getOutboundDb();
+  const stmt = db.prepare("DELETE FROM processing_ack WHERE message_id = $id AND status = 'recovery'");
+  db.transaction(() => {
+    for (const id of ids) stmt.run({ $id: id });
+  })();
+  logAckEvent({ severity: 'info', event: 'clear_recovery_ownership', message_ids: ids, recovery_id: recoveryId, reason });
 }
 
 /** Get a message by ID (read from inbound.db). */

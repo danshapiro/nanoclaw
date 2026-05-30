@@ -46,10 +46,10 @@ export interface QueryTurnInput {
   /**
    * Correlation id for this prompt. The poll loop generates one per top-level
    * prompt and per follow-up push, and treats a prompt as accepted only after
-   * the provider emits an `input-accepted` for the matching id. Optional in
-   * the additive migration window; the poll loop always supplies it.
+   * the provider emits an `input-accepted` for the matching id. Required: every
+   * provider turn carries an inputId so results resolve to exact rows.
    */
-  inputId?: string;
+  inputId: string;
 
   /** Initial prompt (already formatted by agent-runner). */
   prompt: string;
@@ -162,7 +162,12 @@ export interface AgentQuery {
 }
 
 export function normalizeQueryTurnInput(input: string | QueryTurnInput): QueryTurnInput {
-  return typeof input === 'string' ? { prompt: input } : input;
+  // A bare-string push (legacy callers, tests) is not ledger-tracked by the
+  // poll loop, so it gets a synthetic inputId. The poll loop always passes a
+  // structured QueryTurnInput with its own ledger inputId.
+  return typeof input === 'string'
+    ? { inputId: `synthetic-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, prompt: input }
+    : input;
 }
 
 export type ProviderEvent =
@@ -188,8 +193,4 @@ export type ProviderEvent =
       inputId?: string;
       source?: 'sdk_event' | 'sdk_keepalive' | 'provider_wait_tick' | 'provider_internal';
       liveness?: ProviderLivenessMetadata;
-    }
-  // ── TEMPORARY back-compat variant (additive-migration window) ──
-  // Removed in Step 7 sub-step 4 once every emitting site has been migrated to
-  // a `notice`/`interruption` disposition. Do NOT add new emitters of this.
-  | { type: 'error'; message: string; retryable: boolean; classification?: string };
+    };

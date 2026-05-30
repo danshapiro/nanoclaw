@@ -172,6 +172,11 @@ CREATE TABLE IF NOT EXISTS messages_in (
   platform_message_id TEXT,
   channel_type   TEXT,
   thread_id      TEXT,
+  -- Host-stamped route identity. Nullable for legacy/scheduling rows; a null
+  -- value is never collapsible onto another route (fail-safe), so the only
+  -- failure mode of a missing value is a missed merge, never a cross-route leak.
+  messaging_group_id TEXT,
+  is_group       INTEGER,
   content        TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_in_series ON messages_in(series_id);
@@ -207,7 +212,11 @@ CREATE TABLE IF NOT EXISTS session_routing (
   id           INTEGER PRIMARY KEY CHECK (id = 1),
   channel_type TEXT,
   platform_id  TEXT,
-  thread_id    TEXT
+  thread_id    TEXT,
+  -- Host-stamped route identity for the single normalized route active per
+  -- wake (derived from the session's messaging_groups row).
+  messaging_group_id TEXT,
+  is_group     INTEGER
 );
 `;
 
@@ -224,16 +233,44 @@ CREATE TABLE IF NOT EXISTS messages_out (
   platform_id    TEXT,
   channel_type   TEXT,
   thread_id      TEXT,
+  -- Route metadata so recovery can harvest only the active conversation's
+  -- progress/relay rows written during the accepted-input window.
+  input_id       TEXT,
+  route_key      TEXT,
+  messaging_group_id TEXT,
+  is_group       INTEGER,
   content        TEXT NOT NULL
 );
 
 -- Container tracks processing status here instead of updating messages_in.
 -- Host reads this to know which messages have been processed.
 -- On container startup, stale 'processing' entries are cleared (crash recovery).
+-- status ∈ {processing, completed, failed, recovery}. A 'failed' ack is only a
+-- valid host-sync completion when notice_message_out_id points at a written
+-- user-visible terminal notice row; otherwise it is treated as invalid.
 CREATE TABLE IF NOT EXISTS processing_ack (
   message_id     TEXT PRIMARY KEY,
   status         TEXT NOT NULL,
-  status_changed TEXT NOT NULL
+  status_changed TEXT NOT NULL,
+  notice_message_out_id TEXT
+);
+
+-- Validated, imported side effects (idempotency key = id = the proxy audit_id
+-- for GWS, the stable artifact/run key for summarize-dnd). Only records that
+-- pass validation are written here; agent-writable staged JSONL is never
+-- authoritative. kind is the durable recovery side-effect kind.
+CREATE TABLE IF NOT EXISTS side_effect_ledger (
+  id              TEXT PRIMARY KEY,
+  source          TEXT NOT NULL,
+  kind            TEXT NOT NULL,
+  operation       TEXT,
+  input_id        TEXT,
+  route_key       TEXT,
+  evidence_json   TEXT NOT NULL,
+  validation_json TEXT NOT NULL,
+  replay_policy   TEXT,
+  occurred_at     TEXT,
+  imported_at     TEXT NOT NULL
 );
 
 -- Persistent key/value state owned by the container. Used (among other things)

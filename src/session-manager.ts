@@ -216,11 +216,18 @@ export function writeSessionRouting(agentGroupId: string, sessionId: string): vo
 
   let channelType: string | null = null;
   let platformId: string | null = null;
+  // Derive the route's host-stamped identity from the session's already-loaded
+  // messaging_groups row (per-wake). This is distinct from the per-message
+  // values stamped via writeSessionMessage(): session routing carries the
+  // single normalized route active for this wake.
+  let messagingGroupId: string | null = session.messaging_group_id ?? null;
+  let isGroup: 0 | 1 | null = null;
   if (session.messaging_group_id) {
     const mg = getMessagingGroup(session.messaging_group_id);
     if (mg) {
       channelType = mg.channel_type;
       platformId = mg.platform_id;
+      isGroup = mg.is_group === 1 ? 1 : 0;
     }
   }
 
@@ -230,11 +237,13 @@ export function writeSessionRouting(agentGroupId: string, sessionId: string): vo
       channel_type: channelType,
       platform_id: platformId,
       thread_id: session.thread_id,
+      messaging_group_id: messagingGroupId,
+      is_group: isGroup,
     });
   } finally {
     db.close();
   }
-  log.debug('Session routing written', { sessionId, channelType, platformId, threadId: session.thread_id });
+  log.debug('Session routing written', { sessionId, channelType, platformId, threadId: session.thread_id, isGroup });
 }
 
 /**
@@ -265,6 +274,12 @@ export function writeSessionMessage(
      * a trigger-1 message does arrive.
      */
     trigger?: 0 | 1;
+    /**
+     * Host-stamped route identity for this message. Nullable; a null value is
+     * never collapsible onto another route (fail-safe route matching).
+     */
+    messagingGroupId?: string | null;
+    isGroup?: 0 | 1 | null;
   },
 ): void {
   // Extract base64 attachment data, save to inbox, replace with file paths
@@ -284,6 +299,8 @@ export function writeSessionMessage(
       processAfter: message.processAfter ?? null,
       recurrence: message.recurrence ?? null,
       trigger: message.trigger ?? 1,
+      messagingGroupId: message.messagingGroupId ?? null,
+      isGroup: message.isGroup ?? null,
     });
   } finally {
     db.close();
