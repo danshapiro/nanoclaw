@@ -12,8 +12,15 @@ export interface AgentProvider {
   /**
    * True if the given error indicates the stored continuation is invalid
    * (missing transcript, unknown session, etc.) and should be cleared.
+   *
+   * `attemptedContinuation` is the continuation id the provider tried to
+   * resume. It is REQUIRED metadata: a transport error with no attempted
+   * continuation can never be stale-session proof. This is a diagnostic /
+   * trigger predicate only — the authoritative continuation clears live in
+   * the poll loop (explicit clear-continuation, positive existence check, or
+   * the bounded zombie path).
    */
-  isSessionInvalid(err: unknown): boolean;
+  isSessionInvalid(err: unknown, opts: { attemptedContinuation?: string }): boolean;
 }
 
 /**
@@ -36,6 +43,14 @@ export interface QueryAttachment {
 }
 
 export interface QueryTurnInput {
+  /**
+   * Correlation id for this prompt. The poll loop generates one per top-level
+   * prompt and per follow-up push, and treats a prompt as accepted only after
+   * the provider emits an `input-accepted` for the matching id. Optional in
+   * the additive migration window; the poll loop always supplies it.
+   */
+  inputId?: string;
+
   /** Initial prompt (already formatted by agent-runner). */
   prompt: string;
 
@@ -61,6 +76,69 @@ export interface QueryInput extends QueryTurnInput {
   systemContext?: {
     instructions?: string;
   };
+
+  /**
+   * Relay mode: a separate restricted runtime used only for bounded
+   * Yente-authored status relays during long work. Mutation/shell/file/web/
+   * question tools are denied; only the route-locked send_message is exposed.
+   */
+  relayMode?: boolean;
+  relayDeadlineMs?: number;
+  toolPolicy?: 'normal' | 'status_only';
+}
+
+export type ProviderInputScope = 'initial' | 'followup' | 'relay';
+export type ProviderContinuationPolicy = 'preserve' | 'clear' | 'unknown';
+export type ProviderNoticeSeverity = 'info' | 'warn' | 'error';
+
+export interface ProviderLivenessMetadata {
+  configuredTimeoutMs?: number;
+  elapsedMs?: number;
+  lastEventType?: string;
+  lastMeaningfulEventAt?: string | null;
+}
+
+export interface ProviderInputResolution {
+  inputId?: string;
+  resolvedInputIds: string[];
+  supersededInputIds?: string[];
+}
+
+export interface ProviderInterruption {
+  inputId: string;
+  classification: string;
+  severity: ProviderNoticeSeverity;
+  terminal: boolean;
+  agentMessage: string;
+  fallbackUserMessage: string;
+  continuationPolicy: ProviderContinuationPolicy;
+  attemptedContinuation?: string;
+  liveness?: ProviderLivenessMetadata;
+  recoverySeed?: {
+    observations?: string[];
+    safeToolState?: string;
+    sideEffects?: ProviderSideEffect[];
+  };
+}
+
+export interface ProviderSideEffect {
+  id: string;
+  inputId: string;
+  kind: 'gmail_draft_created' | 'summarize_dnd_recording_cached' | 'summarize_dnd_summary_artifact' | 'tool_completed' | 'other';
+  label: string;
+  evidence: Record<string, string | number | boolean | null>;
+  occurredAt: string;
+}
+
+/**
+ * Capability metadata for a provider. Used by the poll loop to decide whether
+ * a separate-runtime relay can carry an inactivity status message during long
+ * work, and what relay tool policy/deadline applies.
+ */
+export interface ProviderCapabilities {
+  supportsSeparateRelayRuntime: boolean;
+  defaultRelayDeadlineMs?: number;
+  relayToolPolicy?: 'status_only';
 }
 
 export interface McpServerConfig {
@@ -89,12 +167,29 @@ export function normalizeQueryTurnInput(input: string | QueryTurnInput): QueryTu
 
 export type ProviderEvent =
   | { type: 'init'; continuation: string }
-  | { type: 'result'; text: string | null }
-  | { type: 'error'; message: string; retryable: boolean; classification?: string }
-  | { type: 'progress'; message: string }
-  /**
-   * Liveness signal. Providers MUST yield this on every underlying SDK
-   * event (tool call, thinking, partial message, anything) so the
-   * poll-loop's idle timer stays honest during long tool runs.
-   */
-  | { type: 'activity' };
+  | { type: 'input-accepted'; inputId: string; scope: ProviderInputScope }
+  | ({ type: 'result'; text: string | null } & ProviderInputResolution)
+  | { type: 'progress'; inputId?: string; message: string }
+  | {
+      type: 'notice';
+      inputId: string;
+      classification: string;
+      severity: ProviderNoticeSeverity;
+      agentMessage: string;
+      fallbackUserMessage: string;
+      relayRecommended: boolean;
+      liveness?: ProviderLivenessMetadata;
+    }
+  | ({ type: 'interruption' } & ProviderInterruption)
+  | { type: 'side-effect'; sideEffect: ProviderSideEffect }
+  | { type: 'clear-continuation'; inputId: string; reason: string; attemptedContinuation?: string }
+  | {
+      type: 'activity';
+      inputId?: string;
+      source?: 'sdk_event' | 'sdk_keepalive' | 'provider_wait_tick' | 'provider_internal';
+      liveness?: ProviderLivenessMetadata;
+    }
+  // ── TEMPORARY back-compat variant (additive-migration window) ──
+  // Removed in Step 7 sub-step 4 once every emitting site has been migrated to
+  // a `notice`/`interruption` disposition. Do NOT add new emitters of this.
+  | { type: 'error'; message: string; retryable: boolean; classification?: string };

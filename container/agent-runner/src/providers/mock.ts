@@ -21,12 +21,12 @@ export class MockProvider implements AgentProvider {
     this.responseFactory = responseFactory ?? ((prompt) => `Mock response to: ${prompt.slice(0, 100)}`);
   }
 
-  isSessionInvalid(_err: unknown): boolean {
+  isSessionInvalid(_err: unknown, _opts: { attemptedContinuation?: string } = {}): boolean {
     return false;
   }
 
   query(input: QueryInput): AgentQuery {
-    const pending: string[] = [];
+    const pending: Array<{ inputId?: string; prompt: string }> = [];
     let waiting: (() => void) | null = null;
     let ended = false;
     let aborted = false;
@@ -37,15 +37,31 @@ export class MockProvider implements AgentProvider {
         yield { type: 'activity' };
         yield { type: 'init', continuation: `mock-session-${Date.now()}` };
 
-        // Process initial prompt
+        // Process initial prompt — accept synchronously, then resolve it.
+        if (input.inputId) {
+          yield { type: 'input-accepted', inputId: input.inputId, scope: 'initial' };
+        }
         yield { type: 'activity' };
-        yield { type: 'result', text: responseFactory(input.prompt) };
+        yield {
+          type: 'result',
+          text: responseFactory(input.prompt),
+          inputId: input.inputId,
+          resolvedInputIds: input.inputId ? [input.inputId] : [],
+        };
 
         // Process any pushed follow-ups
         while (!ended && !aborted) {
           if (pending.length > 0) {
             const msg = pending.shift()!;
-            yield { type: 'result', text: responseFactory(msg) };
+            if (msg.inputId) {
+              yield { type: 'input-accepted', inputId: msg.inputId, scope: 'followup' };
+            }
+            yield {
+              type: 'result',
+              text: responseFactory(msg.prompt),
+              inputId: msg.inputId,
+              resolvedInputIds: msg.inputId ? [msg.inputId] : [],
+            };
             continue;
           }
           // Wait for push() or end()
@@ -58,7 +74,15 @@ export class MockProvider implements AgentProvider {
         // Drain remaining
         while (pending.length > 0) {
           const msg = pending.shift()!;
-          yield { type: 'result', text: responseFactory(msg) };
+          if (msg.inputId) {
+            yield { type: 'input-accepted', inputId: msg.inputId, scope: 'followup' };
+          }
+          yield {
+            type: 'result',
+            text: responseFactory(msg.prompt),
+            inputId: msg.inputId,
+            resolvedInputIds: msg.inputId ? [msg.inputId] : [],
+          };
         }
       },
     };
@@ -66,7 +90,7 @@ export class MockProvider implements AgentProvider {
     return {
       push(message) {
         const turn = normalizeQueryTurnInput(message);
-        pending.push(turn.prompt);
+        pending.push({ inputId: turn.inputId, prompt: turn.prompt });
         waiting?.();
       },
       end() {

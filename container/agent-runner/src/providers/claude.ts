@@ -11,6 +11,7 @@ import type {
   AgentQuery,
   McpServerConfig,
   ProviderEvent,
+  ProviderInputScope,
   ProviderOptions,
   QueryInput,
 } from './types.js';
@@ -84,13 +85,20 @@ class MessageStream {
   private waiting: (() => void) | null = null;
   private done = false;
 
-  push(text: string): void {
+  /**
+   * Fired when a prompt is accepted into the stream (push succeeds). Carries
+   * the prompt's inputId and scope so the provider can emit `input-accepted`.
+   */
+  onAccept: ((inputId: string, scope: ProviderInputScope) => void) | null = null;
+
+  push(text: string, inputId?: string, scope: ProviderInputScope = 'followup'): void {
     this.queue.push({
       type: 'user',
       message: { role: 'user', content: text },
       parent_tool_use_id: null,
       session_id: '',
     });
+    if (inputId) this.onAccept?.(inputId, scope);
     this.waiting?.();
   }
 
@@ -288,14 +296,31 @@ export class ClaudeProvider implements AgentProvider {
     };
   }
 
-  isSessionInvalid(err: unknown): boolean {
+  isSessionInvalid(err: unknown, opts: { attemptedContinuation?: string } = {}): boolean {
+    // Diagnostic/trigger predicate only — never authoritative on its own (the
+    // poll loop owns continuation clears). A transport error with no attempted
+    // continuation can never be stale-session proof.
+    if (!opts.attemptedContinuation) return false;
     const msg = err instanceof Error ? err.message : String(err);
     return STALE_SESSION_RE.test(msg);
   }
 
   query(input: QueryInput): AgentQuery {
     const stream = new MessageStream();
-    stream.push(input.prompt);
+
+    // input-accepted events are produced on the same async channel as SDK
+    // events. The translate loop interleaves them so the poll loop sees an
+    // input-accepted before the matching result.
+    const acceptedBuffer: ProviderEvent[] = [];
+    let acceptWaker: (() => void) | null = null;
+    stream.onAccept = (inputId, scope) => {
+      acceptedBuffer.push({ type: 'input-accepted', inputId, scope });
+      acceptWaker?.();
+      acceptWaker = null;
+    };
+
+    const initialInputId = input.inputId;
+    stream.push(input.prompt, initialInputId, 'initial');
 
     const instructions = input.systemContext?.instructions;
 
@@ -327,11 +352,35 @@ export class ClaudeProvider implements AgentProvider {
 
     let aborted = false;
 
+    // Track accepted-but-unresolved input ids in arrival order. A Claude
+    // `result` ends the current turn; it resolves whichever accepted inputs
+    // have not yet been resolved (typically one — the active prompt).
+    const acceptedUnresolved: string[] = [];
+
+    function drainAccepted(): ProviderEvent[] {
+      const out: ProviderEvent[] = [];
+      while (acceptedBuffer.length > 0) {
+        const ev = acceptedBuffer.shift()!;
+        if (ev.type === 'input-accepted') acceptedUnresolved.push(ev.inputId);
+        out.push(ev);
+      }
+      return out;
+    }
+
+    function takeResolvedIds(): string[] {
+      const ids = acceptedUnresolved.splice(0, acceptedUnresolved.length);
+      return ids;
+    }
+
     async function* translateEvents(): AsyncGenerator<ProviderEvent> {
       let messageCount = 0;
       for await (const message of sdkResult) {
         if (aborted) return;
         messageCount++;
+
+        // Emit any input-accepted events queued since the last SDK event,
+        // before translating this one, so the poll loop sees acceptance first.
+        for (const ev of drainAccepted()) yield ev;
 
         // Yield activity for every SDK event so the poll loop knows the agent is working
         yield { type: 'activity' };
@@ -340,20 +389,50 @@ export class ClaudeProvider implements AgentProvider {
           yield { type: 'init', continuation: message.session_id };
         } else if (message.type === 'result') {
           const text = 'result' in message ? ((message as { result?: string }).result ?? null) : null;
-          yield { type: 'result', text };
+          const resolvedInputIds = takeResolvedIds();
+          yield {
+            type: 'result',
+            text,
+            inputId: resolvedInputIds[resolvedInputIds.length - 1],
+            resolvedInputIds,
+          };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
-          yield { type: 'error', message: 'API retry', retryable: true };
+          // API retry is a mid-turn, non-terminal signal: the turn continues.
+          // Reclassify as a non-terminal notice (warn, no relay) correlated to
+          // the active input — not a terminal interruption, not a throw.
+          yield {
+            type: 'notice',
+            inputId: acceptedUnresolved[acceptedUnresolved.length - 1] ?? initialInputId ?? '',
+            classification: 'api_retry',
+            severity: 'warn',
+            agentMessage: 'Retrying after a transient API error.',
+            fallbackUserMessage: 'A transient error happened; retrying automatically.',
+            relayRecommended: false,
+          };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'rate_limit_event') {
-          yield { type: 'error', message: 'Rate limit', retryable: false, classification: 'quota' };
+          // The current code does NOT return on rate_limit_event — the turn
+          // provably continues — so classify as a continue-the-turn notice
+          // (warn, quota classification), not a terminal interruption.
+          yield {
+            type: 'notice',
+            inputId: acceptedUnresolved[acceptedUnresolved.length - 1] ?? initialInputId ?? '',
+            classification: 'quota',
+            severity: 'warn',
+            agentMessage: 'Rate limited; waiting before continuing.',
+            fallbackUserMessage: 'Rate limited; the turn will continue shortly.',
+            relayRecommended: false,
+          };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'compact_boundary') {
           const meta = (message as { compact_metadata?: { pre_tokens?: number } }).compact_metadata;
           const detail = meta?.pre_tokens ? ` (${meta.pre_tokens.toLocaleString()} tokens compacted)` : '';
-          yield { type: 'result', text: `Context compacted${detail}.` };
+          yield { type: 'result', text: `Context compacted${detail}.`, resolvedInputIds: [] };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
           const tn = message as { summary?: string };
           yield { type: 'progress', message: tn.summary || 'Task notification' };
         }
       }
+      // Flush any trailing acceptance events the SDK never interleaved.
+      for (const ev of drainAccepted()) yield ev;
       log(`Query completed after ${messageCount} SDK messages`);
     }
 
@@ -370,7 +449,7 @@ export class ClaudeProvider implements AgentProvider {
             }),
           );
         }
-        stream.push(turn.prompt);
+        stream.push(turn.prompt, turn.inputId, 'followup');
       },
       end: () => stream.end(),
       events: translateEvents(),

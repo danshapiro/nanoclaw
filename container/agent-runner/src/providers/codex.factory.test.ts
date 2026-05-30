@@ -12,18 +12,20 @@ describe('createProvider (codex)', () => {
     expect(createProvider('codex')).toBeInstanceOf(CodexProvider);
   });
 
-  it('flags stale thread errors as session-invalid', () => {
+  it('flags stale thread errors as session-invalid (2-arg signature)', () => {
     const p = new CodexProvider();
-    expect(p.isSessionInvalid(new Error('thread not found'))).toBe(true);
-    expect(p.isSessionInvalid(new Error('unknown thread 123'))).toBe(true);
-    expect(p.isSessionInvalid(new Error('No such thread: abc'))).toBe(true);
+    expect(p.isSessionInvalid(new Error('thread not found'), { attemptedContinuation: 'thread-1' })).toBe(true);
+    expect(p.isSessionInvalid(new Error('unknown thread 123'), { attemptedContinuation: 'thread-1' })).toBe(true);
+    expect(p.isSessionInvalid(new Error('No such thread: abc'), { attemptedContinuation: 'thread-1' })).toBe(true);
   });
 
   it('does not flag unrelated errors as session-invalid', () => {
     const p = new CodexProvider();
-    expect(p.isSessionInvalid(new Error('rate limit exceeded'))).toBe(false);
-    expect(p.isSessionInvalid(new Error('connection reset'))).toBe(false);
-    expect(p.isSessionInvalid(new Error('codex app-server exited: code=1'))).toBe(false);
+    expect(p.isSessionInvalid(new Error('rate limit exceeded'), { attemptedContinuation: 'thread-1' })).toBe(false);
+    expect(p.isSessionInvalid(new Error('connection reset'), { attemptedContinuation: 'thread-1' })).toBe(false);
+    expect(p.isSessionInvalid(new Error('codex app-server exited: code=1'), { attemptedContinuation: 'thread-1' })).toBe(
+      false,
+    );
   });
 
   it('declares no native slash command support', () => {

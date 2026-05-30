@@ -483,7 +483,12 @@ export class OpenCodeProvider implements AgentProvider {
     this.options = options;
   }
 
-  isSessionInvalid(err: unknown): boolean {
+  isSessionInvalid(err: unknown, opts: { attemptedContinuation?: string } = {}): boolean {
+    // Diagnostic/trigger predicate only — the poll loop owns authoritative
+    // continuation clears (explicit clear-continuation, positive existence
+    // check, or the bounded zombie path). A stale-session text match without
+    // an attempted continuation can never be proof on its own.
+    if (!opts.attemptedContinuation) return false;
     return isStaleSessionError(err);
   }
 
@@ -511,6 +516,7 @@ export class OpenCodeProvider implements AgentProvider {
 
     async function* gen(): AsyncGenerator<ProviderEvent> {
       let initYielded = false;
+      let turnIndex = 0;
       const rt = await ensureSharedRuntime(self.options);
       const { client, stream } = rt;
 
@@ -548,6 +554,16 @@ export class OpenCodeProvider implements AgentProvider {
         if (!initYielded || prompted.recoveredFromStale) {
           yield { type: 'init', continuation: sessionId };
           initYielded = true;
+        }
+
+        // The prompt was accepted by the OpenCode session — emit input-accepted
+        // for the matching id. (The full liveness/notice/interruption event
+        // surface for OpenCode lands in Task 3; the input-accepted + result
+        // resolution contract is wired here.)
+        const turnScope = turnIndex === 0 ? 'initial' : 'followup';
+        turnIndex += 1;
+        if (turn.inputId) {
+          yield { type: 'input-accepted', inputId: turn.inputId, scope: turnScope };
         }
 
         const partTextByMessageId = new Map<string, string>();
@@ -651,7 +667,12 @@ export class OpenCodeProvider implements AgentProvider {
             resultText = partTextByMessageId.get(msgId) ?? resultText;
           }
         }
-        yield { type: 'result', text: resultText || null };
+        yield {
+          type: 'result',
+          text: resultText || null,
+          inputId: turn.inputId,
+          resolvedInputIds: turn.inputId ? [turn.inputId] : [],
+        };
       }
     }
 

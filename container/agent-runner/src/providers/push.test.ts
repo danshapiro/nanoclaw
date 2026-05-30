@@ -2,6 +2,86 @@ import { describe, expect, it, mock } from 'bun:test';
 
 import { CodexProvider } from './codex.js';
 import { MockProvider } from './mock.js';
+import type { ProviderEvent } from './types.js';
+
+/**
+ * Pull the next event of a given type off a single, persistent provider event
+ * iterator. Awaiting forces the generator body to run, which is exactly what
+ * drives input-accepted/result emission in the synchronous-ish providers
+ * (Mock, Claude). OpenCode/Codex need a runtime seam (Task 3) before this
+ * works, which is why Task 1 asserts the event contract on Mock and Claude
+ * only.
+ */
+async function nextEvent(
+  iter: AsyncIterator<ProviderEvent>,
+  type: ProviderEvent['type'],
+): Promise<ProviderEvent> {
+  for (;;) {
+    const { value, done } = await iter.next();
+    if (done) throw new Error(`stream ended before a '${type}' event`);
+    if (value.type === type) return value;
+  }
+}
+
+describe('provider input-accepted/result contract', () => {
+  it('mock provider echoes inputId on input-accepted and resolves it on result', async () => {
+    const provider = new MockProvider({}, (prompt) => `seen: ${prompt}`);
+    const query = provider.query({ inputId: 'initial-1', prompt: 'hello', cwd: '/tmp' });
+    const iter = query.events[Symbol.asyncIterator]();
+
+    await expect(nextEvent(iter, 'input-accepted')).resolves.toMatchObject({
+      type: 'input-accepted',
+      inputId: 'initial-1',
+      scope: 'initial',
+    });
+
+    // Resolve the initial input first, then push a follow-up.
+    await expect(nextEvent(iter, 'result')).resolves.toMatchObject({
+      type: 'result',
+      inputId: 'initial-1',
+      resolvedInputIds: ['initial-1'],
+    });
+
+    query.push({ inputId: 'followup-1', prompt: 'later' });
+    await expect(nextEvent(iter, 'input-accepted')).resolves.toMatchObject({
+      type: 'input-accepted',
+      inputId: 'followup-1',
+      scope: 'followup',
+    });
+
+    await expect(nextEvent(iter, 'result')).resolves.toMatchObject({
+      type: 'result',
+      inputId: 'followup-1',
+      resolvedInputIds: ['followup-1'],
+    });
+    query.end();
+  });
+
+  it('claude provider emits input-accepted with the matching inputId when the SDK stream accepts the prompt', async () => {
+    mock.module('@anthropic-ai/claude-agent-sdk', () => ({
+      query: ({ prompt }: { prompt: AsyncIterable<{ message: { content: string } }> }) =>
+        (async function* () {
+          let count = 0;
+          for await (const _msg of prompt) {
+            count++;
+            if (count >= 1) {
+              yield { type: 'result', result: 'ok' };
+              return;
+            }
+          }
+        })(),
+    }));
+
+    const { ClaudeProvider } = await import('./claude.js');
+    const provider = new ClaudeProvider();
+    const query = provider.query({ inputId: 'claude-initial', prompt: 'hello', cwd: '/tmp' });
+    const iter = query.events[Symbol.asyncIterator]();
+
+    const accepted = await nextEvent(iter, 'input-accepted');
+    expect(accepted).toMatchObject({ type: 'input-accepted', inputId: 'claude-initial', scope: 'initial' });
+    query.end();
+  });
+});
 
 describe('provider push attachment compatibility', () => {
   it('mock provider accepts structured follow-up turns and ignores attachments', async () => {

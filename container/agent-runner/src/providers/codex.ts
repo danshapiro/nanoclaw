@@ -22,6 +22,7 @@ import {
   type AgentProvider,
   type AgentQuery,
   type ProviderEvent,
+  type ProviderInputScope,
   type ProviderOptions,
   type QueryInput,
 } from './types.js';
@@ -120,13 +121,16 @@ export class CodexProvider implements AgentProvider {
     this.model = (options.env?.CODEX_MODEL as string | undefined) ?? 'gpt-5.4-mini';
   }
 
-  isSessionInvalid(err: unknown): boolean {
+  isSessionInvalid(err: unknown, opts: { attemptedContinuation?: string } = {}): boolean {
+    // Diagnostic/trigger predicate only; never authoritative on its own. A
+    // stale-thread error without an attempted continuation is not proof.
+    if (!opts.attemptedContinuation) return false;
     const msg = err instanceof Error ? err.message : String(err);
     return STALE_THREAD_RE.test(msg);
   }
 
   query(input: QueryInput): AgentQuery {
-    const pending: string[] = [];
+    const pending: Array<{ inputId?: string; prompt: string; scope: ProviderInputScope }> = [];
     let waiting: (() => void) | null = null;
     let ended = false;
     let aborted = false;
@@ -134,7 +138,7 @@ export class CodexProvider implements AgentProvider {
       waiting?.();
     };
 
-    pending.push(input.prompt);
+    pending.push({ inputId: input.inputId, prompt: input.prompt, scope: 'initial' });
 
     const self = this;
 
@@ -173,7 +177,7 @@ export class CodexProvider implements AgentProvider {
           if (aborted) return;
           if (pending.length === 0 && ended) return;
 
-          const text = pending.shift()!;
+          const next = pending.shift()!;
 
           // One turn = one channel of streaming events. Each notification
           // from the app-server yields an `activity` first (so the
@@ -182,13 +186,15 @@ export class CodexProvider implements AgentProvider {
           yield* runOneTurn(
             server,
             threadId!,
-            text,
+            next.prompt,
             self.model,
             input.cwd,
             () => initYielded,
             () => {
               initYielded = true;
             },
+            next.inputId,
+            next.scope,
           );
         }
       } finally {
@@ -209,7 +215,7 @@ export class CodexProvider implements AgentProvider {
             }),
           );
         }
-        pending.push(turn.prompt);
+        pending.push({ inputId: turn.inputId, prompt: turn.prompt, scope: 'followup' });
         kick();
       },
       end: () => {
@@ -238,6 +244,8 @@ async function* runOneTurn(
   cwd: string,
   hasInit: () => boolean,
   markInit: () => void,
+  inputId?: string,
+  scope: ProviderInputScope = 'initial',
 ): AsyncGenerator<ProviderEvent> {
   // Mutable refs via object properties — TS can't track closure assignments
   // for narrowing, but property access keeps the declared type visible.
@@ -324,6 +332,11 @@ async function* runOneTurn(
 
     await startCodexTurn(server, { threadId, inputText, model, cwd });
 
+    // turn/start accepted the input — emit input-accepted for the matching id.
+    if (inputId) {
+      yield { type: 'input-accepted', inputId, scope };
+    }
+
     while (true) {
       while (buffer.length > 0) {
         const ev = buffer.shift()!;
@@ -339,11 +352,28 @@ async function* runOneTurn(
     while (buffer.length > 0) yield buffer.shift()!;
 
     if (turnState.error) {
-      yield { type: 'error', message: turnState.error.message, retryable: false };
+      // A real turn error is terminal-recoverable: emit a typed interruption
+      // with input correlation, recovery metadata, and continuation policy so
+      // the poll loop can preserve recovery rather than dropping the turn.
+      yield {
+        type: 'interruption',
+        inputId: inputId ?? '',
+        classification: 'codex_turn_failed',
+        severity: 'error',
+        terminal: true,
+        agentMessage: 'The Codex turn failed before completing.',
+        fallbackUserMessage: `The previous request failed (${turnState.error.message}). Please try again.`,
+        continuationPolicy: 'preserve',
+      };
       return;
     }
 
-    yield { type: 'result', text: resultText || null };
+    yield {
+      type: 'result',
+      text: resultText || null,
+      inputId,
+      resolvedInputIds: inputId ? [inputId] : [],
+    };
   } finally {
     clearTimeout(timer);
     const idx = server.notificationHandlers.indexOf(handler);
