@@ -56,13 +56,16 @@ const OPENCODE_INACTIVITY_NOTICE_REPEAT_MS = (): number =>
   envNum('OPENCODE_INACTIVITY_NOTICE_REPEAT_MS', OPENCODE_INACTIVITY_NOTICE_MS());
 const OPENCODE_WAIT_TICK_MS = (): number => envNum('OPENCODE_WAIT_TICK_MS', 15 * 1000);
 const OPENCODE_RELAY_DEADLINE_MS = (): number => envNum('OPENCODE_RELAY_DEADLINE_MS', 30 * 1000);
-const OPENCODE_CONTINUATION_FAILURE_LIMIT = (): number => envNum('OPENCODE_CONTINUATION_FAILURE_LIMIT', 3);
 const OPENCODE_LONG_TOOL_TIMEOUT_MAX_MS = (): number => envNum('OPENCODE_LONG_TOOL_TIMEOUT_MAX_MS', 6 * 60 * 60 * 1000);
-const OPENCODE_NATIVE_QUESTION_CANCEL_GRACE_MS = (): number =>
-  envNum('OPENCODE_NATIVE_QUESTION_CANCEL_GRACE_MS', 15 * 1000);
 // Model-provider request timeout: a large positive ms value (= absolute turn
 // ceiling) under the ACTIVE provider name, NEVER 0 (which means immediate abort).
 const OPENCODE_MODEL_PROVIDER_TIMEOUT_MS = (): number => envNum('OPENCODE_MODEL_PROVIDER_TIMEOUT_MS', 6 * 60 * 60 * 1000);
+// Note: OPENCODE_CONTINUATION_FAILURE_LIMIT (bounded zombie backstop) is owned
+// by the poll loop, which counts consecutive terminal interruptions across
+// wakes; OPENCODE_NATIVE_QUESTION_CANCEL_GRACE_MS is reserved for a future
+// cancellable-native-question reuse path (today every native question is denied
+// + cleared with restart-capable recovery). Both are still host-forwarded so an
+// operator override reaches the in-container default consumer.
 
 const KEEPALIVE_EVENT_TYPES = ['server.connected', 'server.heartbeat'];
 
