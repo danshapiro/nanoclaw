@@ -774,25 +774,85 @@ describe('GWS proxy mediation boundary', () => {
 });
 
 describe('side-effect ledger container env', () => {
-  function runnerSource(): string {
-    return fs.readFileSync(path.join(process.cwd(), 'src', 'container-runner.ts'), 'utf8');
+  /**
+   * Helper: run wakeContainer through the standard harness and return the
+   * docker-run arg array passed to spawn.  Callers are responsible for
+   * cleanup via harness.close().
+   */
+  async function buildArgs(harness: Awaited<ReturnType<typeof loadContainerRunnerHarness>>): Promise<string[]> {
+    const wake = harness.containerRunner.wakeContainer(harness.session);
+    await harness.oneCliStarted.promise;
+    harness.oneCliRelease.resolve();
+    await wake;
+    return harness.spawnMock.mock.calls[0][1] as string[];
   }
 
-  it('sets the static side-effect ledger path in the container env', () => {
-    expect(runnerSource()).toContain('NANOCLAW_SIDE_EFFECT_LEDGER=/workspace/side-effects.jsonl');
+  it('sets the static side-effect ledger path in the container env', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      const args = await buildArgs(harness);
+      // The flat docker-run arg list is ['-e', 'KEY=VALUE', ...].
+      // Verify the exact static value is present as a discrete arg.
+      expect(args).toContain('NANOCLAW_SIDE_EFFECT_LEDGER=/workspace/side-effects.jsonl');
+    } finally {
+      harness.close();
+    }
   });
 
-  it('injects the Ed25519 public verify key but never the private signing key', () => {
-    const source = runnerSource();
-    // Public verify key is mounted/injected.
-    expect(source).toContain('GWS_SIDE_EFFECT_VERIFY_KEY');
-    // The private signing key must never be referenced in the agent container.
-    expect(source).not.toContain('GWS_SIDE_EFFECT_SIGN_KEY_FILE');
+  it('injects the Ed25519 public verify key when the host env var is set', async () => {
+    const harness = await loadContainerRunnerHarness();
+    const saved = process.env.GWS_SIDE_EFFECT_VERIFY_KEY;
+    try {
+      process.env.GWS_SIDE_EFFECT_VERIFY_KEY = 'test-pub-key-base64';
+      const args = await buildArgs(harness);
+      expect(args).toContain('GWS_SIDE_EFFECT_VERIFY_KEY=test-pub-key-base64');
+    } finally {
+      if (saved === undefined) {
+        delete process.env.GWS_SIDE_EFFECT_VERIFY_KEY;
+      } else {
+        process.env.GWS_SIDE_EFFECT_VERIFY_KEY = saved;
+      }
+      harness.close();
+    }
   });
 
-  it('does not pass per-input correlation as process env (it is the .active-input.json file)', () => {
-    const source = runnerSource();
-    expect(source).not.toContain('NANOCLAW_ACTIVE_INPUT_ID');
-    expect(source).not.toContain('NANOCLAW_ROUTE_KEY=');
+  it('omits the Ed25519 public verify key when the host env var is absent', async () => {
+    const harness = await loadContainerRunnerHarness();
+    const saved = process.env.GWS_SIDE_EFFECT_VERIFY_KEY;
+    try {
+      delete process.env.GWS_SIDE_EFFECT_VERIFY_KEY;
+      const args = await buildArgs(harness);
+      // The key must be absent so the in-container default applies.
+      expect(args.some((a) => a.startsWith('GWS_SIDE_EFFECT_VERIFY_KEY='))).toBe(false);
+    } finally {
+      if (saved !== undefined) {
+        process.env.GWS_SIDE_EFFECT_VERIFY_KEY = saved;
+      }
+      harness.close();
+    }
+  });
+
+  it('never injects the private signing key into the container env under any condition', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      // Inject a dummy value so any accidental pass-through would show up.
+      process.env.GWS_SIDE_EFFECT_SIGN_KEY_FILE = '/run/secrets/sign-key';
+      const args = await buildArgs(harness);
+      expect(args.some((a) => a.includes('GWS_SIDE_EFFECT_SIGN_KEY_FILE'))).toBe(false);
+    } finally {
+      delete process.env.GWS_SIDE_EFFECT_SIGN_KEY_FILE;
+      harness.close();
+    }
+  });
+
+  it('does not pass per-input correlation as process env (it is the .active-input.json file)', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      const args = await buildArgs(harness);
+      expect(args.some((a) => a.includes('NANOCLAW_ACTIVE_INPUT_ID'))).toBe(false);
+      expect(args.some((a) => a.startsWith('NANOCLAW_ROUTE_KEY='))).toBe(false);
+    } finally {
+      harness.close();
+    }
   });
 });

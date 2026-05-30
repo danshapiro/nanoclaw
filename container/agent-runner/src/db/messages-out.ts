@@ -106,11 +106,11 @@ export interface HarvestedProgress {
 export function harvestRouteScopedProgress(routeKey: string): HarvestedProgress[] {
   const rows = getOutboundDb()
     .prepare(
-      `SELECT id, content, timestamp FROM messages_out
+      `SELECT id, kind, content, timestamp FROM messages_out
        WHERE route_key = $route_key AND kind <> 'system'
        ORDER BY timestamp ASC`,
     )
-    .all({ $route_key: routeKey }) as Array<{ id: string; content: string; timestamp: string }>;
+    .all({ $route_key: routeKey }) as Array<{ id: string; kind: string; content: string; timestamp: string }>;
   return rows.map((r) => {
     let text = '';
     try {
@@ -119,7 +119,15 @@ export function harvestRouteScopedProgress(routeKey: string): HarvestedProgress[
     } catch {
       text = r.content;
     }
-    return { messageOutId: r.id, text, source: 'provider_progress' as const, timestamp: r.timestamp };
+    // Derive source from the stored kind value.
+    // Currently all harvested rows carry kind='chat' (provider output and MCP
+    // send_message both land as 'chat'; relay output uses 'chat' too).  When
+    // Task 3 / Task 4B writers stamp a distinguishing kind (e.g. 'relay' or
+    // 'mcp_send_message'), the mapping below will surface the correct label
+    // without any schema change.
+    const source: HarvestedProgress['source'] =
+      r.kind === 'relay' ? 'relay' : r.kind === 'mcp_send_message' ? 'mcp_send_message' : 'provider_progress';
+    return { messageOutId: r.id, text, source, timestamp: r.timestamp };
   });
 }
 

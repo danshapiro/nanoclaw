@@ -1,9 +1,10 @@
 /**
  * Pure, DB-free side-effect verification + sanitization helpers.
  *
- * ⚠ DELIBERATE DUPLICATION. This file is a byte-equivalent copy of
- * `container/agent-runner/src/db/side-effects-verify.ts`. It is NOT a
- * cross-project import: the host TS project (`tsconfig.json` `rootDir:"./src"`,
+ * ⚠ DELIBERATE DUPLICATION. This is the CONTAINER copy of this file.
+ * The byte-equivalent HOST copy will live at `src/db/side-effects-verify.ts`
+ * (created in Task 4B). It is NOT a cross-project import: the host TS project
+ * (`tsconfig.json` `rootDir:"./src"`,
  * include `src` glob only) cannot include the container `src` tree, and
  * the container `side-effects.ts`/`connection.ts` pull in `bun:sqlite`, which
  * does not resolve under the host's Node/Vitest runtime. Only the Node/Bun
