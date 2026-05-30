@@ -654,6 +654,13 @@ async function runSummarizeDndWriter(opts: {
     `res = sw._finalize_short_summary(short_text=${JSON.stringify(opts.shortText)}, output_paths={'short': Path(${JSON.stringify(shortPath)}), 'long': Path(${JSON.stringify(longPath)})}, source_path=Path(${JSON.stringify(longPath)}), stage='generate-short')`,
     'print("OK")',
   ].join('\n');
+  if (!fs.existsSync(SDDND_PY)) {
+    throw new Error(
+      `Task 6 replay requires the summarize-dnd venv at ${SDDND_PY}; ` +
+        `provision it via Task 0 Step 3 (python3 -m venv .venv-wsl; pip install pytest jsonschema httpx) ` +
+        `in the summarize-dnd worktree (${SDDND_DIR})`,
+    );
+  }
   const proc = Bun.spawn([SDDND_PY, '-c', driver], {
     cwd: opts.workDir,
     env: {
@@ -1200,7 +1207,6 @@ describe('Task 6 Step 6 — Fruma Gmail draft: help probe, native question, sign
       // ── Turn 2 wake: NEW session with restart recovery context; create the draft.
       const ctlB = new AbortController();
       const loopB = runPollLoop({ provider, providerName: 'opencode', cwd: '/workspace/agent', signal: ctlB.signal });
-      let promptSeen = '';
       try {
         await waitFor(() => fs.existsSync(activeInput), 4000);
         await sleep(40);
@@ -1255,8 +1261,6 @@ describe('Task 6 Step 6 — Fruma Gmail draft: help probe, native question, sign
       for (const t of outboundTexts()) expect(t).not.toContain('OpenCode event timeout');
       // The Fruma session id was replayed.
       expect(FRUMA_SESSION).toBe('ses_1a47da93effeJdpKh0oiDUOP2Q');
-      // Mark promptSeen used (kept for readability of the wake structure).
-      expect(promptSeen).toBe('');
     } finally {
       gws.stop();
     }

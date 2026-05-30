@@ -931,10 +931,13 @@ async function processQuery(
         // Every terminal path must leave the user with a visible next step (the
         // Inactivity/terminal contract): write ONE sanitized direct fallback
         // (route-stamped) so the user is never silently stranded — e.g. a denied
-        // native question whose recovery is the blocked question text. Guarded by
-        // `directFallbackSent` so a relay/inactivity fallback already sent this
-        // turn is not duplicated. The raw provider error text never leaks (the
-        // provider already sanitized fallbackUserMessage).
+        // native question whose recovery is the blocked question text. We write
+        // this fallback even if an earlier input in the same wake already produced
+        // result text, because the interrupted (usually follow-up) work needs its
+        // own visible recovery path. Guarded by `directFallbackSent` so a
+        // relay/inactivity fallback already sent this turn is not duplicated. The
+        // raw provider error text never leaks (the provider already sanitized
+        // fallbackUserMessage).
         if (event.terminal && !directFallbackSent) {
           directFallbackSent = true;
           writeRoutedMessage(routing, event.fallbackUserMessage);
