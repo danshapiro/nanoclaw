@@ -38,13 +38,21 @@ import {
   getContainerState,
   getMessageForRetry,
   getProcessingClaims,
+  importHostSideEffects,
   markMessageFailed,
   retryWithBackoff,
   syncProcessingAcks,
   type ContainerState,
 } from './db/session-db.js';
 import { log } from './log.js';
-import { openInboundDb, openOutboundDb, openOutboundDbRw, inboundDbPath, heartbeatPath } from './session-manager.js';
+import {
+  openInboundDb,
+  openOutboundDb,
+  openOutboundDbRw,
+  inboundDbPath,
+  heartbeatPath,
+  sessionDir,
+} from './session-manager.js';
 import { isContainerRunning, killContainer, wakeContainer } from './container-runner.js';
 import type { Session } from './types.js';
 
@@ -59,10 +67,18 @@ export function parseSqliteUtc(s: string): number {
 }
 
 const SWEEP_INTERVAL_MS = 60_000;
-// Absolute idle ceiling for a running container. If the heartbeat file hasn't
-// been touched in this long, the container is either stuck or doing genuinely
-// nothing — kill and restart on the next inbound.
+// Absolute idle ceiling for a running container with NO active declared long
+// tool. If the heartbeat file hasn't been touched in this long, the container
+// is either stuck or doing genuinely nothing — kill and restart on the next
+// inbound. A declared active long tool may raise the effective ceiling (see
+// effectiveCeilingMs) up to — but never past — OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS.
 export const ABSOLUTE_CEILING_MS = 30 * 60 * 1000;
+// Single source of truth for maximum turn lifetime. A heartbeat-refreshing-but-
+// stuck/looping turn is terminated/recovered at this ceiling regardless of any
+// declared tool window; the in-container pump enforces the same ceiling itself,
+// and host-sweep is the backstop for a fully wedged pump. Operator-overridable.
+export const OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS =
+  Number(process.env.OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS) || 6 * 60 * 60 * 1000;
 // Stuck tolerance window applied per 'processing' claim — "did we see any
 // signs of life since this message was claimed?"
 export const CLAIM_STUCK_MS = 60 * 1000;
@@ -86,7 +102,7 @@ export function decideStuckAction(args: {
   claims: Array<{ message_id: string; status_changed: string }>;
 }): StuckDecision {
   const { now, heartbeatMtimeMs, containerState, claims } = args;
-  const declaredBashMs = bashTimeoutMs(containerState);
+  const declaredToolMs = declaredToolTimeoutMs(containerState);
 
   // Ceiling check only applies when we have an actual heartbeat timestamp.
   // A freshly-spawned container hasn't had any SDK activity yet so no
@@ -98,13 +114,15 @@ export function decideStuckAction(args: {
   // claim-stuck check below handles it.
   if (heartbeatMtimeMs !== 0) {
     const heartbeatAge = now - heartbeatMtimeMs;
-    const ceiling = Math.max(ABSOLUTE_CEILING_MS, declaredBashMs ?? 0);
+    // The declared tool may raise the ceiling, but NEVER past the absolute
+    // turn ceiling — a heartbeat-refreshing-but-stuck turn dies at the hard cap.
+    const ceiling = effectiveCeilingMs(containerState);
     if (heartbeatAge > ceiling) {
       return { action: 'kill-ceiling', heartbeatAgeMs: heartbeatAge, ceilingMs: ceiling };
     }
   }
 
-  const tolerance = Math.max(CLAIM_STUCK_MS, declaredBashMs ?? 0);
+  const tolerance = Math.max(CLAIM_STUCK_MS, declaredToolMs ?? 0);
   for (const claim of claims) {
     const claimedAt = parseSqliteUtc(claim.status_changed);
     if (Number.isNaN(claimedAt)) continue;
@@ -218,9 +236,30 @@ function heartbeatMtimeMs(agentGroupId: string, sessionId: string): number {
   }
 }
 
-function bashTimeoutMs(state: ContainerState | null): number | null {
-  if (!state || state.current_tool !== 'Bash') return null;
-  return typeof state.tool_declared_timeout_ms === 'number' ? state.tool_declared_timeout_ms : null;
+/**
+ * Declared timeout (ms) of the ANY provider-owned active tool, or null when no
+ * tool with a positive declared timeout is active. Generalized from the former
+ * Bash-only path: any provider (OpenCode long tools, summarize-dnd, Bash, …)
+ * that persists `current_tool` + a positive `tool_declared_timeout_ms` widens
+ * tolerance. A non-positive or missing timeout returns null.
+ */
+export function declaredToolTimeoutMs(state: ContainerState | null): number | null {
+  if (!state || !state.current_tool) return null;
+  const ms = state.tool_declared_timeout_ms;
+  return typeof ms === 'number' && ms > 0 ? ms : null;
+}
+
+/**
+ * Host-sweep's effective kill ceiling for a running OpenCode/agent turn:
+ * `max(ABSOLUTE_CEILING_MS, declaredToolTimeoutMs)`, but a declared tool may
+ * raise it ONLY up to OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS, never past it. The
+ * in-container pump enforces that same hard cap itself (independent of
+ * heartbeat); host-sweep is the backstop for a fully wedged pump.
+ */
+export function effectiveCeilingMs(state: ContainerState | null): number {
+  const declared = declaredToolTimeoutMs(state) ?? 0;
+  const raised = Math.max(ABSOLUTE_CEILING_MS, declared);
+  return Math.min(raised, OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS);
 }
 
 function enforceRunningContainerSla(
@@ -319,5 +358,126 @@ export function resetStuckProcessingRows(
     log.warn('Failed to clear orphan processing claims', { sessionId: session.id, err });
   } finally {
     if (ownsDb) useDb?.close();
+  }
+}
+
+/**
+ * Clear stale provider-owned tool state after a kill/reset so the next sweep
+ * tick does not widen the ceiling based on a tool that the dead container was
+ * "running". Generalized beyond Bash: nulls `current_tool` and its declared
+ * timeout for any provider. Safe to call only when the container that owned
+ * outbound.db is dead (single-writer invariant). No-op if the table is absent.
+ */
+export function clearProviderToolState(outDb: Database.Database): void {
+  try {
+    outDb
+      .prepare(
+        `UPDATE container_state
+            SET current_tool = NULL, tool_declared_timeout_ms = NULL, tool_started_at = NULL
+          WHERE id = 1`,
+      )
+      .run();
+  } catch {
+    /* table may not exist on an old/empty outbound DB — nothing to clear */
+  }
+}
+
+/**
+ * Host-side crash/kill recovery for an interrupted turn. Enforces the ordering
+ * required by the Hard Invariants:
+ *
+ *   1. VERIFY the container is stopped. Refuse to do anything outbound-writable
+ *      while the runner process might still be writing the outbound DB.
+ *   2. IMPORT side effects from the host session path for /workspace/
+ *      side-effects.jsonl (opens outbound DB writable only after the verified
+ *      stop) so recovery does not duplicate completed drafts/summaries.
+ *   3. WRITE recovery/fallback for active processing rows.
+ *   4. CLEAR stale provider-owned tool state, then RESET the processing rows.
+ *   5. Only AFTER all of the above may a replacement container be woken.
+ *
+ * The DB writes + side-effect import + recovery write are injected so callers
+ * (and tests) can assert ordering and so production wires the real
+ * importHostSideEffects / recovery writer / wakeContainer.
+ */
+export async function recoverInterruptedTurn(opts: {
+  inDb: Database.Database;
+  outDb: Database.Database;
+  session: Session;
+  reason: string;
+  /** Already-writable outbound handle (caller owns lifecycle). */
+  writableOutDb?: Database.Database;
+  /** Proof the container is stopped; must resolve true before any write. */
+  verifyContainerStopped: () => Promise<boolean>;
+  /** Import staged side effects (must run before recovery is written). */
+  importSideEffects: (args: { containerStopped: boolean }) => void;
+  /** Write route-scoped recovery / fallback for the active processing rows. */
+  writeRecovery: () => void;
+  /** Wake a replacement container (must run only after recovery is written). */
+  wakeContainer: () => Promise<void>;
+}): Promise<void> {
+  const stopped = await opts.verifyContainerStopped();
+  if (!stopped) {
+    // Fail closed: never open the outbound DB writable or wake a replacement
+    // while the container may still be running.
+    throw new Error(
+      `recoverInterruptedTurn: container for session ${opts.session.id} is not verified stopped; ` +
+        'refusing to import side effects, write recovery, reset rows, or wake a replacement',
+    );
+  }
+
+  // Side effects first, so recovery facts include already-completed work.
+  opts.importSideEffects({ containerStopped: true });
+
+  // Recovery/fallback BEFORE we reset rows or wake anything.
+  opts.writeRecovery();
+
+  // Clear stale tool state and reset the interrupted processing rows.
+  const useDb = opts.writableOutDb ?? opts.outDb;
+  clearProviderToolState(useDb);
+  resetStuckProcessingRows(opts.inDb, opts.outDb, opts.session, opts.reason, opts.writableOutDb);
+
+  // Replacement wake last.
+  await opts.wakeContainer();
+}
+
+/**
+ * Production wiring for recoverInterruptedTurn from the sweep loop. Reopens the
+ * outbound DB writable only after a verified container stop, imports the host
+ * session path for /workspace/side-effects.jsonl, writes recovery, then resets.
+ */
+export async function recoverAfterKill(inDb: Database.Database, session: Session, reason: string): Promise<void> {
+  const dir = sessionDir(session.agent_group_id, session.id);
+  // Verify stop BEFORE opening the outbound DB writable (single-writer invariant).
+  if (isContainerRunning(session.id)) {
+    throw new Error(`recoverAfterKill: container for session ${session.id} is still running; refusing recovery writes`);
+  }
+  const writableOutDb = openOutboundDbRw(session.agent_group_id, session.id);
+  try {
+    await recoverInterruptedTurn({
+      inDb,
+      outDb: writableOutDb,
+      session,
+      reason,
+      writableOutDb,
+      verifyContainerStopped: async () => !isContainerRunning(session.id),
+      importSideEffects: ({ containerStopped }) => {
+        try {
+          importHostSideEffects({ sessionDir: dir, containerStopped });
+        } catch (err) {
+          log.warn('Side-effect import failed during recovery', { sessionId: session.id, err });
+        }
+      },
+      writeRecovery: () => {
+        // Route-scoped recovery payload construction is owned by the poll loop /
+        // session-state recovery APIs (Task 3 wires the full payload). The
+        // backstop here ensures rows are reset with backoff so the next turn
+        // resumes; the user-visible recovery context lands in Task 3.
+      },
+      wakeContainer: async () => {
+        /* replacement wake is driven by the next sweep tick's due-count path */
+      },
+    });
+  } finally {
+    writableOutDb.close();
   }
 }

@@ -18,6 +18,8 @@ import {
   type QueryTurnInput,
 } from './types.js';
 import { mcpServersToOpenCodeConfig } from './mcp-to-opencode.js';
+import { OpenCodeEventPump, type OpenCodePumpClock } from './opencode-events.js';
+import { isMissingOpenCodeSessionError, OpenCodeInterruptionError } from './opencode-errors.js';
 import { sniffImageMime } from '../attachments.js';
 
 function log(msg: string): void {
@@ -26,9 +28,42 @@ function log(msg: string): void {
 
 const SESSION_STATUS_RETRY_ERROR_AFTER = 3;
 
-/** Stale / dead OpenCode session heuristics (complement Claude-centric host patterns). */
+// Liveness/timeout knobs. The pump enforces the absolute ceiling itself,
+// independent of heartbeat; transport timeout is the no-SSE death window.
+const OPENCODE_TRANSPORT_TIMEOUT_MS = Number(process.env.OPENCODE_TRANSPORT_TIMEOUT_MS) || 30 * 60 * 1000;
+const OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS = Number(process.env.OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS) || 6 * 60 * 60 * 1000;
+const OPENCODE_INACTIVITY_NOTICE_MS = Number(process.env.OPENCODE_INACTIVITY_NOTICE_MS) || 5 * 60 * 1000;
+const OPENCODE_WAIT_TICK_MS = Number(process.env.OPENCODE_WAIT_TICK_MS) || 60 * 1000;
+
+const KEEPALIVE_EVENT_TYPES = ['server.connected', 'server.heartbeat'];
+
+/**
+ * Real-timer clock+scheduler for the pump in production. Tests inject a
+ * deterministic fake clock instead; the pump itself NEVER references global
+ * timers — this provider-owned seam is the only place that does.
+ */
+function realTimerClock(): OpenCodePumpClock {
+  return {
+    now: () => Date.now(),
+    schedule: (delayMs, cb) => {
+      const id = setTimeout(cb, delayMs);
+      if (typeof id === 'object' && id && 'unref' in id) {
+        (id as unknown as { unref: () => void }).unref();
+      }
+      return () => clearTimeout(id);
+    },
+  };
+}
+
+/**
+ * Stale / dead OpenCode session heuristics (complement Claude-centric host
+ * patterns). NOTE: this is a trigger-only diagnostic, never an authoritative
+ * continuation clear (see opencode-errors.ts). Deliberately does NOT include
+ * generic transport "timeout" text — a stalled stream is not stale-session
+ * proof.
+ */
 const STALE_SESSION_RE =
-  /no conversation found|ENOENT.*\.jsonl|session.*not found|NotFoundError|connection reset|ECONNRESET|404|event timeout/i;
+  /no conversation found|ENOENT.*\.jsonl|session.*not found|NotFoundError|connection reset|ECONNRESET|404/i;
 
 function errorText(err: unknown): string {
   if (err instanceof Error) return err.message;
@@ -427,52 +462,6 @@ function extractRunId(text: string): string | undefined {
   return text.match(/\b(?:filepart-[a-z-]+-\d{10,}|smoke-\d{10,}-\d+)\b/)?.[0];
 }
 
-export async function nextOpenCodeEvent<T>(
-  stream: AsyncGenerator<T, void, void>,
-  sessionId: string,
-  timeoutMs: number,
-  onTimeout: () => void,
-): Promise<IteratorResult<T, void>> {
-  let timeout: ReturnType<typeof setTimeout> | undefined;
-  try {
-    return await Promise.race([
-      stream.next(),
-      new Promise<never>((_resolve, reject) => {
-        timeout = setTimeout(() => {
-          onTimeout();
-          reject(new Error(`OpenCode event timeout (${timeoutMs}ms) for session ${sessionId}`));
-        }, timeoutMs);
-      }),
-    ]);
-  } finally {
-    if (timeout) clearTimeout(timeout);
-  }
-}
-
-function isOpenCodeKeepaliveEvent(ev: { type?: string } | undefined): boolean {
-  return !ev?.type || ev.type === 'server.connected' || ev.type === 'server.heartbeat';
-}
-
-export async function nextMeaningfulOpenCodeEvent<T extends { type?: string }>(
-  stream: AsyncGenerator<T, void, void>,
-  sessionId: string,
-  timeoutMs: number,
-  onTimeout: () => void,
-): Promise<IteratorResult<T, void>> {
-  const deadline = Date.now() + timeoutMs;
-
-  while (true) {
-    const remainingMs = deadline - Date.now();
-    if (remainingMs <= 0) {
-      onTimeout();
-      throw new Error(`OpenCode event timeout (${timeoutMs}ms) for session ${sessionId}`);
-    }
-
-    const result = await nextOpenCodeEvent(stream, sessionId, remainingMs, onTimeout);
-    if (result.done || !isOpenCodeKeepaliveEvent(result.value)) return result;
-  }
-}
-
 export class OpenCodeProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = false;
 
@@ -487,9 +476,37 @@ export class OpenCodeProvider implements AgentProvider {
     // Diagnostic/trigger predicate only — the poll loop owns authoritative
     // continuation clears (explicit clear-continuation, positive existence
     // check, or the bounded zombie path). A stale-session text match without
-    // an attempted continuation can never be proof on its own.
+    // an attempted continuation can never be proof on its own. We require the
+    // EXACT attempted id to appear verbatim alongside a missing-session phrase;
+    // a generic transport/read/timeout/bare-404 error is never a trigger.
     if (!opts.attemptedContinuation) return false;
-    return isStaleSessionError(err);
+    return isMissingOpenCodeSessionError(err, opts.attemptedContinuation);
+  }
+
+  /**
+   * Positive existence-check seam for the AUTHORITATIVE continuation classifier
+   * (`classifyContinuation`). Backed by the SDK existence check
+   * `client.session.get({ path: { id } })` — a NotFoundError (404) means the
+   * session is gone. Any other error is inconclusive and treated as "exists"
+   * (preserve continuation; never clear on a transport error). Task 3's runtime
+   * controller consumes this seam; Task 2 only needs a minimal injectable check.
+   */
+  async sessionExists(id: string): Promise<boolean> {
+    try {
+      const rt = await ensureSharedRuntime(this.options);
+      const res = await rt.client.session.get({ path: { id } });
+      if (res.error) {
+        const name = (res.error as { name?: string }).name;
+        if (name === 'NotFoundError') return false;
+        // Inconclusive (transport/other) — do not treat as proof of absence.
+        return true;
+      }
+      return Boolean(res.data);
+    } catch {
+      // Transport failure of the existence check itself is NOT proof the
+      // session is gone — preserve continuation.
+      return true;
+    }
   }
 
   query(input: QueryInput): AgentQuery {
@@ -512,7 +529,6 @@ export class OpenCodeProvider implements AgentProvider {
     };
 
     const self = this;
-    const IDLE_TIMEOUT_MS = Number(process.env.OPENCODE_IDLE_TIMEOUT_MS) || 300_000;
 
     async function* gen(): AsyncGenerator<ProviderEvent> {
       let initYielded = false;
@@ -568,28 +584,102 @@ export class OpenCodeProvider implements AgentProvider {
 
         const partTextByMessageId = new Map<string, string>();
         const roleByMessageId = new Map<string, string>();
-        const handleTimeout = () => {
-          log(`OpenCode event timeout (${IDLE_TIMEOUT_MS}ms) — clearing session ${sessionId}`);
-          self.activeSessionId = undefined;
+
+        // Single-reader pump: the ONLY consumer of the shared OpenCode event
+        // stream for this turn. It enforces the transport timeout AND, INDEPENDENT
+        // of heartbeat, the absolute turn ceiling, and emits non-terminal
+        // wait-tick/keepalive/inactivity results so long no-SSE work stays
+        // state-preserving. Typed terminal results PRESERVE continuation — they
+        // tear down the broken transport but never clear self.activeSessionId
+        // (the authoritative continuation clear lives in the poll loop).
+        const pump = new OpenCodeEventPump<{ type: string; properties: Record<string, unknown> }>({
+          ...realTimerClock(),
+          stream,
+          sessionId,
+          transportTimeoutMs: OPENCODE_TRANSPORT_TIMEOUT_MS,
+          absoluteTurnTimeoutMs: OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS,
+          inactivityNoticeMs: OPENCODE_INACTIVITY_NOTICE_MS,
+          inactivityThrottleMs: OPENCODE_INACTIVITY_NOTICE_MS,
+          waitTickMs: OPENCODE_WAIT_TICK_MS,
+          keepaliveTypes: KEEPALIVE_EVENT_TYPES,
+          isSessionEvent: (event) => {
+            const sid = (event.properties as { sessionID?: string }).sessionID;
+            return sid === undefined || sid === sessionId;
+          },
+          isProtectedEvent: (event) =>
+            event.type === 'session.error' ||
+            event.type === 'session.status' ||
+            event.type === 'session.idle' ||
+            event.type === 'permission.updated' ||
+            event.type === 'message.part.updated' ||
+            event.type === 'message.updated',
+        });
+
+        const onTerminalTransport = (err: OpenCodeInterruptionError): never => {
+          // Preserve continuation: do NOT clear self.activeSessionId. Tear down
+          // the broken transport so the next turn spawns a fresh stream against
+          // the same session id.
+          log(
+            JSON.stringify({
+              severity: 'warn',
+              event: 'opencode_turn_interrupted',
+              classification: err.classification,
+              session_id: sessionId,
+              configured_timeout_ms: err.liveness.configuredTimeoutMs,
+              elapsed_ms: err.liveness.elapsedMs,
+              last_event_type: err.liveness.lastEventType,
+            }),
+          );
           destroySharedRuntime();
+          throw err;
         };
 
         try {
           turn: while (true) {
-            if (aborted) return;
-
-            const { value: ev, done } = await nextMeaningfulOpenCodeEvent(
-              stream,
-              sessionId,
-              IDLE_TIMEOUT_MS,
-              handleTimeout,
-            );
-            if (done) {
-              self.activeSessionId = undefined;
-              throw new Error('OpenCode SSE stream ended unexpectedly');
+            if (aborted) {
+              pump.stop();
+              return;
             }
 
-            yield { type: 'activity' };
+            const res = await pump.next();
+
+            // Non-terminal liveness results keep the heartbeat fresh and the
+            // long turn alive — they never end the turn or clear continuation.
+            if (res.kind === 'wait-tick') {
+              yield { type: 'activity', source: 'provider_wait_tick' };
+              continue;
+            }
+            if (res.kind === 'inactivity-notice') {
+              // Task 2 surfaces inactivity as liveness/activity only; the
+              // Yente-authored relay + provider `notice` emission is Task 3.
+              log(
+                JSON.stringify({
+                  severity: 'info',
+                  event: 'opencode_inactivity_notice',
+                  session_id: sessionId,
+                  configured_timeout_ms: res.metadata.configuredTimeoutMs,
+                  elapsed_ms: res.metadata.elapsedMs,
+                  last_meaningful_event_at: res.metadata.lastMeaningfulEventAt,
+                }),
+              );
+              yield { type: 'activity', source: 'provider_internal' };
+              continue;
+            }
+            if (res.kind === 'keepalive') {
+              yield { type: 'activity', source: 'sdk_keepalive' };
+              continue;
+            }
+
+            // Typed terminal interruptions: preserve continuation, tear down
+            // transport, propagate the sanitized typed error.
+            if (res.kind !== 'event') {
+              pump.stop();
+              throw onTerminalTransport(res.error);
+            }
+
+            // res.kind === 'event' — a meaningful, session-scoped event.
+            const ev = res.event;
+            yield { type: 'activity', source: 'sdk_event' };
 
             switch (ev.type) {
               case 'message.updated': {
@@ -634,6 +724,7 @@ export class OpenCodeProvider implements AgentProvider {
                   st.message
                 ) {
                   self.activeSessionId = undefined;
+                  pump.stop();
                   throw new Error(`OpenCode retry limit (${st.attempt}): ${st.message}`);
                 }
                 break;
@@ -642,6 +733,7 @@ export class OpenCodeProvider implements AgentProvider {
                 const props = ev.properties as { sessionID?: string; error?: unknown };
                 if (props.sessionID === sessionId || props.sessionID === undefined) {
                   self.activeSessionId = undefined;
+                  pump.stop();
                   throw new Error(sessionErrorMessage(props));
                 }
                 break;
@@ -649,6 +741,7 @@ export class OpenCodeProvider implements AgentProvider {
               case 'session.idle': {
                 const sid = (ev.properties as { sessionID?: string }).sessionID;
                 if (sid === sessionId) {
+                  pump.stop();
                   break turn;
                 }
                 break;

@@ -8,12 +8,15 @@ import {
   buildOpenCodeConfig,
   buildOpenCodePromptParts,
   isStaleSessionError,
-  nextMeaningfulOpenCodeEvent,
-  nextOpenCodeEvent,
   promptSession,
   splitOpenCodeModel,
   stageOpenCodeAttachments,
 } from './opencode.js';
+import {
+  classifyContinuation,
+  isMissingOpenCodeSessionError,
+  zombieDecision,
+} from './opencode-errors.js';
 
 const tmpRoots: string[] = [];
 
@@ -86,9 +89,12 @@ describe('OpenCode config', () => {
 });
 
 describe('OpenCodeProvider stale session handling', () => {
-  it('classifies missing OpenCode sessions as stale continuations', () => {
+  it('classifies explicit missing-session text as stale, but NOT transport/event-timeout text', () => {
     expect(isStaleSessionError(new Error('NotFoundError: session not found'))).toBe(true);
-    expect(isStaleSessionError(new Error('OpenCode event timeout (300000ms)'))).toBe(true);
+    expect(isStaleSessionError(new Error('no conversation found'))).toBe(true);
+    // Corrected behavior (Hard Invariant 151): a stalled transport / "event
+    // timeout" is NOT stale-session proof — preserving long-running sessions.
+    expect(isStaleSessionError(new Error('OpenCode transport timeout after 1800000ms'))).toBe(false);
     expect(isStaleSessionError(new Error('rate limit exceeded'))).toBe(false);
   });
 
@@ -301,65 +307,69 @@ describe('OpenCode file parts', () => {
   });
 });
 
-describe('nextOpenCodeEvent', () => {
-  it('resolves when the event stream produces an event before the timeout', async () => {
-    async function* stream() {
-      yield { type: 'session.idle', properties: { sessionID: 's1' } };
-    }
-
-    const result = await nextOpenCodeEvent(stream(), 's1', 50, () => {
-      throw new Error('unexpected timeout');
-    });
-
-    expect(result.done).toBe(false);
-    expect(result.value?.type).toBe('session.idle');
+describe('isMissingOpenCodeSessionError (trigger-only predicate)', () => {
+  // Generic transport / read / timeout / bare-404 strings are NEVER a verbatim
+  // attempted-session match, so they must not trigger.
+  it('does not match generic transport/read/timeout/404/NotFound strings', () => {
+    expect(isMissingOpenCodeSessionError(new Error('OpenCode event timeout (300000ms)'), 'ses_old')).toBe(false);
+    expect(isMissingOpenCodeSessionError(new Error('ECONNRESET while reading OpenCode events'), 'ses_old')).toBe(false);
+    expect(isMissingOpenCodeSessionError(new Error('HTTP 404 from OpenCode event stream'), 'ses_old')).toBe(false);
+    expect(isMissingOpenCodeSessionError(new Error('NotFoundError'), 'ses_old')).toBe(false);
   });
 
-  it('rejects and runs timeout cleanup when the event stream stalls', async () => {
-    async function* stream() {
-      await new Promise(() => {});
-    }
+  it('matches only when the attempted session id appears verbatim with a missing-session phrase', () => {
+    expect(isMissingOpenCodeSessionError(new Error('OpenCode promptAsync: session ses_old not found'), 'ses_old')).toBe(
+      true,
+    );
+    expect(
+      isMissingOpenCodeSessionError(new Error('OpenCode promptAsync: session ses_other not found'), 'ses_old'),
+    ).toBe(false);
+  });
 
-    let timedOut = false;
-    await expect(
-      nextOpenCodeEvent(stream(), 's1', 5, () => {
-        timedOut = true;
-      }),
-    ).rejects.toThrow(/OpenCode event timeout/);
-    expect(timedOut).toBe(true);
+  it('requires attempted session context (never matches without it)', () => {
+    expect(isMissingOpenCodeSessionError(new Error('session ses_old not found'), undefined)).toBe(false);
+    expect(isMissingOpenCodeSessionError(new Error('session ses_old not found'), '')).toBe(false);
   });
 });
 
-describe('nextMeaningfulOpenCodeEvent', () => {
-  it('skips keepalive events while waiting for meaningful provider progress', async () => {
-    async function* stream() {
-      yield { type: 'server.connected', properties: {} };
-      yield { type: 'server.heartbeat', properties: {} };
-      yield { type: 'session.idle', properties: { sessionID: 's1' } };
-    }
-
-    const result = await nextMeaningfulOpenCodeEvent(stream(), 's1', 50, () => {
-      throw new Error('unexpected timeout');
-    });
-
-    expect(result.done).toBe(false);
-    expect(result.value?.type).toBe('session.idle');
+describe('classifyContinuation (authoritative clear policy)', () => {
+  it('clears only when the positive existence check proves the session is gone', async () => {
+    expect(await classifyContinuation({ attemptedContinuation: 'ses_old', sessionExists: async () => false })).toMatchObject(
+      { policy: 'clear', reason: 'session-missing' },
+    );
   });
 
-  it('does not let heartbeat-only streams reset the idle timeout', async () => {
-    async function* stream() {
-      while (true) {
-        await new Promise((resolve) => setTimeout(resolve, 1));
-        yield { type: 'server.heartbeat', properties: {} };
-      }
-    }
-
-    let timedOut = false;
-    await expect(
-      nextMeaningfulOpenCodeEvent(stream(), 's1', 8, () => {
-        timedOut = true;
+  it('preserves continuation on a bare 404 when the session still exists', async () => {
+    expect(
+      await classifyContinuation({
+        attemptedContinuation: 'ses_old',
+        sessionExists: async () => true,
+        err: new Error('HTTP 404 from OpenCode event stream'),
       }),
-    ).rejects.toThrow(/OpenCode event timeout/);
-    expect(timedOut).toBe(true);
+    ).toMatchObject({ policy: 'preserve' });
+  });
+
+  it('preserves continuation when there is no existence check (no proof available)', async () => {
+    expect(
+      await classifyContinuation({
+        attemptedContinuation: 'ses_old',
+        err: new Error('ECONNRESET while reading OpenCode events'),
+      }),
+    ).toMatchObject({ policy: 'preserve' });
+  });
+});
+
+describe('zombieDecision (bounded zombie backstop)', () => {
+  it('clears with user-visible restart at the failure limit', () => {
+    expect(zombieDecision({ continuation: 'ses_old', consecutiveTerminalFailures: 3, limit: 3 })).toMatchObject({
+      clear: true,
+      userVisibleRestart: true,
+    });
+  });
+
+  it('does not clear below the failure limit', () => {
+    expect(zombieDecision({ continuation: 'ses_old', consecutiveTerminalFailures: 2, limit: 3 })).toMatchObject({
+      clear: false,
+    });
   });
 });
