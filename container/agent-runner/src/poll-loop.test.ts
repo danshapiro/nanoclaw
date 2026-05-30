@@ -2286,6 +2286,14 @@ describe('poll-loop inactivity relay and terminal recovery', () => {
     await waitFor(() => getAckStatus('term-init') === 'recovery', 3000);
     expect(getAckStatus('term-init')).toBe('recovery');
 
+    // Every terminal path must leave the user a visible next step: exactly ONE
+    // sanitized direct fallback (the interruption's fallbackUserMessage) is
+    // written, and it never leaks raw provider error text. (Task 6 exposed: a
+    // terminal interruption previously stranded the user with no visible row.)
+    await waitFor(() => outboundTexts().some((t) => t.includes('your request is preserved')), 3000);
+    expect(outboundTexts().filter((t) => t.includes('your request is preserved')).length).toBe(1);
+    for (const t of outboundTexts()) expect(t).not.toContain('opencode_transport_timeout');
+
     controller.abort();
     await loopPromise.catch(() => {});
   });

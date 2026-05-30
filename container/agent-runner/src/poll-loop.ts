@@ -883,6 +883,18 @@ async function processQuery(
         if (event.recoverySeed?.sideEffects && event.recoverySeed.sideEffects.length > 0) {
           interruptionSideEffects.push(...event.recoverySeed.sideEffects);
         }
+        // A terminal interruption ends this turn before any user-visible result.
+        // Every terminal path must leave the user with a visible next step (the
+        // Inactivity/terminal contract): write ONE sanitized direct fallback
+        // (route-stamped) so the user is never silently stranded — e.g. a denied
+        // native question whose recovery is the blocked question text. Guarded by
+        // `directFallbackSent` so a relay/inactivity fallback already sent this
+        // turn is not duplicated. The raw provider error text never leaks (the
+        // provider already sanitized fallbackUserMessage).
+        if (event.terminal && !directFallbackSent) {
+          directFallbackSent = true;
+          writeRoutedMessage(routing, event.fallbackUserMessage);
+        }
       } else if (event.type === 'result') {
         // A result — with or without text — means a turn segment is done.
         // Dispatch text first so reply accounting sees direct result text and
