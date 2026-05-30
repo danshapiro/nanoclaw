@@ -792,6 +792,46 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     expect(provider.capabilities.relayToolPolicy).toBe('status_only');
   });
 
+  it('yields a terminal opencode_transport_timeout interruption that preserves continuation and clears tool state', async () => {
+    const clock = new FakeClock();
+    const stream = new FakeStream();
+    const persisted: Array<{ tool: string; declaredTimeoutMs: number | null } | null> = [];
+    process.env.OPENCODE_TRANSPORT_TIMEOUT_MS = '1800000';
+    process.env.OPENCODE_WAIT_TICK_MS = '3600000';
+    process.env.OPENCODE_INACTIVITY_NOTICE_MS = '3600000';
+    const { provider } = makeProvider({ clock, stream, persistActiveTool: (t) => persisted.push(t) });
+    const query = provider.query({ inputId: 'in-tt', prompt: 'no sse work', cwd: '/workspace/agent', continuation: TEST_SESSION });
+    const events: ProviderEvent[] = [];
+    const reader = (async () => {
+      for await (const e of query.events) {
+        events.push(e);
+        if (e.type === 'interruption') break;
+      }
+    })();
+    await new Promise((r) => setTimeout(r, 5));
+    // A long tool starts (so we can assert tool state is cleared on timeout).
+    stream.push({
+      type: 'message.part.updated',
+      properties: { sessionID: TEST_SESSION, part: { type: 'tool', tool: 'bash', callID: 'c-tt', messageID: 'm1', state: { status: 'running', input: { timeout: 600000 } } } },
+    });
+    await new Promise((r) => setTimeout(r, 5));
+    // No further SSE — advance past the transport-death window.
+    await clock.advance(1800000);
+    await new Promise((r) => setTimeout(r, 5));
+    await reader;
+    delete process.env.OPENCODE_TRANSPORT_TIMEOUT_MS;
+    delete process.env.OPENCODE_WAIT_TICK_MS;
+    delete process.env.OPENCODE_INACTIVITY_NOTICE_MS;
+    const interruption = events.find((e) => e.type === 'interruption') as { classification: string; continuationPolicy: string; fallbackUserMessage: string } | undefined;
+    expect(interruption).toBeDefined();
+    expect(interruption!.classification).toBe('opencode_transport_timeout');
+    expect(interruption!.continuationPolicy).toBe('preserve');
+    // No 'OpenCode event timeout' raw text leaks to the user-facing fallback.
+    expect(interruption!.fallbackUserMessage).not.toContain('event timeout');
+    // Active tool state was cleared on the terminal interruption.
+    expect(persisted[persisted.length - 1]).toBeNull();
+  });
+
   it('a concurrent relay query uses a SEPARATE controller and never destroys the original turn', async () => {
     const mainStream = new FakeStream();
     const relayStream = new FakeStream();

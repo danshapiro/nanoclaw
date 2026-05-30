@@ -10,6 +10,7 @@ import {
 } from './db/messages-in.js';
 import { writeMessageOut, harvestRouteScopedProgress } from './db/messages-out.js';
 import { touchHeartbeat, clearStaleProcessingAcks, getOutboundDb } from './db/connection.js';
+import { zombieDecision } from './providers/opencode-errors.js';
 import {
   appendRecoveryEntry,
   appendRecoveryEntryAndOwnRows,
@@ -127,6 +128,52 @@ function writeActiveInput(inputId: string, routeKey: string): void {
     fs.renameSync(tmp, dest);
   } catch {
     // /workspace may not exist (in-memory test DBs) — non-fatal.
+  }
+}
+
+const OPENCODE_CONTINUATION_FAILURE_LIMIT =
+  Number(process.env.OPENCODE_CONTINUATION_FAILURE_LIMIT) > 0
+    ? Number(process.env.OPENCODE_CONTINUATION_FAILURE_LIMIT)
+    : 3;
+
+/**
+ * Bounded zombie backstop counter (Hard Invariant 152). Counts CONSECUTIVE
+ * terminal interruptions on the SAME continuation with no successful event in
+ * between, persisted across wakes in session_state so a genuinely dead session
+ * that only emits bare 404s is not preserved forever. Keyed per provider +
+ * continuation. A successful result resets it.
+ */
+function zombieCounterKey(providerName: string, continuation: string): string {
+  return `zombie_failures:${providerName.toLowerCase()}:${continuation}`;
+}
+
+function readZombieCounter(providerName: string, continuation: string): number {
+  try {
+    const row = getOutboundDb()
+      .prepare('SELECT value FROM session_state WHERE key = ?')
+      .get(zombieCounterKey(providerName, continuation)) as { value: string } | undefined;
+    const n = row ? Number(row.value) : 0;
+    return Number.isFinite(n) && n >= 0 ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function writeZombieCounter(providerName: string, continuation: string, count: number): void {
+  try {
+    getOutboundDb()
+      .prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
+      .run(zombieCounterKey(providerName, continuation), String(count), new Date().toISOString());
+  } catch {
+    /* non-fatal */
+  }
+}
+
+function resetZombieCounter(providerName: string, continuation: string): void {
+  try {
+    getOutboundDb().prepare('DELETE FROM session_state WHERE key = ?').run(zombieCounterKey(providerName, continuation));
+  } catch {
+    /* non-fatal */
   }
 }
 
@@ -482,6 +529,7 @@ async function processQuery(
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let clearContinuationRequested = false;
+  let zombieFailureCleared = false;
   let done = false;
   let initialBatchSettled = false;
   const abortQuery = () => query.abort();
@@ -764,6 +812,36 @@ async function processQuery(
         if (event.continuationPolicy === 'clear') {
           clearContinuationRequested = true;
           queryContinuation = undefined;
+        } else if (event.continuationPolicy === 'preserve' && (event.attemptedContinuation ?? queryContinuation)) {
+          // Bounded zombie backstop (Hard Invariant 152): count CONSECUTIVE
+          // preserve-continuation terminal interruptions on the SAME
+          // continuation. At the limit, the continuation is treated as a zombie,
+          // cleared, and the next turn restarts from recovery with user-visible
+          // context — so a dead session that only emits bare 404s is not
+          // preserved forever. A successful result resets the counter.
+          const cont = (event.attemptedContinuation ?? queryContinuation) as string;
+          const failures = readZombieCounter(providerName, cont) + 1;
+          const decision = zombieDecision({
+            continuation: cont,
+            consecutiveTerminalFailures: failures,
+            limit: OPENCODE_CONTINUATION_FAILURE_LIMIT,
+          });
+          if (decision.clear) {
+            clearContinuationRequested = true;
+            queryContinuation = undefined;
+            zombieFailureCleared = decision.userVisibleRestart;
+            resetZombieCounter(providerName, cont);
+            log(
+              JSON.stringify({
+                severity: 'warn',
+                event: 'continuation_zombie_cleared',
+                provider: providerName,
+                consecutive_terminal_failures: failures,
+              }),
+            );
+          } else {
+            writeZombieCounter(providerName, cont, failures);
+          }
         }
         // Seed the recovery payload with any provider-collected side effects so
         // the next Yente turn can report existing work rather than duplicate it.
@@ -783,6 +861,9 @@ async function processQuery(
           completeResolved(resolved);
           resolvedAtLeastOne = true;
         }
+        // A successful result on this continuation resets the zombie backstop —
+        // the session proved live.
+        if (queryContinuation) resetZombieCounter(providerName, queryContinuation);
         settleInitialBatch(resolvedAtLeastOne);
       }
     }
@@ -824,10 +905,15 @@ async function processQuery(
       const entry: ProviderRecoveryEntry = {
         id: recoveryId,
         status: 'pending',
-        classification: 'terminal_interruption_accepted_unresolved',
-        agentMessage: 'I was interrupted mid-turn and will resume this work.',
-        fallbackUserMessage:
-          'Something interrupted me while I was working on your request. I still have it queued — no need to resend.',
+        classification: zombieFailureCleared
+          ? 'continuation_zombie_restart'
+          : 'terminal_interruption_accepted_unresolved',
+        agentMessage: zombieFailureCleared
+          ? 'The previous session became unusable after repeated failures; I am restarting this work from scratch.'
+          : 'I was interrupted mid-turn and will resume this work.',
+        fallbackUserMessage: zombieFailureCleared
+          ? 'I had to restart your request after the session repeatedly failed — I still have it and am retrying from scratch.'
+          : 'Something interrupted me while I was working on your request. I still have it queued — no need to resend.',
         // Ordered same-route wake-triggering rows (A3, Invariant 166).
         originalTasks: ledgerCtx.originalTasks,
         acceptedUnresolvedInputs,

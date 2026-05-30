@@ -2067,6 +2067,54 @@ describe('poll-loop inactivity relay and terminal recovery', () => {
     await loopPromise.catch(() => {});
   });
 
+  it('clears continuation via the bounded zombie path after the failure limit of preserve interruptions', async () => {
+    // Default limit is 3. Seed the counter at 2 so the next preserve-continuation
+    // terminal interruption (failures=3) trips the zombie clear.
+    setContinuation('test', 'ses_zombie');
+    getOutboundDb()
+      .prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
+      .run('zombie_failures:test:ses_zombie', '2', new Date().toISOString());
+    dmMsg('zombie-init', 'work on the zombie session');
+
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query(input) {
+        return {
+          push() {},
+          end() {},
+          abort() {},
+          events: (async function* () {
+            yield { type: 'init', continuation: 'ses_zombie' };
+            yield { type: 'input-accepted', inputId: (input as QueryInput).inputId, scope: 'initial' };
+            yield {
+              type: 'interruption',
+              inputId: (input as QueryInput).inputId,
+              classification: 'opencode_transport_timeout',
+              severity: 'warn',
+              terminal: true,
+              agentMessage: 'interrupted again',
+              fallbackUserMessage: 'I was interrupted; your request is preserved.',
+              continuationPolicy: 'preserve',
+              attemptedContinuation: 'ses_zombie',
+            };
+          })(),
+        };
+      },
+    };
+
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+    // The 3rd consecutive preserve-continuation interruption trips the zombie
+    // clear — the continuation is cleared even though policy was 'preserve'.
+    await waitFor(() => getContinuation('test') === undefined, 3000);
+    expect(getContinuation('test')).toBeUndefined();
+
+    controller.abort();
+    await loopPromise.catch(() => {});
+  });
+
   it('clears the stored continuation on a clear-continuation event', async () => {
     dmMsg('clear-init', 'something that ends in a native question');
     // Seed a stored continuation so we can observe it being cleared.
