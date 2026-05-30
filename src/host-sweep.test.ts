@@ -6,7 +6,7 @@
 import Database from 'better-sqlite3';
 import { describe, expect, it } from 'vitest';
 
-import { getProcessingClaims } from './db/session-db.js';
+import { countDueMessagesExcludingRecovery, getProcessingClaims } from './db/session-db.js';
 import {
   ABSOLUTE_CEILING_MS,
   CLAIM_STUCK_MS,
@@ -516,6 +516,55 @@ describe('host wake/sync preserves recovery-owned acks', () => {
       .prepare('SELECT message_id, status FROM processing_ack ORDER BY message_id')
       .all() as Array<{ message_id: string; status: string }>;
     expect(remaining).toEqual([{ message_id: 'm-rec', status: 'recovery' }]);
+
+    // "as due work" half: the outbound-aware due count that sweepSession now uses
+    // must also exclude the recovery-owned row, so it does not appear as due work
+    // that would trigger wakeContainer.
+    expect(countDueMessagesExcludingRecovery(inDb, outDb)).toBe(0);
+
+    inDb.close();
+    outDb.close();
+  });
+});
+
+describe('host sweep wake decision excludes recovery-owned rows', () => {
+  it('does not count a recovery-owned pending row as due (no wake)', () => {
+    const { inDb, outDb } = testDbs();
+    // Only row is pending in inbound but recovery-owned in outbound.
+    inDb.prepare("INSERT INTO messages_in (id, status, tries, trigger) VALUES ('m-rec', 'pending', 0, 1)").run();
+    outDb.prepare("INSERT INTO processing_ack VALUES ('m-rec', 'recovery', ?)").run('2026-04-20 11:00:00');
+
+    // sweepSession uses countDueMessagesExcludingRecovery(inDb, outDb) when outDb
+    // is available. Verify: due count is 0 → wakeContainer must not be triggered.
+    const dueCount = countDueMessagesExcludingRecovery(inDb, outDb);
+    expect(dueCount).toBe(0);
+
+    inDb.close();
+    outDb.close();
+  });
+
+  it('counts a genuinely pending row (no recovery ack) as due (wake fires)', () => {
+    const { inDb, outDb } = testDbs();
+    // Pending row with no processing_ack at all — ordinary unprocessed message.
+    inDb.prepare("INSERT INTO messages_in (id, status, tries, trigger) VALUES ('m-new', 'pending', 0, 1)").run();
+
+    const dueCount = countDueMessagesExcludingRecovery(inDb, outDb);
+    expect(dueCount).toBe(1);
+
+    inDb.close();
+    outDb.close();
+  });
+
+  it('counts genuinely pending but not recovery-owned rows when both kinds exist', () => {
+    const { inDb, outDb } = testDbs();
+    // m-rec is recovery-owned; m-new is a normal pending message.
+    inDb.prepare("INSERT INTO messages_in (id, status, tries, trigger) VALUES ('m-rec', 'pending', 0, 1)").run();
+    inDb.prepare("INSERT INTO messages_in (id, status, tries, trigger) VALUES ('m-new', 'pending', 0, 1)").run();
+    outDb.prepare("INSERT INTO processing_ack VALUES ('m-rec', 'recovery', ?)").run('2026-04-20 11:00:00');
+
+    // Only m-new should be counted as due.
+    const dueCount = countDueMessagesExcludingRecovery(inDb, outDb);
+    expect(dueCount).toBe(1);
 
     inDb.close();
     outDb.close();

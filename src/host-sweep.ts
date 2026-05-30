@@ -34,6 +34,7 @@ import { getActiveSessions } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import {
   countDueMessages,
+  countDueMessagesExcludingRecovery,
   deleteOrphanProcessingClaims,
   getContainerState,
   getMessageForRetry,
@@ -195,7 +196,12 @@ async function sweepSession(session: Session): Promise<void> {
     // container/agent-runner/src/db/connection.ts). Otherwise the reset path
     // would keep bumping process_after into the future, dueCount would stay 0,
     // and the wake would never fire.
-    const dueCount = countDueMessages(inDb);
+    // Use the outbound-aware count when outDb is available so that
+    // recovery-owned rows (processing_ack.status='recovery') are excluded and
+    // do not trigger a redundant container wake. Fall back to the inbound-only
+    // count when outDb does not exist yet (brand-new session: no outbound DB
+    // means no recovery rows either, so the counts are equivalent).
+    const dueCount = outDb ? countDueMessagesExcludingRecovery(inDb, outDb) : countDueMessages(inDb);
     if (dueCount > 0 && !isContainerRunning(session.id)) {
       log.info('Waking container for due messages', { sessionId: session.id, count: dueCount });
       await wakeContainer(session);
