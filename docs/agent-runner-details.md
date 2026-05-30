@@ -68,11 +68,23 @@ interface AgentQuery {
 }
 
 type ProviderEvent =
-  | { type: 'init'; sessionId: string }
-  | { type: 'result'; text: string | null }
-  | { type: 'error'; message: string; retryable: boolean; classification?: string }
-  | { type: 'progress'; message: string };
+  | { type: 'init'; continuation: string }
+  | { type: 'input-accepted'; inputId: string; scope: 'initial' | 'followup' | 'relay' }
+  | ({ type: 'result'; text: string | null } & { inputId?: string; resolvedInputIds: string[]; supersededInputIds?: string[] })
+  | { type: 'notice'; inputId: string; classification: string; severity; agentMessage; fallbackUserMessage; relayRecommended: boolean; liveness? }
+  | ({ type: 'interruption' } & ProviderInterruption)
+  | { type: 'side-effect'; sideEffect: ProviderSideEffect }
+  | { type: 'clear-continuation'; inputId: string; reason: string; attemptedContinuation? }
+  | { type: 'activity'; inputId?: string; source?: 'sdk_event' | 'sdk_keepalive' | 'provider_wait_tick' | 'provider_internal'; liveness? }
+  | { type: 'progress'; inputId?: string; message: string };
 ```
+
+The provider emits **facts** about an input-correlated turn; the poll loop owns
+recovery, row-lifecycle, and continuation decisions. See
+[Recoverable Provider Interruptions](#recoverable-provider-interruptions) for
+the full contract. (`init` carries the resumable `continuation`, not a bare
+`sessionId`; the legacy retryable-`error` event is replaced by the typed
+`interruption` event.)
 
 ### What the interface does NOT include
 
@@ -84,10 +96,30 @@ type ProviderEvent =
 
 ### Provider event semantics
 
-- **`init`** — emitted once per query when the provider establishes or resumes a session. The agent-runner captures `sessionId` for future resume.
-- **`result`** — emitted when the agent produces a complete response. May be emitted multiple times per query (e.g., Claude's multi-turn with subagents). The agent-runner writes each result to messages_out.
-- **`error`** — emitted on failure. `retryable` indicates whether the agent-runner should retry. `classification` is optional detail (e.g., 'quota', 'auth', 'transport').
-- **`progress`** — optional, for logging. The agent-runner logs these but doesn't act on them.
+Every input-correlated event carries the `inputId` the poll loop assigned to the
+triggering turn, so the poll loop can resolve exactly the rows that input owns.
+
+- **`init`** — emitted once per session establish/resume. Carries the resumable `continuation`; the poll loop persists it immediately so a mid-turn crash can resume.
+- **`input-accepted`** — emitted when the provider has accepted a specific `inputId` for processing (`scope`: `initial`, `followup`, or `relay`). Acceptance is **not** completion: the poll loop marks the input accepted-but-unresolved and only completes its rows on a successful `result`.
+- **`result`** — a turn segment finished. `resolvedInputIds` (and optional `supersededInputIds`) name exactly which inputs this result settles. Those — and only those — rows are completed. May be emitted multiple times per query.
+- **`notice`** — a non-terminal liveness/quota/retry signal; the turn continues. The poll loop relays it (see [Inactivity Relay](#inactivity-relay)); it never settles rows or clears continuation.
+- **`interruption`** — a typed, terminal, recoverable interruption (never a raw throw). Carries `classification`, sanitized `agentMessage`/`fallbackUserMessage`, a `continuationPolicy` (`preserve`/`clear`), `attemptedContinuation`, liveness, and an optional `recoverySeed`. The poll loop routes accepted-but-unresolved rows into recovery ownership.
+- **`side-effect`** — a reference to a (validated or hint-only) side effect observed this turn. Seeds recovery so a resumed turn reports existing work instead of duplicating it.
+- **`clear-continuation`** — the only provider-originated authoritative continuation clear (explicit clear, positive session-existence not-found, or the bounded zombie path). Carries `reason` and `attemptedContinuation`.
+- **`activity`** — a liveness pulse (`source`: `sdk_event`, `sdk_keepalive`, `provider_wait_tick`, `provider_internal`). Refreshes the host heartbeat; no row effect.
+- **`progress`** — optional, for logging only.
+
+**Successful-result input resolution.** When a `result` names `resolvedInputIds`,
+exactly those inputs are resolved. When it names none, the **one-active-input
+fallback** applies: if exactly one input is still unresolved, that input is
+resolved. If two or more inputs are active and the result names none, nothing is
+resolved (the ambiguity is logged), and the rows fall through to recovery at turn
+end. The fallback is a **safety net**, not a normal path: all providers — Claude,
+Codex, OpenCode, and Mock — emit `input-accepted` with an `inputId` and carry
+`resolvedInputIds` (or `supersededInputIds`) in their `result` (Task 1 updated
+Claude and Codex to do this; see the Deploy Ordering section of the plan). In
+normal operation every result names its resolved inputs explicitly, and the
+fallback only fires if a result somehow declares none.
 
 ## Provider Implementations
 
@@ -298,13 +330,174 @@ class OpenCodeProvider implements AgentProvider {
 }
 ```
 
+> The sketch above is simplified for the interface contract. The production
+> OpenCode provider is substantially more involved: it owns a per-query runtime
+> controller, a single-reader event pump, native-question denial, liveness
+> notices, and typed terminal interruptions. See
+> [Recoverable Provider Interruptions](#recoverable-provider-interruptions) and
+> [OpenCode Long-Work Liveness](#opencode-long-work-liveness) below.
+
 **OpenCode-specific behavior inside the provider:**
-- Local gRPC/HTTP server lifecycle (`server.close()`)
-- SSE event stream for output
-- Provider/model selection via config (`OPENCODE_PROVIDER`, `OPENCODE_MODEL`)
-- MCP config format translation (`type: 'local'`, `command: [cmd, ...args]`, `environment`)
-- System prompt injected via `<system>` prefix in prompt text
-- No resume support (sessions are always new or reused by ID)
+- A **per-query runtime controller** (`OpenCodeRuntimeController`) owns exactly one `opencode serve` process + root client + SSE event stream. There is no module-global singleton: a relay (below) builds a *separate* controller, so a timeout/abort on one turn cannot kill a concurrent relay turn. `destroy()` quiesces the in-flight read (`stream.return()`) before killing the process so a retiring runtime cannot steal a new query's first event.
+- Provider/model selection via config (`OPENCODE_PROVIDER` — default `anthropic` in-container, only OneCLI-managed built-in auth providers allowed; `OPENCODE_MODEL`, `OPENCODE_SMALL_MODEL`, `OPENCODE_VISION_MODEL`).
+- MCP config format translation (`type: 'local'`, `command: [cmd, ...args]`, `environment`).
+- Shared base + per-group fragments + per-group memory loaded through OpenCode's native `instructions` pipeline (`/app/CLAUDE.md`, `/workspace/agent/.claude-fragments/*.md`, `/workspace/agent/CLAUDE.local.md`) — concrete files, because OpenCode does not expand `@./...` includes.
+- Stale-session recovery: a verbatim stale-session phrase on `promptAsync` starts a fresh session once (`recoveredFromStale`), re-emitting `init`.
+- **Native questions are disabled and denied** — see [Native Question Handling](#opencode-native-question-handling).
+
+## Recoverable Provider Interruptions
+
+A long Yente turn must never end in a raw timeout, a silently-dropped row, or a
+lost session. The contract: **the provider reports facts, the poll loop owns
+recovery and the row lifecycle.** A terminal failure surfaces as a typed
+`interruption` event (sanitized, input-correlated, continuation-policy-tagged),
+and the poll loop converts accepted-but-unresolved rows into durable, route-scoped
+recovery rather than completing or re-queuing them blindly.
+
+### Input ledger and row lifecycle
+
+The poll loop assigns each batch of work an `inputId` and tracks it in an in-turn
+ledger with states `queued → accepted → resolved`, plus `returned` (unaccepted,
+sent back to pending) and `recovery_owned`.
+
+- A claimed row is marked `processing` (`processing_ack.status='processing'`) only after a *successful* `query.push`; a throwing push leaves rows in `processing` (host-sweep retries) and registers no ledger entry.
+- `input-accepted` moves the entry to `accepted`. Acceptance is never completion.
+- A `result` naming the `inputId` (or the one-active-input fallback) resolves it; only resolved inputs' rows are completed.
+- At turn end (the `finally` block), any entry still `accepted` is moved into recovery ownership; any entry still `queued` (never accepted) is returned to pending so a later wake retries it. Neither is silently completed.
+
+### Recovery lifecycle
+
+Route-scoped recovery entries (`ProviderRecoveryEntry`, stored in `session_state`)
+move through `pending → in_flight → resolved`/`superseded`:
+
+- On a wake, `pending`/`in_flight` recovery entries for the **active route** are resumed: their context is injected (XML-escaped) into the **top-level** prompt only, and the entries are marked `in_flight` on acceptance.
+- An entry is marked `resolved` (and its owned rows completed) **only on a successful provider result** that resolves/supersedes the exact inputs it owns — never on mere acceptance, relay notice, or fallback notice (the "deletion only on success" invariant).
+- **Unresolved entries are never count-pruned.** `pruneResolvedRecoveryEntries` only trims `resolved`/`superseded` entries; `pending`/`in_flight` always survive. Appending under pressure fails closed (`pressureExceeded`) and keeps existing unresolved work rather than discarding it.
+- Recovery-ownership is **atomic**: `appendRecoveryEntryAndOwnRows` writes the recovery payload (`session_state`) and the row ownership (`processing_ack.status='recovery'`) in one outbound-DB transaction, so a crash mid-transaction strands no half-owned state. If it fails, rows stay `processing` (retryable) and a structured alert is logged.
+- A malformed recovery payload is repaired **non-destructively** (`recoverMalformedRecovery`): salvage any `messageId` fragments into a reconstructed `pending` entry, otherwise leave a fallback marker. It never silently deletes owned work (`destroyedSilently` is always false).
+
+### Recovery-owned ack host sync
+
+Recovery-owned rows (`processing_ack.status='recovery'`) are **excluded from the
+host due-count** (`countDueMessagesExcludingRecovery`) so they don't trigger a
+redundant wake, and are **preserved across container startup and host sweep**
+(recovery owns them until it succeeds; startup orphan-cleanup only removes
+transient `processing` acks, never `recovery`). A `processing_ack.status='failed'`
+row syncs to a completed inbound row **only with notice-proof** — its
+`notice_message_out_id` must point at an existing user-visible terminal notice in
+`messages_out`; a failed ack with a NULL or dangling notice id is invalid host
+state and is left uncompleted (so a failure never silently swallows inbound work).
+
+### Route normalization and route-scoped recovery
+
+All routing uses a single host-stamped normalizer (`normalizeRoute`) over
+`platform_id`/`channel_type`/`thread_id` plus host-stamped `messaging_group_id`
+and `is_group`. The same normalizer drives both route splitting and recovery
+scope:
+
+- Only rows on the **trigger route** (the route of the wake-triggering message) are claimed into a turn; other-route rows stay pending and are never folded into the active prompt, accumulated context, or recovery — both in the initial batch and in follow-up polling.
+- Recovery is keyed by `provider + normalized route`, stored under the **trigger** route (not the first-row route).
+- Same-route, multi-trigger rows become the recovery entry's ordered `originalTasks`.
+- The agent's own outbound rows (`messages_out`) are stamped with the active route (`route_key`/`messaging_group_id`/`is_group`) so the agent's progress, results, relay messages, and fallbacks are harvestable into route-scoped recovery and never leak across conversations.
+- Null-thread DMs are aliased consistently by the normalizer so a DM's recovery route is stable.
+
+### Inactivity relay
+
+On a non-terminal `notice` (inactivity), the poll loop keeps the original turn
+draining and surfaces a status message out-of-band:
+
+- If the provider advertises `supportsSeparateRelayRuntime`, the loop starts at most one bounded **relay** per throttle window as a *child task* (never awaited in the main loop). The relay is a **separate restricted runtime**: its own process/client/event pump/session id, no continuation, and a route-locked, `send_message`-only MCP allowlist (its NanoClaw MCP subprocess is launched in relay mode; native mutation/shell/file/web/question tools are denied via the OpenCode `tools`/`permission` maps).
+- The relay races a `relayDeadlineMs` deadline. If the relay fails at setup or misses its deadline (and nothing was delivered), the loop sends **one** direct sanitized fallback (`fallbackUserMessage`) — guarded once per turn by `directFallbackSent`.
+- While a relay is in flight, follow-up polling is disabled so the relay never claims user rows and unrelated rows stay pending.
+- If the provider has no relay capability, a single direct sanitized fallback is sent instead.
+
+### OpenCode native question handling
+
+OpenCode's native interactive-question tool is **disabled and denied** — NanoClaw
+routes user questions through its own `ask_user_question` MCP tool, not the
+provider's native surface. The behavior is driven by the *probed* SDK 1.15.10
+surface (recorded in `fixtures/opencode-sdk-question-surface.json`):
+
+- The provider uses the **root** `createOpencodeClient`, whose event union has no `question.*` events and no `client.question` namespace. So native questions are detected on the root surface: a `message.part.updated` whose part is a `ToolPart` with `tool === 'question'`, correlated by `callID` to the matching `permission.updated`, which is denied via the real reject API (`postSessionIdPermissionsPermissionId(..., { response: 'reject' })`). The v2 `client.question`/`question.asked` surface is recorded in the probe fixture so a future client swap is caught, but production uses root.
+- The native question tool is disabled at config time via `tools.question = false` (the real surface — a `permission.question` key would silently no-op, since the only real permission keys are `edit|bash|webfetch|doom_loop|external_directory`).
+- **Current behavior:** when a native question is denied, the continuation is cleared (`clear-continuation`) and the turn ends with a user-visible terminal interruption whose recovery seed visibly names the blocked question, so the next turn restarts with that context. The cancellable-preserve-on-reuse optimization is **not implemented** — `OPENCODE_NATIVE_QUESTION_CANCEL_GRACE_MS` is reserved for that future path; today every native question is denied and cleared with restart recovery.
+
+### Continuation clearing
+
+A continuation is cleared **only** through one of three sanctioned paths — never
+on transport error text, a bare `404`, `ECONNRESET`, or any timeout string:
+
+1. An explicit provider `clear-continuation` event.
+2. A **positive session-existence check** (`client.session.get`; a `NotFoundError` result ⇒ session gone). This is wired only on a terminal `transport-timeout` / `stream-read-error` / `stream-ended` interruption that carries an attempted continuation, and is consulted on the live controller *before* teardown. A throwing/transport-failing check is inconclusive ⇒ continuation is preserved.
+3. The bounded **zombie** path: `OPENCODE_CONTINUATION_FAILURE_LIMIT` consecutive preserve-continuation terminal interruptions on the *same* continuation (counter persisted per provider+continuation in `session_state`, reset by any successful result) ⇒ clear and restart with user-visible context.
+
+The diagnostic predicate `isMissingOpenCodeSessionError` is trigger-only (requires
+the exact attempted id verbatim alongside a missing-session phrase) and is never
+itself authoritative. `clearContinuationWithProof` refuses to act without
+attempted-continuation metadata.
+
+## OpenCode Long-Work Liveness
+
+A long Yente turn (minutes to hours of tool work, often with no SSE traffic) must
+stay alive and state-preserving. The provider runs a **single-reader event pump**
+(`OpenCodeEventPump`) over the runtime's SSE stream:
+
+- **Heartbeat / wait-tick.** The pump emits non-terminal `wait-tick`, `keepalive`, and `inactivity-notice` results (`OPENCODE_WAIT_TICK_MS`, `OPENCODE_INACTIVITY_NOTICE_MS` / `..._REPEAT_MS`). Each maps to an `activity`/`notice` provider event, refreshing the host heartbeat. The inactivity-notice clock tracks **meaningful** events only, so a heartbeat-only stream still surfaces inactivity, while the transport clock tracks **any** event so a heartbeat keeps the transport alive.
+- **No-SSE transport timeout.** `OPENCODE_TRANSPORT_TIMEOUT_MS` (default 30 min) is the silence window after the last event; hitting it yields a typed `transport-timeout` interruption.
+- **Absolute turn ceiling, enforced by the pump independent of heartbeat.** `OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS` (default 6 h) is computed from turn start, so heartbeats cannot push it out; hitting it yields a typed `absolute-timeout` interruption. Host-sweep mirrors this: its kill ceiling is `max(ABSOLUTE_CEILING_MS, declaredToolTimeoutMs)` but a declared long tool may raise it only up to `OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS`, never past it.
+- **Declared-tool timeout caps.** A long OpenCode tool's declared timeout is persisted to `container_state` (so host-sweep widens its tolerance) but is capped by `min(OPENCODE_LONG_TOOL_TIMEOUT_MAX_MS, declared, absolute-budget − elapsed − margin)`; a non-positive cap is treated as "no widening tool."
+- **Injected clock/scheduler.** The pump takes a mandatory injected `now()`/`schedule()` and **never** calls global `setTimeout`/`setInterval`/`Date.now` (production wires real timers in the provider; tests inject a fake clock so a 6-hour scenario runs instantly).
+- **Single-reader rule.** Exactly one perpetual reader calls `stream.next()` for the stream's whole lifetime, so a read-ahead past one turn's terminal event survives the turn boundary in the bounded queue. The queue never silently drops a *protected* event (terminal/permission/question/assistant-text/side-effect) — it signals `queue-overflow` instead.
+- **Model-provider request timeout.** Set under the *active* provider name: `provider[OPENCODE_PROVIDER || 'anthropic'].options.timeout` (a large positive ms value, default = the absolute ceiling; **never** `0`, which means immediate abort). SDK 1.15.10 has no top-level `Config.options.timeout`, so this is the correct key to stop the hidden 5-minute provider request abort from undercutting the liveness pump.
+
+**`OPENCODE_*` knobs (10).** The host forwards only present overrides (omitting
+unset keys so the in-container default applies):
+`OPENCODE_TRANSPORT_TIMEOUT_MS`, `OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS`,
+`OPENCODE_INACTIVITY_NOTICE_MS`, `OPENCODE_INACTIVITY_NOTICE_REPEAT_MS`,
+`OPENCODE_WAIT_TICK_MS`, `OPENCODE_RELAY_DEADLINE_MS`,
+`OPENCODE_LONG_TOOL_TIMEOUT_MAX_MS`, `OPENCODE_MODEL_PROVIDER_TIMEOUT_MS`,
+`OPENCODE_CONTINUATION_FAILURE_LIMIT`, and the reserved
+`OPENCODE_NATIVE_QUESTION_CANCEL_GRACE_MS`.
+
+## Side-Effect Trust Mechanism
+
+A recovered/resumed turn must report work it already did (a sent Gmail draft, a
+generated D&D summary) instead of duplicating it — but agent-writable evidence can
+never be trusted. The mechanism is asymmetric **Ed25519**: the GWS proxy holds the
+*private* signing key; the container and host hold only the *public* verify key.
+The pure verify + canonical-JSON + classify/sanitize logic lives in
+`side-effects-verify.ts`, kept **byte-identical** as a container copy and a host
+copy (the host TS project cannot import `bun:sqlite`; a cross-check test diffs the
+two copies against the same signed/forged/tampered vectors).
+
+- **GWS split (Task 4A vs 4B).** Audit *classification* (4A) labels every GWS proxy call (API-effect vs non-API probe/help/schema) for the audit log. The *signed ledger* (4B) is the separate trust path: the proxy emits `X-GWS-Side-Effect-*` headers and a detached Ed25519 signature; the shim's ledger write is gated on `X-GWS-Api-Effect: true`.
+- **Per-input correlation file.** The poll loop atomically writes `/workspace/.active-input.json` (`{inputId, routeKey, updatedAt}`, temp+rename) at acceptance time. The GWS shim and summarize-dnd read it to stamp staged JSONL with the *current* input's correlation (a file, not env, because a long-lived tool child can't see env updates across follow-ups). Staleness is judged by timestamp.
+- **Validation rules.** Staged JSONL is a staging channel, not truth. `importSideEffectLedger` is idempotent on the record id (`audit_id` for GWS). A `gmail_draft_created` entry is authoritative **only** when its detached Ed25519 signature verifies over the exact forwarded canonical payload bytes AND that payload's `audit_id` binds to the record's idempotency key (so a real signature can't be replayed under a different id). A `summarize_dnd_summary_artifact` is authoritative only when the referenced artifact exists under an allowed root and matches the staged size. Unsigned / no-key / forged / tampered entries fail closed and stay **unvalidated hints**; only authoritative entries seed recovery or satisfy success assertions. The agent never holds the private key, so it cannot fabricate a valid entry.
+- **Host import + crash-window discovery.** On recovery-after-kill, the host reopens the outbound DB writable only after verified container exit, then imports the host session path's staged JSONL. A **host-only** `GWS_AUDIT_STORE` crash-window fallback catches a completed `drafts.create` whose JSONL append was lost to a kill in the window. Because the audit store is a shared global file, the discovery is **scoped** to this turn (route + inputId from `.active-input.json`, plus a `notBefore` turn-start bound) so it never imports another conversation's drafts.
+- **Partial success.** If the external mutation succeeded but staging/import failed, the durable proof is the signed audit record (crash-window discovery), so recovery still records the side effect rather than redoing it.
+- **Feature status.** The GWS side-effect feature is **inactive** until the Ed25519 keypair is provisioned: with no configured verify key, every `gmail_draft_created` entry stays an unvalidated hint. It can be enabled/disabled independently of code (key present vs absent).
+
+## Optional MCP Bridge Credential Degradation
+
+An optional MCP bridge (e.g. Granola) degrades to a sanitized "unavailable" state
+**only** for known, expected credential failures — never for anything that could
+mask a real problem:
+
+- The marker-check is the production path: a missing auth marker ⇒ `auth_required`; a present-but-expired marker ⇒ `auth_expired`. Both surface as the typed `AgentMcpCredentialUnavailableError`, which the container-runner degrades to unavailable **only for an optional bridge** (`required === false`); a required bridge fails closed.
+- Integrity gates run first and always **fail closed** (never degrade): auth-dir ownership must match the service uid/gid, the auth path must contain no symlinks, and private-perm / mount-overlap / malformed-marker / missing-required-bridge conditions all propagate as plain startup errors.
+- When a bridge degrades, its MCP entry and allowed tools are omitted, and a sanitized always-in-context fragment (`mcp-<name>-unavailable.md`) is written into the agent's `.claude-fragments` so the unavailable state reaches the OpenCode-loaded context Yente reads. Fragments are cleared once every optional bridge is healthy again.
+
+## Deploy Ordering, Rollback, and Backward Compatibility
+
+Each cross-repo change is an additive no-op against an old peer, so a partial
+deploy fails safe to "feature inactive," never to a half-present contract. Safe
+deploy order is GWS proxy (4A then 4B) and summarize-dnd first, then provision the
+Ed25519 keypair, then NanoClaw last; revert in reverse. The full deploy-ordering,
+rollback, and cross-repo backward-compatibility contract (including the in-flight
+outbound-DB self-migration and the `inputId` provider-contract-flip regression
+gate) lives in the implementation plan's **"Deploy Ordering, Rollback, And
+Backward Compatibility"** section
+(`docs/plans/2026-05-28-yente-opencode-timeout-hardening.md`).
 
 ## Agent-Runner Core
 
@@ -444,6 +637,7 @@ pending → processing → completed
 - **Pick up:** `UPDATE messages_in SET status = 'processing', status_changed = now(), tries = tries + 1 WHERE id IN (...)`
 - **Complete:** `UPDATE messages_in SET status = 'completed', status_changed = now() WHERE id IN (...)`
 - **Error:** Agent-runner does NOT set `failed` — it leaves the message as `processing`. The host detects stale processing via `status_changed` and handles retry logic (reset to pending with backoff). This keeps retry policy on the host side.
+- **Recovery:** A terminal interruption with accepted-but-unresolved rows is a fourth disposition: those rows are moved into recovery ownership (`processing_ack.status='recovery'`) instead of completed or returned to pending. See [Recoverable Provider Interruptions](#recoverable-provider-interruptions) for the input ledger and recovery lifecycle, and [Recovery-owned ack host sync](#recovery-owned-ack-host-sync) for how recovery and `failed` acks sync to inbound status.
 
 ### MCP Tools
 
