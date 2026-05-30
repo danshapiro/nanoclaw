@@ -792,6 +792,64 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     expect(provider.capabilities.relayToolPolicy).toBe('status_only');
   });
 
+  it('a concurrent relay query uses a SEPARATE controller and never destroys the original turn', async () => {
+    const mainStream = new FakeStream();
+    const relayStream = new FakeStream();
+    const mainController = new FakeController(mainStream);
+    const relayController = new FakeController(relayStream);
+    let relayRouteKey: string | undefined;
+    const provider = new OpenCodeProvider(
+      { mcpServers: { nanoclaw: { command: 'bun', args: ['x'], env: {} } } },
+      {
+        runtimeFactory: {
+          async createRuntime() {
+            return mainController;
+          },
+          async createRelayRuntime(_options, policy) {
+            relayRouteKey = policy.routeKey;
+            return relayController;
+          },
+        },
+        clockFactory: () => new FakeClock() as unknown as OpenCodePumpClock,
+      },
+    );
+
+    // Start the original (normal) turn but keep it open.
+    const mainQuery = provider.query({ inputId: 'in-main', prompt: 'long', cwd: '/workspace/agent' });
+    let mainResult = false;
+    const mainReader = (async () => {
+      for await (const e of mainQuery.events) {
+        if (e.type === 'result') {
+          mainResult = true;
+          break;
+        }
+      }
+    })();
+    await new Promise((r) => setTimeout(r, 5));
+
+    // Concurrently run a relay query (relayMode) — it must NOT destroy the main
+    // controller and must use its own relay controller.
+    const relayQuery = provider.query({ inputId: 'in-relay', prompt: 'status', cwd: '/workspace/agent', relayMode: true, relayDeadlineMs: 30000, toolPolicy: 'status_only' });
+    const relayReader = (async () => {
+      for await (const e of relayQuery.events) {
+        if (e.type === 'result') break;
+      }
+    })();
+    await new Promise((r) => setTimeout(r, 5));
+    relayStream.push({ type: 'session.idle', properties: { sessionID: TEST_SESSION } });
+    await relayReader;
+
+    // The relay used its own controller (createRelayRuntime), with a route key.
+    expect(relayRouteKey).toBeDefined();
+    // The original turn's controller was NOT destroyed by the relay.
+    expect(mainController.destroyed).toHaveLength(0);
+
+    // Now the main turn can complete normally.
+    mainStream.push({ type: 'session.idle', properties: { sessionID: TEST_SESSION } });
+    await mainReader;
+    expect(mainResult).toBe(true);
+  });
+
   it('imports staged ledger evidence on tool completion and emits ONLY authoritative side-effect references', async () => {
     const stream = new FakeStream();
     const controller = new FakeController(stream);

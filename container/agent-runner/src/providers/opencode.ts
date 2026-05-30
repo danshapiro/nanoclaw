@@ -736,10 +736,19 @@ export class OpenCodeProvider implements AgentProvider {
   }
 
   query(input: QueryInput): AgentQuery {
-    if (input.continuation) {
-      this.activeSessionId = input.continuation;
-    } else {
-      this.activeSessionId = undefined;
+    const self = this;
+    const relayMode = input.relayMode === true;
+    const relayRouteKey = input.relayMode ? (input.continuation ?? 'relay') : 'relay';
+
+    // Relay queries run a SEPARATE controller with their OWN local session id so
+    // they NEVER touch the instance's normal-turn state (this.controller /
+    // this.activeSessionId / container_state). This is the per-instance
+    // separation that keeps a relay from killing the concurrent original turn.
+    // A relay has no continuation and never seeds the instance session id.
+    let relayController: OpenCodeRuntimeController | null = null;
+    let relayActiveSessionId: string | undefined;
+    if (!relayMode) {
+      this.activeSessionId = input.continuation ? input.continuation : undefined;
     }
 
     const pending: QueryTurnInput[] = [];
@@ -753,14 +762,36 @@ export class OpenCodeProvider implements AgentProvider {
     const kick = (): void => {
       waiting?.();
     };
-
-    const self = this;
-    const relayMode = input.relayMode === true;
+    const getActiveSession = (): string | undefined => (relayMode ? relayActiveSessionId : self.activeSessionId);
+    const setActiveSession = (id: string | undefined): void => {
+      if (relayMode) relayActiveSessionId = id;
+      else self.activeSessionId = id;
+    };
+    const teardownRuntime = (reason: string): void => {
+      if (relayMode) {
+        relayController?.destroy(reason);
+        relayController = null;
+      } else {
+        self.destroyRuntime(reason);
+      }
+    };
+    const persistTool = (tool: ActiveOpenCodeTool | null): void => {
+      // Relay mode has no mutation/long tools and must not clobber the original
+      // turn's container_state.
+      if (!relayMode) self.persistActiveTool(tool);
+    };
 
     async function* gen(): AsyncGenerator<ProviderEvent> {
       let initYielded = false;
       let turnIndex = 0;
-      const rt = await self.ensureRuntime(relayMode ? { relayMode: true } : {});
+      const rt = relayMode
+        ? (relayController = await self.runtimeFactory.createRelayRuntime(self.options, {
+            allowedTools: ['send_message'],
+            deniedNativeTools: relayDeniedNativeToolIds(),
+            routeKey: relayRouteKey,
+            deadlineMs: input.relayDeadlineMs ?? OPENCODE_RELAY_DEADLINE_MS(),
+          }))
+        : await self.ensureRuntime({});
       const { client } = rt;
       const stream = rt.stream as AsyncGenerator<OpenCodeSseEvent, void, void>;
 
@@ -775,11 +806,11 @@ export class OpenCodeProvider implements AgentProvider {
           if (t.declaredTimeoutMs == null) continue;
           if (!longest || (t.declaredTimeoutMs ?? 0) > (longest.declaredTimeoutMs ?? 0)) longest = t;
         }
-        self.persistActiveTool(longest);
+        persistTool(longest);
       };
       const clearActiveTools = (): void => {
         activeTools.clear();
-        self.persistActiveTool(null);
+        persistTool(null);
       };
 
       // Native-question correlation: question tool parts seen this turn (by
@@ -805,7 +836,7 @@ export class OpenCodeProvider implements AgentProvider {
         keepaliveTypes: KEEPALIVE_EVENT_TYPES,
         isSessionEvent: (event) => {
           const sid = (event.properties as { sessionID?: string }).sessionID;
-          return sid === undefined || sid === self.activeSessionId;
+          return sid === undefined || sid === getActiveSession();
         },
         isProtectedEvent: (event) =>
           event.type === 'session.error' ||
@@ -842,12 +873,12 @@ export class OpenCodeProvider implements AgentProvider {
           );
           const prompted = await promptSession(
             client.session,
-            self.activeSessionId,
+            getActiveSession(),
             buildOpenCodePromptParts(turn.prompt, staged),
             modelForAttachments(staged),
           );
           const sessionId = prompted.sessionId;
-          self.activeSessionId = sessionId;
+          setActiveSession(sessionId);
 
           if (!initYielded || prompted.recoveredFromStale) {
             yield { type: 'init', continuation: sessionId };
@@ -970,7 +1001,7 @@ export class OpenCodeProvider implements AgentProvider {
                   err.continuationPolicy,
                 );
                 pump.dispose();
-                self.destroyRuntime(err.classification);
+                teardownRuntime(err.classification);
                 break turn;
               }
 
@@ -1021,7 +1052,7 @@ export class OpenCodeProvider implements AgentProvider {
                         yield { type: 'side-effect', sideEffect };
                       }
                       refreshActiveTool();
-                      if (activeTools.size === 0) self.persistActiveTool(null);
+                      if (activeTools.size === 0) persistTool(null);
                     } else if (part.tool !== NATIVE_QUESTION_TOOL_ID) {
                       const declaredTimeoutMs = cappedDeclaredTimeoutMs(part, pump.liveness().elapsedMs);
                       activeTools.set(part.callID, {
@@ -1063,7 +1094,7 @@ export class OpenCodeProvider implements AgentProvider {
                     // proof: clear continuation with a restart-capable recovery
                     // seed that VISIBLY contains the blocked question.
                     yield { type: 'clear-continuation', inputId: turnInputId, reason: 'native_question_denied', attemptedContinuation: input.continuation };
-                    self.activeSessionId = undefined;
+                    setActiveSession(undefined);
                     terminalInterruption = buildInterruption(
                       'opencode_native_question',
                       `I need your input to continue: ${questionText}`,
@@ -1072,7 +1103,7 @@ export class OpenCodeProvider implements AgentProvider {
                       'clear',
                     );
                     pump.dispose();
-                    self.destroyRuntime('native_question_denied');
+                    teardownRuntime('native_question_denied');
                     break turn;
                   }
                   // Non-question permission: auto-approve (existing behavior).
@@ -1112,7 +1143,7 @@ export class OpenCodeProvider implements AgentProvider {
                       'preserve',
                     );
                     pump.dispose();
-                    self.destroyRuntime('session_retry_limit');
+                    teardownRuntime('session_retry_limit');
                     break turn;
                   }
                   break;
@@ -1140,7 +1171,7 @@ export class OpenCodeProvider implements AgentProvider {
                       'preserve',
                     );
                     pump.dispose();
-                    self.destroyRuntime('session_error');
+                    teardownRuntime('session_error');
                     break turn;
                   }
                   break;
@@ -1198,9 +1229,11 @@ export class OpenCodeProvider implements AgentProvider {
       events: gen(),
       abort: () => {
         aborted = true;
-        this.activeSessionId = undefined;
+        // Relay aborts tear down only the relay's own controller and never
+        // touch the instance's normal-turn session/runtime.
+        setActiveSession(undefined);
         kick();
-        this.destroyRuntime('abort');
+        teardownRuntime('abort');
       },
     };
   }
