@@ -15,14 +15,19 @@ import {
   appendRecoveryEntry,
   appendRecoveryEntryAndOwnRows,
   clearContinuation,
+  listRecoveryEntries,
+  markRecoveryInFlight,
   migrateLegacyContinuation,
+  resolveRecoveryEntry,
   setContinuation,
   type ProviderRecoveryEntry,
   type ProviderRecoveryScope,
 } from './db/session-state.js';
+import { markRecoveryCompleted } from './db/messages-in.js';
 import { collectQueryAttachments, type InspectedFile } from './attachments.js';
 import {
   formatMessages,
+  formatRecoveryContext,
   extractRouting,
   categorizeMessage,
   normalizeRoute,
@@ -308,6 +313,15 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const originalTasks: ProviderRecoveryEntry['originalTasks'] = activeMessages
       .filter((m) => m.trigger === 1)
       .map((m) => ({ messageId: m.id, text: textOfMessage(m), timestamp: m.timestamp }));
+    // Pending/in_flight recovery entries for THIS route are resumed on this
+    // top-level turn: their XML-escaped context is prepended to the prompt so the
+    // next Yente turn picks up interrupted work (original task + prior progress +
+    // completed side effects + continuation policy), and they are marked in_flight
+    // on acceptance and resolved (with their owned rows completed) only on a
+    // successful result (Invariants 128/129/140; plan lines 743-744).
+    const resumableRecovery = listRecoveryEntries(activeRouteScope).filter(
+      (e) => e.status === 'pending' || e.status === 'in_flight',
+    );
     // Generate a top-level inputId for this wake's prompt. Acceptance is tracked
     // when the provider emits input-accepted for this id.
     const topLevelInputId = generateInputId('initial');
@@ -353,6 +367,11 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // Format messages: passthrough commands get raw text (only if the
       // provider natively handles slash commands), others get XML.
       prompt = formatMessagesWithCommands(keep, config.provider.supportsNativeSlashCommands);
+
+      // Prepend route-scoped recovery context (XML-escaped) so an interrupted
+      // prior turn resumes as a normal top-level prompt (plan line 86).
+      const recoveryBlock = formatRecoveryContext(resumableRecovery);
+      if (recoveryBlock) prompt = `${recoveryBlock}\n\n${prompt}`;
 
       log(`Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}`);
 
@@ -426,7 +445,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         processingIds,
         config.providerName,
         replyAccounting,
-        { topLevelInputId, activeRouteKey, activeRouteScope, originalTasks },
+        { topLevelInputId, activeRouteKey, activeRouteScope, originalTasks, resumableRecoveryIds: resumableRecovery.map((e) => e.id) },
         config.inspectAttachmentFile,
         config.signal,
         config,
@@ -543,6 +562,8 @@ async function processQuery(
     activeRouteKey: string;
     activeRouteScope: ProviderRecoveryScope;
     originalTasks: ProviderRecoveryEntry['originalTasks'];
+    /** Pending/in_flight recovery entry ids resumed by THIS top-level turn. */
+    resumableRecoveryIds: string[];
   },
   inspectAttachmentFile?: (filePath: string) => Promise<InspectedFile | null>,
   signal?: AbortSignal,
@@ -598,6 +619,14 @@ async function processQuery(
     entry.state = 'accepted';
     // Stamp the current accepted input for tool-time side-effect correlation.
     writeActiveInput(inputId, ledgerCtx.activeRouteKey);
+    // Resuming a prior interrupted turn: mark its recovery entries in_flight for
+    // THIS top-level input. They are NOT consumed yet (mere acceptance never
+    // resolves recovery — Invariant 140); resolution happens only on success.
+    if (inputId === ledgerCtx.topLevelInputId) {
+      for (const recId of ledgerCtx.resumableRecoveryIds) {
+        markRecoveryInFlight(ledgerCtx.activeRouteScope, recId, inputId);
+      }
+    }
   }
 
   /**
@@ -626,11 +655,26 @@ async function processQuery(
 
   function completeResolved(inputIds: string[]): void {
     const idsToComplete: string[] = [];
+    let topLevelResolved = false;
     for (const inputId of inputIds) {
+      if (inputId === ledgerCtx.topLevelInputId) topLevelResolved = true;
       const entry = ledger.get(inputId);
       if (!entry || entry.state === 'resolved') continue;
       entry.state = 'resolved';
       idsToComplete.push(...entry.messageIds);
+    }
+    // A successful result that resolves the top-level input also resolves the
+    // recovery entries this turn resumed (and completes their owned recovery rows).
+    // Recovery is consumed ONLY on success, never on mere acceptance (Inv. 140).
+    // The resuming turn supersedes the entry's own accepted-unresolved inputs, so
+    // we resolve against THOSE owned input ids (not the new top-level id).
+    if (topLevelResolved && ledgerCtx.resumableRecoveryIds.length > 0) {
+      const entries = listRecoveryEntries(ledgerCtx.activeRouteScope);
+      for (const recId of ledgerCtx.resumableRecoveryIds) {
+        const ownedInputIds = (entries.find((e) => e.id === recId)?.acceptedUnresolvedInputs ?? []).map((a) => a.inputId);
+        const res = resolveRecoveryEntry(ledgerCtx.activeRouteScope, recId, { resolvedInputIds: ownedInputIds });
+        if (res.resolvedMessageIds.length > 0) markRecoveryCompleted(res.resolvedMessageIds, recId);
+      }
     }
     if (idsToComplete.length > 0) markCompleted(idsToComplete);
   }

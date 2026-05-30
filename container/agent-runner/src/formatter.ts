@@ -275,6 +275,47 @@ export function escapeXmlText(str: string): string {
   return escapeXml(str);
 }
 
+/** Minimal shape of a recovery entry needed for prompt injection. */
+export interface RecoveryContextInput {
+  classification: string;
+  agentMessage: string;
+  originalTasks: Array<{ text: string }>;
+  acceptedUnresolvedInputs: Array<{ prompt: string }>;
+  priorProgress: Array<{ text: string }>;
+  observations: string[];
+  sideEffects: Array<{ kind: string; label: string }>;
+  continuationPolicy: string;
+}
+
+/**
+ * Build an XML-escaped `<recovery>` block prepended to a top-level prompt so the
+ * next Yente turn resumes interrupted work with full route-scoped context: the
+ * original task(s), any accepted-but-unresolved input prompts, the agent's prior
+ * user-visible progress, completed side effects (so it reports existing work
+ * rather than duplicating it), and the continuation policy. All untrusted text is
+ * XML-escaped. Returns '' when there is nothing to inject.
+ */
+export function formatRecoveryContext(entries: RecoveryContextInput[]): string {
+  if (entries.length === 0) return '';
+  const lines: string[] = ['<recovery>'];
+  lines.push(
+    '  <note>You were interrupted on a previous turn for this conversation. Resume the work below; do NOT repeat any completed side effects.</note>',
+  );
+  for (const e of entries) {
+    lines.push(`  <interrupted classification="${escapeXml(e.classification)}" continuation_policy="${escapeXml(e.continuationPolicy)}">`);
+    if (e.agentMessage) lines.push(`    <status>${escapeXml(e.agentMessage)}</status>`);
+    for (const t of e.originalTasks) lines.push(`    <original_task>${escapeXml(t.text)}</original_task>`);
+    for (const a of e.acceptedUnresolvedInputs) lines.push(`    <unresolved_input>${escapeXml(a.prompt)}</unresolved_input>`);
+    for (const p of e.priorProgress) lines.push(`    <prior_progress>${escapeXml(p.text)}</prior_progress>`);
+    for (const o of e.observations) lines.push(`    <observation>${escapeXml(o)}</observation>`);
+    for (const s of e.sideEffects)
+      lines.push(`    <completed_side_effect kind="${escapeXml(s.kind)}">${escapeXml(s.label)}</completed_side_effect>`);
+    lines.push('  </interrupted>');
+  }
+  lines.push('</recovery>');
+  return lines.join('\n');
+}
+
 // ── Route normalization (Task 1 Step 10) ─────────────────────────────────────
 
 export interface RouteInput {

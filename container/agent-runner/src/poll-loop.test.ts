@@ -1747,6 +1747,82 @@ describe('poll-loop accepted-but-unresolved terminal recovery', () => {
     controller.abort();
     await loopPromise.catch(() => {});
   });
+
+  // Regression (Task 6 exposed): the poll loop STORED recovery entries but never
+  // CONSUMED them — a stored pending entry's context was not injected into the
+  // next top-level prompt, and a successful resuming turn neither resolved the
+  // recovery entry nor completed its recovery-owned rows. So an interrupted turn's
+  // rows stayed in processing_ack.status='recovery' forever and the agent lost the
+  // interrupted context. This wires injection-on-wake + resolve-on-success.
+  it('injects pending recovery into the next top-level prompt and resolves it (rows completed) only on success', async () => {
+    insertMessage('resume-trigger', 'chat', { sender: 'User', text: 'answer that resumes the prior work' }, {
+      platformId: 'chan-1',
+      channelType: 'discord',
+      messagingGroupId: 'mg-resume',
+      isGroup: 0,
+    });
+    const routeKey = normalizeRoute('test', {
+      platformId: 'chan-1',
+      channelType: 'discord',
+      threadId: null,
+      messagingGroupId: 'mg-resume',
+      isGroup: 0,
+    }).routeKey;
+    const scope = recoveryScope(routeKey, 'mg-resume', 0);
+
+    // Seed a pending recovery entry owning a prior interrupted row, with that row
+    // already in processing_ack.status='recovery' (the terminal-interruption state).
+    const now = new Date().toISOString();
+    const seed: ProviderRecoveryEntry = {
+      id: 'rec-resume-1',
+      status: 'pending',
+      classification: 'terminal_interruption_accepted_unresolved',
+      agentMessage: 'I was interrupted mid-turn and will resume this work.',
+      fallbackUserMessage: 'I still have your earlier request.',
+      originalTasks: [{ messageId: 'prior-row', text: 'do the earlier interrupted task', timestamp: now }],
+      acceptedUnresolvedInputs: [{ inputId: 'in-prior', messageIds: ['prior-row'], prompt: 'do the earlier interrupted task' }],
+      pendingFollowups: [],
+      priorProgress: [{ messageOutId: 'mo-1', text: 'I had started reading the file.', source: 'provider_progress', timestamp: now }],
+      observations: [],
+      sideEffects: [],
+      continuationPolicy: 'preserve',
+      createdAt: now,
+      updatedAt: now,
+    };
+    getOutboundDb()
+      .prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
+      .run(`recovery:test:${routeKey}`, JSON.stringify([seed]), now);
+    getOutboundDb()
+      .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('prior-row', 'recovery', datetime('now'))")
+      .run();
+
+    let seenPrompt = '';
+    const provider = new ScriptedProvider(async function* (input) {
+      seenPrompt = input.prompt;
+      yield { type: 'init', continuation: 'sess-resume' };
+      // Mark in_flight observed on acceptance happens in the loop; here, on the
+      // FIRST observation, the entry must NOT yet be resolved (accept != consume).
+      yield { type: 'result', text: 'Resumed and finished the earlier task.' };
+    });
+
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+    await waitFor(() => getAckStatus('resume-trigger') === 'completed', 3000);
+
+    // The recovery context was injected into the top-level prompt (original task +
+    // prior progress), XML-escaped.
+    expect(seenPrompt).toContain('<recovery>');
+    expect(seenPrompt).toContain('do the earlier interrupted task');
+    expect(seenPrompt).toContain('I had started reading the file.');
+
+    // On success, the recovery entry is resolved AND its owned row is completed.
+    await waitFor(() => listRecoveryEntries(scope).every((e) => e.status === 'resolved'), 3000);
+    expect(getAckStatus('prior-row')).toBe('completed');
+
+    controller.abort();
+    await loopPromise.catch(() => {});
+  });
 });
 
 describe('poll-loop pre-query failure recovery (Step 4 lines 557-559)', () => {
