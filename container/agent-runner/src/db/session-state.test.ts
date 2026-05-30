@@ -12,6 +12,7 @@ import {
 } from './side-effects.js';
 import {
   appendRecoveryEntry,
+  appendRecoveryEntryAndOwnRows,
   clearContinuation,
   enrichRecoveryEntry,
   getContinuation,
@@ -416,5 +417,64 @@ describe('provider recovery entries', () => {
     // Either reconstructed into a replacement entry or returned a fallback — never silently dropped.
     expect(outcome.destroyedSilently).toBe(false);
     expect(['reconstructed', 'fallback', 'returned_to_pending']).toContain(outcome.disposition);
+  });
+
+  // ── Step 3 line 533/164: move rows into recovery ownership + append recovery
+  // payload is ONE atomic transaction on the outbound DB. ───────────────────────
+  function ackStatus(id: string): string | null {
+    const row = getOutboundDb().prepare('SELECT status FROM processing_ack WHERE message_id = ?').get(id) as
+      | { status: string }
+      | undefined;
+    return row?.status ?? null;
+  }
+
+  test('appendRecoveryEntryAndOwnRows moves rows to recovery and stores the payload atomically', () => {
+    const scope = dmScope();
+    // Rows are currently claimed (processing) — terminal interruption is moving
+    // them to recovery ownership.
+    getOutboundDb()
+      .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m1', 'processing', datetime('now'))")
+      .run();
+    getOutboundDb()
+      .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m2', 'processing', datetime('now'))")
+      .run();
+
+    const entry = newRecoveryEntry(scope, {
+      acceptedUnresolvedInputs: [{ inputId: 'in-1', messageIds: ['m1', 'm2'], prompt: 'do it' }],
+    });
+    const result = appendRecoveryEntryAndOwnRows(scope, entry, ['m1', 'm2']);
+    expect(result.pressureExceeded).toBeUndefined();
+
+    // Both halves landed: payload stored AND rows owned by recovery.
+    expect(listRecoveryEntries(scope)).toHaveLength(1);
+    expect(listRecoveryEntries(scope)[0].id).toBe(entry.id);
+    expect(ackStatus('m1')).toBe('recovery');
+    expect(ackStatus('m2')).toBe('recovery');
+  });
+
+  test('a mid-transaction failure rolls back BOTH the ownership move and the payload append (no partial state)', () => {
+    const scope = dmScope();
+    getOutboundDb()
+      .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m1', 'processing', datetime('now'))")
+      .run();
+
+    const entry = newRecoveryEntry(scope, {
+      acceptedUnresolvedInputs: [{ inputId: 'in-1', messageIds: ['m1'], prompt: 'do it' }],
+    });
+
+    // Inject a throw partway through the atomic transaction (after the payload
+    // write begins but before it commits). The whole transaction must roll back.
+    expect(() =>
+      appendRecoveryEntryAndOwnRows(scope, entry, ['m1'], {
+        __injectMidTransactionThrow: () => {
+          throw new Error('simulated crash mid-transaction');
+        },
+      }),
+    ).toThrow('simulated crash mid-transaction');
+
+    // NEITHER half landed: the row is still 'processing' (not stranded in
+    // 'recovery' with no payload, and not lost), and no recovery payload exists.
+    expect(ackStatus('m1')).toBe('processing');
+    expect(listRecoveryEntries(scope)).toHaveLength(0);
   });
 });

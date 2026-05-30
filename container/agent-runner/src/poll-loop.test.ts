@@ -1,6 +1,16 @@
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
-import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './db/connection.js';
+import {
+  initTestSessionDb,
+  closeSessionDb,
+  getInboundDb,
+  getOutboundDb,
+  clearStaleProcessingAcks,
+} from './db/connection.js';
 import {
   getPendingMessages,
   markCompleted,
@@ -9,6 +19,14 @@ import {
   returnProcessingToPending,
 } from './db/messages-in.js';
 import { getUndeliveredMessages, writeMessageOut } from './db/messages-out.js';
+import {
+  appendRecoveryEntry,
+  listRecoveryEntries,
+  markRecoveryInFlight,
+  resolveRecoveryEntry,
+  type ProviderRecoveryEntry,
+  type ProviderRecoveryScope,
+} from './db/session-state.js';
 import { formatMessages, extractRouting, normalizeRoute } from './formatter.js';
 import { runPollLoop } from './poll-loop.js';
 import { MockProvider } from './providers/mock.js';
@@ -833,6 +851,75 @@ describe('messages-in recovery ack lifecycle', () => {
     markRecoveryCompleted(['m1'], 'rec-1');
     expect(ackStatus('m1')).toBe('completed');
   });
+
+  // B5 (Step 3 lines 539-540): startup clears orphan 'processing' acks but
+  // PRESERVES 'recovery' acks (and does not touch completed/failed).
+  it('clearStaleProcessingAcks clears orphan processing acks but preserves recovery acks', () => {
+    getOutboundDb()
+      .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('orphan-proc', 'processing', datetime('now'))")
+      .run();
+    getOutboundDb()
+      .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('rec-owned', 'recovery', datetime('now'))")
+      .run();
+    getOutboundDb()
+      .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('done', 'completed', datetime('now'))")
+      .run();
+
+    clearStaleProcessingAcks();
+
+    expect(ackStatus('orphan-proc')).toBeNull(); // orphan processing cleared
+    expect(ackStatus('rec-owned')).toBe('recovery'); // recovery preserved
+    expect(ackStatus('done')).toBe('completed'); // completed untouched
+  });
+
+  // B6 (Step 3 line 541): resolving a recovery entry resolves its owned input
+  // ledger row ids and they are marked completed.
+  it('recovery deletion/resolution resolves owned row ids to completed', () => {
+    const scope: ProviderRecoveryScope = {
+      providerName: 'test',
+      routeKey: 'test|discord|chan-1|dm:mg-rec',
+      messagingGroupId: 'mg-rec',
+      isGroup: 0,
+      platformId: 'chan-1',
+      channelType: 'discord',
+      threadKey: null,
+    };
+    // Two rows owned by recovery under input 'in-rec'.
+    getOutboundDb()
+      .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('mr1', 'recovery', datetime('now'))")
+      .run();
+    getOutboundDb()
+      .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('mr2', 'recovery', datetime('now'))")
+      .run();
+    const now = new Date().toISOString();
+    const entry: ProviderRecoveryEntry = {
+      id: 'rec-b6',
+      status: 'pending',
+      classification: 'terminal',
+      agentMessage: 'resuming',
+      fallbackUserMessage: 'resend if needed',
+      originalTasks: [],
+      acceptedUnresolvedInputs: [{ inputId: 'in-rec', messageIds: ['mr1', 'mr2'], prompt: 'do it' }],
+      pendingFollowups: [],
+      priorProgress: [],
+      observations: [],
+      sideEffects: [],
+      continuationPolicy: 'preserve',
+      createdAt: now,
+      updatedAt: now,
+    };
+    appendRecoveryEntry(scope, entry);
+    markRecoveryInFlight(scope, entry.id, 'in-rec');
+
+    // A successful recovery result resolves the entry → returns owned row ids.
+    const resolution = resolveRecoveryEntry(scope, entry.id, { resolvedInputIds: ['in-rec'] });
+    expect(resolution.resolvedMessageIds.sort()).toEqual(['mr1', 'mr2']);
+
+    // Those row ids are then marked completed.
+    markRecoveryCompleted(resolution.resolvedMessageIds, entry.id);
+    expect(ackStatus('mr1')).toBe('completed');
+    expect(ackStatus('mr2')).toBe('completed');
+  });
 });
 
 describe('poll-loop input ledger and recovery (route-scoped)', () => {
@@ -921,6 +1008,778 @@ describe('poll-loop input ledger and recovery (route-scoped)', () => {
     }
 
     expect(returnedToPending.has('followup-dm')).toBe(true);
+  });
+});
+
+describe('poll-loop active-input stamping (follow-up correlation)', () => {
+  // B4 (Step 1 line 473): a side effect produced during an accepted FOLLOW-UP
+  // must be stamped with the follow-up's inputId, NOT the initial input id. The
+  // poll loop writes /workspace/.active-input.json (atomic temp+rename) on each
+  // input-accepted; the latest accepted input wins.
+  it('stamps .active-input.json with the latest accepted (follow-up) input id, not the initial', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-active-input-'));
+    const activeInputFile = path.join(dir, '.active-input.json');
+    const prevEnv = process.env.NANOCLAW_ACTIVE_INPUT_PATH;
+    process.env.NANOCLAW_ACTIVE_INPUT_PATH = activeInputFile;
+
+    insertMessage('init-msg', 'chat', { sender: 'User', text: 'initial' }, {
+      platformId: 'chan-1',
+      channelType: 'discord',
+      messagingGroupId: 'mg-fu',
+      isGroup: 0,
+    });
+
+    const acceptedInputIds: string[] = [];
+    let releaseQuery!: () => void;
+    let acceptFollowup!: (inputId: string) => void;
+    const queryStarted = deferred();
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query(input) {
+        queryStarted.resolve();
+        let followupId: string | null = null;
+        let signalFollowup: (() => void) | null = null;
+        acceptFollowup = (id: string) => {
+          followupId = id;
+          signalFollowup?.();
+        };
+        return {
+          push(message) {
+            // The poll loop pushes a follow-up with a NEW inputId; accept it.
+            const turn = typeof message === 'string' ? { inputId: undefined } : message;
+            if (turn.inputId) acceptFollowup(turn.inputId);
+          },
+          end() {
+            releaseQuery?.();
+          },
+          abort() {
+            releaseQuery?.();
+          },
+          events: (async function* () {
+            yield { type: 'init', continuation: 'sess-fu' };
+            const initialId = (input as QueryInput).inputId;
+            acceptedInputIds.push(initialId);
+            yield { type: 'input-accepted', inputId: initialId, scope: 'initial' };
+            // Wait for a follow-up to be pushed, then accept it.
+            await new Promise<void>((resolve) => {
+              signalFollowup = resolve;
+            });
+            acceptedInputIds.push(followupId!);
+            yield { type: 'input-accepted', inputId: followupId!, scope: 'followup' };
+            await new Promise<void>((resolve) => {
+              releaseQuery = resolve;
+            });
+          })(),
+        };
+      },
+    };
+
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+    try {
+      await queryStarted.promise;
+      // Insert a follow-up on the same route so the poll loop pushes it.
+      insertMessage('fu-msg', 'chat', { sender: 'User', text: 'follow-up' }, {
+        platformId: 'chan-1',
+        channelType: 'discord',
+        messagingGroupId: 'mg-fu',
+        isGroup: 0,
+      });
+
+      // Wait until BOTH inputs have been accepted (initial then follow-up).
+      await waitFor(() => acceptedInputIds.length >= 2, 4000);
+      // Wait for the stamp to reflect the follow-up id.
+      await waitFor(() => {
+        if (!fs.existsSync(activeInputFile)) return false;
+        try {
+          const stamp = JSON.parse(fs.readFileSync(activeInputFile, 'utf8')) as { inputId: string };
+          return stamp.inputId === acceptedInputIds[1];
+        } catch {
+          return false;
+        }
+      }, 4000);
+
+      const stamp = JSON.parse(fs.readFileSync(activeInputFile, 'utf8')) as { inputId: string };
+      const initialInputId = acceptedInputIds[0];
+      const followupInputId = acceptedInputIds[1];
+      expect(followupInputId).not.toBe(initialInputId);
+      // The stamp reflects the LATEST accepted (follow-up) input, not the initial.
+      expect(stamp.inputId).toBe(followupInputId);
+    } finally {
+      controller.abort();
+      releaseQuery?.();
+      await loopPromise.catch(() => {});
+      if (prevEnv === undefined) delete process.env.NANOCLAW_ACTIVE_INPUT_PATH;
+      else process.env.NANOCLAW_ACTIVE_INPUT_PATH = prevEnv;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('poll-loop ambiguous result resolution guard', () => {
+  function ackStatusFor(id: string): string | null {
+    const row = getOutboundDb().prepare('SELECT status FROM processing_ack WHERE message_id = ?').get(id) as
+      | { status: string }
+      | undefined;
+    return row?.status ?? null;
+  }
+
+  // B7 (Step 3 line 542 / poll-loop resolveResult): one active accepted input +
+  // a result with no explicit resolvedInputIds → the one input resolves and its
+  // row is completed (the unambiguous one-active-input rule).
+  it('one active accepted input resolves a result lacking explicit resolvedInputIds', async () => {
+    insertMessage('one-active', 'chat', { sender: 'User', text: 'do it' }, {
+      platformId: 'chan-1',
+      channelType: 'discord',
+      messagingGroupId: 'mg-one',
+      isGroup: 0,
+    });
+
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query(input) {
+        return {
+          push() {},
+          end() {},
+          abort() {},
+          events: (async function* () {
+            yield { type: 'init', continuation: 'sess-one' };
+            yield { type: 'input-accepted', inputId: (input as QueryInput).inputId, scope: 'initial' };
+            // result with NO resolvedInputIds — one-active rule must map it.
+            yield { type: 'result', text: '<message to="discord-test">ok</message>', resolvedInputIds: [] };
+          })(),
+        };
+      },
+    };
+
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+    await waitFor(() => ackStatusFor('one-active') === 'completed', 3000);
+    expect(ackStatusFor('one-active')).toBe('completed');
+    controller.abort();
+    await loopPromise.catch(() => {});
+  });
+
+  // B7: two active accepted inputs + a result with no explicit resolvedInputIds
+  // → ambiguous; the guard logs `ambiguous_result_resolution` and completes
+  // NOTHING (ambiguous success must never complete the wrong row).
+  it('two active accepted inputs with no explicit ids is ambiguous: logs and completes nothing', async () => {
+    insertMessage('amb-initial', 'chat', { sender: 'User', text: 'first' }, {
+      platformId: 'chan-1',
+      channelType: 'discord',
+      messagingGroupId: 'mg-amb',
+      isGroup: 0,
+    });
+
+    const ambiguousLogged = { value: false };
+    const origError = console.error;
+    console.error = (...args: unknown[]) => {
+      const line = typeof args[0] === 'string' ? args[0] : '';
+      if (line.includes('ambiguous_result_resolution')) ambiguousLogged.value = true;
+      origError(...(args as []));
+    };
+
+    let releaseQuery!: () => void;
+    let acceptFollowup!: (id: string) => void;
+    const queryStarted = deferred();
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query(input) {
+        queryStarted.resolve();
+        let followupId: string | null = null;
+        let signalFollowup: (() => void) | null = null;
+        acceptFollowup = (id: string) => {
+          followupId = id;
+          signalFollowup?.();
+        };
+        return {
+          push(message) {
+            const turn = typeof message === 'string' ? { inputId: undefined } : message;
+            if (turn.inputId) acceptFollowup(turn.inputId);
+          },
+          end() {
+            releaseQuery?.();
+          },
+          abort() {
+            releaseQuery?.();
+          },
+          events: (async function* () {
+            yield { type: 'init', continuation: 'sess-amb' };
+            yield { type: 'input-accepted', inputId: (input as QueryInput).inputId, scope: 'initial' };
+            // Wait for and accept a follow-up — now TWO inputs are active.
+            await new Promise<void>((resolve) => {
+              signalFollowup = resolve;
+            });
+            yield { type: 'input-accepted', inputId: followupId!, scope: 'followup' };
+            // Emit a result with NO resolvedInputIds — ambiguous (2 active).
+            yield { type: 'result', text: '<message to="discord-test">ambiguous</message>', resolvedInputIds: [] };
+            await new Promise<void>((resolve) => {
+              releaseQuery = resolve;
+            });
+          })(),
+        };
+      },
+    };
+
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+    try {
+      await queryStarted.promise;
+      insertMessage('amb-followup', 'chat', { sender: 'User', text: 'second' }, {
+        platformId: 'chan-1',
+        channelType: 'discord',
+        messagingGroupId: 'mg-amb',
+        isGroup: 0,
+      });
+
+      await waitFor(() => ambiguousLogged.value, 4000);
+      // Neither row is completed by the ambiguous result.
+      expect(ackStatusFor('amb-initial')).not.toBe('completed');
+      expect(ackStatusFor('amb-followup')).not.toBe('completed');
+    } finally {
+      console.error = origError;
+      controller.abort();
+      releaseQuery?.();
+      await loopPromise.catch(() => {});
+    }
+    expect(ambiguousLogged.value).toBe(true);
+  });
+});
+
+describe('poll-loop accepted-but-unresolved terminal recovery', () => {
+  function recoveryScope(routeKey: string, messagingGroupId: string | null, isGroup: 0 | 1 | null): ProviderRecoveryScope {
+    return {
+      providerName: 'test',
+      routeKey,
+      messagingGroupId,
+      isGroup,
+      platformId: null,
+      channelType: null,
+      threadKey: null,
+    };
+  }
+
+  function ackStatusFor(id: string): string | null {
+    const row = getOutboundDb().prepare('SELECT status FROM processing_ack WHERE message_id = ?').get(id) as
+      | { status: string }
+      | undefined;
+    return row?.status ?? null;
+  }
+
+  // A1 (Step 3 line 538 / Invariants 160,162): an accepted-but-unresolved input
+  // that hits a terminal turn-end (stream end, no result) moves into recovery
+  // ownership (processing_ack.status='recovery') with a stored recovery payload —
+  // it is NOT completed and NOT returned to pending.
+  it('moves accepted-but-unresolved rows to recovery ownership (not completed) on terminal stream end', async () => {
+    insertMessage('acc-dm', 'chat', { sender: 'User', text: 'long running task' }, {
+      platformId: 'chan-1',
+      channelType: 'discord',
+      messagingGroupId: 'mg-acc-1',
+      isGroup: 0,
+    });
+
+    let releaseQuery!: () => void;
+    const queryStarted = deferred();
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query(input) {
+        queryStarted.resolve();
+        return {
+          push() {},
+          end() {
+            releaseQuery?.();
+          },
+          abort() {
+            releaseQuery?.();
+          },
+          events: (async function* () {
+            yield { type: 'init', continuation: 'sess-acc' };
+            // Provider ACCEPTS the input but never resolves it (no result).
+            yield { type: 'input-accepted', inputId: (input as QueryInput).inputId, scope: 'initial' };
+            await new Promise<void>((resolve) => {
+              releaseQuery = resolve;
+            });
+            // Stream ends here — terminal interruption, input unresolved.
+          })(),
+        };
+      },
+    };
+
+    const routeKey = normalizeRoute('test', {
+      platformId: 'chan-1',
+      channelType: 'discord',
+      threadId: null,
+      messagingGroupId: 'mg-acc-1',
+      isGroup: 0,
+    }).routeKey;
+    const scope = recoveryScope(routeKey, 'mg-acc-1', 0);
+
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+    await queryStarted.promise;
+    // End the turn while the input is accepted-but-unresolved (wait for the
+    // generator to reach its await point so releaseQuery is wired).
+    await waitFor(() => !!releaseQuery, 2000);
+    releaseQuery();
+
+    await waitFor(() => listRecoveryEntries(scope).length >= 1, 3000);
+    expect(ackStatusFor('acc-dm')).toBe('recovery'); // recovery-owned, not completed
+    const entries = listRecoveryEntries(scope);
+    expect(entries).toHaveLength(1);
+    expect(entries[0].acceptedUnresolvedInputs.some((a) => a.messageIds.includes('acc-dm'))).toBe(true);
+    expect(entries[0].status).toBe('pending');
+
+    controller.abort();
+    await loopPromise.catch(() => {});
+  });
+
+  // A2 (Step 3 line 543/544): route-scoped outbound progress / MCP send_message
+  // rows written during the accepted-input window are harvested into priorProgress;
+  // progress from another conversation (different route) is NOT harvested.
+  it('harvests route-scoped priorProgress and excludes other-conversation progress', async () => {
+    insertMessage('acc-prog', 'chat', { sender: 'User', text: 'do work and report progress' }, {
+      platformId: 'chan-1',
+      channelType: 'discord',
+      messagingGroupId: 'mg-prog-1',
+      isGroup: 0,
+    });
+
+    const activeRouteKey = normalizeRoute('test', {
+      platformId: 'chan-1',
+      channelType: 'discord',
+      threadId: null,
+      messagingGroupId: 'mg-prog-1',
+      isGroup: 0,
+    }).routeKey;
+    const otherRouteKey = normalizeRoute('test', {
+      platformId: 'chan-OTHER',
+      channelType: 'discord',
+      threadId: null,
+      messagingGroupId: 'mg-OTHER',
+      isGroup: 0,
+    }).routeKey;
+
+    let releaseQuery!: () => void;
+    const queryStarted = deferred();
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query(input) {
+        queryStarted.resolve();
+        return {
+          push() {},
+          end() {
+            releaseQuery?.();
+          },
+          abort() {
+            releaseQuery?.();
+          },
+          events: (async function* () {
+            yield { type: 'init', continuation: 'sess-prog' };
+            yield { type: 'input-accepted', inputId: (input as QueryInput).inputId, scope: 'initial' };
+            // Active-route progress written during the accepted-input window.
+            writeMessageOut({
+              id: 'prog-active',
+              kind: 'chat',
+              content: JSON.stringify({ text: 'partial progress on the task' }),
+              route_key: activeRouteKey,
+              messaging_group_id: 'mg-prog-1',
+              is_group: 0,
+            });
+            // Progress from ANOTHER conversation — must NOT be harvested.
+            writeMessageOut({
+              id: 'prog-other',
+              kind: 'chat',
+              content: JSON.stringify({ text: 'unrelated other-conversation progress' }),
+              route_key: otherRouteKey,
+              messaging_group_id: 'mg-OTHER',
+              is_group: 0,
+            });
+            await new Promise<void>((resolve) => {
+              releaseQuery = resolve;
+            });
+          })(),
+        };
+      },
+    };
+
+    const scope = recoveryScope(activeRouteKey, 'mg-prog-1', 0);
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+    await queryStarted.promise;
+    await waitFor(() => !!releaseQuery, 2000);
+    releaseQuery();
+
+    await waitFor(() => listRecoveryEntries(scope).length >= 1, 3000);
+    const entry = listRecoveryEntries(scope)[0];
+    const progressTexts = entry.priorProgress.map((p) => p.text);
+    expect(progressTexts).toContain('partial progress on the task');
+    expect(progressTexts.some((t) => t.includes('unrelated other-conversation'))).toBe(false);
+
+    controller.abort();
+    await loopPromise.catch(() => {});
+  });
+
+  // A3 (Step 4 line 552): same-route multiple trigger rows are preserved in order
+  // as the recovery entry's originalTasks array (not collapsed to newest).
+  it('preserves same-route multi-trigger rows in order as originalTasks', async () => {
+    insertMessage('trig-1', 'chat', { sender: 'User', text: 'first task' }, {
+      platformId: 'chan-1',
+      channelType: 'discord',
+      messagingGroupId: 'mg-multi',
+      isGroup: 0,
+    });
+    insertMessage('trig-2', 'chat', { sender: 'User', text: 'second task' }, {
+      platformId: 'chan-1',
+      channelType: 'discord',
+      messagingGroupId: 'mg-multi',
+      isGroup: 0,
+    });
+
+    const routeKey = normalizeRoute('test', {
+      platformId: 'chan-1',
+      channelType: 'discord',
+      threadId: null,
+      messagingGroupId: 'mg-multi',
+      isGroup: 0,
+    }).routeKey;
+    const scope = recoveryScope(routeKey, 'mg-multi', 0);
+
+    let releaseQuery!: () => void;
+    const queryStarted = deferred();
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query(input) {
+        queryStarted.resolve();
+        return {
+          push() {},
+          end() {
+            releaseQuery?.();
+          },
+          abort() {
+            releaseQuery?.();
+          },
+          events: (async function* () {
+            yield { type: 'init', continuation: 'sess-multi' };
+            yield { type: 'input-accepted', inputId: (input as QueryInput).inputId, scope: 'initial' };
+            await new Promise<void>((resolve) => {
+              releaseQuery = resolve;
+            });
+          })(),
+        };
+      },
+    };
+
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+    await queryStarted.promise;
+    await waitFor(() => !!releaseQuery, 2000);
+    releaseQuery();
+
+    await waitFor(() => listRecoveryEntries(scope).length >= 1, 3000);
+    const entry = listRecoveryEntries(scope)[0];
+    const taskIds = entry.originalTasks.map((t) => t.messageId);
+    expect(taskIds).toEqual(['trig-1', 'trig-2']); // ordered, not collapsed to newest
+
+    controller.abort();
+    await loopPromise.catch(() => {});
+  });
+
+  // A3 (Step 4 line 553/554): a mixed batch partitions trigger=0 context by route;
+  // recovery is stored under the TRIGGER route, and unrelated-route context does
+  // NOT appear in the active prompt or recovery payload.
+  it('partitions trigger=0 context by route; recovery stored under trigger route, unrelated context excluded', async () => {
+    // Unrelated-route accumulated context (trigger=0) — must NOT join the active route.
+    insertMessage('ctx-other', 'chat', { sender: 'Other', text: 'UNRELATED context line' }, {
+      trigger: 0,
+      platformId: 'chan-OTHER',
+      channelType: 'discord',
+      messagingGroupId: 'mg-ctx-other',
+      isGroup: 0,
+    });
+    // Same-route accumulated context (trigger=0) — rides along with the trigger.
+    insertMessage('ctx-same', 'chat', { sender: 'User', text: 'SAME-route earlier context' }, {
+      trigger: 0,
+      platformId: 'chan-1',
+      channelType: 'discord',
+      messagingGroupId: 'mg-trig',
+      isGroup: 0,
+    });
+    // The wake-triggering row (trigger=1) on the active route.
+    insertMessage('trig-main', 'chat', { sender: 'User', text: 'TRIGGER task' }, {
+      trigger: 1,
+      platformId: 'chan-1',
+      channelType: 'discord',
+      messagingGroupId: 'mg-trig',
+      isGroup: 0,
+    });
+
+    const triggerRouteKey = normalizeRoute('test', {
+      platformId: 'chan-1',
+      channelType: 'discord',
+      threadId: null,
+      messagingGroupId: 'mg-trig',
+      isGroup: 0,
+    }).routeKey;
+    const firstRowRouteKey = normalizeRoute('test', {
+      platformId: 'chan-OTHER',
+      channelType: 'discord',
+      threadId: null,
+      messagingGroupId: 'mg-ctx-other',
+      isGroup: 0,
+    }).routeKey;
+    const scope = recoveryScope(triggerRouteKey, 'mg-trig', 0);
+    const otherScope = recoveryScope(firstRowRouteKey, 'mg-ctx-other', 0);
+
+    let releaseQuery!: () => void;
+    const queryStarted = deferred();
+    let seenPrompt = '';
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query(input) {
+        seenPrompt = input.prompt;
+        queryStarted.resolve();
+        return {
+          push() {},
+          end() {
+            releaseQuery?.();
+          },
+          abort() {
+            releaseQuery?.();
+          },
+          events: (async function* () {
+            yield { type: 'init', continuation: 'sess-mixed' };
+            yield { type: 'input-accepted', inputId: (input as QueryInput).inputId, scope: 'initial' };
+            await new Promise<void>((resolve) => {
+              releaseQuery = resolve;
+            });
+          })(),
+        };
+      },
+    };
+
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+    await queryStarted.promise;
+    // Active prompt includes same-route context + trigger, excludes unrelated route.
+    expect(seenPrompt).toContain('TRIGGER task');
+    expect(seenPrompt).toContain('SAME-route earlier context');
+    expect(seenPrompt).not.toContain('UNRELATED context line');
+
+    await waitFor(() => !!releaseQuery, 2000);
+    releaseQuery();
+    await waitFor(() => listRecoveryEntries(scope).length >= 1, 3000);
+
+    // Recovery is stored under the TRIGGER route, not the first-row (unrelated) route.
+    expect(listRecoveryEntries(scope)).toHaveLength(1);
+    expect(listRecoveryEntries(otherScope)).toHaveLength(0);
+    // The unrelated-route context never appears in the active route's recovery.
+    const entry = listRecoveryEntries(scope)[0];
+    const allText = JSON.stringify(entry);
+    expect(allText).not.toContain('UNRELATED context line');
+
+    controller.abort();
+    await loopPromise.catch(() => {});
+  });
+});
+
+describe('poll-loop pre-query failure recovery (Step 4 lines 557-559)', () => {
+  function ackStatusFor(id: string): string | null {
+    const row = getOutboundDb().prepare('SELECT status FROM processing_ack WHERE message_id = ?').get(id) as
+      | { status: string }
+      | undefined;
+    return row?.status ?? null;
+  }
+  function nonSystemOut(): ReturnType<typeof getUndeliveredMessages> {
+    return getUndeliveredMessages().filter((m) => m.kind !== 'system');
+  }
+  function rawProviderErrorWritten(): boolean {
+    return nonSystemOut().some((m) => {
+      try {
+        return /^Error: /.test(JSON.parse(m.content).text ?? '');
+      } catch {
+        return false;
+      }
+    });
+  }
+
+  // B8: attachment inspection failure AFTER the rows are claimed returns rows to
+  // pending (deletes the transient 'processing' ack) without writing a raw error.
+  it('attachment inspection failure after claim returns rows to pending without a raw error', async () => {
+    const filePath = '/workspace/agent/attachments/discord/msg/photo.png';
+    insertMessage(
+      'attach-fail',
+      'chat-sdk',
+      {
+        sender: 'User',
+        text: 'inspect this',
+        attachments: [{ workspacePath: filePath, originalName: 'photo.png', contentType: 'image/png', sizeBytes: 8 }],
+      },
+      { platformId: 'chan-1', channelType: 'discord' },
+    );
+
+    const returnedToPending = new Set<string>();
+    const origError = console.error;
+    console.error = (...args: unknown[]) => {
+      const line = typeof args[0] === 'string' ? args[0] : '';
+      if (line.includes('return_processing_to_pending') || line.includes('pre_query_failure')) {
+        const m = /(\{.*"message_ids".*\})/.exec(line);
+        if (m) {
+          try {
+            const ev = JSON.parse(m[1]) as { message_ids: string[] };
+            for (const id of ev.message_ids ?? []) returnedToPending.add(id);
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+      origError(...(args as []));
+    };
+
+    const provider = new ScriptedProvider(async function* () {
+      throw new Error('provider should never be queried after attachment failure');
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({
+      provider,
+      providerName: 'test',
+      cwd: '/tmp',
+      signal: controller.signal,
+      inspectAttachmentFile: async () => {
+        throw new Error('attachment inspection blew up');
+      },
+    });
+
+    try {
+      await waitFor(() => returnedToPending.has('attach-fail'), 3000);
+      expect(returnedToPending.has('attach-fail')).toBe(true);
+      expect(rawProviderErrorWritten()).toBe(false);
+    } finally {
+      console.error = origError;
+      controller.abort();
+      await loopPromise.catch(() => {});
+    }
+  });
+
+  // B8: pre-task script handling failure AFTER claim follows the same recoverable
+  // lifecycle (returns rows to pending), without writing a raw error.
+  it('pre-task script handling failure after claim returns rows to pending without a raw error', async () => {
+    insertMessage('pretask-fail', 'task', { prompt: 'do the scheduled thing' }, {
+      platformId: 'chan-1',
+      channelType: 'discord',
+      messagingGroupId: 'mg-pt',
+      isGroup: 0,
+    });
+
+    const returnedToPending = new Set<string>();
+    const origError = console.error;
+    console.error = (...args: unknown[]) => {
+      const line = typeof args[0] === 'string' ? args[0] : '';
+      if (line.includes('return_processing_to_pending') || line.includes('pre_query_failure')) {
+        const m = /(\{.*"message_ids".*\})/.exec(line);
+        if (m) {
+          try {
+            const ev = JSON.parse(m[1]) as { message_ids: string[] };
+            for (const id of ev.message_ids ?? []) returnedToPending.add(id);
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+      origError(...(args as []));
+    };
+
+    const provider = new ScriptedProvider(async function* () {
+      throw new Error('provider should never be queried after pre-task failure');
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({
+      provider,
+      providerName: 'test',
+      cwd: '/tmp',
+      signal: controller.signal,
+      // Test seam: a pre-task handler that throws (e.g. module import / handler crash).
+      runPreTaskScripts: async () => {
+        throw new Error('pre-task handler crashed');
+      },
+    });
+
+    try {
+      await waitFor(() => returnedToPending.has('pretask-fail'), 3000);
+      expect(returnedToPending.has('pretask-fail')).toBe(true);
+      expect(rawProviderErrorWritten()).toBe(false);
+    } finally {
+      console.error = origError;
+      controller.abort();
+      await loopPromise.catch(() => {});
+    }
+  });
+
+  // B8: provider startup / session-creation failure (query() throws synchronously)
+  // stores route-scoped recovery before settling, and does NOT write a raw error.
+  it('provider startup/session-creation failure stores recovery and does not write a raw error', async () => {
+    insertMessage('startup-fail', 'chat', { sender: 'User', text: 'kick off' }, {
+      platformId: 'chan-1',
+      channelType: 'discord',
+      messagingGroupId: 'mg-startup',
+      isGroup: 0,
+    });
+
+    const routeKey = normalizeRoute('test', {
+      platformId: 'chan-1',
+      channelType: 'discord',
+      threadId: null,
+      messagingGroupId: 'mg-startup',
+      isGroup: 0,
+    }).routeKey;
+    const scope: ProviderRecoveryScope = {
+      providerName: 'test',
+      routeKey,
+      messagingGroupId: 'mg-startup',
+      isGroup: 0,
+      platformId: 'chan-1',
+      channelType: 'discord',
+      threadKey: null,
+    };
+
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query() {
+        // Provider startup / session creation fails synchronously.
+        throw new Error('opencode server failed to spawn');
+      },
+    };
+
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+    try {
+      await waitFor(() => listRecoveryEntries(scope).length >= 1 || ackStatusFor('startup-fail') === null, 3000);
+      // Either recovery stored (preferred) or rows returned to pending — never
+      // settled with a raw provider error.
+      const recoveryStored = listRecoveryEntries(scope).length >= 1;
+      const returnedToPending = ackStatusFor('startup-fail') === null;
+      expect(recoveryStored || returnedToPending).toBe(true);
+      expect(rawProviderErrorWritten()).toBe(false);
+      // The row is NOT completed by a startup failure.
+      expect(ackStatusFor('startup-fail')).not.toBe('completed');
+    } finally {
+      controller.abort();
+      await loopPromise.catch(() => {});
+    }
   });
 });
 

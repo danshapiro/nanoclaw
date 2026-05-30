@@ -204,6 +204,73 @@ export function appendRecoveryEntry(
   return {};
 }
 
+/**
+ * Atomically move row ids into `processing_ack.status='recovery'` AND append the
+ * route-scoped recovery payload in ONE outbound-DB transaction (Hard Invariant
+ * 164). Both writes live in the outbound DB (recovery payload in `session_state`,
+ * ownership in `processing_ack`), so a single `db.transaction` makes them
+ * all-or-nothing: a crash mid-transaction strands NO accepted row in `recovery`
+ * with no payload, and loses no payload with no ownership.
+ *
+ * Pressure is checked first (fail-closed): if appending would exceed
+ * `maxUnresolved`, nothing is written and `{ pressureExceeded: true }` is
+ * returned so the caller can fall back without discarding unresolved work.
+ *
+ * `opts.__injectMidTransactionThrow` is a test-only seam to prove rollback.
+ */
+export function appendRecoveryEntryAndOwnRows(
+  scope: ProviderRecoveryScope,
+  entry: ProviderRecoveryEntry,
+  messageIds: string[],
+  opts: { maxUnresolved?: number; recoveryId?: string; __injectMidTransactionThrow?: () => void } = {},
+): AppendRecoveryResult {
+  const existing = listRecoveryEntries(scope);
+  if (opts.maxUnresolved !== undefined) {
+    const unresolvedCount = existing.filter(isUnresolved).length;
+    if (unresolvedCount >= opts.maxUnresolved) {
+      console.error(
+        JSON.stringify({
+          severity: 'error',
+          event: 'recovery_pressure_exceeded',
+          provider: scope.providerName,
+          route_key: scope.routeKey,
+          unresolved: unresolvedCount,
+          max_unresolved: opts.maxUnresolved,
+        }),
+      );
+      return { pressureExceeded: true };
+    }
+  }
+
+  const db = getOutboundDb();
+  const key = recoveryKey(scope);
+  const now = new Date().toISOString();
+  const nextPayload = JSON.stringify([...existing, entry]);
+  const setStateStmt = db.prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES ($key, $value, $updated_at)');
+  const ownStmt = db.prepare(
+    "INSERT OR REPLACE INTO processing_ack (message_id, status, status_changed) VALUES ($id, 'recovery', datetime('now'))",
+  );
+  db.transaction(() => {
+    setStateStmt.run({ $key: key, $value: nextPayload, $updated_at: now });
+    // Test seam: throw AFTER the payload write but before the ownership move
+    // commits, to prove the whole transaction rolls back (no partial state).
+    opts.__injectMidTransactionThrow?.();
+    for (const id of messageIds) ownStmt.run({ $id: id });
+  })();
+
+  console.error(
+    JSON.stringify({
+      severity: 'info',
+      event: 'recovery_owned_atomic',
+      provider: scope.providerName,
+      route_key: scope.routeKey,
+      recovery_id: opts.recoveryId ?? entry.id,
+      message_ids: messageIds,
+    }),
+  );
+  return {};
+}
+
 /** Mark an entry in_flight for the given input id. Retained while in_flight. */
 export function markRecoveryInFlight(scope: ProviderRecoveryScope, recoveryId: string, inputId: string): void {
   const entries = listRecoveryEntries(scope);

@@ -8,9 +8,17 @@ import {
   returnProcessingToPending,
   type MessageInRow,
 } from './db/messages-in.js';
-import { writeMessageOut } from './db/messages-out.js';
+import { writeMessageOut, harvestRouteScopedProgress } from './db/messages-out.js';
 import { touchHeartbeat, clearStaleProcessingAcks, getOutboundDb } from './db/connection.js';
-import { clearContinuation, migrateLegacyContinuation, setContinuation } from './db/session-state.js';
+import {
+  appendRecoveryEntry,
+  appendRecoveryEntryAndOwnRows,
+  clearContinuation,
+  migrateLegacyContinuation,
+  setContinuation,
+  type ProviderRecoveryEntry,
+  type ProviderRecoveryScope,
+} from './db/session-state.js';
 import { collectQueryAttachments, type InspectedFile } from './attachments.js';
 import {
   formatMessages,
@@ -25,7 +33,17 @@ import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
 const HOST_OWNED_COMMANDS = new Set(['/new', '/clear']);
-const ACTIVE_INPUT_PATH = '/workspace/.active-input.json';
+const DEFAULT_ACTIVE_INPUT_PATH = '/workspace/.active-input.json';
+
+/**
+ * Path to the per-input correlation file. Production uses the static
+ * `/workspace/.active-input.json` (what the GWS shim and summarize-dnd read);
+ * `NANOCLAW_ACTIVE_INPUT_PATH` overrides it only for tests pointing at a temp
+ * dir. The default is unchanged when the env var is unset.
+ */
+function activeInputPath(): string {
+  return process.env.NANOCLAW_ACTIVE_INPUT_PATH || DEFAULT_ACTIVE_INPUT_PATH;
+}
 
 function log(msg: string): void {
   console.error(`[poll-loop] ${msg}`);
@@ -57,6 +75,44 @@ function routeKeyForMessage(providerName: string, m: MessageInRow): string {
 }
 
 /**
+ * Full route-scoped recovery scope for a message row, derived from the SAME
+ * host-stamped normalizer used for route splitting. Recovery is keyed by
+ * provider + normalized route (Invariants 166/167), so an interrupted turn's
+ * recovery is stored under the TRIGGER route, never the first-row route.
+ */
+function routeScopeForMessage(providerName: string, m: MessageInRow): ProviderRecoveryScope {
+  const n = normalizeRoute(providerName, {
+    platformId: m.platform_id,
+    channelType: m.channel_type,
+    threadId: m.thread_id,
+    messagingGroupId: m.messaging_group_id ?? null,
+    isGroup: (m.is_group as 0 | 1 | null) ?? null,
+  });
+  return {
+    providerName,
+    routeKey: n.routeKey,
+    messagingGroupId: n.messagingGroupId,
+    isGroup: n.isGroup,
+    platformId: n.platformId,
+    channelType: n.channelType,
+    threadKey: n.threadKey,
+  };
+}
+
+function recoveryIdFor(routeKey: string): string {
+  return `rec-${routeKey}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+}
+
+function textOfMessage(m: MessageInRow): string {
+  try {
+    const parsed = JSON.parse(m.content) as { text?: string; prompt?: string };
+    return parsed.text ?? parsed.prompt ?? m.content;
+  } catch {
+    return m.content;
+  }
+}
+
+/**
  * Atomically write the currently-accepted input correlation to
  * /workspace/.active-input.json (temp+rename) so the GWS shim and summarize-dnd
  * stamp the CURRENT input's correlation at tool-invocation time. Per-input
@@ -65,9 +121,10 @@ function routeKeyForMessage(providerName: string, m: MessageInRow): string {
  */
 function writeActiveInput(inputId: string, routeKey: string): void {
   try {
-    const tmp = `${ACTIVE_INPUT_PATH}.tmp`;
+    const dest = activeInputPath();
+    const tmp = `${dest}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify({ inputId, routeKey, updatedAt: new Date().toISOString() }));
-    fs.renameSync(tmp, ACTIVE_INPUT_PATH);
+    fs.renameSync(tmp, dest);
   } catch {
     // /workspace may not exist (in-memory test DBs) — non-fatal.
   }
@@ -86,6 +143,13 @@ export interface PollLoopConfig {
     instructions?: string;
   };
   inspectAttachmentFile?: (filePath: string) => Promise<InspectedFile | null>;
+  /**
+   * Pre-task script runner override (testability seam). Production defaults to the
+   * dynamically-imported scheduling `applyPreTaskScripts`; a throw here is treated
+   * as a recoverable pre-query failure (rows returned to pending), never a raw
+   * provider error.
+   */
+  runPreTaskScripts?: (messages: MessageInRow[]) => Promise<{ keep: MessageInRow[]; skipped: string[] }>;
   signal?: AbortSignal;
 }
 
@@ -168,6 +232,14 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const activeMessages = activeRouteMessages;
 
     const ids = activeMessages.map((m) => m.id);
+    // Route scope for this wake — recovery is keyed by provider + the TRIGGER
+    // route, never the first-row route. The wake-triggering rows on the active
+    // route, in chronological order, become the recovery entry's originalTasks
+    // (Invariant 166: not collapsed to a single newest task).
+    const activeRouteScope = routeScopeForMessage(config.providerName, triggerRows[triggerRows.length - 1]);
+    const originalTasks: ProviderRecoveryEntry['originalTasks'] = activeMessages
+      .filter((m) => m.trigger === 1)
+      .map((m) => ({ messageId: m.id, text: textOfMessage(m), timestamp: m.timestamp }));
     // Generate a top-level inputId for this wake's prompt. Acceptance is tracked
     // when the provider emits input-accepted for this id.
     const topLevelInputId = generateInputId('initial');
@@ -175,37 +247,41 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     const routing = extractRouting(activeMessages);
 
-    // Pre-task scripts: for any task rows with a `script`, run it before the
-    // provider call. Scripts returning wakeAgent=false (or erroring) gate
-    // their own task row only — surviving messages still go to the agent.
-    // Without the scheduling module, the marker block is empty, `keep`
-    // falls back to `messages`, and no gating happens.
+    // Pre-query failures after rows are claimed are recoverable (Invariant 170):
+    // a throw in pre-task script HANDLING, formatting, attachment inspection,
+    // provider startup, session creation, or prompt acceptance must return the
+    // claimed UNACCEPTED rows to pending (delete their transient 'processing'
+    // acks) — or store route-scoped recovery — rather than writing a raw provider
+    // error or stranding rows. None of these points has an accepted input yet, so
+    // returning to pending is the correct disposition (the next wake retries).
     let keep: MessageInRow[] = activeMessages;
     let skipped: string[] = [];
-    // MODULE-HOOK:scheduling-pre-task:start
-    const { applyPreTaskScripts } = await import('./scheduling/task-script.js');
-    const preTask = await applyPreTaskScripts(activeMessages);
-    keep = preTask.keep;
-    skipped = preTask.skipped;
-    if (skipped.length > 0) {
-      markCompleted(skipped);
-      log(`Pre-task script skipped ${skipped.length} task(s): ${skipped.join(', ')}`);
-    }
-    // MODULE-HOOK:scheduling-pre-task:end
-
-    if (keep.length === 0) {
-      log(`All ${activeMessages.length} message(s) gated by script, skipping query`);
-      continue;
-    }
-
-    // Pre-query failures after rows are claimed are recoverable: a throw in
-    // attachment inspection / formatting / pre-task handling must return the
-    // claimed rows to pending (delete their transient 'processing' acks) rather
-    // than writing a raw provider error. Wrap the pre-query setup so a failure
-    // here is treated under the same recoverable lifecycle.
     let prompt: string;
     let attachments: Awaited<ReturnType<typeof collectQueryAttachments>>;
+    let query: AgentQuery;
     try {
+      // Pre-task scripts: for any task rows with a `script`, run it before the
+      // provider call. Scripts returning wakeAgent=false (or erroring) gate
+      // their own task row only — surviving messages still go to the agent.
+      // A THROW in the pre-task handler itself (module import / handler crash) is
+      // a recoverable pre-query failure handled by the catch below.
+      // MODULE-HOOK:scheduling-pre-task:start
+      const runPreTask =
+        config.runPreTaskScripts ?? (await import('./scheduling/task-script.js')).applyPreTaskScripts;
+      const preTask = await runPreTask(activeMessages);
+      keep = preTask.keep;
+      skipped = preTask.skipped;
+      if (skipped.length > 0) {
+        markCompleted(skipped);
+        log(`Pre-task script skipped ${skipped.length} task(s): ${skipped.join(', ')}`);
+      }
+      // MODULE-HOOK:scheduling-pre-task:end
+
+      if (keep.length === 0) {
+        log(`All ${activeMessages.length} message(s) gated by script, skipping query`);
+        continue;
+      }
+
       // Format messages: passthrough commands get raw text (only if the
       // provider natively handles slash commands), others get XML.
       prompt = formatMessagesWithCommands(keep, config.provider.supportsNativeSlashCommands);
@@ -218,6 +294,18 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         inspectFile: config.inspectAttachmentFile,
         log: logAttachmentEvent,
       });
+
+      // Provider startup / session creation. A synchronous throw here (the
+      // OpenCode server failing to spawn, session creation rejecting) is a
+      // pre-acceptance failure: no input has been accepted, so it is recoverable.
+      query = config.provider.query({
+        inputId: topLevelInputId,
+        prompt,
+        attachments,
+        continuation,
+        cwd: config.cwd,
+        systemContext: config.systemContext,
+      });
     } catch (preErr) {
       const preMsg = preErr instanceof Error ? preErr.message : String(preErr);
       log(
@@ -229,20 +317,32 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           error: preMsg,
         }),
       );
-      // Return claimed rows to pending; the next wake retries them.
+      // Store a route-scoped recovery entry so the next Yente turn has the
+      // original-task context, then return the claimed rows to pending. The rows
+      // are unaccepted (no provider input-accepted), so returning them to pending
+      // is the correct lifecycle; recovery preserves the original-task context.
+      const now = new Date().toISOString();
+      appendRecoveryEntry(activeRouteScope, {
+        id: recoveryIdFor(activeRouteScope.routeKey),
+        status: 'pending',
+        classification: 'pre_query_failure',
+        agentMessage: 'A setup step failed before I started working; I will retry.',
+        fallbackUserMessage:
+          'I hit a problem before starting your request and will retry it automatically.',
+        originalTasks,
+        acceptedUnresolvedInputs: [],
+        pendingFollowups: [],
+        priorProgress: [],
+        observations: [`pre_query_failure: ${preMsg}`],
+        sideEffects: [],
+        continuationPolicy: 'preserve',
+        createdAt: now,
+        updatedAt: now,
+      });
       returnProcessingToPending(ids, 'pre_query_failure');
       await sleep(POLL_INTERVAL_MS, config.signal);
       continue;
     }
-
-    const query = config.provider.query({
-      inputId: topLevelInputId,
-      prompt,
-      attachments,
-      continuation,
-      cwd: config.cwd,
-      systemContext: config.systemContext,
-    });
 
     // Process the query while concurrently polling for new messages
     const skippedSet = new Set(skipped);
@@ -258,7 +358,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         processingIds,
         config.providerName,
         replyAccounting,
-        { topLevelInputId, activeRouteKey },
+        { topLevelInputId, activeRouteKey, activeRouteScope, originalTasks },
         config.inspectAttachmentFile,
         config.signal,
       );
@@ -350,6 +450,8 @@ interface InputLedgerEntry {
   /** queued → accepted → resolved, or returned (unaccepted, sent back to pending). */
   state: 'queued' | 'accepted' | 'resolved' | 'returned' | 'recovery_owned';
   scope: 'initial' | 'followup';
+  /** Prompt text for this input, used to seed recovery acceptedUnresolvedInputs. */
+  prompt: string;
 }
 
 async function processQuery(
@@ -358,7 +460,12 @@ async function processQuery(
   initialBatchIds: string[],
   providerName: string,
   replyAccounting: ReplyAccounting,
-  ledgerCtx: { topLevelInputId: string; activeRouteKey: string },
+  ledgerCtx: {
+    topLevelInputId: string;
+    activeRouteKey: string;
+    activeRouteScope: ProviderRecoveryScope;
+    originalTasks: ProviderRecoveryEntry['originalTasks'];
+  },
   inspectAttachmentFile?: (filePath: string) => Promise<InspectedFile | null>,
   signal?: AbortSignal,
 ): Promise<QueryResult> {
@@ -376,6 +483,7 @@ async function processQuery(
     messageIds: [...initialBatchIds],
     state: 'queued',
     scope: 'initial',
+    prompt: ledgerCtx.originalTasks.map((t) => t.text).join('\n') || '(initial turn)',
   });
 
   if (signal?.aborted) {
@@ -492,7 +600,13 @@ async function processQuery(
     // Registered only on a SUCCESSFUL push. The row is completed only when the
     // provider resolves followupInputId via a result; if never accepted by the
     // turn's end it is returned to pending.
-    ledger.set(followupInputId, { inputId: followupInputId, messageIds: newIds, state: 'queued', scope: 'followup' });
+    ledger.set(followupInputId, {
+      inputId: followupInputId,
+      messageIds: newIds,
+      state: 'queued',
+      scope: 'followup',
+      prompt: newMessages.map(textOfMessage).join('\n'),
+    });
   }
 
   let resolvedAtLeastOne = false;
@@ -532,11 +646,77 @@ async function processQuery(
     clearInterval(pollHandle);
     signal?.removeEventListener('abort', abortQuery);
 
-    // Terminal handling for un-resolved ledger entries. Accepted-but-unresolved
-    // rows would be moved to recovery ownership (handled fully once the
-    // recovery payload is built — see Task 2/3 wiring); for Task 1 the
-    // load-bearing invariant proven here is that UNACCEPTED claimed rows are
-    // returned to pending rather than stranded in 'processing'.
+    // Terminal handling for un-resolved ledger entries. Two dispositions
+    // (Invariants 160/161/162):
+    //  - UNACCEPTED claimed rows (queued) → returned to pending so a later wake
+    //    retries them (never stranded in 'processing').
+    //  - ACCEPTED-but-unresolved rows → moved into recovery OWNERSHIP with an
+    //    enriched recovery payload, in ONE atomic transaction; NOT completed and
+    //    NOT returned to pending (the SDK accepted them, so a bare retry would
+    //    drop work the provider may have partially done).
+    const acceptedUnresolved = [...ledger.values()].filter((e) => e.state === 'accepted');
+    if (acceptedUnresolved.length > 0) {
+      const scope = ledgerCtx.activeRouteScope;
+      const now = new Date().toISOString();
+      // Harvest route-scoped progress / MCP send_message rows written during the
+      // accepted-input window — ONLY for the active route, so a shared session's
+      // other conversation can never leak in (Invariants 167; A2).
+      const priorProgress = harvestRouteScopedProgress(scope.routeKey).map((p) => ({
+        messageOutId: p.messageOutId,
+        text: p.text,
+        source: p.source,
+        timestamp: p.timestamp,
+      }));
+      const recoveryId = recoveryIdFor(scope.routeKey);
+      const ownedIds: string[] = [];
+      const acceptedUnresolvedInputs = acceptedUnresolved.map((e) => {
+        ownedIds.push(...e.messageIds);
+        return { inputId: e.inputId, messageIds: [...e.messageIds], prompt: e.prompt };
+      });
+      const entry: ProviderRecoveryEntry = {
+        id: recoveryId,
+        status: 'pending',
+        classification: 'terminal_interruption_accepted_unresolved',
+        agentMessage: 'I was interrupted mid-turn and will resume this work.',
+        fallbackUserMessage:
+          'Something interrupted me while I was working on your request. I still have it queued — no need to resend.',
+        // Ordered same-route wake-triggering rows (A3, Invariant 166).
+        originalTasks: ledgerCtx.originalTasks,
+        acceptedUnresolvedInputs,
+        pendingFollowups: [],
+        priorProgress,
+        observations: [],
+        sideEffects: [],
+        continuationPolicy: 'preserve',
+        attemptedContinuation: queryContinuation,
+        createdAt: now,
+        updatedAt: now,
+      };
+      try {
+        const res = appendRecoveryEntryAndOwnRows(scope, entry, ownedIds, { recoveryId });
+        if (res.pressureExceeded) {
+          // Fail closed: don't complete or lose the rows. Write one user-visible
+          // fallback and leave the rows claimed (recovery pressure is structurally
+          // alerted; host sweep is the backstop).
+          writeMissingVisibleReplyError(routing);
+        } else {
+          for (const e of acceptedUnresolved) e.state = 'recovery_owned';
+        }
+      } catch (recErr) {
+        // Atomic transaction rolled back (no partial state). Surface a structured
+        // alert; the rows remain in 'processing' and stay retryable.
+        log(
+          JSON.stringify({
+            severity: 'error',
+            event: 'recovery_ownership_failed',
+            route_key: scope.routeKey,
+            recovery_id: recoveryId,
+            error: recErr instanceof Error ? recErr.message : String(recErr),
+          }),
+        );
+      }
+    }
+
     for (const entry of ledger.values()) {
       if (entry.state === 'queued') {
         // Never accepted by the provider before the turn ended → return to
