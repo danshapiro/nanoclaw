@@ -11,16 +11,26 @@ import {
   normalizeQueryTurnInput,
   type AgentProvider,
   type AgentQuery,
+  type ProviderCapabilities,
+  type ProviderContinuationPolicy,
   type ProviderEvent,
+  type ProviderInputScope,
   type ProviderOptions,
+  type ProviderSideEffect,
   type QueryAttachment,
   type QueryInput,
   type QueryTurnInput,
 } from './types.js';
 import { buildRelayOpenCodeToolConfig, mcpServersToOpenCodeConfig } from './mcp-to-opencode.js';
-import { OpenCodeEventPump, type OpenCodePumpClock } from './opencode-events.js';
-import { isMissingOpenCodeSessionError, isMissingSessionResultError, OpenCodeInterruptionError } from './opencode-errors.js';
-import { NATIVE_QUESTION_TOOL_ID } from './opencode-sdk-surface.js';
+import { OpenCodeEventPump, type OpenCodePumpClock, type OpenCodeLivenessSnapshot } from './opencode-events.js';
+import { isMissingOpenCodeSessionError, isMissingSessionResultError } from './opencode-errors.js';
+import {
+  detectNativeQuestionPart,
+  detectNativeQuestionPermission,
+  NATIVE_QUESTION_TOOL_ID,
+  relayDeniedNativeToolIds,
+} from './opencode-sdk-surface.js';
+import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
 import { sniffImageMime } from '../attachments.js';
 
 function log(msg: string): void {
@@ -239,69 +249,160 @@ export function buildOpenCodeConfig(
   };
 }
 
-type SharedRuntime = {
-  proc: ChildProcess;
-  client: OpencodeClient;
-  stream: AsyncGenerator<{ type: string; properties: Record<string, unknown> }, void, void>;
-  streamRelease: () => void;
-};
+type OpenCodeSseEvent = { type: string; properties: Record<string, unknown> };
 
-let sharedRuntime: SharedRuntime | null = null;
-let sharedConfigKey: string | null = null;
-let sharedInit: Promise<SharedRuntime> | null = null;
+/**
+ * Per-query runtime controller seam (Task 3 Step 4). Replaces the former module-
+ * global singleton (`sharedRuntime`/`sharedConfigKey`/`sharedInit`/
+ * `ensureSharedRuntime`/`destroySharedRuntime`). Each controller owns ONE
+ * process/client/event stream, and `destroy(reason)` targets exactly that
+ * runtime — so a timeout/abort during a concurrent relay window can no longer
+ * kill BOTH turns. The relay path constructs a SEPARATE controller (its own
+ * process/client/stream/MCP server) so it never lands on the original runtime.
+ */
+/**
+ * Minimal client surface a runtime controller needs: a session sub-client
+ * (create / promptAsync / get) and the permission-reply method. The production
+ * `OpencodeClient` satisfies this; tests provide a fake.
+ */
+export interface OpenCodeControllerClient {
+  session: SessionClient & {
+    get: (args: { path: { id: string } }) => Promise<{ data?: unknown; error?: unknown }>;
+  };
+  postSessionIdPermissionsPermissionId: (args: {
+    path: { id: string; permissionID: string };
+    body: { response: 'once' | 'always' | 'reject' };
+  }) => Promise<unknown>;
+}
 
-function runtimeConfigKey(options: ProviderOptions): string {
+export interface OpenCodeRuntimeController {
+  readonly proc?: ChildProcess;
+  readonly client: OpenCodeControllerClient;
+  /** Long-lived single-reader event stream for this runtime. */
+  readonly stream: AsyncGenerator<OpenCodeSseEvent, void, void> | { next(): Promise<IteratorResult<OpenCodeSseEvent, void>> };
+  /** Deny (reject) a permission for a native question or tool. */
+  denyPermission(sessionId: string, permissionId: string, reason: string): Promise<void>;
+  /** Positive existence check for the exact attempted session id. */
+  sessionExists(id: string): Promise<boolean>;
+  /** Tear down THIS runtime (and quiesce its stream) — never the relay's. */
+  destroy(reason: string): void;
+}
+
+/** Factory seam so tests can inject a deterministic controller. */
+export interface OpenCodeRuntimeFactory {
+  createRuntime(options: ProviderOptions, opts: BuildOpenCodeConfigOpts): Promise<OpenCodeRuntimeController>;
+}
+
+/** Separate relay-runtime factory (Task 3 Step 4). */
+export interface OpenCodeRelayRuntimeFactory {
+  createRelayRuntime(
+    options: ProviderOptions,
+    policy: { allowedTools: string[]; deniedNativeTools: string[]; routeKey: string; deadlineMs: number },
+  ): Promise<OpenCodeRuntimeController>;
+}
+
+export function runtimeConfigKey(options: ProviderOptions, opts: BuildOpenCodeConfigOpts = {}): string {
   return JSON.stringify({
     mcp: mcpServersToOpenCodeConfig(options.mcpServers),
     model: process.env.OPENCODE_MODEL,
     small: process.env.OPENCODE_SMALL_MODEL,
     op: process.env.OPENCODE_PROVIDER,
+    // Relay differs only in denied tools, so it MUST get a distinct config key
+    // or it would collide on the normal runtime and a destroy would kill both.
+    relay: opts.relayMode ? `relay:${opts.relayRouteKey ?? ''}` : 'normal',
   });
 }
 
-async function ensureSharedRuntime(options: ProviderOptions): Promise<SharedRuntime> {
-  const key = runtimeConfigKey(options);
-  if (sharedRuntime && sharedConfigKey === key) return sharedRuntime;
+/** Real production controller: owns one opencode server proc + client + stream. */
+class RealOpenCodeRuntimeController implements OpenCodeRuntimeController {
+  constructor(
+    readonly proc: ChildProcess,
+    readonly client: OpencodeClient,
+    readonly stream: AsyncGenerator<OpenCodeSseEvent, void, void>,
+  ) {}
 
-  if (sharedInit) return sharedInit;
+  async denyPermission(sessionId: string, permissionId: string, _reason: string): Promise<void> {
+    await this.client.postSessionIdPermissionsPermissionId({
+      path: { id: sessionId, permissionID: permissionId },
+      body: { response: 'reject' },
+    });
+  }
 
-  sharedInit = (async () => {
-    if (sharedRuntime) {
-      destroySharedRuntime();
-    }
-    const config = buildOpenCodeConfig(options);
-    const { url, proc } = await spawnOpencodeServer(config);
-    const client = createOpencodeClient({ baseUrl: url });
-    const sub = await client.event.subscribe();
-    const stream = sub.stream as AsyncGenerator<{ type: string; properties: Record<string, unknown> }, void, void>;
-    sharedRuntime = {
-      proc,
-      client,
-      stream,
-      streamRelease: () => {
-        void stream.return?.(undefined);
-      },
-    };
-    sharedConfigKey = key;
-    sharedInit = null;
-    return sharedRuntime;
-  })();
-
-  return sharedInit;
-}
-
-export function destroySharedRuntime(): void {
-  if (sharedRuntime) {
+  async sessionExists(id: string): Promise<boolean> {
     try {
-      sharedRuntime.streamRelease();
+      const res = await this.client.session.get({ path: { id } });
+      if (res.error) {
+        if (isMissingSessionResultError(res.error)) return false;
+        return true;
+      }
+      return Boolean(res.data);
+    } catch {
+      return true;
+    }
+  }
+
+  destroy(_reason: string): void {
+    // Quiesce the in-flight read BEFORE killing the proc so a retiring runtime's
+    // outstanding pump read cannot steal a new query's first event (cross-query
+    // protected-event-loss race). stream.return() ends the generator cleanly.
+    try {
+      void this.stream.return?.(undefined);
     } catch {
       /* ignore */
     }
-    killProcessTree(sharedRuntime.proc);
-    sharedRuntime = null;
-    sharedConfigKey = null;
+    killProcessTree(this.proc);
   }
-  sharedInit = null;
+}
+
+/** Default factory: spawns a real opencode server + root client + event stream. */
+export const realRuntimeFactory: OpenCodeRuntimeFactory & OpenCodeRelayRuntimeFactory = {
+  async createRuntime(options, opts): Promise<OpenCodeRuntimeController> {
+    const config = buildOpenCodeConfig(options, opts);
+    const { url, proc } = await spawnOpencodeServer(config);
+    const client = createOpencodeClient({ baseUrl: url });
+    const sub = await client.event.subscribe();
+    const stream = sub.stream as AsyncGenerator<OpenCodeSseEvent, void, void>;
+    return new RealOpenCodeRuntimeController(proc, client, stream);
+  },
+  async createRelayRuntime(options, policy): Promise<OpenCodeRuntimeController> {
+    // The relay launches its OWN NanoClaw MCP-server subprocess in relay mode
+    // (route-locked send_message only). The relay env tells mcp-tools/server.ts
+    // to expose only the status-only allowlist; native mutation tools are denied
+    // via the relay config tools/permission map.
+    const relayMcpServers = withRelayMcpEnv(options.mcpServers, policy.routeKey);
+    return realRuntimeFactory.createRuntime(
+      { ...options, mcpServers: relayMcpServers },
+      { relayMode: true, relayRouteKey: policy.routeKey },
+    );
+  },
+};
+
+/**
+ * Stamp `NANOCLAW_RELAY_MODE=1` + `NANOCLAW_RELAY_ROUTE_KEY=<route>` into the
+ * nanoclaw MCP server's env so its own subprocess exposes only the route-locked
+ * status tool map. The relay never shares the original turn's MCP server.
+ */
+function withRelayMcpEnv(
+  servers: ProviderOptions['mcpServers'],
+  routeKey: string,
+): ProviderOptions['mcpServers'] {
+  if (!servers) return servers;
+  const out: NonNullable<ProviderOptions['mcpServers']> = {};
+  for (const [name, cfg] of Object.entries(servers)) {
+    out[name] =
+      name === 'nanoclaw'
+        ? {
+            ...cfg,
+            env: {
+              ...cfg.env,
+              NANOCLAW_RELAY_MODE: '1',
+              NANOCLAW_RELAY_ROUTE_KEY: routeKey,
+              NANOCLAW_RELAY_STATUS_TOOLS: '',
+            },
+          }
+        : cfg;
+  }
+  return out;
 }
 
 function sessionErrorMessage(props: { error?: unknown }): string {
@@ -513,14 +614,52 @@ function extractRunId(text: string): string | undefined {
   return text.match(/\b(?:filepart-[a-z-]+-\d{10,}|smoke-\d{10,}-\d+)\b/)?.[0];
 }
 
+/** Active OpenCode tool tracked for declared-timeout host-sweep widening. */
+interface ActiveOpenCodeTool {
+  callID: string;
+  tool: string;
+  declaredTimeoutMs: number | null;
+  startedAt: string;
+}
+
 export class OpenCodeProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = false;
 
   private readonly options: ProviderOptions;
   private activeSessionId: string | undefined;
 
-  constructor(options: ProviderOptions = {}) {
+  // Per-instance runtime controller state (replaces the former module-global
+  // singleton). A normal runtime and a separate relay runtime are tracked
+  // independently so destroying one never kills the other.
+  private controller: OpenCodeRuntimeController | null = null;
+  private controllerKey: string | null = null;
+  private controllerInit: Promise<OpenCodeRuntimeController> | null = null;
+
+  private readonly runtimeFactory: OpenCodeRuntimeFactory & OpenCodeRelayRuntimeFactory;
+  private readonly persistActiveTool: (tool: ActiveOpenCodeTool | null) => void;
+  private readonly clockFactory: () => OpenCodePumpClock;
+
+  constructor(
+    options: ProviderOptions = {},
+    seams: {
+      runtimeFactory?: OpenCodeRuntimeFactory & OpenCodeRelayRuntimeFactory;
+      persistActiveTool?: (tool: ActiveOpenCodeTool | null) => void;
+      clockFactory?: () => OpenCodePumpClock;
+    } = {},
+  ) {
     this.options = options;
+    this.runtimeFactory = seams.runtimeFactory ?? realRuntimeFactory;
+    this.persistActiveTool = seams.persistActiveTool ?? defaultPersistActiveTool;
+    this.clockFactory = seams.clockFactory ?? realTimerClock;
+  }
+
+  /** Capabilities: OpenCode supports a separate-runtime status relay. */
+  get capabilities(): ProviderCapabilities {
+    return {
+      supportsSeparateRelayRuntime: true,
+      defaultRelayDeadlineMs: OPENCODE_RELAY_DEADLINE_MS(),
+      relayToolPolicy: 'status_only',
+    };
   }
 
   isSessionInvalid(err: unknown, opts: { attemptedContinuation?: string } = {}): boolean {
@@ -534,29 +673,62 @@ export class OpenCodeProvider implements AgentProvider {
     return isMissingOpenCodeSessionError(err, opts.attemptedContinuation);
   }
 
+  /** Lazily create / reuse this instance's normal runtime controller. */
+  private async ensureRuntime(opts: BuildOpenCodeConfigOpts = {}): Promise<OpenCodeRuntimeController> {
+    const key = runtimeConfigKey(this.options, opts);
+    if (this.controller && this.controllerKey === key) return this.controller;
+    if (this.controllerInit) return this.controllerInit;
+    this.controllerInit = (async () => {
+      // A config change retires the prior runtime — dispose its stream first so
+      // its in-flight read can't steal a new query's first event.
+      if (this.controller) this.controller.destroy('runtime_config_changed');
+      const rt = await this.runtimeFactory.createRuntime(this.options, opts);
+      this.controller = rt;
+      this.controllerKey = key;
+      this.controllerInit = null;
+      return rt;
+    })();
+    return this.controllerInit;
+  }
+
+  /** Destroy ONLY this instance's normal runtime (never a relay's). */
+  private destroyRuntime(reason: string): void {
+    if (this.controller) {
+      this.controller.destroy(reason);
+      this.controller = null;
+      this.controllerKey = null;
+    }
+    this.controllerInit = null;
+  }
+
   /**
    * Positive existence-check seam for the AUTHORITATIVE continuation classifier
    * (`classifyContinuation`). Backed by the SDK existence check
-   * `client.session.get({ path: { id } })` — a missing-session SDK error means
-   * the session is gone. Any other error is inconclusive and treated as "exists"
-   * (preserve continuation; never clear on a transport error). Task 3's runtime
-   * controller consumes this seam; Task 2 only needs a minimal injectable check.
+   * `client.session.get({ path: { id } })`.
    */
   async sessionExists(id: string): Promise<boolean> {
     try {
-      const rt = await ensureSharedRuntime(this.options);
-      const res = await rt.client.session.get({ path: { id } });
-      if (res.error) {
-        if (isMissingSessionResultError(res.error)) return false;
-        // Inconclusive (transport/other) — do not treat as proof of absence.
-        return true;
-      }
-      return Boolean(res.data);
+      const rt = await this.ensureRuntime();
+      return rt.sessionExists(id);
     } catch {
-      // Transport failure of the existence check itself is NOT proof the
-      // session is gone — preserve continuation.
       return true;
     }
+  }
+
+  /**
+   * Construct a separate relay runtime for a bounded Yente-authored status
+   * relay. The relay has its OWN process/client/event pump/session id, no
+   * continuation, no mutation tools, and its own route-locked MCP server. It is
+   * NEVER the original runtime, and destroying it never affects the original
+   * turn.
+   */
+  async createRelayRuntime(routeKey: string, deadlineMs: number): Promise<OpenCodeRuntimeController> {
+    return this.runtimeFactory.createRelayRuntime(this.options, {
+      allowedTools: ['send_message'],
+      deniedNativeTools: relayDeniedNativeToolIds(),
+      routeKey,
+      deadlineMs,
+    });
   }
 
   query(input: QueryInput): AgentQuery {
@@ -579,31 +751,46 @@ export class OpenCodeProvider implements AgentProvider {
     };
 
     const self = this;
+    const relayMode = input.relayMode === true;
 
     async function* gen(): AsyncGenerator<ProviderEvent> {
       let initYielded = false;
       let turnIndex = 0;
-      const rt = await ensureSharedRuntime(self.options);
-      const { client, stream } = rt;
+      const rt = await self.ensureRuntime(relayMode ? { relayMode: true } : {});
+      const { client } = rt;
+      const stream = rt.stream as AsyncGenerator<OpenCodeSseEvent, void, void>;
 
-      // Single-reader, long-lived pump: the ONLY consumer of the shared OpenCode
-      // event stream for the WHOLE query (all turns). One perpetual reader means
-      // a read-ahead past one turn's terminal `session.idle` lands in the pump's
-      // shared queue for the NEXT turn rather than in a discarded per-turn reader
-      // — so a follow-up turn's first protected event is never lost across a
-      // clean turn boundary. Per turn the loop calls `pump.beginTurn()` to reset
-      // liveness/timer state; `pump.stop()` ends a turn without killing the
-      // reader; `pump.dispose()` tears it down on terminal transport / abort.
-      // It enforces the transport timeout AND, INDEPENDENT of heartbeat, the
-      // absolute turn ceiling, and emits non-terminal wait-tick/keepalive/
-      // inactivity results so long no-SSE work stays state-preserving. Typed
-      // terminal results PRESERVE continuation — they tear down the broken
-      // transport but never clear self.activeSessionId (the authoritative
-      // continuation clear lives in the poll loop). `isSessionEvent` /
-      // `isProtectedEvent` read the LIVE active session so a stale-recovery
-      // session swap filters against the current id.
-      const pump = new OpenCodeEventPump<{ type: string; properties: Record<string, unknown> }>({
-        ...realTimerClock(),
+      // Active tool tracking (Step 8): the active tool with the LARGEST bounded
+      // declared timeout is persisted to container_state so host-sweep can widen
+      // its kill ceiling for a long OpenCode tool. Cleared when all tools finish
+      // or on terminal interruption.
+      const activeTools = new Map<string, ActiveOpenCodeTool>();
+      const refreshActiveTool = (): void => {
+        let longest: ActiveOpenCodeTool | null = null;
+        for (const t of activeTools.values()) {
+          if (t.declaredTimeoutMs == null) continue;
+          if (!longest || (t.declaredTimeoutMs ?? 0) > (longest.declaredTimeoutMs ?? 0)) longest = t;
+        }
+        self.persistActiveTool(longest);
+      };
+      const clearActiveTools = (): void => {
+        activeTools.clear();
+        self.persistActiveTool(null);
+      };
+
+      // Native-question correlation: question tool parts seen this turn (by
+      // callID) so a matching permission.updated is denied through the SDK.
+      const questionCallIds = new Set<string>();
+      const questionTextByCallId = new Map<string, string>();
+
+      // Side-effect evidence collected during the accepted-input window, so a
+      // terminal interruption after a side effect carries it into the recovery
+      // seed and the agent reports existing work rather than duplicating it.
+      const collectedSideEffects: ProviderSideEffect[] = [];
+
+      // Single-reader, long-lived pump over THIS controller's event stream.
+      const pump = new OpenCodeEventPump<OpenCodeSseEvent>({
+        ...self.clockFactory(),
         stream,
         transportTimeoutMs: OPENCODE_TRANSPORT_TIMEOUT_MS(),
         absoluteTurnTimeoutMs: OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS(),
@@ -625,146 +812,252 @@ export class OpenCodeProvider implements AgentProvider {
       });
 
       try {
-      while (!aborted) {
-        while (pending.length === 0 && !ended && !aborted) {
-          await new Promise<void>((resolve) => {
-            waiting = resolve;
-          });
-          waiting = null;
-        }
+        while (!aborted) {
+          while (pending.length === 0 && !ended && !aborted) {
+            await new Promise<void>((resolve) => {
+              waiting = resolve;
+            });
+            waiting = null;
+          }
 
-        if (aborted) return;
-        if (pending.length === 0 && ended) return;
+          if (aborted) return;
+          if (pending.length === 0 && ended) return;
 
-        const turn = pending.shift()!;
-        const staged = await stageOpenCodeAttachments(turn.attachments ?? []);
-        log(
-          JSON.stringify({
-            severity: 'info',
-            event: 'opencode_file_parts_prepared',
-            file_part_count: staged.length,
-            mime_summary: summarizeMimes(turn.attachments ?? []),
-            run_id: extractRunId(turn.prompt),
-          }),
-        );
-        const prompted = await promptSession(
-          client.session,
-          self.activeSessionId,
-          buildOpenCodePromptParts(turn.prompt, staged),
-          modelForAttachments(staged),
-        );
-        const sessionId = prompted.sessionId;
-        self.activeSessionId = sessionId;
-
-        if (!initYielded || prompted.recoveredFromStale) {
-          yield { type: 'init', continuation: sessionId };
-          initYielded = true;
-        }
-
-        // The prompt was accepted by the OpenCode session — emit input-accepted
-        // for the matching id. (The full liveness/notice/interruption event
-        // surface for OpenCode lands in Task 3; the input-accepted + result
-        // resolution contract is wired here.)
-        const turnScope = turnIndex === 0 ? 'initial' : 'followup';
-        turnIndex += 1;
-        if (turn.inputId) {
-          yield { type: 'input-accepted', inputId: turn.inputId, scope: turnScope };
-        }
-
-        const partTextByMessageId = new Map<string, string>();
-        const roleByMessageId = new Map<string, string>();
-
-        // Reset the long-lived pump's per-turn liveness/timer state. Any
-        // follow-up event already read-ahead into the pump's shared queue
-        // survives this and is delivered to this turn.
-        pump.beginTurn();
-
-        const onTerminalTransport = (err: OpenCodeInterruptionError): never => {
-          // Preserve continuation: do NOT clear self.activeSessionId. Tear down
-          // the broken transport so the next turn spawns a fresh stream against
-          // the same session id.
+          const turn = pending.shift()!;
+          const turnInputId = turn.inputId;
+          const staged = await stageOpenCodeAttachments(turn.attachments ?? []);
           log(
             JSON.stringify({
-              severity: 'warn',
-              event: 'opencode_turn_interrupted',
-              classification: err.classification,
-              session_id: sessionId,
-              configured_timeout_ms: err.liveness.configuredTimeoutMs,
-              elapsed_ms: err.liveness.elapsedMs,
-              last_event_type: err.liveness.lastEventType,
+              severity: 'info',
+              event: 'opencode_file_parts_prepared',
+              file_part_count: staged.length,
+              mime_summary: summarizeMimes(turn.attachments ?? []),
+              run_id: extractRunId(turn.prompt),
             }),
           );
-          destroySharedRuntime();
-          throw err;
-        };
+          const prompted = await promptSession(
+            client.session,
+            self.activeSessionId,
+            buildOpenCodePromptParts(turn.prompt, staged),
+            modelForAttachments(staged),
+          );
+          const sessionId = prompted.sessionId;
+          self.activeSessionId = sessionId;
 
-        try {
-          turn: while (true) {
-            if (aborted) {
-              pump.dispose();
-              return;
-            }
+          if (!initYielded || prompted.recoveredFromStale) {
+            yield { type: 'init', continuation: sessionId };
+            initYielded = true;
+          }
 
-            const res = await pump.next();
+          // The prompt() returned for this exact inputId — emit input-accepted.
+          const turnScope: ProviderInputScope = relayMode ? 'relay' : turnIndex === 0 ? 'initial' : 'followup';
+          turnIndex += 1;
+          if (turnInputId) {
+            yield { type: 'input-accepted', inputId: turnInputId, scope: turnScope };
+          }
 
-            // Non-terminal liveness results keep the heartbeat fresh and the
-            // long turn alive — they never end the turn or clear continuation.
-            if (res.kind === 'wait-tick') {
-              yield { type: 'activity', source: 'provider_wait_tick' };
-              continue;
-            }
-            if (res.kind === 'inactivity-notice') {
-              // Task 2 surfaces inactivity as liveness/activity only; the
-              // Yente-authored relay + provider `notice` emission is Task 3.
-              log(
-                JSON.stringify({
+          const partTextByMessageId = new Map<string, string>();
+          const roleByMessageId = new Map<string, string>();
+
+          pump.beginTurn();
+
+          /**
+           * Build a typed terminal interruption ProviderEvent (Invariant 159:
+           * provider error events are terminal recoverable interruptions, never
+           * log-only). Preserves continuation by default; carries liveness,
+           * input correlation, and any collected side-effect evidence as the
+           * recovery seed.
+           */
+          const buildInterruption = (
+            classification: string,
+            agentMessage: string,
+            fallbackUserMessage: string,
+            liveness: OpenCodeLivenessSnapshot,
+            continuationPolicy: ProviderContinuationPolicy,
+          ): Extract<ProviderEvent, { type: 'interruption' }> => ({
+            type: 'interruption',
+            inputId: turnInputId,
+            classification,
+            severity: 'warn',
+            terminal: true,
+            agentMessage,
+            fallbackUserMessage,
+            continuationPolicy,
+            attemptedContinuation: input.continuation,
+            liveness: {
+              configuredTimeoutMs: liveness.configuredTimeoutMs,
+              elapsedMs: liveness.elapsedMs,
+              lastEventType: liveness.lastEventType ?? undefined,
+              lastMeaningfulEventAt: liveness.lastMeaningfulEventAt,
+            },
+            recoverySeed: collectedSideEffects.length > 0 ? { sideEffects: [...collectedSideEffects] } : undefined,
+          });
+
+          let terminalInterruption: Extract<ProviderEvent, { type: 'interruption' }> | null = null;
+
+          try {
+            turn: while (true) {
+              if (aborted) {
+                pump.dispose();
+                return;
+              }
+
+              const res = await pump.next();
+
+              if (res.kind === 'wait-tick') {
+                yield { type: 'activity', source: 'provider_wait_tick', inputId: turnInputId };
+                continue;
+              }
+              if (res.kind === 'inactivity-notice') {
+                // Non-terminal liveness moment. Emit activity AND a provider
+                // `notice` with agent-facing wording + liveness metadata. The
+                // poll loop relays it through a separate restricted relay runtime
+                // (or one sanitized direct fallback). NEVER pushed into the busy
+                // turn; never clears continuation; never settles user rows.
+                yield { type: 'activity', source: 'provider_internal', inputId: turnInputId };
+                yield {
+                  type: 'notice',
+                  inputId: turnInputId,
+                  classification: 'inactivity',
                   severity: 'info',
-                  event: 'opencode_inactivity_notice',
-                  session_id: sessionId,
-                  configured_timeout_ms: res.metadata.configuredTimeoutMs,
-                  elapsed_ms: res.metadata.elapsedMs,
-                  last_meaningful_event_at: res.metadata.lastMeaningfulEventAt,
-                }),
-              );
-              yield { type: 'activity', source: 'provider_internal' };
-              continue;
-            }
-            if (res.kind === 'keepalive') {
-              yield { type: 'activity', source: 'sdk_keepalive' };
-              continue;
-            }
-
-            // Typed terminal interruptions: preserve continuation, tear down
-            // transport, propagate the sanitized typed error. The runtime/stream
-            // is destroyed here, so dispose the pump's perpetual reader too.
-            // onTerminalTransport is typed `: never` and always throws.
-            if (res.kind !== 'event') {
-              pump.dispose();
-              return onTerminalTransport(res.error);
-            }
-
-            // res.kind === 'event' — a meaningful, session-scoped event.
-            const ev = res.event;
-            yield { type: 'activity', source: 'sdk_event' };
-
-            switch (ev.type) {
-              case 'message.updated': {
-                const info = ev.properties.info as { id?: string; role?: string } | undefined;
-                if (info?.id && info?.role) {
-                  roleByMessageId.set(info.id, info.role);
-                }
-                break;
+                  agentMessage:
+                    "I'm still working on this — it's taking a while but the task is progressing. I'll keep going.",
+                  fallbackUserMessage:
+                    "I'm still working on your request — it's taking a while, but I'm on it.",
+                  relayRecommended: true,
+                  liveness: {
+                    configuredTimeoutMs: res.metadata.configuredTimeoutMs,
+                    elapsedMs: res.metadata.elapsedMs,
+                    lastEventType: res.metadata.lastEventType ?? undefined,
+                    lastMeaningfulEventAt: res.metadata.lastMeaningfulEventAt,
+                  },
+                };
+                continue;
               }
-              case 'message.part.updated': {
-                const part = ev.properties.part as { type?: string; messageID?: string; text?: string } | undefined;
-                if (part?.type === 'text' && part.messageID && part.text) {
-                  partTextByMessageId.set(part.messageID, part.text);
-                }
-                break;
+              if (res.kind === 'keepalive') {
+                yield { type: 'activity', source: 'sdk_keepalive', inputId: turnInputId };
+                continue;
               }
-              case 'permission.updated': {
-                const perm = ev.properties as { id?: string; sessionID?: string };
-                if (perm.sessionID === sessionId && perm.id) {
+
+              // Typed terminal pump result (transport/absolute/read/ended/
+              // overflow). Emit one typed interruption, clear active tool state,
+              // tear down THIS runtime, and end the turn (Invariant 159: never a
+              // raw throw to the poll loop).
+              if (res.kind !== 'event') {
+                const err = res.error;
+                log(
+                  JSON.stringify({
+                    severity: 'warn',
+                    event: 'opencode_turn_interrupted',
+                    classification: err.classification,
+                    session_id: sessionId,
+                    configured_timeout_ms: err.liveness.configuredTimeoutMs,
+                    elapsed_ms: err.liveness.elapsedMs,
+                    last_event_type: err.liveness.lastEventType,
+                  }),
+                );
+                clearActiveTools();
+                terminalInterruption = buildInterruption(
+                  `opencode_${err.classification.replace(/-/g, '_')}`,
+                  'I was interrupted mid-turn and stopped before finishing. Your request is preserved.',
+                  err.fallbackUserMessage,
+                  err.liveness,
+                  err.continuationPolicy,
+                );
+                pump.dispose();
+                self.destroyRuntime(err.classification);
+                break turn;
+              }
+
+              const ev = res.event;
+              yield { type: 'activity', source: 'sdk_event', inputId: turnInputId };
+
+              switch (ev.type) {
+                case 'message.updated': {
+                  const info = ev.properties.info as { id?: string; role?: string } | undefined;
+                  if (info?.id && info?.role) roleByMessageId.set(info.id, info.role);
+                  break;
+                }
+                case 'message.part.updated': {
+                  const part = ev.properties.part as
+                    | { type?: string; messageID?: string; text?: string; tool?: string; callID?: string; state?: unknown }
+                    | undefined;
+                  if (part?.type === 'text' && part.messageID && part.text) {
+                    partTextByMessageId.set(part.messageID, part.text);
+                  }
+                  // Native question detection (root-client surface).
+                  const q = detectNativeQuestionPart(ev);
+                  if (q) {
+                    questionCallIds.add(q.callID);
+                    questionTextByCallId.set(q.callID, q.questionText);
+                  }
+                  // Active tool tracking + side-effect enrichment for tool parts.
+                  if (part?.type === 'tool' && part.callID && part.tool) {
+                    const st = part.state as { status?: string; time?: { end?: number }; input?: Record<string, unknown> } | undefined;
+                    const status = st?.status;
+                    if (status === 'completed' || st?.time?.end) {
+                      activeTools.delete(part.callID);
+                      const sideEffect = self.captureToolSideEffect(part, turnInputId);
+                      if (sideEffect) {
+                        collectedSideEffects.push(sideEffect);
+                        yield { type: 'side-effect', sideEffect };
+                      }
+                      refreshActiveTool();
+                      if (activeTools.size === 0) self.persistActiveTool(null);
+                    } else if (part.tool !== NATIVE_QUESTION_TOOL_ID) {
+                      const declaredTimeoutMs = cappedDeclaredTimeoutMs(part, pump.liveness().elapsedMs);
+                      activeTools.set(part.callID, {
+                        callID: part.callID,
+                        tool: part.tool,
+                        declaredTimeoutMs,
+                        startedAt: new Date().toISOString(),
+                      });
+                      refreshActiveTool();
+                    }
+                  }
+                  break;
+                }
+                case 'permission.updated': {
+                  const perm = ev.properties as { id?: string; sessionID?: string; callID?: string; type?: string; title?: string };
+                  if (perm.sessionID !== sessionId || !perm.id) break;
+                  // Native question permission: DENY via reject and emit a
+                  // user-visible recovery interruption naming the blocked
+                  // question, then clear continuation if not reusable.
+                  const nq = detectNativeQuestionPermission(ev, questionCallIds);
+                  if (nq) {
+                    try {
+                      await rt.denyPermission(sessionId, nq.permissionId, 'native_question_denied');
+                    } catch (err) {
+                      log(`Failed to deny native question permission: ${err instanceof Error ? err.message : String(err)}`);
+                    }
+                    const questionText =
+                      (nq.callID && questionTextByCallId.get(nq.callID)) || nq.title || 'a question that requires your input';
+                    log(
+                      JSON.stringify({
+                        severity: 'info',
+                        event: 'opencode_native_question_denied',
+                        session_id: sessionId,
+                        permission_id: nq.permissionId,
+                      }),
+                    );
+                    clearActiveTools();
+                    // Non-cancellable native question / denial without reuse
+                    // proof: clear continuation with a restart-capable recovery
+                    // seed that VISIBLY contains the blocked question.
+                    yield { type: 'clear-continuation', inputId: turnInputId, reason: 'native_question_denied', attemptedContinuation: input.continuation };
+                    self.activeSessionId = undefined;
+                    terminalInterruption = buildInterruption(
+                      'opencode_native_question',
+                      `I need your input to continue: ${questionText}`,
+                      `I need more information before I can finish: ${questionText}`,
+                      pump.liveness(),
+                      'clear',
+                    );
+                    pump.dispose();
+                    self.destroyRuntime('native_question_denied');
+                    break turn;
+                  }
+                  // Non-question permission: auto-approve (existing behavior).
                   try {
                     await client.postSessionIdPermissionsPermissionId({
                       path: { id: sessionId, permissionID: perm.id },
@@ -773,71 +1066,104 @@ export class OpenCodeProvider implements AgentProvider {
                   } catch (err) {
                     log(`Failed to auto-reply permission: ${err instanceof Error ? err.message : String(err)}`);
                   }
+                  break;
                 }
-                break;
-              }
-              case 'session.status': {
-                const props = ev.properties as {
-                  sessionID?: string;
-                  status?: { type?: string; attempt?: number; message?: string };
-                };
-                if (props.sessionID !== sessionId) break;
-                const st = props.status;
-                if (
-                  st?.type === 'retry' &&
-                  typeof st.attempt === 'number' &&
-                  st.attempt >= SESSION_STATUS_RETRY_ERROR_AFTER &&
-                  st.message
-                ) {
-                  self.activeSessionId = undefined;
-                  pump.dispose();
-                  throw new Error(`OpenCode retry limit (${st.attempt}): ${st.message}`);
+                case 'session.status': {
+                  const props = ev.properties as {
+                    sessionID?: string;
+                    status?: { type?: string; attempt?: number; message?: string };
+                  };
+                  if (props.sessionID !== sessionId) break;
+                  const st = props.status;
+                  if (
+                    st?.type === 'retry' &&
+                    typeof st.attempt === 'number' &&
+                    st.attempt >= SESSION_STATUS_RETRY_ERROR_AFTER &&
+                    st.message
+                  ) {
+                    // Invariant 159: convert the retry-limit path into a typed,
+                    // input-correlated terminal interruption (NOT a raw throw,
+                    // NOT a direct activeSessionId clear). Continuation is
+                    // preserved — a retry-limit is not stale-session proof.
+                    clearActiveTools();
+                    terminalInterruption = buildInterruption(
+                      'opencode_session_retry_limit',
+                      'The model hit its retry limit on this turn and I stopped before finishing. Your request is preserved.',
+                      'The model had trouble finishing this turn. Your request is preserved — ask me to continue.',
+                      pump.liveness(),
+                      'preserve',
+                    );
+                    pump.dispose();
+                    self.destroyRuntime('session_retry_limit');
+                    break turn;
+                  }
+                  break;
                 }
-                break;
-              }
-              case 'session.error': {
-                const props = ev.properties as { sessionID?: string; error?: unknown };
-                if (props.sessionID === sessionId || props.sessionID === undefined) {
-                  self.activeSessionId = undefined;
-                  pump.dispose();
-                  throw new Error(sessionErrorMessage(props));
+                case 'session.error': {
+                  const props = ev.properties as { sessionID?: string; error?: unknown };
+                  if (props.sessionID === sessionId || props.sessionID === undefined) {
+                    // Invariant 159: typed terminal interruption, input-
+                    // correlated, sanitized (no raw provider error text in the
+                    // user-facing fallback). Continuation preserved.
+                    log(
+                      JSON.stringify({
+                        severity: 'warn',
+                        event: 'opencode_session_error',
+                        session_id: sessionId,
+                        message: sessionErrorMessage(props),
+                      }),
+                    );
+                    clearActiveTools();
+                    terminalInterruption = buildInterruption(
+                      'opencode_session_error',
+                      'The model reported an error on this turn and I stopped before finishing. Your request is preserved.',
+                      'Something went wrong on this turn. Your request is preserved — ask me to continue.',
+                      pump.liveness(),
+                      'preserve',
+                    );
+                    pump.dispose();
+                    self.destroyRuntime('session_error');
+                    break turn;
+                  }
+                  break;
                 }
-                break;
-              }
-              case 'session.idle': {
-                const sid = (ev.properties as { sessionID?: string }).sessionID;
-                if (sid === sessionId) {
-                  pump.stop();
-                  break turn;
+                case 'session.idle': {
+                  const sid = (ev.properties as { sessionID?: string }).sessionID;
+                  if (sid === sessionId) {
+                    pump.stop();
+                    break turn;
+                  }
+                  break;
                 }
-                break;
+                default:
+                  break;
               }
-              default:
-                break;
+            }
+          } finally {
+            await cleanupStagedAttachments(staged);
+          }
+
+          if (terminalInterruption) {
+            yield terminalInterruption;
+            return;
+          }
+
+          let resultText = '';
+          for (const [msgId, role] of roleByMessageId) {
+            if (role === 'assistant') {
+              resultText = partTextByMessageId.get(msgId) ?? resultText;
             }
           }
-        } finally {
-          await cleanupStagedAttachments(staged);
+          // A successful turn completes — clear any lingering active tool state.
+          clearActiveTools();
+          yield {
+            type: 'result',
+            text: resultText || null,
+            inputId: turnInputId,
+            resolvedInputIds: turnInputId ? [turnInputId] : [],
+          };
         }
-
-        let resultText = '';
-        for (const [msgId, role] of roleByMessageId) {
-          if (role === 'assistant') {
-            resultText = partTextByMessageId.get(msgId) ?? resultText;
-          }
-        }
-        yield {
-          type: 'result',
-          text: resultText || null,
-          inputId: turn.inputId,
-          resolvedInputIds: turn.inputId ? [turn.inputId] : [],
-        };
-      }
       } finally {
-        // Tear down the long-lived pump's perpetual reader whenever the
-        // generator exits (normal end, throw, or consumer .return()), so the
-        // single-reader invariant holds for any later pump over the shared
-        // stream. dispose() is idempotent.
         pump.dispose();
       }
     }
@@ -856,9 +1182,67 @@ export class OpenCodeProvider implements AgentProvider {
         aborted = true;
         this.activeSessionId = undefined;
         kick();
-        destroySharedRuntime();
+        this.destroyRuntime('abort');
       },
     };
+  }
+
+  /**
+   * Best-effort side-effect evidence from a completed tool part. The
+   * authoritative side-effect ledger is imported from the JSONL/tool boundary
+   * (Step 7); a provider tool-completion event only REFERENCES/enriches it. We
+   * surface a sanitized `tool_completed` reference here; GWS/summarize-dnd
+   * durable kinds come from validated ledger import, never from this event.
+   */
+  private captureToolSideEffect(
+    part: { tool?: string; callID?: string; state?: unknown },
+    inputId: string,
+  ): ProviderSideEffect | null {
+    if (!part.callID || !part.tool) return null;
+    // Only surface a reference for tools that performed real work; the native
+    // question tool and read-only status tools are not side effects.
+    if (part.tool === NATIVE_QUESTION_TOOL_ID) return null;
+    const st = part.state as { status?: string; output?: unknown } | undefined;
+    if (st?.status !== 'completed') return null;
+    return {
+      id: `tool-${part.callID}`,
+      inputId,
+      kind: 'tool_completed',
+      label: part.tool,
+      evidence: { tool: part.tool, call_id: part.callID },
+      occurredAt: new Date().toISOString(),
+    };
+  }
+}
+
+/**
+ * Cap a declared tool timeout by the absolute-ceiling budget so a tool cannot
+ * widen host-sweep tolerance beyond the hard ceiling (Invariant 156):
+ * min(OPENCODE_LONG_TOOL_TIMEOUT_MAX_MS, ABSOLUTE - elapsed - safetyMargin).
+ */
+function cappedDeclaredTimeoutMs(
+  part: { state?: unknown },
+  elapsedTurnMs: number,
+): number | null {
+  const st = part.state as { input?: Record<string, unknown> } | undefined;
+  const raw = st?.input?.timeout ?? st?.input?.timeoutMs ?? st?.input?.timeout_ms;
+  const declared = typeof raw === 'number' && raw > 0 ? raw : null;
+  if (declared == null) return null;
+  const safetyMarginMs = 60_000;
+  const budget = OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS() - elapsedTurnMs - safetyMarginMs;
+  return Math.max(0, Math.min(OPENCODE_LONG_TOOL_TIMEOUT_MAX_MS(), declared, budget));
+}
+
+/** Default container_state writer for the active long tool (Step 8). */
+function defaultPersistActiveTool(tool: ActiveOpenCodeTool | null): void {
+  try {
+    if (tool && tool.declaredTimeoutMs != null) {
+      setContainerToolInFlight(tool.tool, tool.declaredTimeoutMs);
+    } else {
+      clearContainerToolInFlight();
+    }
+  } catch {
+    // container_state may be absent in some test setups — non-fatal.
   }
 }
 

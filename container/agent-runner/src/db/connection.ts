@@ -181,9 +181,26 @@ export function touchHeartbeat(): void {
  * Clear stale processing_ack entries on container startup.
  * If the previous container crashed, 'processing' entries are leftover.
  * Clearing them lets the new container re-process those messages.
+ *
+ * Recovery-owned acks (`status='recovery'`) and terminal-fallback acks
+ * (`status='failed'`) are PRESERVED — only orphan `processing` claims are reset.
  */
 export function clearStaleProcessingAcks(): void {
   getOutboundDb().prepare("DELETE FROM processing_ack WHERE status = 'processing'").run();
+}
+
+/**
+ * Clear stale provider-owned tool state on container startup (Task 3 Step 8).
+ * `container_state` records the in-flight tool for host-sweep timeout widening.
+ * After a crash the row may still claim a long OpenCode/Bash tool is running, so
+ * a fresh container must reset it to avoid the host honoring a phantom long
+ * timeout. The recovery-owned ack rows are untouched here (see
+ * clearStaleProcessingAcks).
+ */
+export function clearStaleContainerToolState(): void {
+  // Reuse the canonical clear so the row is reset to NULL (not deleted), keeping
+  // the singleton id=1 invariant.
+  clearContainerToolInFlight();
 }
 
 /** For tests — creates in-memory DBs with the session schemas. */
