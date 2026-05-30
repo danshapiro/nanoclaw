@@ -8,6 +8,16 @@ export type AgentMcpBridgeConfig = {
   remoteUrl: string;
   callbackPort: number;
   socketNamePrefix: string;
+  /**
+   * Whether the agent container must NOT start if this bridge fails to come
+   * up. Defaults to `true` (fail-closed) for every bridge except `granola`,
+   * which defaults to `false` so that expected missing/expired Granola
+   * credentials degrade to an optional-unavailable state instead of blocking
+   * the whole agent. Non-credential failures (integrity, ownership, symlink,
+   * mount-overlap, malformed config) always fail closed regardless of this
+   * flag — see `agent-mcp-bridge.ts` and `container-runner.ts`.
+   */
+  required: boolean;
 };
 
 export type AgentMcpConfigForGroup = {
@@ -75,6 +85,21 @@ function validateCallbackPort(serverName: string, value: unknown): number {
   return value;
 }
 
+// Only `granola` is an optional bridge by default. Optionality is intentionally
+// per-server, not a blanket policy, so a future bridge cannot silently inherit
+// credential-degradation behavior.
+const OPTIONAL_BY_DEFAULT = new Set(['granola']);
+
+function resolveRequired(serverName: string, value: unknown): boolean {
+  if (value === undefined) {
+    return !OPTIONAL_BY_DEFAULT.has(serverName);
+  }
+  if (typeof value !== 'boolean') {
+    throw new Error(`Agent MCP bridge ${serverName} required must be a boolean`);
+  }
+  return value;
+}
+
 function configuredPath(): string | undefined {
   return process.env.AGENT_MCP_CONFIG_PATH || process.env.NANOCLAW_AGENT_MCP_CONFIG || AGENT_MCP_CONFIG_PATH;
 }
@@ -103,6 +128,7 @@ function parseAgentMcpConfigBlock(rawConfig: unknown, name: string): AgentMcpCon
       remoteUrl: validateRemoteUrl(serverName, bridge.remoteUrl),
       callbackPort: validateCallbackPort(serverName, bridge.callbackPort),
       socketNamePrefix: validateSocketNamePrefix(serverName, bridge.socketNamePrefix),
+      required: resolveRequired(serverName, bridge.required),
     };
   }
 

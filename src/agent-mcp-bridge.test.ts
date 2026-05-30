@@ -5,7 +5,11 @@ import path from 'path';
 
 import { describe, expect, it } from 'vitest';
 
-import { startAgentMcpBridge } from './agent-mcp-bridge.js';
+import {
+  AgentMcpCredentialUnavailableError,
+  classifyBridgeCredentialFailure,
+  startAgentMcpBridge,
+} from './agent-mcp-bridge.js';
 
 function makeReleaseRoot(proxySource = 'process.stdin.resume();'): string {
   const releaseRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-mcp-release-'));
@@ -18,6 +22,25 @@ function makeReleaseRoot(proxySource = 'process.stdin.resume();'): string {
 function makeReadyProxyReleaseRoot(): string {
   return makeReleaseRoot(`
 process.stdout.write('ready');
+process.stdin.resume();
+`);
+}
+
+// A proxy that emits a known credential prompt on stderr and then hangs
+// forever without ever writing the readiness byte to stdout — the real
+// "auth stall at startup" shape.
+function makeAuthStallProxyReleaseRoot(stderrPrompt: string): string {
+  return makeReleaseRoot(`
+process.stderr.write(${JSON.stringify(stderrPrompt)});
+process.stdin.resume();
+`);
+}
+
+// A proxy that hangs at startup but emits NO recognizable credential prompt —
+// an unclassified stall that must remain fail-closed.
+function makeUnclassifiedStallProxyReleaseRoot(): string {
+  return makeReleaseRoot(`
+process.stderr.write('some unrelated internal error');
 process.stdin.resume();
 `);
 }
@@ -35,6 +58,7 @@ const granolaBridge = {
   remoteUrl: 'https://mcp.granola.ai/mcp',
   callbackPort: 37947,
   socketNamePrefix: 'granola',
+  required: false,
 };
 
 describe('startAgentMcpBridge', () => {
@@ -42,6 +66,8 @@ describe('startAgentMcpBridge', () => {
     const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-mcp-data-'));
     const releaseRoot = makeReleaseRoot();
     try {
+      // A missing marker now surfaces as the typed, sanitized auth_required
+      // credential error so an optional bridge can degrade upstream.
       await expect(
         startAgentMcpBridge({
           groupFolder: 'main',
@@ -52,7 +78,7 @@ describe('startAgentMcpBridge', () => {
           dataDir,
           releaseRoot,
         }),
-      ).rejects.toThrow(/Granola MCP auth required/);
+      ).rejects.toThrow(AgentMcpCredentialUnavailableError);
     } finally {
       fs.rmSync(dataDir, { recursive: true, force: true });
       fs.rmSync(releaseRoot, { recursive: true, force: true });
@@ -267,5 +293,144 @@ describe('startAgentMcpBridge', () => {
       fs.rmSync(dataDir, { recursive: true, force: true });
       fs.rmSync(releaseRoot, { recursive: true, force: true });
     }
+  });
+
+  it('classifies a missing auth marker as the auth_required credential class', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-mcp-data-'));
+    const releaseRoot = makeReleaseRoot();
+    try {
+      const err = await startAgentMcpBridge({
+        groupFolder: 'main',
+        agentGroupId: 'ag-main',
+        bridge: granolaBridge,
+        containerUid: serviceIdentity().uid,
+        containerGid: serviceIdentity().gid,
+        dataDir,
+        releaseRoot,
+      }).then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(AgentMcpCredentialUnavailableError);
+      expect((err as AgentMcpCredentialUnavailableError).category).toBe('auth_required');
+      // Sanitized: no host paths, uid/gid values, or raw thrown internals.
+      const text = (err as AgentMcpCredentialUnavailableError).message;
+      expect(text).not.toContain(dataDir);
+      expect(text).not.toContain(String(serviceIdentity().uid));
+      expect(text).not.toMatch(/\d+:\d+/);
+    } finally {
+      fs.rmSync(dataDir, { recursive: true, force: true });
+      fs.rmSync(releaseRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('classifies an expired auth marker as the auth_expired credential class', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-mcp-data-'));
+    const releaseRoot = makeReleaseRoot();
+    const authDir = path.join(dataDir, 'v2-sessions', 'ag-main', '.mcp-auth', 'granola');
+    fs.mkdirSync(authDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(
+      path.join(authDir, '.nanoclaw-granola-auth-ok'),
+      JSON.stringify({ expiresAt: new Date(Date.now() - 60_000).toISOString() }),
+    );
+    try {
+      const err = await startAgentMcpBridge({
+        groupFolder: 'main',
+        agentGroupId: 'ag-main',
+        bridge: granolaBridge,
+        containerUid: serviceIdentity().uid,
+        containerGid: serviceIdentity().gid,
+        dataDir,
+        releaseRoot,
+      }).then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(AgentMcpCredentialUnavailableError);
+      expect((err as AgentMcpCredentialUnavailableError).category).toBe('auth_expired');
+    } finally {
+      fs.rmSync(dataDir, { recursive: true, force: true });
+      fs.rmSync(releaseRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('degrades an auth-required startup stall when verifying readiness on startup', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-mcp-data-'));
+    const releaseRoot = makeAuthStallProxyReleaseRoot('Please authorize this client by visiting https://example');
+    const authDir = path.join(dataDir, 'v2-sessions', 'ag-main', '.mcp-auth', 'granola');
+    fs.mkdirSync(authDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(authDir, '.nanoclaw-granola-auth-ok'), '');
+    try {
+      const err = await startAgentMcpBridge({
+        groupFolder: 'main',
+        agentGroupId: 'ag-main',
+        bridge: granolaBridge,
+        containerUid: serviceIdentity().uid,
+        containerGid: serviceIdentity().gid,
+        dataDir,
+        releaseRoot,
+        verifyReadyOnStartup: true,
+        startupWatchdogMs: 80,
+      }).then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(AgentMcpCredentialUnavailableError);
+      expect((err as AgentMcpCredentialUnavailableError).category).toBe('auth_required');
+      // Sanitized: the agent-facing message must not leak the raw stderr URL.
+      expect((err as AgentMcpCredentialUnavailableError).message).not.toContain('https://example');
+    } finally {
+      fs.rmSync(dataDir, { recursive: true, force: true });
+      fs.rmSync(releaseRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps an unclassified startup stall as a fail-closed startup error (not degradation)', async () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-mcp-data-'));
+    const releaseRoot = makeUnclassifiedStallProxyReleaseRoot();
+    const authDir = path.join(dataDir, 'v2-sessions', 'ag-main', '.mcp-auth', 'granola');
+    fs.mkdirSync(authDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(authDir, '.nanoclaw-granola-auth-ok'), '');
+    try {
+      const err = await startAgentMcpBridge({
+        groupFolder: 'main',
+        agentGroupId: 'ag-main',
+        bridge: granolaBridge,
+        containerUid: serviceIdentity().uid,
+        containerGid: serviceIdentity().gid,
+        dataDir,
+        releaseRoot,
+        verifyReadyOnStartup: true,
+        startupWatchdogMs: 80,
+      }).then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(Error);
+      expect(err).not.toBeInstanceOf(AgentMcpCredentialUnavailableError);
+      expect((err as Error).message).toMatch(/startup timed out|proxy startup/i);
+    } finally {
+      fs.rmSync(dataDir, { recursive: true, force: true });
+      fs.rmSync(releaseRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('classifyBridgeCredentialFailure', () => {
+  it('classifies known auth-required prompts', () => {
+    expect(classifyBridgeCredentialFailure('Please authorize this client by visiting ...', null)).toBe('auth_required');
+    expect(classifyBridgeCredentialFailure('Authentication required', null)).toBe('auth_required');
+    expect(classifyBridgeCredentialFailure('auth timeout reached', null)).toBe('auth_required');
+  });
+
+  it('classifies known auth-expired prompts', () => {
+    expect(classifyBridgeCredentialFailure('Authentication failed', 1)).toBe('auth_expired');
+    expect(classifyBridgeCredentialFailure('Auth failed: token rejected', 1)).toBe('auth_expired');
+  });
+
+  it('returns null for unrelated failures (fail-closed)', () => {
+    expect(classifyBridgeCredentialFailure('ECONNREFUSED 127.0.0.1:443', 1)).toBeNull();
+    expect(classifyBridgeCredentialFailure('', null)).toBeNull();
+    expect(classifyBridgeCredentialFailure('some unrelated internal error', null)).toBeNull();
   });
 });

@@ -16,6 +16,74 @@ const MAX_SOCKET_PATH_BYTES = 99;
 
 type SpawnLike = typeof spawn;
 
+/** Narrow, expected Granola credential failure classes that may degrade. */
+export type AgentMcpCredentialCategory = 'auth_required' | 'auth_expired';
+
+/**
+ * Thrown ONLY for expected missing/expired credential conditions. The caller
+ * (`container-runner.ts`) degrades an OPTIONAL bridge to unavailable on this
+ * error and fails closed on every other error. The `message` is already
+ * sanitized for agent-facing context: it never contains host paths, uid/gid
+ * values, or raw underlying errors.
+ */
+export class AgentMcpCredentialUnavailableError extends Error {
+  readonly category: AgentMcpCredentialCategory;
+
+  constructor(category: AgentMcpCredentialCategory, message: string) {
+    super(message);
+    this.name = 'AgentMcpCredentialUnavailableError';
+    this.category = category;
+  }
+}
+
+const SANITIZED_AUTH_REQUIRED_MESSAGE =
+  'Granola is temporarily unavailable: it needs to be re-authorized from the workstation before it can be used.';
+const SANITIZED_AUTH_EXPIRED_MESSAGE =
+  'Granola is temporarily unavailable: its saved credentials have expired and must be refreshed from the workstation.';
+
+function sanitizedCredentialMessage(category: AgentMcpCredentialCategory): string {
+  return category === 'auth_expired' ? SANITIZED_AUTH_EXPIRED_MESSAGE : SANITIZED_AUTH_REQUIRED_MESSAGE;
+}
+
+// Known mcp-remote credential prompts (grounded in mcp-remote's own stderr
+// strings). Matching is case-insensitive. Anything not on these lists is
+// treated as an UNCLASSIFIED failure and must stay fail-closed.
+const AUTH_REQUIRED_PROMPTS = [
+  'please authorize',
+  'authentication required',
+  'authorization required',
+  'auth required',
+  'auth needed',
+  'auth_needed',
+  'auth timeout',
+  'auth-timeout',
+];
+const AUTH_EXPIRED_PROMPTS = ['authentication failed', 'authorization failed', 'auth failed', 'token expired'];
+
+/**
+ * Classify a captured stderr blob / exit status against the narrow set of
+ * known Granola credential prompts. Returns the credential category for an
+ * expected missing/expired credential failure, or `null` for anything else
+ * (which the caller must treat as a fail-closed startup error). Exported for
+ * unit testing the matcher in isolation.
+ */
+export function classifyBridgeCredentialFailure(
+  stderr: string,
+  _exitCode: number | null,
+): AgentMcpCredentialCategory | null {
+  const haystack = (stderr || '').toLowerCase();
+  if (!haystack) return null;
+  // Expired/rejected credentials take precedence over the generic "auth
+  // required" so a "Authentication failed" prompt isn't mislabeled.
+  if (AUTH_EXPIRED_PROMPTS.some((prompt) => haystack.includes(prompt))) {
+    return 'auth_expired';
+  }
+  if (AUTH_REQUIRED_PROMPTS.some((prompt) => haystack.includes(prompt))) {
+    return 'auth_required';
+  }
+  return null;
+}
+
 export type AgentMcpBridgeRuntimeConfig = AgentMcpBridgeConfig & {
   serverName: string;
 };
@@ -41,6 +109,15 @@ export type AgentMcpBridgeOptions = {
   spawnImpl?: SpawnLike;
   lockWaitMs?: number;
   startupWatchdogMs?: number;
+  /**
+   * When true, probe the proxy at startup by spawning it and waiting up to the
+   * startup watchdog for the readiness byte. If the proxy stalls or exits and
+   * the captured stderr/status matches a known credential prompt, this throws
+   * `AgentMcpCredentialUnavailableError`; an unclassified stall throws a plain
+   * fail-closed startup error. Off by default so the normal lazy-spawn path
+   * (proxy started on first client connection) is unchanged.
+   */
+  verifyReadyOnStartup?: boolean;
 };
 
 type HeldLock = {
@@ -94,6 +171,32 @@ function enforcePrivatePermissions(dir: string): void {
       fs.chmodSync(fullPath, 0o600);
     }
   }
+}
+
+/**
+ * The auth marker is written empty by the workstation login helper (existence
+ * == authorized). A login helper MAY instead write JSON carrying an `expiresAt`
+ * ISO timestamp; when that timestamp is in the past the credentials are treated
+ * as expired. An empty or non-JSON marker is treated as non-expiring so the
+ * existing existence-only contract keeps working. Marker read/parse failures
+ * are NOT swallowed into "expired" — a missing marker is handled separately,
+ * and any other read error must propagate as a fail-closed startup error.
+ */
+function isMarkerExpired(markerPath: string): boolean {
+  const raw = fs.readFileSync(markerPath, 'utf8').trim();
+  if (!raw) return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return false;
+  }
+  if (!parsed || typeof parsed !== 'object') return false;
+  const expiresAt = (parsed as { expiresAt?: unknown }).expiresAt;
+  if (typeof expiresAt !== 'string') return false;
+  const expiryMs = Date.parse(expiresAt);
+  if (Number.isNaN(expiryMs)) return false;
+  return expiryMs <= Date.now();
 }
 
 function resolveProxyEntrypoint(releaseRoot: string): string {
@@ -301,13 +404,22 @@ export async function startAgentMcpBridge(options: AgentMcpBridgeOptions): Promi
     path.join(groupSessionDir, '.mcp-auth', options.bridge.serverName),
     'auth path',
   );
+  // Integrity gates (ownership, symlink, private perms) run FIRST and throw
+  // plain Errors — they must always fail closed, never degrade.
   mkdirPrivate(authDir);
   verifyOwnedByServiceUser(authDir);
   enforcePrivatePermissions(authDir);
 
+  // Credential presence/expiry is the ONLY degradable condition here. A
+  // missing marker is auth_required; a present-but-expired marker is
+  // auth_expired. Both surface as the typed credential error so the caller
+  // can degrade an optional bridge (or fail closed for a required one).
   const marker = path.join(authDir, AUTH_MARKER);
   if (!fs.existsSync(marker)) {
-    throw new Error('Granola MCP auth required; run the workstation login helper before using this bridge');
+    throw new AgentMcpCredentialUnavailableError('auth_required', sanitizedCredentialMessage('auth_required'));
+  }
+  if (isMarkerExpired(marker)) {
+    throw new AgentMcpCredentialUnavailableError('auth_expired', sanitizedCredentialMessage('auth_expired'));
   }
 
   const proxyEntrypoint = resolveProxyEntrypoint(releaseRoot);
@@ -419,7 +531,7 @@ export async function startAgentMcpBridge(options: AgentMcpBridgeOptions): Promi
     });
   });
 
-  return {
+  const bridge: AgentMcpBridge = {
     serverName: options.bridge.serverName,
     hostSocketDir,
     hostSocketPath,
@@ -441,4 +553,83 @@ export async function startAgentMcpBridge(options: AgentMcpBridgeOptions): Promi
       removeEmptyDirIfExists(hostSocketDir);
     },
   };
+
+  if (options.verifyReadyOnStartup) {
+    try {
+      await verifyProxyReadyOnStartup(
+        spawnImpl,
+        releaseRoot,
+        proxyEntrypoint,
+        options.bridge,
+        authDir,
+        startupWatchdogMs,
+      );
+    } catch (err) {
+      await bridge.stop();
+      throw err;
+    }
+  }
+
+  return bridge;
+}
+
+/**
+ * Spawn the proxy once at startup and wait up to the watchdog for the
+ * readiness byte. On a stall/exit, classify the captured stderr against the
+ * known credential prompts: a match throws the typed credential error (so an
+ * optional bridge can degrade), an unclassified stall throws a plain
+ * fail-closed startup error. The probe child is always killed before return.
+ */
+async function verifyProxyReadyOnStartup(
+  spawnImpl: SpawnLike,
+  releaseRoot: string,
+  proxyEntrypoint: string,
+  bridge: AgentMcpBridgeRuntimeConfig,
+  authDir: string,
+  startupWatchdogMs: number,
+): Promise<void> {
+  const previousUmask = process.umask(0o077);
+  let child: ChildProcessWithoutNullStreams;
+  try {
+    child = spawnProxy(spawnImpl, releaseRoot, proxyEntrypoint, bridge, authDir);
+  } finally {
+    process.umask(previousUmask);
+  }
+
+  let stderr = '';
+  const outcome = await new Promise<{ ready: boolean; exitCode: number | null }>((resolve) => {
+    let done = false;
+    const finish = (result: { ready: boolean; exitCode: number | null }) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const timer = setTimeout(() => finish({ ready: false, exitCode: null }), startupWatchdogMs);
+    child.stderr.on('data', (chunk) => {
+      stderr += String(chunk);
+      if (stderr.length > 4000) stderr = stderr.slice(-4000);
+    });
+    child.stdout.once('data', () => finish({ ready: true, exitCode: null }));
+    child.on('error', () => finish({ ready: false, exitCode: null }));
+    child.on('close', (code) => finish({ ready: false, exitCode: code }));
+  });
+
+  if (!child.killed) child.kill();
+  enforcePrivatePermissions(authDir);
+
+  if (outcome.ready) return;
+
+  const category = classifyBridgeCredentialFailure(stderr, outcome.exitCode);
+  if (category) {
+    throw new AgentMcpCredentialUnavailableError(category, sanitizedCredentialMessage(category));
+  }
+  // Unclassified stall/abort — fail closed. The raw stderr is logged (not
+  // surfaced to the agent) so the cause is diagnosable without leaking it.
+  log.warn('Agent MCP bridge startup probe failed without a recognized credential prompt', {
+    serverName: bridge.serverName,
+    exitCode: outcome.exitCode,
+    stderr: stderr.slice(0, 1000),
+  });
+  throw new Error('Granola MCP bridge unavailable; proxy startup timed out');
 }

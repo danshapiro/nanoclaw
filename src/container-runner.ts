@@ -21,7 +21,7 @@ import {
   TIMEZONE,
 } from './config.js';
 import { loadAgentMcpConfigForGroup } from './agent-mcp-config.js';
-import { type AgentMcpBridge, startAgentMcpBridge } from './agent-mcp-bridge.js';
+import { AgentMcpCredentialUnavailableError, type AgentMcpBridge, startAgentMcpBridge } from './agent-mcp-bridge.js';
 import { readContainerConfig, writeContainerConfig, type ContainerConfig } from './container-config.js';
 import {
   CONTAINER_RUNTIME_BIN,
@@ -453,16 +453,20 @@ function rejectAuthOverlappingMounts(mounts: VolumeMount[], authDirs: string[]):
   }
 }
 
+type AgentMcpUnavailableMap = NonNullable<import('./container-config.js').ContainerConfig['agentMcpUnavailable']>;
+
 function syncAgentMcpRuntimeConfig(
   groupFolder: string,
   containerConfig: import('./container-config.js').ContainerConfig,
   bridges: AgentMcpBridge[],
   allowedTools: string[],
+  unavailable: AgentMcpUnavailableMap,
 ): void {
   const before = JSON.stringify({
     mcpServers: containerConfig.mcpServers,
     agentMcpServerNames: containerConfig.agentMcpServerNames,
     agentMcpAllowedTools: containerConfig.agentMcpAllowedTools,
+    agentMcpUnavailable: containerConfig.agentMcpUnavailable,
   });
 
   const previousManagedServers = new Set(containerConfig.agentMcpServerNames ?? []);
@@ -476,6 +480,10 @@ function syncAgentMcpRuntimeConfig(
     }
   }
 
+  // A degraded server's MCP entry and its allowed tools are omitted from the
+  // runtime config so the agent neither sees a dead bridge nor a tool it
+  // cannot use.
+  const degradedNames = new Set(Object.keys(unavailable));
   for (const bridge of bridges) {
     containerConfig.mcpServers[bridge.serverName] = {
       command: 'bun',
@@ -484,13 +492,23 @@ function syncAgentMcpRuntimeConfig(
     };
   }
   containerConfig.agentMcpServerNames = bridges.map((bridge) => bridge.serverName);
-  containerConfig.agentMcpAllowedTools = [...allowedTools];
+  containerConfig.agentMcpAllowedTools = allowedTools.filter(
+    (tool) => ![...degradedNames].some((name) => tool.startsWith(`mcp__${name}__`)),
+  );
+
+  if (degradedNames.size > 0) {
+    containerConfig.agentMcpUnavailable = unavailable;
+  } else {
+    // Clear stale unavailable entries once every optional bridge is healthy.
+    delete containerConfig.agentMcpUnavailable;
+  }
 
   if (
     JSON.stringify({
       mcpServers: containerConfig.mcpServers,
       agentMcpServerNames: containerConfig.agentMcpServerNames,
       agentMcpAllowedTools: containerConfig.agentMcpAllowedTools,
+      agentMcpUnavailable: containerConfig.agentMcpUnavailable,
     }) !== before
   ) {
     writeContainerConfig(groupFolder, containerConfig);
@@ -505,22 +523,40 @@ async function attachAgentMcpBridges(
   const mcpConfig = loadAgentMcpConfigForGroup(agentGroup.folder);
   const containerIdentity = resolveContainerIdentity();
   const bridges: AgentMcpBridge[] = [];
+  const unavailable: AgentMcpUnavailableMap = {};
 
   try {
     for (const [serverName, bridgeConfig] of Object.entries(mcpConfig.bridges)) {
-      const bridge = await startAgentMcpBridge({
-        groupFolder: agentGroup.folder,
-        agentGroupId: agentGroup.id,
-        bridge: { serverName, ...bridgeConfig },
-        containerUid: containerIdentity.uid,
-        containerGid: containerIdentity.gid,
-      });
-      bridges.push(bridge);
-      mounts.push({
-        hostPath: bridge.hostSocketDir,
-        containerPath: bridge.containerSocketDir,
-        readonly: false,
-      });
+      try {
+        const bridge = await startAgentMcpBridge({
+          groupFolder: agentGroup.folder,
+          agentGroupId: agentGroup.id,
+          bridge: { serverName, ...bridgeConfig },
+          containerUid: containerIdentity.uid,
+          containerGid: containerIdentity.gid,
+        });
+        bridges.push(bridge);
+        mounts.push({
+          hostPath: bridge.hostSocketDir,
+          containerPath: bridge.containerSocketDir,
+          readonly: false,
+        });
+      } catch (err) {
+        // Narrow degradation: ONLY an expected missing/expired credential class
+        // on an OPTIONAL bridge degrades to unavailable. A required bridge, or
+        // ANY non-credential failure (integrity/ownership/symlink/mount-overlap/
+        // malformed), rethrows and fails closed (stopping started bridges).
+        if (err instanceof AgentMcpCredentialUnavailableError && bridgeConfig.required === false) {
+          log.warn('Optional agent MCP bridge degraded to unavailable', {
+            group: agentGroup.folder,
+            serverName,
+            category: err.category,
+          });
+          unavailable[serverName] = { category: err.category, message: err.message };
+          continue;
+        }
+        throw err;
+      }
     }
     if (bridges.length > 0) {
       rejectAuthOverlappingMounts(
@@ -528,7 +564,10 @@ async function attachAgentMcpBridges(
         bridges.map((bridge) => bridge.authDir),
       );
     }
-    syncAgentMcpRuntimeConfig(agentGroup.folder, containerConfig, bridges, mcpConfig.allowedTools);
+    syncAgentMcpRuntimeConfig(agentGroup.folder, containerConfig, bridges, mcpConfig.allowedTools, unavailable);
+    // Recompose CLAUDE.md so the sanitized unavailable state (or its removal)
+    // reaches the OpenCode-loaded .claude-fragments/*.md system context.
+    composeGroupClaudeMd(agentGroup);
     return bridges;
   } catch (err) {
     await stopAgentMcpBridges(bridges);

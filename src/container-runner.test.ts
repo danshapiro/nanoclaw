@@ -15,7 +15,7 @@ import {
   resolveAgentImageForRun,
   resolveProviderName,
 } from './container-runner.js';
-import type { AgentMcpBridgeOptions } from './agent-mcp-bridge.js';
+import { AgentMcpCredentialUnavailableError, type AgentMcpBridgeOptions } from './agent-mcp-bridge.js';
 import type { AgentMcpConfigForGroup } from './agent-mcp-config.js';
 import type { ContainerConfig } from './container-config.js';
 import type { AgentGroup } from './types.js';
@@ -47,9 +47,24 @@ function fakeChildProcess(pid = 12345): NodeJS.EventEmitter & { pid: number; kil
   return proc;
 }
 
+type StartBridgeResult = {
+  serverName: string;
+  hostSocketDir: string;
+  hostSocketPath: string;
+  containerSocketDir: string;
+  containerSocketPath: string;
+  authDir: string;
+  stop: ReturnType<typeof vi.fn>;
+};
+
 async function loadContainerRunnerHarness(
   options: {
     mcpConfigForGroup?: (folder: string) => AgentMcpConfigForGroup;
+    startBridge?: (
+      opts: AgentMcpBridgeOptions,
+      defaultResult: StartBridgeResult,
+      credentialError: typeof AgentMcpCredentialUnavailableError,
+    ) => Promise<StartBridgeResult>;
   } = {},
 ) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-container-runner-'));
@@ -78,15 +93,24 @@ async function loadContainerRunnerHarness(
   const loadAgentMcpConfigForGroupMock = vi.fn(
     (folder: string) => options.mcpConfigForGroup?.(folder) ?? { bridges: {}, allowedTools: [] },
   );
-  const startAgentMcpBridgeMock = vi.fn(async (opts: AgentMcpBridgeOptions) => ({
-    serverName: opts.bridge.serverName,
-    hostSocketDir: path.join(root, 'mcp-runs', opts.bridge.serverName),
-    hostSocketPath: path.join(root, 'mcp-runs', opts.bridge.serverName, `${opts.bridge.socketNamePrefix}.sock`),
-    containerSocketDir: `/workspace/mcp/${opts.bridge.serverName}`,
-    containerSocketPath: `/workspace/mcp/${opts.bridge.serverName}/${opts.bridge.socketNamePrefix}.sock`,
-    authDir: path.join(root, 'auth', opts.bridge.serverName),
-    stop: vi.fn(),
-  }));
+  // Populated after the post-reset bridge import so callbacks throw the same
+  // class identity container-runner.ts resolves (instanceof works).
+  const credentialErrorRef: { ctor?: typeof AgentMcpCredentialUnavailableError } = {};
+  const startAgentMcpBridgeMock = vi.fn(async (opts: AgentMcpBridgeOptions) => {
+    const defaultResult: StartBridgeResult = {
+      serverName: opts.bridge.serverName,
+      hostSocketDir: path.join(root, 'mcp-runs', opts.bridge.serverName),
+      hostSocketPath: path.join(root, 'mcp-runs', opts.bridge.serverName, `${opts.bridge.socketNamePrefix}.sock`),
+      containerSocketDir: `/workspace/mcp/${opts.bridge.serverName}`,
+      containerSocketPath: `/workspace/mcp/${opts.bridge.serverName}/${opts.bridge.socketNamePrefix}.sock`,
+      authDir: path.join(root, 'auth', opts.bridge.serverName),
+      stop: vi.fn(),
+    };
+    if (options.startBridge) {
+      return options.startBridge(opts, defaultResult, credentialErrorRef.ctor!);
+    }
+    return defaultResult;
+  });
 
   vi.resetModules();
   vi.doMock('child_process', async (importOriginal) => {
@@ -118,9 +142,13 @@ async function loadContainerRunnerHarness(
   vi.doMock('./agent-mcp-config.js', () => ({
     loadAgentMcpConfigForGroup: loadAgentMcpConfigForGroupMock,
   }));
-  vi.doMock('./agent-mcp-bridge.js', () => ({
-    startAgentMcpBridge: startAgentMcpBridgeMock,
-  }));
+  vi.doMock('./agent-mcp-bridge.js', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('./agent-mcp-bridge.js')>();
+    return {
+      ...actual,
+      startAgentMcpBridge: startAgentMcpBridgeMock,
+    };
+  });
   vi.doMock('./providers/index.js', () => ({}));
   vi.doMock('./yente/service-env.js', () => ({
     assertOneCliApplied(applied: boolean): void {
@@ -132,6 +160,12 @@ async function loadContainerRunnerHarness(
   const db = await import('./db/index.js');
   const sessions = await import('./db/sessions.js');
   const sessionManager = await import('./session-manager.js');
+  // Import the bridge module AFTER vi.resetModules() so its
+  // AgentMcpCredentialUnavailableError class identity matches the one
+  // container-runner.ts resolves — `instanceof` would otherwise fail across
+  // the module-registry reset.
+  const bridgeModule = await import('./agent-mcp-bridge.js');
+  credentialErrorRef.ctor = bridgeModule.AgentMcpCredentialUnavailableError;
   const containerRunner = await import('./container-runner.js');
 
   const mainDb = db.initTestDb();
@@ -168,6 +202,7 @@ async function loadContainerRunnerHarness(
       vi.doUnmock('./yente/service-env.js');
       vi.resetModules();
     },
+    bridgeModule,
     containerRunner,
     oneCliRelease,
     oneCliStarted,
@@ -437,6 +472,7 @@ describe('session wake lifecycle', () => {
               remoteUrl: 'https://mcp.granola.ai/mcp',
               callbackPort: 37947,
               socketNamePrefix: 'granola',
+              required: true,
             },
           },
         };
@@ -465,6 +501,152 @@ describe('session wake lifecycle', () => {
       );
       expect(containerJson.mcpServers.granola.args).toContain('/workspace/mcp/granola/granola.sock');
       expect(containerJson.agentMcpAllowedTools).toEqual(['mcp__granola__*']);
+    } finally {
+      harness.close();
+    }
+  });
+
+  function granolaOnlyConfig(): (folder: string) => AgentMcpConfigForGroup {
+    return () => ({
+      allowedTools: ['mcp__granola__*'],
+      bridges: {
+        granola: {
+          type: 'mcp-remote-unix-socket',
+          remoteUrl: 'https://mcp.granola.ai/mcp',
+          callbackPort: 37947,
+          socketNamePrefix: 'granola',
+          required: false,
+        },
+      },
+    });
+  }
+
+  for (const category of ['auth_required', 'auth_expired'] as const) {
+    it(`spawns the container with Granola omitted when it degrades with ${category}`, async () => {
+      const harness = await loadContainerRunnerHarness({
+        mcpConfigForGroup: granolaOnlyConfig(),
+        startBridge: async (_opts, _defaultResult, CredentialError) => {
+          throw new CredentialError(category, 'Granola is temporarily unavailable.');
+        },
+      });
+      try {
+        const wake = harness.containerRunner.wakeContainer(harness.session);
+        await harness.oneCliStarted.promise;
+        harness.oneCliRelease.resolve();
+        await wake;
+
+        // Container still spawned (degraded, not fail-closed).
+        expect(harness.spawnMock).toHaveBeenCalled();
+
+        const containerJson = JSON.parse(
+          fs.readFileSync(path.join(harness.groupsDir, 'agent', 'container.json'), 'utf8'),
+        );
+        // Granola MCP server + allowed tools omitted from the runtime config.
+        expect(containerJson.mcpServers.granola).toBeUndefined();
+        expect(containerJson.agentMcpServerNames).not.toContain('granola');
+        expect(containerJson.agentMcpAllowedTools ?? []).not.toContain('mcp__granola__*');
+        // Sanitized unavailable state recorded with the credential category.
+        expect(containerJson.agentMcpUnavailable.granola.category).toBe(category);
+        const text = JSON.stringify(containerJson.agentMcpUnavailable.granola);
+        expect(text).not.toContain(harness.root);
+        expect(text).not.toMatch(/\b\d{3,5}:\d{3,5}\b/);
+        expect(text).not.toMatch(/\/home\//);
+      } finally {
+        harness.close();
+      }
+    });
+  }
+
+  it('clears a stale unavailable entry when Granola starts successfully later', async () => {
+    const harness = await loadContainerRunnerHarness({ mcpConfigForGroup: granolaOnlyConfig() });
+    try {
+      // Pre-seed container.json with a stale unavailable entry from a prior spawn.
+      const containerJsonPath = path.join(harness.groupsDir, 'agent', 'container.json');
+      fs.mkdirSync(path.dirname(containerJsonPath), { recursive: true });
+      fs.writeFileSync(
+        containerJsonPath,
+        JSON.stringify({
+          mcpServers: {},
+          agentMcpUnavailable: { granola: { category: 'auth_required', message: 'stale' } },
+        }),
+      );
+
+      const wake = harness.containerRunner.wakeContainer(harness.session);
+      await harness.oneCliStarted.promise;
+      harness.oneCliRelease.resolve();
+      await wake;
+
+      const containerJson = JSON.parse(fs.readFileSync(containerJsonPath, 'utf8'));
+      // Granola started successfully — stale unavailable entry removed.
+      expect(containerJson.agentMcpUnavailable?.granola).toBeUndefined();
+      expect(containerJson.mcpServers.granola).toBeDefined();
+      expect(containerJson.agentMcpAllowedTools).toContain('mcp__granola__*');
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('fails closed (does not spawn) when a non-credential Granola failure occurs', async () => {
+    const harness = await loadContainerRunnerHarness({
+      mcpConfigForGroup: granolaOnlyConfig(),
+      startBridge: async () => {
+        // Integrity-style failure: NOT a credential class, so it must fail closed
+        // even for the optional Granola bridge.
+        throw new Error('Granola MCP auth path must not contain symlinks');
+      },
+    });
+    try {
+      // attachAgentMcpBridges throws before OneCLI is invoked, so don't wait
+      // on oneCliStarted — just resolve the release latch and await rejection.
+      harness.oneCliRelease.resolve();
+      const wake = harness.containerRunner.wakeContainer(harness.session);
+      await expect(wake).rejects.toThrow(/must not contain symlinks/);
+      expect(harness.spawnMock).not.toHaveBeenCalled();
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('fails closed when a required bridge fails, and stops already-started bridges', async () => {
+    const stopSpies: ReturnType<typeof vi.fn>[] = [];
+    const harness = await loadContainerRunnerHarness({
+      mcpConfigForGroup: () => ({
+        allowedTools: ['mcp__granola__*', 'mcp__other__*'],
+        bridges: {
+          granola: {
+            type: 'mcp-remote-unix-socket',
+            remoteUrl: 'https://mcp.granola.ai/mcp',
+            callbackPort: 37947,
+            socketNamePrefix: 'granola',
+            required: false,
+          },
+          other: {
+            type: 'mcp-remote-unix-socket',
+            remoteUrl: 'https://example.com/mcp',
+            callbackPort: 37948,
+            socketNamePrefix: 'other',
+            required: true,
+          },
+        },
+      }),
+      startBridge: async (opts, defaultResult, CredentialError) => {
+        if (opts.bridge.serverName === 'other') {
+          // Even a credential-shaped failure on a REQUIRED bridge must fail closed.
+          throw new CredentialError('auth_required', 'Other is unavailable.');
+        }
+        stopSpies.push(defaultResult.stop);
+        return defaultResult;
+      },
+    });
+    try {
+      // The required-bridge failure throws before OneCLI is invoked.
+      harness.oneCliRelease.resolve();
+      const wake = harness.containerRunner.wakeContainer(harness.session);
+      await expect(wake).rejects.toBeInstanceOf(Error);
+      expect(harness.spawnMock).not.toHaveBeenCalled();
+      // The already-started granola bridge must be stopped on the required failure.
+      expect(stopSpies.length).toBeGreaterThan(0);
+      for (const stop of stopSpies) expect(stop).toHaveBeenCalled();
     } finally {
       harness.close();
     }

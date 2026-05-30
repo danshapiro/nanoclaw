@@ -100,6 +100,20 @@ export function composeGroupClaudeMd(group: AgentGroup): void {
     }
   }
 
+  // Agent MCP unavailable fragments — sanitized, always-in-context notices for
+  // OPTIONAL bridges (e.g. Granola) that degraded due to expected missing or
+  // expired credentials. Written as inline fragments so they reach the
+  // OpenCode-loaded `/workspace/agent/.claude-fragments/*.md` system context,
+  // not just host-side config. The `message` is already sanitized upstream
+  // (no host paths, uid/gid, or raw errors); these fragments are pruned
+  // automatically by the reconcile step below once the bridge is healthy.
+  for (const [name, info] of Object.entries(config.agentMcpUnavailable ?? {})) {
+    desired.set(`mcp-${name}-unavailable.md`, {
+      type: 'inline',
+      content: composeUnavailableFragment(name, info),
+    });
+  }
+
   // Reconcile: drop stale, write desired.
   for (const existing of fs.readdirSync(fragmentsDir)) {
     if (!desired.has(existing)) {
@@ -171,6 +185,24 @@ export function migrateGroupsToClaudeLocal(): void {
   if (actions.length > 0) {
     log.info('Migrated groups to CLAUDE.local.md model', { actions });
   }
+}
+
+/**
+ * Build the always-in-context notice for a degraded optional MCP bridge. The
+ * `message` is already sanitized by the host (no paths/uid/gid/raw errors); we
+ * title-case the server name for readability and keep the body to the supplied
+ * message plus a short usage note so the agent does not try to call the tool.
+ */
+function composeUnavailableFragment(name: string, info: { category: string; message: string }): string {
+  const title = name.charAt(0).toUpperCase() + name.slice(1);
+  return [
+    `## ${title} MCP server is unavailable`,
+    '',
+    info.message,
+    '',
+    `Do not attempt to use the ${title} tools this turn; they are not loaded. If you need ${title}, ask the operator to re-authorize it.`,
+    '',
+  ].join('\n');
 }
 
 function syncSymlink(linkPath: string, target: string): void {

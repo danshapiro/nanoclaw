@@ -38,6 +38,15 @@ export interface ContainerConfig {
   agentMcpServerNames?: string[];
   /** Host-managed provider tool allowlist entries for agent MCP bridges. */
   agentMcpAllowedTools?: string[];
+  /**
+   * Host-managed map of agent MCP bridges that degraded to unavailable due to
+   * an expected missing/expired credential. Written at spawn time when an
+   * OPTIONAL bridge (e.g. Granola) hits a known credential class; the offending
+   * MCP server + its allowed tools are omitted from the runtime config. The
+   * sanitized `message` is surfaced to the agent via a CLAUDE.md fragment.
+   * Cleared at spawn time when the bridge later starts successfully.
+   */
+  agentMcpUnavailable?: Record<string, { category: string; message: string }>;
   packages: { apt: string[]; npm: string[] };
   imageTag?: string;
   additionalMounts: AdditionalMountConfig[];
@@ -85,6 +94,7 @@ export function readContainerConfig(folder: string): ContainerConfig {
       mcpServers: raw.mcpServers ?? {},
       agentMcpServerNames: raw.agentMcpServerNames ?? [],
       agentMcpAllowedTools: raw.agentMcpAllowedTools ?? [],
+      agentMcpUnavailable: raw.agentMcpUnavailable,
       packages: {
         apt: raw.packages?.apt ?? [],
         npm: raw.packages?.npm ?? [],

@@ -48,6 +48,7 @@ describe('loadAgentMcpConfigForGroup', () => {
             remoteUrl: 'https://mcp.granola.ai/mcp',
             callbackPort: 37947,
             socketNamePrefix: 'granola',
+            required: false,
           },
         },
       });
@@ -81,6 +82,7 @@ describe('loadAgentMcpConfigForGroup', () => {
             remoteUrl: 'https://mcp.granola.ai/mcp',
             callbackPort: 37947,
             socketNamePrefix: 'granola',
+            required: false,
           },
         },
       });
@@ -119,6 +121,94 @@ describe('loadAgentMcpConfigForGroup', () => {
     try {
       expect(Object.keys(loadAgentMcpConfigForGroup('main').bridges).sort()).toEqual(['granola', 'other']);
       expect(loadAgentMcpConfigForGroup('main').allowedTools.sort()).toEqual(['mcp__granola__*', 'mcp__other__*']);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('defaults granola bridges to optional and non-granola bridges to required', () => {
+    const root = writeConfig({
+      groups: {
+        main: {
+          allowedTools: ['mcp__granola__*', 'mcp__other__*'],
+          bridges: {
+            granola: {
+              type: 'mcp-remote-unix-socket',
+              remoteUrl: 'https://mcp.granola.ai/mcp',
+              callbackPort: 37947,
+              socketNamePrefix: 'granola',
+            },
+            other: {
+              type: 'mcp-remote-unix-socket',
+              remoteUrl: 'https://example.com/mcp',
+              callbackPort: 37948,
+              socketNamePrefix: 'other',
+            },
+          },
+        },
+      },
+    });
+    try {
+      const config = loadAgentMcpConfigForGroup('main');
+      expect(config.bridges.granola.required).toBe(false);
+      expect(config.bridges.other.required).toBe(true);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves an explicit required/optional setting that overrides the default', () => {
+    const root = writeConfig({
+      groups: {
+        main: {
+          allowedTools: ['mcp__granola__*', 'mcp__other__*'],
+          bridges: {
+            granola: {
+              type: 'mcp-remote-unix-socket',
+              remoteUrl: 'https://mcp.granola.ai/mcp',
+              callbackPort: 37947,
+              socketNamePrefix: 'granola',
+              required: true,
+            },
+            other: {
+              type: 'mcp-remote-unix-socket',
+              remoteUrl: 'https://example.com/mcp',
+              callbackPort: 37948,
+              socketNamePrefix: 'other',
+              required: false,
+            },
+          },
+        },
+      },
+    });
+    try {
+      const config = loadAgentMcpConfigForGroup('main');
+      expect(config.bridges.granola.required).toBe(true);
+      expect(config.bridges.other.required).toBe(false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a non-boolean required field as malformed config (fail-closed)', () => {
+    const root = writeConfig({
+      groups: {
+        main: {
+          allowedTools: ['mcp__granola__*'],
+          bridges: {
+            granola: {
+              type: 'mcp-remote-unix-socket',
+              remoteUrl: 'https://mcp.granola.ai/mcp',
+              callbackPort: 37947,
+              socketNamePrefix: 'granola',
+              required: 'yes',
+            },
+          },
+        },
+      },
+    });
+    try {
+      expect(() => loadAgentMcpConfigForGroup('main')).toThrow(/required must be a boolean/);
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }
