@@ -358,8 +358,21 @@ export function classifyAndSanitize(raw: RawSideEffectRecord, opts: ClassifyOpti
 
 /**
  * Return the exact canonical payload string to verify the signature over. The
- * shim forwards the proxy's payload verbatim as a string; verify over those
- * exact bytes. A legacy object form is re-serialized canonically as a fallback.
+ * PRIMARY path: the shim forwards the proxy's signed payload verbatim as a
+ * string, and we verify over those exact bytes — so cross-language byte parity
+ * is guaranteed regardless of any character (U+2028/U+2029 included), because we
+ * never re-serialize.
+ *
+ * The object form below is a LEGACY FALLBACK only (a payload that arrived
+ * already parsed instead of as the forwarded string). It re-serializes with
+ * `JSON.stringify`, which emits U+2028/U+2029 (LINE/PARAGRAPH SEPARATOR) RAW,
+ * whereas the Go signer's `SetEscapeHTML(false)` encoder still escapes those two
+ * code points — so a re-serialized payload whose `method`/`service`/etc.
+ * contained U+2028/U+2029 would NOT byte-match the Go-signed bytes and would
+ * (safely) fail to verify. This fallback must therefore only be relied on for
+ * content free of U+2028/U+2029; the verbatim-string primary path is the
+ * authoritative one and is unaffected. (No production payload field carries
+ * those separators today.)
  */
 function payloadCanonicalString(payload: string | Record<string, unknown> | undefined): string {
   if (typeof payload === 'string') return payload;

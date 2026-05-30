@@ -29,6 +29,7 @@
  */
 import type Database from 'better-sqlite3';
 import fs from 'fs';
+import path from 'path';
 
 import { getActiveSessions } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
@@ -448,6 +449,92 @@ export async function recoverInterruptedTurn(opts: {
 }
 
 /**
+ * Scoping for the host-only GWS crash-window discovery, derived from the
+ * interrupted turn's recovery context so we import ONLY the active turn's
+ * orphan draft-create — never another session's/route's drafts from the shared
+ * global audit store.
+ *
+ * Sources (all host-readable, host-authoritative — never agent-written truth):
+ *   - `routeKey`/`inputId`: the poll loop's atomically-written
+ *     `<sessionDir>/.active-input.json` ({inputId, routeKey, updatedAt}). This is
+ *     the SAME file the in-container tools read to stamp staged JSONL, mapped to
+ *     the host session dir (the container's /workspace). The poll loop is the
+ *     trusted writer; the agent never writes it. `inputId` may be absent (e.g.
+ *     the file is missing because the kill landed before the first
+ *     input-accepted), in which case we scope by route + time only.
+ *   - `notBefore`: the earliest processing-claim time on this session's
+ *     interrupted rows (turn-start), so we never import a draft from an OLDER,
+ *     already-recovered turn on the same route.
+ *
+ * The minimum scope is `routeKey` + `notBefore`; we never leave the global audit
+ * store fully unscoped.
+ */
+export function gwsDiscoveryScope(
+  sessionDir: string,
+  outDb: Database.Database,
+): { inputId?: string; routeKey?: string; notBefore?: string } {
+  const scope: { inputId?: string; routeKey?: string; notBefore?: string } = {};
+
+  // routeKey/inputId from the poll loop's active-input correlation file.
+  try {
+    const activeInputPath = path.join(sessionDir, '.active-input.json');
+    if (fs.existsSync(activeInputPath)) {
+      const parsed = JSON.parse(fs.readFileSync(activeInputPath, 'utf8')) as {
+        inputId?: unknown;
+        routeKey?: unknown;
+      };
+      if (typeof parsed.routeKey === 'string' && parsed.routeKey) scope.routeKey = parsed.routeKey;
+      if (typeof parsed.inputId === 'string' && parsed.inputId) scope.inputId = parsed.inputId;
+    }
+  } catch {
+    // Missing/unparseable correlation file ⇒ fall back to route+time only (route
+    // may also be absent here; notBefore still bounds the import window).
+  }
+
+  // notBefore = earliest interrupted-turn processing-claim time (turn-start).
+  // Convert the SQLite UTC claim string to a Z-suffixed ISO-8601 so it compares
+  // correctly against the audit store's `occurred_at` (also Z-suffixed ISO).
+  try {
+    const claims = getProcessingClaims(outDb);
+    let earliest = Number.POSITIVE_INFINITY;
+    for (const c of claims) {
+      const ms = parseSqliteUtc(c.status_changed);
+      if (Number.isFinite(ms) && ms < earliest) earliest = ms;
+    }
+    if (Number.isFinite(earliest)) scope.notBefore = new Date(earliest).toISOString();
+  } catch {
+    // No claims / table missing ⇒ no time bound (route still scopes the import).
+  }
+
+  return scope;
+}
+
+/**
+ * Production crash-window discovery wiring: compute the active turn's scope from
+ * the host session dir + outbound DB, then run the host-only GWS audit-store
+ * discovery bounded to THAT scope. Exported so the production wiring (not just
+ * the unscoped primitive) is directly testable: a shared global audit store
+ * with a draft-create for THIS route/window plus one for a DIFFERENT route must
+ * import only the matching one.
+ */
+export function discoverGwsCrashWindowDraftsScoped(opts: {
+  sessionDir: string;
+  outDb: Database.Database;
+  containerStopped: boolean;
+  auditStorePath: string | undefined;
+}): ReturnType<typeof discoverGwsCrashWindowDrafts> {
+  const scope = gwsDiscoveryScope(opts.sessionDir, opts.outDb);
+  return discoverGwsCrashWindowDrafts({
+    sessionDir: opts.sessionDir,
+    containerStopped: opts.containerStopped,
+    auditStorePath: opts.auditStorePath,
+    inputId: scope.inputId,
+    routeKey: scope.routeKey,
+    notBefore: scope.notBefore,
+  });
+}
+
+/**
  * Production wiring for recoverInterruptedTurn from the sweep loop. Reopens the
  * outbound DB writable only after a verified container stop, imports the host
  * session path for /workspace/side-effects.jsonl, writes recovery, then resets.
@@ -481,9 +568,17 @@ export async function recoverAfterKill(inDb: Database.Database, session: Session
         // drafts.create whose JSONL append was lost to a kill-in-the-window so
         // recovery does not duplicate the draft. Gated on GWS_AUDIT_STORE; unset
         // ⇒ inactive (degrades to no-duplication-when-tool-survives).
+        //
+        // SCOPE the discovery to THIS turn — the audit store is a SHARED GLOBAL
+        // file across every session/route, so an unscoped read would import
+        // other conversations' drafts into this session's ledger. We pass the
+        // active turn's route (and inputId when known) plus a notBefore
+        // turn-start bound, computed while the interrupted processing claims are
+        // still present (recoverInterruptedTurn resets them only after this).
         try {
-          discoverGwsCrashWindowDrafts({
+          discoverGwsCrashWindowDraftsScoped({
             sessionDir: dir,
+            outDb: writableOutDb,
             containerStopped,
             auditStorePath: process.env.GWS_AUDIT_STORE,
           });

@@ -6,9 +6,11 @@
  *
  * Workspace JSONL is a STAGING CHANNEL, not authoritative truth. Validation
  * decides what recovery may rely on:
- *   - `gmail_draft_created` requires a valid Ed25519 signature over the proxy's
- *     canonical payload, verified with the PUBLIC key. In Task 1 the verifier
- *     is a fail-closed stub, so EVERY gmail entry stays an unvalidated hint.
+ *   - `gmail_draft_created` is authoritative ONLY if its detached Ed25519
+ *     signature verifies over the staged canonical payload with the configured
+ *     PUBLIC verify key. Unsigned, no-key-configured, forged, or tampered
+ *     entries fail closed and stay unvalidated hints — the agent cannot forge a
+ *     valid entry because it never holds the proxy's private key.
  *   - `summarize_dnd_summary_artifact` requires the referenced artifact to
  *     exist under an allowed output root and match the staged size.
  * Only validated entries are authoritative; unvalidated entries are retained as
@@ -184,7 +186,8 @@ export function getAuthoritativeSideEffects(opts: { routeKey?: string; inputId?:
 }
 
 /**
- * Unvalidated hints (e.g. unsigned gmail_draft_created in Task 1). NEVER
+ * Unvalidated hints (e.g. an unsigned / no-key / forged / tampered
+ * gmail_draft_created whose Ed25519 signature did not verify). NEVER
  * authoritative; surfaced only for diagnostics, never to satisfy recovery or
  * final-success assertions.
  */

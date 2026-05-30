@@ -20,6 +20,7 @@ import { describe, it, expect } from 'vitest';
 
 import {
   canonicalSideEffectPayload,
+  classifyAndSanitize,
   verifyGwsSideEffectSignature,
   type GwsVerifyResult,
 } from './side-effects-verify.js';
@@ -128,5 +129,57 @@ describe('side-effects-verify cross-check (host copy)', () => {
     expect(canonical).toBe(
       '{"audit_id":"abc123","service":"gmail","method":"users.drafts.create","request_class":"api","api_effect":true,"operation_succeeded":true,"occurred_at":"2026-05-29T00:00:00.000Z","result_digest":"deadbeef"}',
     );
+  });
+
+  it('rejects an audit_id-rebinding: a valid signature over payload audit_id:"X" attached to a record audit_id:"Y" is NOT authoritative', () => {
+    const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+    const pem = publicKey.export({ format: 'pem', type: 'spki' }).toString();
+
+    // Genuine signature over a payload whose embedded audit_id is "X".
+    const signedPayloadX = canonicalSideEffectPayload({
+      audit_id: 'X',
+      service: 'gmail',
+      method: 'users.drafts.create',
+      request_class: 'api',
+      api_effect: true,
+      operation_succeeded: true,
+      occurred_at: '2026-05-29T00:00:00.000Z',
+      result_digest: 'r-abc',
+    });
+    const sigOverX = edSign(null, Buffer.from(signedPayloadX, 'utf8'), privateKey).toString('base64');
+
+    // The PURE verify still passes — the signature genuinely covers these bytes.
+    expect(verifyGwsSideEffectSignature(signedPayloadX, sigOverX, pem)).toBe('valid');
+
+    // …but binding it to a record whose own audit_id (idempotency key) is "Y"
+    // must downgrade to NOT authoritative, so a genuine past signature cannot be
+    // replayed under a different idempotency key.
+    const rebound = classifyAndSanitize(
+      {
+        kind: 'gmail_draft_created',
+        audit_id: 'Y',
+        signature: sigOverX,
+        payload: signedPayloadX,
+        evidence: { draft_id: 'r-abc' },
+      },
+      { gwsPublicKey: pem },
+    );
+    expect(rebound?.id).toBe('Y');
+    expect(rebound?.validation.authoritative).toBe(false);
+    expect(rebound?.validation.reason).toBe('gmail_invalid');
+
+    // Control: the same signature attached to the MATCHING record audit_id "X"
+    // IS authoritative, proving only the rebinding (not the signature) was rejected.
+    const matched = classifyAndSanitize(
+      {
+        kind: 'gmail_draft_created',
+        audit_id: 'X',
+        signature: sigOverX,
+        payload: signedPayloadX,
+        evidence: { draft_id: 'r-abc' },
+      },
+      { gwsPublicKey: pem },
+    );
+    expect(matched?.validation.authoritative).toBe(true);
   });
 });

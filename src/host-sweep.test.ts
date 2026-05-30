@@ -3,16 +3,22 @@
  * ACTION-ITEMS item 9. Lives on the pure helper `decideStuckAction` so we
  * don't have to mock the filesystem or the container runner.
  */
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+
 import Database from 'better-sqlite3';
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { countDueMessagesExcludingRecovery, getProcessingClaims } from './db/session-db.js';
+import { OUTBOUND_SCHEMA } from './db/schema.js';
 import {
   ABSOLUTE_CEILING_MS,
   CLAIM_STUCK_MS,
   OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS,
   clearProviderToolState,
   decideStuckAction,
+  discoverGwsCrashWindowDraftsScoped,
   effectiveCeilingMs,
   parseSqliteUtc,
   recoverInterruptedTurn,
@@ -568,5 +574,177 @@ describe('host sweep wake decision excludes recovery-owned rows', () => {
 
     inDb.close();
     outDb.close();
+  });
+});
+
+/**
+ * PRODUCTION wiring for the host-only GWS crash-window discovery. The audit
+ * store is a SHARED GLOBAL file across every session/route, so the recovery
+ * path MUST scope the import to the interrupted turn (route + time window, plus
+ * inputId when known) — otherwise one session's recovery would import every
+ * other session's/route's orphan drafts into this session's ledger.
+ *
+ * These tests exercise `discoverGwsCrashWindowDraftsScoped` (the exact scope
+ * derivation + discovery call that `recoverAfterKill` runs) against a real
+ * session dir, a real `.active-input.json`, real processing claims, and a global
+ * audit store holding both a MATCHING and a NON-MATCHING entry.
+ */
+describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)', () => {
+  let tmpRoot: string;
+
+  beforeEach(() => {
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'host-sweep-scope-'));
+  });
+  afterEach(() => {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  function setupSession(): { sessionPath: string; outPath: string } {
+    const sessionPath = path.join(tmpRoot, 'sess');
+    fs.mkdirSync(sessionPath, { recursive: true });
+    const outPath = path.join(sessionPath, 'outbound.db');
+    const out = new Database(outPath);
+    out.exec(OUTBOUND_SCHEMA);
+    out.close();
+    return { sessionPath, outPath };
+  }
+
+  function writeAuditStore(p: string, entries: object[]): void {
+    fs.writeFileSync(p, entries.map((e) => JSON.stringify(e)).join('\n') + '\n');
+  }
+
+  it('imports ONLY this turn’s route/window draft, excluding other-session/route entries from the shared global store', () => {
+    const { sessionPath, outPath } = setupSession();
+    const auditStore = path.join(tmpRoot, 'gws-audit.jsonl');
+
+    const thisRoute = 'opencode|discord|chan-1|dm:mg-1';
+    const otherRoute = 'opencode|discord|chan-9|dm:mg-9';
+    const turnStart = '2026-05-29T12:00:00.000Z';
+
+    // The poll loop's active-input correlation file: this turn's route/input.
+    fs.writeFileSync(
+      path.join(sessionPath, '.active-input.json'),
+      JSON.stringify({ inputId: 'in-this', routeKey: thisRoute, updatedAt: turnStart }),
+    );
+
+    // The interrupted turn's processing claim sets the turn-start (notBefore).
+    const out = new Database(outPath);
+    out
+      .prepare('INSERT INTO processing_ack (message_id, status, status_changed) VALUES (?, ?, ?)')
+      .run('m-this', 'processing', '2026-05-29 12:00:00');
+    out.close();
+
+    writeAuditStore(auditStore, [
+      // MATCHING: this route, this input, after turn-start.
+      {
+        audit_id: 'draft-this',
+        input_id: 'in-this',
+        route_key: thisRoute,
+        service: 'gmail',
+        method: 'users.drafts.create',
+        occurred_at: '2026-05-29T12:00:05.000Z',
+      },
+      // NON-MATCHING (other session/route): must be excluded.
+      {
+        audit_id: 'draft-other-route',
+        input_id: 'in-other',
+        route_key: otherRoute,
+        service: 'gmail',
+        method: 'users.drafts.create',
+        occurred_at: '2026-05-29T12:00:06.000Z',
+      },
+      // NON-MATCHING (this route but BEFORE turn-start — an older, already-
+      // recovered turn): excluded by notBefore.
+      {
+        audit_id: 'draft-stale',
+        input_id: 'in-old',
+        route_key: thisRoute,
+        service: 'gmail',
+        method: 'users.drafts.create',
+        occurred_at: '2026-05-29T11:00:00.000Z',
+      },
+    ]);
+
+    const writableOutDb = new Database(outPath);
+    try {
+      const r = discoverGwsCrashWindowDraftsScoped({
+        sessionDir: sessionPath,
+        outDb: writableOutDb,
+        containerStopped: true,
+        auditStorePath: auditStore,
+      });
+      expect(r.discovered).toBe(1);
+    } finally {
+      writableOutDb.close();
+    }
+
+    const verify = new Database(outPath, { readonly: true });
+    const rows = verify
+      .prepare("SELECT id FROM side_effect_ledger WHERE kind = 'gmail_draft_created' ORDER BY id")
+      .all() as Array<{ id: string }>;
+    verify.close();
+    // Only the matching draft was imported; the other route's and the stale
+    // pre-turn drafts were excluded.
+    expect(rows.map((x) => x.id)).toEqual(['draft-this']);
+  });
+
+  it('falls back to route + notBefore when .active-input.json has no inputId, still excluding the other route', () => {
+    const { sessionPath, outPath } = setupSession();
+    const auditStore = path.join(tmpRoot, 'gws-audit.jsonl');
+
+    const thisRoute = 'opencode|discord|chan-1|dm:mg-1';
+    const otherRoute = 'opencode|discord|chan-9|dm:mg-9';
+
+    // The kill landed before a single accepted input id was recorded: route is
+    // known (host-authoritative) but inputId is absent.
+    fs.writeFileSync(
+      path.join(sessionPath, '.active-input.json'),
+      JSON.stringify({ routeKey: thisRoute, updatedAt: '2026-05-29T12:00:00.000Z' }),
+    );
+
+    const out = new Database(outPath);
+    out
+      .prepare('INSERT INTO processing_ack (message_id, status, status_changed) VALUES (?, ?, ?)')
+      .run('m-this', 'processing', '2026-05-29 12:00:00');
+    out.close();
+
+    writeAuditStore(auditStore, [
+      {
+        audit_id: 'draft-this',
+        input_id: 'in-a',
+        route_key: thisRoute,
+        service: 'gmail',
+        method: 'users.drafts.create',
+        occurred_at: '2026-05-29T12:00:05.000Z',
+      },
+      {
+        audit_id: 'draft-other-route',
+        input_id: 'in-b',
+        route_key: otherRoute,
+        service: 'gmail',
+        method: 'users.drafts.create',
+        occurred_at: '2026-05-29T12:00:06.000Z',
+      },
+    ]);
+
+    const writableOutDb = new Database(outPath);
+    try {
+      const r = discoverGwsCrashWindowDraftsScoped({
+        sessionDir: sessionPath,
+        outDb: writableOutDb,
+        containerStopped: true,
+        auditStorePath: auditStore,
+      });
+      expect(r.discovered).toBe(1);
+    } finally {
+      writableOutDb.close();
+    }
+
+    const verify = new Database(outPath, { readonly: true });
+    const rows = verify.prepare("SELECT id FROM side_effect_ledger WHERE kind = 'gmail_draft_created'").all() as Array<{
+      id: string;
+    }>;
+    verify.close();
+    expect(rows.map((x) => x.id)).toEqual(['draft-this']);
   });
 });

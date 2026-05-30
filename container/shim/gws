@@ -60,24 +60,41 @@ case "${1:-}" in
 esac
 
 # Read the poll-loop-written active-input file at INVOCATION time (not from env,
-# which would be stale across follow-ups in this long-lived container). Absent or
-# unparseable ⇒ an uncorrelated diagnostic record (no inputId). The path is
-# overridable for tests via NANOCLAW_ACTIVE_INPUT_FILE.
+# which would be stale across follow-ups in this long-lived container). Absent,
+# unparseable, OR stale-by-timestamp ⇒ an uncorrelated diagnostic record (no
+# inputId). The path is overridable for tests via NANOCLAW_ACTIVE_INPUT_FILE.
 active_input_file="${NANOCLAW_ACTIVE_INPUT_FILE:-/workspace/.active-input.json}"
+
+# Staleness ceiling for the active-input correlation. The poll loop refreshes
+# `updatedAt` on every input-accepted; a normal in-turn tool call therefore sees
+# a fresh timestamp. We default to the absolute turn ceiling (6h) so a live turn
+# is NEVER wrongly treated stale, while an ancient file left by a long-dead turn
+# does not mis-correlate a fresh tool call. Env-overridable for tests/operators.
+active_input_max_age_ms="${NANOCLAW_ACTIVE_INPUT_MAX_AGE_MS:-21600000}"
 
 # Build the request body, folding in inputId/routeKey from the active-input file
 # so the proxy's audit store is correlated for crash-window discovery even when a
 # kill happens before the JSONL append. The shim NEVER adds an Authorization
 # header (OneCLI injects it at the gateway).
 request_body="$(
-  NODE_NO_WARNINGS=1 NANOCLAW_ACTIVE_INPUT_FILE="$active_input_file" node -e '
+  NODE_NO_WARNINGS=1 NANOCLAW_ACTIVE_INPUT_FILE="$active_input_file" \
+  NANOCLAW_ACTIVE_INPUT_MAX_AGE_MS="$active_input_max_age_ms" node -e '
     const fs = require("fs");
     const args = process.argv.slice(1);
     const body = { args };
     try {
       const ai = JSON.parse(fs.readFileSync(process.env.NANOCLAW_ACTIVE_INPUT_FILE, "utf8"));
-      if (ai && typeof ai.inputId === "string") body.input_id = ai.inputId;
-      if (ai && typeof ai.routeKey === "string") body.route_key = ai.routeKey;
+      // Stale-by-timestamp ⇒ uncorrelated. updatedAt is refreshed each
+      // input-accepted; an ancient file from a long-dead turn must not stamp a
+      // fresh tool call. Missing/invalid updatedAt is treated as stale.
+      const maxAge = Number(process.env.NANOCLAW_ACTIVE_INPUT_MAX_AGE_MS);
+      const updatedAt = ai && typeof ai.updatedAt === "string" ? Date.parse(ai.updatedAt) : NaN;
+      const stale =
+        !Number.isFinite(updatedAt) || (Number.isFinite(maxAge) && maxAge > 0 && Date.now() - updatedAt > maxAge);
+      if (ai && !stale) {
+        if (typeof ai.inputId === "string") body.input_id = ai.inputId;
+        if (typeof ai.routeKey === "string") body.route_key = ai.routeKey;
+      }
     } catch (e) { /* absent/unparseable ⇒ uncorrelated */ }
     process.stdout.write(JSON.stringify(body));
   ' -- "$@"
@@ -135,11 +152,19 @@ case "$http_code" in
         # sanitized (method/resource preserved, long body fields redacted); the
         # stdout is scanned for an optional draft id; NO raw auth header / NO full
         # email body. Print exactly one line to stdout for the atomic append.
+        #
+        # Capture node's exit status WITHOUT letting the command-substitution
+        # abort the script under `set -e`: a record-build failure AFTER a
+        # successful API mutation must route through the SAME exit-75
+        # partial-success path as an append failure (audit id, no body), never a
+        # bare generic failure that hides that the draft already exists.
+        record_build_status=0
         record_line="$(
           NODE_NO_WARNINGS=1 \
           NC_AUDIT_ID="$audit_id" NC_REQUEST_CLASS="$request_class" \
           NC_SIG="$sig" NC_PAYLOAD="$payload" NC_BODY="$body" \
           NANOCLAW_ACTIVE_INPUT_FILE="$active_input_file" \
+          NANOCLAW_ACTIVE_INPUT_MAX_AGE_MS="$active_input_max_age_ms" \
           node -e '
             const fs = require("fs");
             const args = process.argv.slice(1);
@@ -157,8 +182,16 @@ case "$http_code" in
             let inputId = null, routeKey = null;
             try {
               const ai = JSON.parse(fs.readFileSync(process.env.NANOCLAW_ACTIVE_INPUT_FILE, "utf8"));
-              if (ai && typeof ai.inputId === "string") inputId = ai.inputId;
-              if (ai && typeof ai.routeKey === "string") routeKey = ai.routeKey;
+              // Stale-by-timestamp ⇒ uncorrelated (same policy as the request body).
+              const maxAge = Number(process.env.NANOCLAW_ACTIVE_INPUT_MAX_AGE_MS);
+              const updatedAt = ai && typeof ai.updatedAt === "string" ? Date.parse(ai.updatedAt) : NaN;
+              const stale =
+                !Number.isFinite(updatedAt) ||
+                (Number.isFinite(maxAge) && maxAge > 0 && Date.now() - updatedAt > maxAge);
+              if (ai && !stale) {
+                if (typeof ai.inputId === "string") inputId = ai.inputId;
+                if (typeof ai.routeKey === "string") routeKey = ai.routeKey;
+              }
             } catch (e) { /* uncorrelated diagnostic */ }
             // Best-effort draft id from stdout (e.g. "Draft created: r-987654" or JSON id).
             let draftId = null;
@@ -180,7 +213,14 @@ case "$http_code" in
             };
             process.stdout.write(JSON.stringify(rec));
           ' -- "$@"
-        )"
+        )" || record_build_status=$?
+        # A record-build failure after API success is a recoverable partial
+        # success, NOT a generic failure: the draft exists but we could not stage
+        # its ledger line. Route through the exit-75 message (audit id, no body).
+        if [ "$record_build_status" -ne 0 ] || [ -z "$record_line" ]; then
+          printf 'Error: GWS draft was created (audit_id=%s) but the side-effect ledger record could not be built. The draft exists; do not recreate it.\n' "$audit_id" >&2
+          exit 75
+        fi
         # TRUE atomic append: a single >> write of the whole line. Never
         # temp+rename (which would clobber a concurrent appender). If the append
         # fails AFTER the API mutation already succeeded, emit a structured

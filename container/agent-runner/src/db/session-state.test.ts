@@ -373,7 +373,7 @@ describe('side_effect_ledger import', () => {
 function signedGmailLine(
   auditId: string,
   key: ReturnType<typeof generateKeyPairSync>,
-  overrides: { tamper?: boolean } = {},
+  overrides: { tamper?: boolean; recordAuditId?: string } = {},
 ): string {
   const payload = canonicalSideEffectPayload({
     audit_id: auditId,
@@ -401,7 +401,9 @@ function signedGmailLine(
     : payload;
   return JSON.stringify({
     kind: 'gmail_draft_created',
-    audit_id: auditId,
+    // Rebinding vector: the RECORD's audit_id (idempotency key) may differ from
+    // the audit_id embedded in the validly-signed payload.
+    audit_id: overrides.recordAuditId ?? auditId,
     occurred_at: '2026-05-29T00:00:00.000Z',
     input_id: 'in-1',
     route_key: 'opencode|discord|chan-1|dm:mg-1',
@@ -459,6 +461,27 @@ describe('side_effect_ledger signed gmail import (Task 4B)', () => {
     expect(r.imported).toBe(1);
     expect(getAuthoritativeSideEffects().some((s) => s.id === 'nokey-1')).toBe(false);
     expect(getSideEffectHints().some((s) => s.id === 'nokey-1')).toBe(true);
+  });
+
+  test('audit_id-rebinding: a valid signature over payload audit_id "X" attached to a record audit_id "Y" stays a hint', () => {
+    const key = generateKeyPairSync('ed25519');
+    const pem = key.publicKey.export({ format: 'pem', type: 'spki' }).toString();
+    // Genuinely sign a payload with audit_id "X", but attach it to a record
+    // whose own idempotency key (audit_id) is "Y". A genuine past signature must
+    // not be replayable under a different audit_id.
+    const r = importSideEffectLedger({
+      jsonl: signedGmailLine('X', key, { recordAuditId: 'Y' }),
+      gwsPublicKey: pem,
+    });
+    expect(r.imported).toBe(1);
+    expect(getAuthoritativeSideEffects().some((s) => s.id === 'Y')).toBe(false);
+    expect(getSideEffectHints().some((s) => s.id === 'Y')).toBe(true);
+
+    // Control: the same signature with a MATCHING record audit_id "X" IS
+    // authoritative — proving only the rebinding was rejected, not the signature.
+    const ok = importSideEffectLedger({ jsonl: signedGmailLine('X', key), gwsPublicKey: pem });
+    expect(ok.validated).toBe(1);
+    expect(getAuthoritativeSideEffects().some((s) => s.id === 'X')).toBe(true);
   });
 });
 
