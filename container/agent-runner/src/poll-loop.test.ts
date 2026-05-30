@@ -1621,6 +1621,132 @@ describe('poll-loop accepted-but-unresolved terminal recovery', () => {
     controller.abort();
     await loopPromise.catch(() => {});
   });
+
+  // Regression (Task 6 exposed): the poll loop's OWN user-visible output — a
+  // result-text reply (and relay/inactivity fallback) — must be stamped with the
+  // active route_key/messaging_group_id/is_group. Previously dispatchResultText /
+  // sendToDestination wrote it with route_key=NULL, so harvestRouteScopedProgress
+  // (which filters on route_key) could never recover the agent's own progress
+  // line on a terminal interruption — the Dvora "recovery must include the
+  // harvested progress line" contract was unreachable through the real result
+  // path. This drives the REAL result path (not a hand-stamped writeMessageOut).
+  it('stamps the active route metadata on a result-text reply so it is harvestable into recovery', async () => {
+    insertMessage('routed-init', 'chat', { sender: 'User', text: 'report a progress line then get interrupted' }, {
+      platformId: 'chan-1',
+      channelType: 'discord',
+      messagingGroupId: 'mg-routed',
+      isGroup: 0,
+    });
+    const routeKey = normalizeRoute('test', {
+      platformId: 'chan-1',
+      channelType: 'discord',
+      threadId: null,
+      messagingGroupId: 'mg-routed',
+      isGroup: 0,
+    }).routeKey;
+    const scope = recoveryScope(routeKey, 'mg-routed', 0);
+
+    let releaseFollowup!: () => void;
+    const queryStarted = deferred();
+    const followupAccepted = deferred();
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query(input) {
+        queryStarted.resolve();
+        let followupInputId: string | undefined;
+        return {
+          push(turn) {
+            followupInputId = typeof turn === 'string' ? undefined : turn.inputId;
+          },
+          end() {
+            releaseFollowup?.();
+          },
+          abort() {
+            releaseFollowup?.();
+          },
+          events: (async function* () {
+            yield { type: 'init', continuation: 'sess-routed' };
+            yield { type: 'input-accepted', inputId: (input as QueryInput).inputId, scope: 'initial' };
+            // A user-visible progress segment delivered through the REAL result
+            // path (plain text → dispatchResultText → routed reply). This resolves
+            // the initial input and writes the routed progress row.
+            yield {
+              type: 'result',
+              text: 'Working on it — partial progress delivered.',
+              inputId: (input as QueryInput).inputId,
+              resolvedInputIds: [(input as QueryInput).inputId],
+            };
+            // A route-matched follow-up arrives and is accepted (kept alive).
+            await new Promise<void>((resolve) => {
+              const iv = setInterval(() => {
+                if (followupInputId) {
+                  clearInterval(iv);
+                  resolve();
+                }
+              }, 10);
+            });
+            yield { type: 'input-accepted', inputId: followupInputId!, scope: 'followup' };
+            followupAccepted.resolve();
+            // Then a terminal interruption with the follow-up accepted-unresolved,
+            // so it moves into recovery, which harvests the earlier routed progress
+            // row by route_key.
+            await new Promise<void>((resolve) => {
+              releaseFollowup = resolve;
+            });
+            yield {
+              type: 'interruption',
+              inputId: followupInputId!,
+              classification: 'opencode_transport_timeout',
+              severity: 'warn',
+              terminal: true,
+              agentMessage: 'interrupted',
+              fallbackUserMessage: 'I was interrupted; your request is preserved.',
+              continuationPolicy: 'preserve',
+            };
+          })(),
+        };
+      },
+    };
+
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+    await queryStarted.promise;
+    // The routed progress row is written before the follow-up arrives.
+    await waitFor(
+      () =>
+        !!getOutboundDb()
+          .prepare("SELECT 1 FROM messages_out WHERE content LIKE '%partial progress delivered%'")
+          .get(),
+      3000,
+    );
+    // A route-matched follow-up that the turn accepts and that gets interrupted.
+    insertMessage('routed-followup', 'chat', { sender: 'User', text: 'keep going' }, {
+      platformId: 'chan-1',
+      channelType: 'discord',
+      messagingGroupId: 'mg-routed',
+      isGroup: 0,
+    });
+    await followupAccepted.promise;
+    releaseFollowup();
+    await waitFor(() => listRecoveryEntries(scope).length >= 1, 3000);
+
+    // The result-text reply row carries the active route_key (the fix).
+    const routedRow = getOutboundDb()
+      .prepare("SELECT route_key, messaging_group_id, is_group FROM messages_out WHERE content LIKE '%partial progress delivered%'")
+      .get() as { route_key: string | null; messaging_group_id: string | null; is_group: number | null } | undefined;
+    expect(routedRow?.route_key).toBe(routeKey);
+    expect(routedRow?.messaging_group_id).toBe('mg-routed');
+    expect(routedRow?.is_group).toBe(0);
+
+    // And it is therefore harvested into the recovery entry's priorProgress.
+    const entry = listRecoveryEntries(scope)[0];
+    expect(entry.priorProgress.map((p) => p.text)).toContain('Working on it — partial progress delivered.');
+
+    controller.abort();
+    await loopPromise.catch(() => {});
+  });
 });
 
 describe('poll-loop pre-query failure recovery (Step 4 lines 557-559)', () => {

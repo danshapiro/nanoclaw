@@ -75,6 +75,18 @@ export interface RoutingContext {
   channelType: string | null;
   threadId: string | null;
   inReplyTo: string | null;
+  /**
+   * Normalized active route metadata so every route-bearing `messages_out` row
+   * the poll loop writes (result text, relay status, inactivity fallback) is
+   * stamped with `route_key`/`messaging_group_id`/`is_group`. Without these,
+   * `harvestRouteScopedProgress` could never find the agent's own user-visible
+   * progress during recovery (it filters on `route_key`). The poll loop fills
+   * these from the wake's authoritative active route scope; `extractRouting`
+   * leaves them null for callers that only need the bare destination.
+   */
+  routeKey?: string | null;
+  messagingGroupId?: string | null;
+  isGroup?: 0 | 1 | null;
 }
 
 /**
@@ -88,6 +100,9 @@ export function extractRouting(messages: MessageInRow[]): RoutingContext {
     channelType: first?.channel_type ?? null,
     threadId: first?.thread_id ?? null,
     inReplyTo: first?.id ?? null,
+    routeKey: null,
+    messagingGroupId: null,
+    isGroup: null,
   };
 }
 

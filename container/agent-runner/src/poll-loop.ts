@@ -104,6 +104,27 @@ function recoveryIdFor(routeKey: string): string {
   return `rec-${routeKey}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 }
 
+/**
+ * Write a user-visible outbound chat row stamped with the active route metadata
+ * from `routing` (`route_key`/`messaging_group_id`/`is_group`). All poll-loop
+ * outbound writes go through this so the agent's own progress/result/relay rows
+ * are harvestable into route-scoped recovery and never leak across conversations.
+ */
+function writeRoutedMessage(routing: RoutingContext, text: string): void {
+  writeMessageOut({
+    id: generateId(),
+    in_reply_to: routing.inReplyTo,
+    kind: 'chat',
+    platform_id: routing.platformId,
+    channel_type: routing.channelType,
+    thread_id: routing.threadId,
+    route_key: routing.routeKey ?? null,
+    messaging_group_id: routing.messagingGroupId ?? null,
+    is_group: routing.isGroup ?? null,
+    content: JSON.stringify({ text }),
+  });
+}
+
 function textOfMessage(m: MessageInRow): string {
   try {
     const parsed = JSON.parse(m.content) as { text?: string; prompt?: string };
@@ -534,6 +555,15 @@ async function processQuery(
   let initialBatchSettled = false;
   const abortQuery = () => query.abort();
 
+  // Stamp the authoritative active route metadata onto the routing context so
+  // EVERY route-bearing outbound row this turn writes (result text, relay status,
+  // inactivity fallback) carries `route_key`/`messaging_group_id`/`is_group`.
+  // This is what makes the agent's own user-visible progress harvestable into
+  // route-scoped recovery (harvestRouteScopedProgress filters on route_key).
+  routing.routeKey = ledgerCtx.activeRouteScope.routeKey;
+  routing.messagingGroupId = ledgerCtx.activeRouteScope.messagingGroupId;
+  routing.isGroup = ledgerCtx.activeRouteScope.isGroup;
+
   // Inactivity relay state. At most ONE bounded relay per throttle window. While
   // a relay is in flight, follow-up polling is disabled so unrelated pending
   // rows stay pending (Invariant 169) and the relay never claims user rows.
@@ -663,15 +693,7 @@ async function processQuery(
             // The relay's own MCP send_message appends the status row; if the
             // relay returned text directly, deliver it as a status message.
             if (ev.text) {
-              writeMessageOut({
-                id: generateId(),
-                in_reply_to: routing.inReplyTo,
-                kind: 'chat',
-                platform_id: routing.platformId,
-                channel_type: routing.channelType,
-                thread_id: routing.threadId,
-                content: JSON.stringify({ text: ev.text }),
-              });
+              writeRoutedMessage(routing, ev.text);
             }
             delivered = true;
             break;
@@ -702,15 +724,7 @@ async function processQuery(
       if (!delivered && !directFallbackSent) {
         directFallbackSent = true;
         try {
-          writeMessageOut({
-            id: generateId(),
-            in_reply_to: routing.inReplyTo,
-            kind: 'chat',
-            platform_id: routing.platformId,
-            channel_type: routing.channelType,
-            thread_id: routing.threadId,
-            content: JSON.stringify({ text: notice.fallbackUserMessage }),
-          });
+          writeRoutedMessage(routing, notice.fallbackUserMessage);
         } catch (err) {
           log(
             JSON.stringify({
@@ -729,15 +743,7 @@ async function processQuery(
   function sendDirectInactivityFallback(notice: Extract<ProviderEvent, { type: 'notice' }>): void {
     if (directFallbackSent) return;
     directFallbackSent = true;
-    writeMessageOut({
-      id: generateId(),
-      in_reply_to: routing.inReplyTo,
-      kind: 'chat',
-      platform_id: routing.platformId,
-      channel_type: routing.channelType,
-      thread_id: routing.threadId,
-      content: JSON.stringify({ text: notice.fallbackUserMessage }),
-    });
+    writeRoutedMessage(routing, notice.fallbackUserMessage);
   }
 
   async function pollFollowups(): Promise<void> {
@@ -1009,17 +1015,7 @@ function countOutboundNonSystemMessages(): number {
 }
 
 function writeMissingVisibleReplyError(routing: RoutingContext): void {
-  writeMessageOut({
-    id: generateId(),
-    in_reply_to: routing.inReplyTo,
-    kind: 'chat',
-    platform_id: routing.platformId,
-    channel_type: routing.channelType,
-    thread_id: routing.threadId,
-    content: JSON.stringify({
-      text: 'Error: agent completed without sending a user-visible response. Please try again.',
-    }),
-  });
+  writeRoutedMessage(routing, 'Error: agent completed without sending a user-visible response. Please try again.');
 }
 
 function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
@@ -1119,16 +1115,9 @@ function dispatchResultText(text: string, routing: RoutingContext): void {
   // otherwise fall back to the single destination.
   if (sent === 0 && scratchpad) {
     if (routing.channelType && routing.platformId) {
-      // Reply to the channel/thread the message came from
-      writeMessageOut({
-        id: generateId(),
-        in_reply_to: routing.inReplyTo,
-        kind: 'chat',
-        platform_id: routing.platformId,
-        channel_type: routing.channelType,
-        thread_id: routing.threadId,
-        content: JSON.stringify({ text: scratchpad }),
-      });
+      // Reply to the channel/thread the message came from, stamped with the
+      // active route so recovery can harvest the agent's own progress/result.
+      writeRoutedMessage(routing, scratchpad);
       return;
     }
     const all = getAllDestinations();
@@ -1152,7 +1141,8 @@ function sendToDestination(dest: DestinationEntry, body: string, routing: Routin
   const channelType = dest.type === 'channel' ? dest.channelType! : 'agent';
   // Inherit thread_id from the inbound routing context so replies land in the
   // same thread the conversation is in. For non-threaded adapters the router
-  // strips thread_id at ingest, so this will already be null.
+  // strips thread_id at ingest, so this will already be null. Stamp the active
+  // route metadata so the row is harvestable into route-scoped recovery.
   writeMessageOut({
     id: generateId(),
     in_reply_to: routing.inReplyTo,
@@ -1160,6 +1150,9 @@ function sendToDestination(dest: DestinationEntry, body: string, routing: Routin
     platform_id: platformId,
     channel_type: channelType,
     thread_id: routing.threadId,
+    route_key: routing.routeKey ?? null,
+    messaging_group_id: routing.messagingGroupId ?? null,
+    is_group: routing.isGroup ?? null,
     content: JSON.stringify({ text: body }),
   });
 }
