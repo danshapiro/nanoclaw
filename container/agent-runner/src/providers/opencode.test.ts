@@ -791,4 +791,55 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     expect(provider.capabilities.supportsSeparateRelayRuntime).toBe(true);
     expect(provider.capabilities.relayToolPolicy).toBe('status_only');
   });
+
+  it('imports staged ledger evidence on tool completion and emits ONLY authoritative side-effect references', async () => {
+    const stream = new FakeStream();
+    const controller = new FakeController(stream);
+    // Seam: staged ledger import returns one authoritative entry + one hint.
+    const imported: ProviderEvent[] = [];
+    const provider = new OpenCodeProvider(
+      { mcpServers: { nanoclaw: { command: 'bun', args: ['x'], env: {} } } },
+      {
+        runtimeFactory: {
+          async createRuntime() {
+            return controller;
+          },
+          async createRelayRuntime() {
+            return controller;
+          },
+        },
+        clockFactory: () => new FakeClock() as unknown as OpenCodePumpClock,
+        importStagedSideEffects: (inputId: string) => [
+          // Authoritative validated entry (emitted).
+          {
+            id: 'audit-validated',
+            inputId,
+            kind: 'summarize_dnd_summary_artifact' as const,
+            label: 'summarize_dnd',
+            evidence: { artifact_path: '/allowed/out.md' },
+            occurredAt: new Date().toISOString(),
+          },
+        ],
+      },
+    );
+    const query = provider.query({ inputId: 'in-imp', prompt: 'summarize', cwd: '/workspace/agent' });
+    const events: ProviderEvent[] = [];
+    const reader = (async () => {
+      for await (const e of query.events) {
+        events.push(e);
+        if (e.type === 'side-effect') imported.push(e);
+        if (e.type === 'result') break;
+      }
+    })();
+    await new Promise((r) => setTimeout(r, 5));
+    stream.push({
+      type: 'message.part.updated',
+      properties: { sessionID: TEST_SESSION, part: { type: 'tool', tool: 'bash', callID: 'gws-1', messageID: 'm1', state: { status: 'completed' } } },
+    });
+    stream.push({ type: 'session.idle', properties: { sessionID: TEST_SESSION } });
+    await reader;
+    const sideEffects = events.filter((e) => e.type === 'side-effect') as Array<{ sideEffect: { id: string; kind: string } }>;
+    // The authoritative imported entry is emitted (kind summarize_dnd_summary_artifact).
+    expect(sideEffects.some((e) => e.sideEffect.id === 'audit-validated')).toBe(true);
+  });
 });

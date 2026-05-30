@@ -21,9 +21,11 @@ import {
 import { getUndeliveredMessages, writeMessageOut } from './db/messages-out.js';
 import {
   appendRecoveryEntry,
+  getContinuation,
   listRecoveryEntries,
   markRecoveryInFlight,
   resolveRecoveryEntry,
+  setContinuation,
   type ProviderRecoveryEntry,
   type ProviderRecoveryScope,
 } from './db/session-state.js';
@@ -1870,3 +1872,240 @@ function getAckStatus(messageId: string): string | null {
     | undefined;
   return row?.status ?? null;
 }
+
+// ── Task 3 Step 2: inactivity relay + terminal recovery ─────────────────────
+
+describe('poll-loop inactivity relay and terminal recovery', () => {
+  function dmMsg(id: string, text: string): void {
+    insertMessage(id, 'chat', { sender: 'User', text }, {
+      platformId: 'chan-1',
+      channelType: 'discord',
+      messagingGroupId: 'mg-relay',
+      isGroup: 0,
+    });
+  }
+
+  function outboundTexts(): string[] {
+    return getUndeliveredMessages().map((m) => {
+      try {
+        return (JSON.parse(m.content) as { text?: string }).text ?? '';
+      } catch {
+        return '';
+      }
+    });
+  }
+
+  it('starts a bounded Yente-authored relay while the original long turn keeps running (relay-capable provider)', async () => {
+    dmMsg('relay-init', 'do the long thing');
+
+    const relayQueries: QueryInput[] = [];
+    let releaseMain!: () => void;
+    const mainStarted = deferred();
+
+    class RelayCapableProvider implements AgentProvider {
+      readonly supportsNativeSlashCommands = false;
+      readonly capabilities = {
+        supportsSeparateRelayRuntime: true,
+        defaultRelayDeadlineMs: 30000,
+        relayToolPolicy: 'status_only' as const,
+      };
+      isSessionInvalid(): boolean {
+        return false;
+      }
+      query(input: QueryInput): AgentQuery {
+        if (input.relayMode) {
+          relayQueries.push(input);
+          // Relay turn: accept + result quickly.
+          return {
+            push() {},
+            end() {},
+            abort() {},
+            events: (async function* () {
+              yield { type: 'init', continuation: 'relay-sess' };
+              yield { type: 'input-accepted', inputId: input.inputId, scope: 'relay' };
+              yield { type: 'result', text: 'still working', inputId: input.inputId, resolvedInputIds: [input.inputId] };
+            })(),
+          };
+        }
+        mainStarted.resolve();
+        return {
+          push() {},
+          end() {},
+          abort() {
+            releaseMain?.();
+          },
+          events: (async function* () {
+            yield { type: 'init', continuation: 'main-sess' };
+            yield { type: 'input-accepted', inputId: input.inputId, scope: 'initial' };
+            // Non-terminal inactivity notice — the original turn stays alive.
+            yield {
+              type: 'notice',
+              inputId: input.inputId,
+              classification: 'inactivity',
+              severity: 'info',
+              agentMessage: 'still working',
+              fallbackUserMessage: "I'm still on it",
+              relayRecommended: true,
+            };
+            // Keep the turn open until released, then resolve.
+            await new Promise<void>((resolve) => {
+              releaseMain = resolve;
+            });
+            yield { type: 'result', text: 'done at last', inputId: input.inputId, resolvedInputIds: [input.inputId] };
+          })(),
+        };
+      }
+    }
+
+    const provider = new RelayCapableProvider();
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+    await mainStarted.promise;
+    // The relay must be started while the original turn is still running.
+    await waitFor(() => relayQueries.length >= 1, 3000);
+    expect(relayQueries[0].relayMode).toBe(true);
+    expect(relayQueries[0].toolPolicy).toBe('status_only');
+    expect(typeof relayQueries[0].relayDeadlineMs).toBe('number');
+
+    releaseMain();
+    await waitFor(() => outboundTexts().includes('done at last'), 3000);
+
+    controller.abort();
+    await loopPromise.catch(() => {});
+  });
+
+  it('sends one direct sanitized fallback for inactivity when the provider has NO relay capability', async () => {
+    dmMsg('norelay-init', 'do the long thing');
+
+    let releaseMain!: () => void;
+    const mainStarted = deferred();
+
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query(input) {
+        mainStarted.resolve();
+        return {
+          push() {},
+          end() {},
+          abort() {
+            releaseMain?.();
+          },
+          events: (async function* () {
+            yield { type: 'init', continuation: 'main-sess' };
+            yield { type: 'input-accepted', inputId: (input as QueryInput).inputId, scope: 'initial' };
+            yield {
+              type: 'notice',
+              inputId: (input as QueryInput).inputId,
+              classification: 'inactivity',
+              severity: 'info',
+              agentMessage: 'still working',
+              fallbackUserMessage: "I'm still working on your request — it's taking a while, but I'm on it.",
+              relayRecommended: true,
+            };
+            await new Promise<void>((resolve) => {
+              releaseMain = resolve;
+            });
+            yield { type: 'result', text: 'done', inputId: (input as QueryInput).inputId, resolvedInputIds: [(input as QueryInput).inputId] };
+          })(),
+        };
+      },
+    };
+
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+    await mainStarted.promise;
+    // One direct fallback notice is written (no relay capability).
+    await waitFor(() => outboundTexts().some((t) => t.includes("still working on your request")), 3000);
+
+    releaseMain();
+    controller.abort();
+    await loopPromise.catch(() => {});
+  });
+
+  it('routes a terminal interruption with accepted-unresolved rows through recovery ownership (the existing seam)', async () => {
+    dmMsg('term-init', 'long task that gets interrupted');
+
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query(input) {
+        return {
+          push() {},
+          end() {},
+          abort() {},
+          events: (async function* () {
+            yield { type: 'init', continuation: 'main-sess' };
+            yield { type: 'input-accepted', inputId: (input as QueryInput).inputId, scope: 'initial' };
+            // Typed terminal interruption (preserve continuation).
+            yield {
+              type: 'interruption',
+              inputId: (input as QueryInput).inputId,
+              classification: 'opencode_transport_timeout',
+              severity: 'warn',
+              terminal: true,
+              agentMessage: 'interrupted mid-turn',
+              fallbackUserMessage: 'I was interrupted; your request is preserved.',
+              continuationPolicy: 'preserve',
+            };
+          })(),
+        };
+      },
+    };
+
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+    // The accepted-but-unresolved row moves into recovery ownership (status
+    // 'recovery'), NOT completed and NOT returned to pending.
+    await waitFor(() => getAckStatus('term-init') === 'recovery', 3000);
+    expect(getAckStatus('term-init')).toBe('recovery');
+
+    controller.abort();
+    await loopPromise.catch(() => {});
+  });
+
+  it('clears the stored continuation on a clear-continuation event', async () => {
+    dmMsg('clear-init', 'something that ends in a native question');
+    // Seed a stored continuation so we can observe it being cleared.
+    setContinuation('test', 'ses_to_clear');
+
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query(input) {
+        return {
+          push() {},
+          end() {},
+          abort() {},
+          events: (async function* () {
+            yield { type: 'init', continuation: 'ses_to_clear' };
+            yield { type: 'input-accepted', inputId: (input as QueryInput).inputId, scope: 'initial' };
+            yield { type: 'clear-continuation', inputId: (input as QueryInput).inputId, reason: 'native_question_denied' };
+            yield {
+              type: 'interruption',
+              inputId: (input as QueryInput).inputId,
+              classification: 'opencode_native_question',
+              severity: 'warn',
+              terminal: true,
+              agentMessage: 'I need your input: what is the email?',
+              fallbackUserMessage: 'I need more info to finish.',
+              continuationPolicy: 'clear',
+            };
+          })(),
+        };
+      },
+    };
+
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+    await waitFor(() => getContinuation('test') === undefined, 3000);
+    expect(getContinuation('test')).toBeUndefined();
+
+    controller.abort();
+    await loopPromise.catch(() => {});
+  });
+});

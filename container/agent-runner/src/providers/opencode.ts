@@ -31,6 +31,7 @@ import {
   relayDeniedNativeToolIds,
 } from './opencode-sdk-surface.js';
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
+import { getAuthoritativeSideEffects, importSideEffectLedger } from '../db/side-effects.js';
 import { sniffImageMime } from '../attachments.js';
 
 function log(msg: string): void {
@@ -638,6 +639,7 @@ export class OpenCodeProvider implements AgentProvider {
   private readonly runtimeFactory: OpenCodeRuntimeFactory & OpenCodeRelayRuntimeFactory;
   private readonly persistActiveTool: (tool: ActiveOpenCodeTool | null) => void;
   private readonly clockFactory: () => OpenCodePumpClock;
+  private readonly importStagedSideEffects: (inputId: string) => ProviderSideEffect[];
 
   constructor(
     options: ProviderOptions = {},
@@ -645,12 +647,14 @@ export class OpenCodeProvider implements AgentProvider {
       runtimeFactory?: OpenCodeRuntimeFactory & OpenCodeRelayRuntimeFactory;
       persistActiveTool?: (tool: ActiveOpenCodeTool | null) => void;
       clockFactory?: () => OpenCodePumpClock;
+      importStagedSideEffects?: (inputId: string) => ProviderSideEffect[];
     } = {},
   ) {
     this.options = options;
     this.runtimeFactory = seams.runtimeFactory ?? realRuntimeFactory;
     this.persistActiveTool = seams.persistActiveTool ?? defaultPersistActiveTool;
     this.clockFactory = seams.clockFactory ?? realTimerClock;
+    this.importStagedSideEffects = seams.importStagedSideEffects ?? defaultImportStagedSideEffects;
   }
 
   /** Capabilities: OpenCode supports a separate-runtime status relay. */
@@ -787,6 +791,7 @@ export class OpenCodeProvider implements AgentProvider {
       // terminal interruption after a side effect carries it into the recovery
       // seed and the agent reports existing work rather than duplicating it.
       const collectedSideEffects: ProviderSideEffect[] = [];
+      const emittedSideEffectIds = new Set<string>();
 
       // Single-reader, long-lived pump over THIS controller's event stream.
       const pump = new OpenCodeEventPump<OpenCodeSseEvent>({
@@ -997,8 +1002,21 @@ export class OpenCodeProvider implements AgentProvider {
                     const status = st?.status;
                     if (status === 'completed' || st?.time?.end) {
                       activeTools.delete(part.callID);
+                      // Step 7: import already-staged JSONL evidence FIRST (the
+                      // authoritative source), then enrich with the SDK tool
+                      // completion. Only VALIDATED/authoritative entries are
+                      // emitted as provider side-effect references — unsigned/
+                      // unvalidated staged JSONL stays a hint and is never
+                      // emitted (Task 1 keeps gmail entries unauthoritative).
+                      for (const se of self.importStagedSideEffects(turnInputId)) {
+                        if (emittedSideEffectIds.has(se.id)) continue;
+                        emittedSideEffectIds.add(se.id);
+                        collectedSideEffects.push(se);
+                        yield { type: 'side-effect', sideEffect: se };
+                      }
                       const sideEffect = self.captureToolSideEffect(part, turnInputId);
-                      if (sideEffect) {
+                      if (sideEffect && !emittedSideEffectIds.has(sideEffect.id)) {
+                        emittedSideEffectIds.add(sideEffect.id);
                         collectedSideEffects.push(sideEffect);
                         yield { type: 'side-effect', sideEffect };
                       }
@@ -1243,6 +1261,33 @@ function defaultPersistActiveTool(tool: ActiveOpenCodeTool | null): void {
     }
   } catch {
     // container_state may be absent in some test setups — non-fatal.
+  }
+}
+
+/**
+ * Default Step 7 staged side-effect import: read the static workspace ledger,
+ * import + validate it into `side_effect_ledger` (idempotent), and return the
+ * AUTHORITATIVE entries only. Unsigned/unvalidated staged JSONL stays a hint and
+ * is never returned (so it cannot become a provider side-effect reference until
+ * Task 4B wires the real Ed25519 verify). Best-effort: returns [] if the ledger
+ * is absent (no /workspace) or import fails.
+ */
+function defaultImportStagedSideEffects(inputId: string): ProviderSideEffect[] {
+  void inputId; // provider-side correlation is stamped by the tool, not here.
+  try {
+    const ledgerPath = process.env.NANOCLAW_SIDE_EFFECT_LEDGER || '/workspace/side-effects.jsonl';
+    const allowedArtifactRoots = (process.env.NANOCLAW_SIDE_EFFECT_ARTIFACT_ROOTS || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    importSideEffectLedger({
+      path: ledgerPath,
+      allowedArtifactRoots: allowedArtifactRoots.length > 0 ? allowedArtifactRoots : undefined,
+      gwsPublicKey: process.env.GWS_SIDE_EFFECT_VERIFY_KEY || undefined,
+    });
+    return getAuthoritativeSideEffects();
+  } catch {
+    return [];
   }
 }
 

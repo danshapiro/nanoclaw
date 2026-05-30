@@ -28,7 +28,7 @@ import {
   stripInternalTags,
   type RoutingContext,
 } from './formatter.js';
-import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
+import type { AgentProvider, AgentQuery, ProviderCapabilities, ProviderEvent } from './providers/types.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
@@ -361,8 +361,16 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         { topLevelInputId, activeRouteKey, activeRouteScope, originalTasks },
         config.inspectAttachmentFile,
         config.signal,
+        config,
       );
-      if (result.continuation && result.continuation !== continuation) {
+      if (result.clearContinuation) {
+        // Authoritative clear (explicit provider clear-continuation, positive
+        // existence not-found, or the bounded zombie path). Never on transport
+        // text alone — that comes from the provider as a clear-continuation
+        // event or a 'clear' continuationPolicy on a terminal interruption.
+        continuation = undefined;
+        clearContinuation(config.providerName);
+      } else if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
         setContinuation(config.providerName, continuation);
       }
@@ -437,6 +445,8 @@ function formatMessagesWithCommands(messages: MessageInRow[], nativeSlashCommand
 
 interface QueryResult {
   continuation?: string;
+  /** Authoritative clear request (provider clear-continuation / clear policy). */
+  clearContinuation?: boolean;
 }
 
 interface ReplyAccounting {
@@ -468,11 +478,23 @@ async function processQuery(
   },
   inspectAttachmentFile?: (filePath: string) => Promise<InspectedFile | null>,
   signal?: AbortSignal,
+  config?: PollLoopConfig,
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
+  let clearContinuationRequested = false;
   let done = false;
   let initialBatchSettled = false;
   const abortQuery = () => query.abort();
+
+  // Inactivity relay state. At most ONE bounded relay per throttle window. While
+  // a relay is in flight, follow-up polling is disabled so unrelated pending
+  // rows stay pending (Invariant 169) and the relay never claims user rows.
+  const relayCaps = (config?.provider as { capabilities?: ProviderCapabilities } | undefined)?.capabilities;
+  let relayInFlight = false;
+  let directFallbackSent = false;
+  // Side-effect evidence carried on a terminal interruption's recovery seed, so
+  // the accepted-unresolved recovery entry records what already happened.
+  const interruptionSideEffects: ProviderRecoveryEntry['sideEffects'] = [];
 
   // Input ledger: every prompt the poll loop sends is tracked by inputId. A
   // prompt is `accepted` only after the provider emits input-accepted for it,
@@ -554,12 +576,106 @@ async function processQuery(
   // rather than close+reopen (no cold prompt cache, no reconnect).
   let pollingFollowups = false;
   const pollHandle = setInterval(() => {
-    if (done || pollingFollowups) return;
+    // Disable follow-up polling while a bounded recovery relay is in flight so
+    // unrelated pending rows stay pending and the relay never claims user rows
+    // (Invariant 169).
+    if (done || pollingFollowups || relayInFlight) return;
     pollingFollowups = true;
     void pollFollowups().finally(() => {
       pollingFollowups = false;
     });
   }, ACTIVE_POLL_INTERVAL_MS);
+
+  /**
+   * Run a bounded Yente-authored status relay through a SEPARATE restricted
+   * runtime. It has its own process/client/event pump/session id, no
+   * continuation, no mutation tools, and route-locked status-only output. The
+   * original long turn keeps running (we do NOT await this in the main loop —
+   * it runs as a child task). Failure/deadline falls back to one direct notice.
+   */
+  async function runInactivityRelay(notice: Extract<ProviderEvent, { type: 'notice' }>): Promise<void> {
+    if (!config) return;
+    relayInFlight = true;
+    const deadlineMs = relayCaps?.defaultRelayDeadlineMs ?? 30000;
+    const relayInputId = generateInputId('relay');
+    let delivered = false;
+    try {
+      const relayQuery = config.provider.query({
+        inputId: relayInputId,
+        prompt: notice.agentMessage,
+        cwd: config.cwd,
+        systemContext: config.systemContext,
+        relayMode: true,
+        relayDeadlineMs: deadlineMs,
+        toolPolicy: 'status_only',
+      });
+      const relayRun = (async () => {
+        for await (const ev of relayQuery.events) {
+          if (ev.type === 'result') {
+            // The relay's own MCP send_message appends the status row; if the
+            // relay returned text directly, deliver it as a status message.
+            if (ev.text) {
+              writeMessageOut({
+                id: generateId(),
+                in_reply_to: routing.inReplyTo,
+                kind: 'chat',
+                platform_id: routing.platformId,
+                channel_type: routing.channelType,
+                thread_id: routing.threadId,
+                content: JSON.stringify({ text: ev.text }),
+              });
+            }
+            delivered = true;
+            break;
+          }
+          if (ev.type === 'interruption') break;
+        }
+      })();
+      const timeout = new Promise<void>((resolve) => setTimeout(resolve, deadlineMs));
+      await Promise.race([relayRun, timeout]);
+      relayQuery.abort();
+    } catch (err) {
+      log(
+        JSON.stringify({
+          severity: 'warn',
+          event: 'inactivity_relay_failed',
+          route_key: ledgerCtx.activeRouteKey,
+          error: err instanceof Error ? err.message : String(err),
+        }),
+      );
+    } finally {
+      relayInFlight = false;
+      // If the relay could not deliver anything, send ONE sanitized direct
+      // fallback so the user is not left silent — but only once per turn.
+      if (!delivered && !directFallbackSent) {
+        directFallbackSent = true;
+        writeMessageOut({
+          id: generateId(),
+          in_reply_to: routing.inReplyTo,
+          kind: 'chat',
+          platform_id: routing.platformId,
+          channel_type: routing.channelType,
+          thread_id: routing.threadId,
+          content: JSON.stringify({ text: notice.fallbackUserMessage }),
+        });
+      }
+    }
+  }
+
+  /** One direct sanitized fallback for inactivity when relay is unsupported. */
+  function sendDirectInactivityFallback(notice: Extract<ProviderEvent, { type: 'notice' }>): void {
+    if (directFallbackSent) return;
+    directFallbackSent = true;
+    writeMessageOut({
+      id: generateId(),
+      in_reply_to: routing.inReplyTo,
+      kind: 'chat',
+      platform_id: routing.platformId,
+      channel_type: routing.channelType,
+      thread_id: routing.threadId,
+      content: JSON.stringify({ text: notice.fallbackUserMessage }),
+    });
+  }
 
   async function pollFollowups(): Promise<void> {
     // Only claim follow-ups on the ACTIVE route. Rows on other routes remain
@@ -622,6 +738,38 @@ async function processQuery(
         setContinuation(providerName, event.continuation);
       } else if (event.type === 'input-accepted') {
         onInputAccepted(event.inputId);
+      } else if (event.type === 'notice') {
+        // Non-terminal liveness moment. If the provider supports a separate-
+        // runtime relay, start at most one bounded relay per throttle window as
+        // a CHILD task while the original turn keeps draining; otherwise send one
+        // sanitized direct fallback. Never push into the busy turn; never settle
+        // user rows; never clear continuation.
+        if (event.relayRecommended !== false) {
+          if (relayCaps?.supportsSeparateRelayRuntime && config) {
+            if (!relayInFlight) void runInactivityRelay(event);
+          } else {
+            sendDirectInactivityFallback(event);
+          }
+        }
+      } else if (event.type === 'clear-continuation') {
+        // Authoritative continuation clear from the provider (explicit clear /
+        // positive existence not-found / bounded zombie path).
+        clearContinuationRequested = true;
+        queryContinuation = undefined;
+      } else if (event.type === 'interruption') {
+        // Typed terminal recoverable interruption (Invariant 159). The accepted-
+        // but-unresolved rows are routed into recovery ownership by the
+        // finally-block via the existing seam. Here we only honor the
+        // continuation policy: a 'clear' policy is an authoritative clear.
+        if (event.continuationPolicy === 'clear') {
+          clearContinuationRequested = true;
+          queryContinuation = undefined;
+        }
+        // Seed the recovery payload with any provider-collected side effects so
+        // the next Yente turn can report existing work rather than duplicate it.
+        if (event.recoverySeed?.sideEffects && event.recoverySeed.sideEffects.length > 0) {
+          interruptionSideEffects.push(...event.recoverySeed.sideEffects);
+        }
       } else if (event.type === 'result') {
         // A result — with or without text — means a turn segment is done.
         // Dispatch text first so reply accounting sees direct result text and
@@ -686,8 +834,10 @@ async function processQuery(
         pendingFollowups: [],
         priorProgress,
         observations: [],
-        sideEffects: [],
-        continuationPolicy: 'preserve',
+        // Provider-collected side-effect evidence (Step 7) so the next Yente
+        // turn reports existing work rather than duplicating it.
+        sideEffects: [...interruptionSideEffects],
+        continuationPolicy: clearContinuationRequested ? 'clear' : 'preserve',
         attemptedContinuation: queryContinuation,
         createdAt: now,
         updatedAt: now,
@@ -729,7 +879,7 @@ async function processQuery(
     }
   }
 
-  return { continuation: queryContinuation };
+  return { continuation: queryContinuation, clearContinuation: clearContinuationRequested };
 }
 
 function requiresUserVisibleReply(messages: MessageInRow[]): boolean {
