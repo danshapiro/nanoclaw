@@ -45,20 +45,33 @@ function sanitizedCredentialMessage(category: AgentMcpCredentialCategory): strin
   return category === 'auth_expired' ? SANITIZED_AUTH_EXPIRED_MESSAGE : SANITIZED_AUTH_REQUIRED_MESSAGE;
 }
 
-// Known mcp-remote credential prompts (grounded in mcp-remote's own stderr
+// Known mcp-remote credential prompts (grounded in mcp-remote@0.1.38 stderr
 // strings). Matching is case-insensitive. Anything not on these lists is
 // treated as an UNCLASSIFIED failure and must stay fail-closed.
+//
+// Removed/replaced entries (do not re-add without grounding in mcp-remote source):
+//   'auth-timeout'    — matches only the CLI flag name --auth-timeout, not any failure string.
+//   'auth timeout'    — matches only the benign config-parse warning
+//                       "Warning: Ignoring invalid auth timeout value: …"; not a failure.
+//   'auth needed'     — not a real mcp-remote stderr string; the reconnect reason tag is
+//                       'authentication-needed' (REASON_AUTH_NEEDED). Replaced below.
+//   'auth_needed'     — same; underscore form is not emitted by mcp-remote.
+//   'auth failed'     — matches "Auth failed during long poll, responding with 500", which is a
+//                       TRANSIENT callback-server 500 (network/timeout blip), not a token
+//                       rejection. Removed to stay fail-closed on transients; the related HTTP
+//                       response body "Authentication failed" is kept in AUTH_EXPIRED_PROMPTS.
 const AUTH_REQUIRED_PROMPTS = [
-  'please authorize',
-  'authentication required',
+  'please authorize', // "Please authorize this client by visiting:" (redirectToAuthorization)
+  'authentication required', // "Authentication required. Initializing auth..." / "Waiting for authorization..."
   'authorization required',
   'auth required',
-  'auth needed',
-  'auth_needed',
-  'auth timeout',
-  'auth-timeout',
+  'authentication-needed', // REASON_AUTH_NEEDED reconnect reason tag emitted in log lines
 ];
-const AUTH_EXPIRED_PROMPTS = ['authentication failed', 'authorization failed', 'auth failed', 'token expired'];
+// "authentication failed" matches the HTTP response body "Authentication failed" sent by
+// setupOAuthCallbackServerWithLongPoll when the auth promise rejects (a real credential
+// failure path, distinct from the transient "Auth failed during long poll" log line which
+// was removed from AUTH_REQUIRED_PROMPTS above).
+const AUTH_EXPIRED_PROMPTS = ['authentication failed', 'authorization failed', 'token expired'];
 
 /**
  * Classify a captured stderr blob / exit status against the narrow set of

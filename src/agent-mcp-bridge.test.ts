@@ -420,12 +420,21 @@ describe('classifyBridgeCredentialFailure', () => {
   it('classifies known auth-required prompts', () => {
     expect(classifyBridgeCredentialFailure('Please authorize this client by visiting ...', null)).toBe('auth_required');
     expect(classifyBridgeCredentialFailure('Authentication required', null)).toBe('auth_required');
-    expect(classifyBridgeCredentialFailure('auth timeout reached', null)).toBe('auth_required');
+    // authentication-needed is the REASON_AUTH_NEEDED reconnect reason tag logged by mcp-remote.
+    expect(classifyBridgeCredentialFailure('Recursively reconnecting for reason: authentication-needed', null)).toBe(
+      'auth_required',
+    );
   });
 
   it('classifies known auth-expired prompts', () => {
     expect(classifyBridgeCredentialFailure('Authentication failed', 1)).toBe('auth_expired');
-    expect(classifyBridgeCredentialFailure('Auth failed: token rejected', 1)).toBe('auth_expired');
+    expect(classifyBridgeCredentialFailure('token expired, please re-authenticate', 1)).toBe('auth_expired');
+  });
+
+  it('does NOT classify the transient long-poll 500 log as auth_expired (fail-closed on transients)', () => {
+    // "Auth failed during long poll, responding with 500" is a transient callback-server
+    // network/timeout blip, not a token rejection — must stay unclassified (fail-closed).
+    expect(classifyBridgeCredentialFailure('Auth failed during long poll, responding with 500', 1)).toBeNull();
   });
 
   it('returns null for unrelated failures (fail-closed)', () => {
