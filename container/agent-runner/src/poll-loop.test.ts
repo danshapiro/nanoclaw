@@ -10,6 +10,8 @@ import {
   getInboundDb,
   getOutboundDb,
   clearStaleProcessingAcks,
+  clearStaleContainerToolState,
+  setContainerToolInFlight,
 } from './db/connection.js';
 import {
   getPendingMessages,
@@ -872,6 +874,30 @@ describe('messages-in recovery ack lifecycle', () => {
     expect(ackStatus('orphan-proc')).toBeNull(); // orphan processing cleared
     expect(ackStatus('rec-owned')).toBe('recovery'); // recovery preserved
     expect(ackStatus('done')).toBe('completed'); // completed untouched
+  });
+
+  // Step 8 (line 981): startup clears stale OpenCode-owned tool state. After a
+  // crash, container_state may still claim a long tool is in flight (which would
+  // make host-sweep honor a phantom long timeout); a fresh container resets it.
+  it('clearStaleContainerToolState resets a stale in-flight tool row on startup', () => {
+    // A prior crashed turn left a long tool claimed in container_state.
+    setContainerToolInFlight('bash', 3_600_000);
+    const before = getOutboundDb()
+      .prepare('SELECT current_tool, tool_declared_timeout_ms FROM container_state WHERE id = 1')
+      .get() as { current_tool: string | null; tool_declared_timeout_ms: number | null } | undefined;
+    expect(before?.current_tool).toBe('bash');
+    expect(before?.tool_declared_timeout_ms).toBe(3_600_000);
+
+    clearStaleContainerToolState();
+
+    const after = getOutboundDb()
+      .prepare('SELECT current_tool, tool_declared_timeout_ms, tool_started_at FROM container_state WHERE id = 1')
+      .get() as { current_tool: string | null; tool_declared_timeout_ms: number | null; tool_started_at: string | null };
+    // Row is reset to NULL (kept as the singleton id=1 row, not deleted), so the
+    // host no longer honors a phantom long timeout.
+    expect(after.current_tool).toBeNull();
+    expect(after.tool_declared_timeout_ms).toBeNull();
+    expect(after.tool_started_at).toBeNull();
   });
 
   // B6 (Step 3 line 541): resolving a recovery entry resolves its owned input
@@ -1970,6 +1996,77 @@ describe('poll-loop inactivity relay and terminal recovery', () => {
 
     releaseMain();
     await waitFor(() => outboundTexts().includes('done at last'), 3000);
+
+    controller.abort();
+    await loopPromise.catch(() => {});
+  });
+
+  it('a relay child task that throws is observed (no unhandled rejection) and still sends ONE direct fallback', async () => {
+    dmMsg('relaythrow-init', 'do the long thing');
+
+    let releaseMain!: () => void;
+    const mainStarted = deferred();
+    let relayAttempts = 0;
+
+    class RelayThrowsProvider implements AgentProvider {
+      readonly supportsNativeSlashCommands = false;
+      readonly capabilities = {
+        supportsSeparateRelayRuntime: true,
+        defaultRelayDeadlineMs: 30000,
+        relayToolPolicy: 'status_only' as const,
+      };
+      isSessionInvalid(): boolean {
+        return false;
+      }
+      query(input: QueryInput): AgentQuery {
+        if (input.relayMode) {
+          // The relay query itself throws synchronously inside the void-ed child
+          // task — must be observed via .catch and fall back, not crash the loop.
+          relayAttempts++;
+          throw new Error('relay startup blew up');
+        }
+        mainStarted.resolve();
+        return {
+          push() {},
+          end() {},
+          abort() {
+            releaseMain?.();
+          },
+          events: (async function* () {
+            yield { type: 'init', continuation: 'main-sess' };
+            yield { type: 'input-accepted', inputId: input.inputId, scope: 'initial' };
+            yield {
+              type: 'notice',
+              inputId: input.inputId,
+              classification: 'inactivity',
+              severity: 'info',
+              agentMessage: 'still working',
+              fallbackUserMessage: "I'm still working on your request — it's taking a while.",
+              relayRecommended: true,
+            };
+            await new Promise<void>((resolve) => {
+              releaseMain = resolve;
+            });
+            yield { type: 'result', text: 'done at last', inputId: input.inputId, resolvedInputIds: [input.inputId] };
+          })(),
+        };
+      }
+    }
+
+    const provider = new RelayThrowsProvider();
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+    await mainStarted.promise;
+    await waitFor(() => relayAttempts >= 1, 3000);
+    // The relay failed, so exactly one sanitized direct fallback is delivered.
+    await waitFor(() => outboundTexts().some((t) => t.includes('still working on your request')), 3000);
+
+    releaseMain();
+    // The original turn still completes cleanly (the child rejection did not
+    // tear down the loop).
+    await waitFor(() => outboundTexts().includes('done at last'), 3000);
+    expect(outboundTexts().filter((t) => t.includes('still working on your request')).length).toBe(1);
 
     controller.abort();
     await loopPromise.catch(() => {});

@@ -10,6 +10,7 @@ import {
   isStaleSessionError,
   OpenCodeProvider,
   promptSession,
+  RealOpenCodeRuntimeController,
   splitOpenCodeModel,
   stageOpenCodeAttachments,
   type OpenCodeRuntimeController,
@@ -745,6 +746,84 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     expect(persisted[persisted.length - 1]).toBeNull();
   });
 
+  it('keeps the LONGEST bounded declared timeout active while a shorter overlapping tool completes (Line 980)', async () => {
+    const stream = new FakeStream();
+    const persisted: Array<{ tool: string; declaredTimeoutMs: number | null } | null> = [];
+    const { provider } = makeProvider({ stream, persistActiveTool: (t) => persisted.push(t) });
+    const query = provider.query({ inputId: 'in-overlap', prompt: 'two tools', cwd: '/workspace/agent' });
+    const reader = (async () => {
+      for await (const e of query.events) {
+        if (e.type === 'result') break;
+      }
+    })();
+    await new Promise((r) => setTimeout(r, 5));
+    // Two overlapping tools: a SHORT one (10 min) and a LONG one (60 min).
+    stream.push({
+      type: 'message.part.updated',
+      properties: { sessionID: TEST_SESSION, part: { type: 'tool', tool: 'short_tool', callID: 'c-short', messageID: 'm1', state: { status: 'running', input: { timeout: 600000 } } } },
+    });
+    stream.push({
+      type: 'message.part.updated',
+      properties: { sessionID: TEST_SESSION, part: { type: 'tool', tool: 'long_tool', callID: 'c-long', messageID: 'm1', state: { status: 'running', input: { timeout: 3600000 } } } },
+    });
+    // The SHORT tool completes first; the LONG tool is still running.
+    stream.push({
+      type: 'message.part.updated',
+      properties: { sessionID: TEST_SESSION, part: { type: 'tool', tool: 'short_tool', callID: 'c-short', messageID: 'm1', state: { status: 'completed' } } },
+    });
+    // Snapshot point: after the short tool completes, the long tool must still be
+    // the persisted (widening) active tool.
+    await new Promise((r) => setTimeout(r, 5));
+    // Now the long tool completes too.
+    stream.push({
+      type: 'message.part.updated',
+      properties: { sessionID: TEST_SESSION, part: { type: 'tool', tool: 'long_tool', callID: 'c-long', messageID: 'm1', state: { status: 'completed' } } },
+    });
+    stream.push({ type: 'session.idle', properties: { sessionID: TEST_SESSION } });
+    await reader;
+
+    // The persisted widening tool was the LONG tool (3,600,000 ms), never the
+    // short tool's smaller timeout.
+    const longPersists = persisted.filter((p) => p && p.tool === 'long_tool');
+    expect(longPersists.length).toBeGreaterThan(0);
+    expect(longPersists.every((p) => p!.declaredTimeoutMs === 3600000)).toBe(true);
+    // The container_state was NOT cleared (no null) until BOTH tools completed:
+    // the short tool completing while the long tool ran must not clear the
+    // widening. So the first null must come AFTER the last long_tool persist.
+    const firstNull = persisted.findIndex((p) => p === null);
+    const lastLongIdx = persisted.map((p) => (p && p.tool === 'long_tool' ? 1 : 0)).lastIndexOf(1);
+    expect(firstNull).toBeGreaterThan(lastLongIdx);
+    // The FINAL state is a clear (both tools done).
+    expect(persisted[persisted.length - 1]).toBeNull();
+  });
+
+  it('does NOT persist a widening tool when the capped declared timeout is <= 0 (absolute-ceiling budget exhausted)', async () => {
+    const stream = new FakeStream();
+    const persisted: Array<{ tool: string; declaredTimeoutMs: number | null } | null> = [];
+    // Absolute ceiling below the 60s safety margin ⇒ budget is always negative ⇒
+    // any declared tool caps to <= 0 and must be treated as "no active tool".
+    process.env.OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS = '30000';
+    const { provider } = makeProvider({ stream, persistActiveTool: (t) => persisted.push(t) });
+    const query = provider.query({ inputId: 'in-cap0', prompt: 'long tool', cwd: '/workspace/agent' });
+    const reader = (async () => {
+      for await (const e of query.events) {
+        if (e.type === 'result') break;
+      }
+    })();
+    await new Promise((r) => setTimeout(r, 5));
+    // A tool with a declared timeout starts, but the budget is already negative.
+    stream.push({
+      type: 'message.part.updated',
+      properties: { sessionID: TEST_SESSION, part: { type: 'tool', tool: 'bash', callID: 'c-cap0', messageID: 'm1', state: { status: 'running', input: { timeout: 600000 } } } },
+    });
+    stream.push({ type: 'session.idle', properties: { sessionID: TEST_SESSION } });
+    await reader;
+    delete process.env.OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS;
+    // No positive-timeout tool was ever persisted (only null clears).
+    expect(persisted.every((p) => p === null || p.declaredTimeoutMs == null || p.declaredTimeoutMs > 0)).toBe(true);
+    expect(persisted.some((p) => p && (p.declaredTimeoutMs ?? 0) > 0)).toBe(false);
+  });
+
   it('emits a notice (not pushed into the busy turn) on inactivity and keeps the turn alive', async () => {
     const clock = new FakeClock();
     const stream = new FakeStream();
@@ -830,6 +909,76 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     expect(interruption!.fallbackUserMessage).not.toContain('event timeout');
     // Active tool state was cleared on the terminal interruption.
     expect(persisted[persisted.length - 1]).toBeNull();
+  });
+
+  it('clears continuation on a transport-timeout interruption when the positive existence check proves the attempted session is GONE', async () => {
+    const clock = new FakeClock();
+    const stream = new FakeStream();
+    process.env.OPENCODE_TRANSPORT_TIMEOUT_MS = '1800000';
+    process.env.OPENCODE_WAIT_TICK_MS = '3600000';
+    process.env.OPENCODE_INACTIVITY_NOTICE_MS = '3600000';
+    const { provider, controller } = makeProvider({ clock, stream });
+    // The existence check (client.session.get) proves the attempted session is
+    // gone — the ONLY authoritative clear allowed on a transport interruption.
+    controller.sessionExistsResult = false;
+    const query = provider.query({ inputId: 'in-clr', prompt: 'no sse work', cwd: '/workspace/agent', continuation: TEST_SESSION });
+    const events: ProviderEvent[] = [];
+    const reader = (async () => {
+      for await (const e of query.events) {
+        events.push(e);
+        if (e.type === 'interruption') break;
+      }
+    })();
+    await new Promise((r) => setTimeout(r, 5));
+    await clock.advance(1800000);
+    await new Promise((r) => setTimeout(r, 5));
+    await reader;
+    delete process.env.OPENCODE_TRANSPORT_TIMEOUT_MS;
+    delete process.env.OPENCODE_WAIT_TICK_MS;
+    delete process.env.OPENCODE_INACTIVITY_NOTICE_MS;
+    const interruption = events.find((e) => e.type === 'interruption') as { classification: string; continuationPolicy: string } | undefined;
+    expect(interruption).toBeDefined();
+    expect(interruption!.classification).toBe('opencode_transport_timeout');
+    // Authoritative existence-check not-found ⇒ clear continuation.
+    expect(interruption!.continuationPolicy).toBe('clear');
+    const clear = events.find((e) => e.type === 'clear-continuation') as
+      | { reason: string; attemptedContinuation?: string }
+      | undefined;
+    expect(clear).toBeDefined();
+    expect(clear!.attemptedContinuation).toBe(TEST_SESSION);
+  });
+
+  it('PRESERVES continuation on a transport-timeout interruption when the existence check throws (inconclusive)', async () => {
+    const clock = new FakeClock();
+    const stream = new FakeStream();
+    process.env.OPENCODE_TRANSPORT_TIMEOUT_MS = '1800000';
+    process.env.OPENCODE_WAIT_TICK_MS = '3600000';
+    process.env.OPENCODE_INACTIVITY_NOTICE_MS = '3600000';
+    const { provider, controller } = makeProvider({ clock, stream });
+    // The existence check itself transport-fails ⇒ inconclusive ⇒ never clears
+    // (the bounded zombie path remains the backstop).
+    controller.sessionExists = async () => {
+      throw new Error('ECONNRESET while probing session existence');
+    };
+    const query = provider.query({ inputId: 'in-incon', prompt: 'no sse work', cwd: '/workspace/agent', continuation: TEST_SESSION });
+    const events: ProviderEvent[] = [];
+    const reader = (async () => {
+      for await (const e of query.events) {
+        events.push(e);
+        if (e.type === 'interruption') break;
+      }
+    })();
+    await new Promise((r) => setTimeout(r, 5));
+    await clock.advance(1800000);
+    await new Promise((r) => setTimeout(r, 5));
+    await reader;
+    delete process.env.OPENCODE_TRANSPORT_TIMEOUT_MS;
+    delete process.env.OPENCODE_WAIT_TICK_MS;
+    delete process.env.OPENCODE_INACTIVITY_NOTICE_MS;
+    const interruption = events.find((e) => e.type === 'interruption') as { continuationPolicy: string } | undefined;
+    expect(interruption).toBeDefined();
+    expect(interruption!.continuationPolicy).toBe('preserve');
+    expect(events.find((e) => e.type === 'clear-continuation')).toBeUndefined();
   });
 
   it('a concurrent relay query uses a SEPARATE controller and never destroys the original turn', async () => {
@@ -939,5 +1088,50 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     const sideEffects = events.filter((e) => e.type === 'side-effect') as Array<{ sideEffect: { id: string; kind: string } }>;
     // The authoritative imported entry is emitted (kind summarize_dnd_summary_artifact).
     expect(sideEffects.some((e) => e.sideEffect.id === 'audit-validated')).toBe(true);
+  });
+});
+
+describe('RealOpenCodeRuntimeController.destroy ordering', () => {
+  it('quiesces the in-flight stream read (stream.return) BEFORE killing the process', () => {
+    const order: string[] = [];
+    // Fake stream whose return() records the quiesce step.
+    const stream = {
+      next: async () => ({ done: true as const, value: undefined }),
+      return: async () => {
+        order.push('stream.return');
+        return { done: true as const, value: undefined };
+      },
+    } as unknown as AsyncGenerator<{ type: string; properties: Record<string, unknown> }, void, void>;
+    // Fake proc with a pid; killProcessTree tries process.kill(-pid) first, so we
+    // stub process.kill to record the kill step (and throw so it falls back to
+    // proc.kill, which also records) — no real signal is ever sent.
+    const proc = {
+      pid: 4242,
+      kill: () => {
+        order.push('proc.kill');
+        return true;
+      },
+    } as unknown as import('child_process').ChildProcess;
+    const client = { session: {}, async postSessionIdPermissionsPermissionId() {} } as never;
+    const controller = new RealOpenCodeRuntimeController(proc, client, stream);
+
+    const realKill = process.kill;
+    (process as unknown as { kill: (pid: number, sig?: string | number) => boolean }).kill = (pid: number) => {
+      order.push(`process.kill(${pid})`);
+      throw new Error('ESRCH (stubbed — no real signal)');
+    };
+    try {
+      controller.destroy('test-ordering');
+    } finally {
+      (process as unknown as { kill: typeof realKill }).kill = realKill;
+    }
+
+    // The stream was quiesced FIRST, then the process group was killed. This is
+    // the cross-query event-loss residual closure: a retiring runtime's pump read
+    // is ended before the proc dies so it cannot steal a new query's first event.
+    expect(order[0]).toBe('stream.return');
+    const killIdx = order.findIndex((s) => s.startsWith('process.kill') || s === 'proc.kill');
+    expect(killIdx).toBeGreaterThan(0);
+    expect(order.indexOf('stream.return')).toBeLessThan(killIdx);
   });
 });

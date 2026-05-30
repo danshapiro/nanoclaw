@@ -317,6 +317,52 @@ describe('side_effect_ledger import', () => {
     const authoritative = getAuthoritativeSideEffects({ routeKey: 'opencode|discord|chan-1|dm:mg-1' });
     expect(authoritative.map((s) => s.kind)).toContain('summarize_dnd_summary_artifact');
   });
+
+  test('authoritative side effects are filterable by inputId so an earlier/other turn does not leak into the active turn', () => {
+    const dir = tmpdir();
+    const root = path.join(dir, 'allowed');
+    fs.mkdirSync(root, { recursive: true });
+    const artifact = path.join(root, 'sum.md');
+    fs.writeFileSync(artifact, 'BODY');
+    const size = fs.statSync(artifact).size;
+
+    importSideEffectLedger({
+      jsonl: [
+        // An EARLIER turn's authoritative entry on a DIFFERENT route/input.
+        JSON.stringify({
+          kind: 'summarize_dnd_summary_artifact',
+          audit_id: 'other-turn',
+          occurred_at: new Date().toISOString(),
+          input_id: 'in-OTHER',
+          route_key: 'opencode|discord|chan-9|dm:mg-9',
+          evidence: { artifact_path: artifact, size_bytes: size },
+        }),
+        // The ACTIVE turn's authoritative entry.
+        JSON.stringify({
+          kind: 'summarize_dnd_summary_artifact',
+          audit_id: 'active-turn',
+          occurred_at: new Date().toISOString(),
+          input_id: 'in-ACTIVE',
+          route_key: 'opencode|discord|chan-1|dm:mg-1',
+          evidence: { artifact_path: artifact, size_bytes: size },
+        }),
+      ].join('\n'),
+      allowedArtifactRoots: [root],
+    });
+
+    // Only the active turn's entry is surfaced when correlated by inputId; the
+    // unrelated earlier entry is excluded.
+    const active = getAuthoritativeSideEffects({ inputId: 'in-ACTIVE' });
+    expect(active.map((s) => s.id)).toEqual(['active-turn']);
+    // Combining route + input is also exact.
+    const combined = getAuthoritativeSideEffects({ inputId: 'in-ACTIVE', routeKey: 'opencode|discord|chan-1|dm:mg-1' });
+    expect(combined.map((s) => s.id)).toEqual(['active-turn']);
+    // A mismatched route with the active inputId yields nothing (no cross-leak).
+    const mismatch = getAuthoritativeSideEffects({ inputId: 'in-ACTIVE', routeKey: 'opencode|discord|chan-9|dm:mg-9' });
+    expect(mismatch.map((s) => s.id)).toEqual([]);
+    // No filter still returns both (back-compat).
+    expect(getAuthoritativeSideEffects().map((s) => s.id).sort()).toEqual(['active-turn', 'other-turn']);
+  });
 });
 
 // ── Task 1 Step 3: route-scoped recovery + lifecycle ─────────────────────────

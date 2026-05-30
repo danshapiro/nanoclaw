@@ -7,39 +7,13 @@ import { requireYenteHostEnv, YENTE_LOCAL_PROXY_HOSTNAMES } from '../yente/servi
 
 const OPENCODE_ONECLI_PLACEHOLDER = 'onecli-managed';
 
-const OPENCODE_HOST_ENV_KEYS = [
-  'ONECLI_URL',
-  'ONECLI_API_KEY',
-  'ONECLI_GATEWAY_URL',
-  'GWS_PROXY_URL',
-  'MSGVAULT_PROXY_URL',
-  'FAMILIAR_PROXY_URL',
-  'NYNE_PROXY_URL',
-  'NO_PROXY',
-  'no_proxy',
-  'OPENCODE_PROVIDER',
-  'OPENCODE_MODEL',
-  'OPENCODE_SMALL_MODEL',
-  'OPENCODE_VISION_MODEL',
-  // Liveness/timeout knobs (Task 3 Step 5). Forwarded only when the operator
-  // sets them in host .env; unset keys are omitted so the in-container default
-  // applies. Defined in container/agent-runner/src/providers/opencode.ts.
-  'OPENCODE_INACTIVITY_NOTICE_MS',
-  'OPENCODE_INACTIVITY_NOTICE_REPEAT_MS',
-  'OPENCODE_TRANSPORT_TIMEOUT_MS',
-  'OPENCODE_WAIT_TICK_MS',
-  'OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS',
-  'OPENCODE_NATIVE_QUESTION_CANCEL_GRACE_MS',
-  'OPENCODE_LONG_TOOL_TIMEOUT_MAX_MS',
-  'OPENCODE_RELAY_DEADLINE_MS',
-  'OPENCODE_CONTINUATION_FAILURE_LIMIT',
-  'OPENCODE_MODEL_PROVIDER_TIMEOUT_MS',
-] as const;
-
 /**
- * The OPENCODE_* liveness knobs forwarded only when present (omit-if-unset), so
- * an unset key falls back to the in-container default rather than overriding it
- * with `undefined`/empty.
+ * The OPENCODE_* liveness/timeout knobs (Task 3 Step 5). Forwarded only when the
+ * operator sets them in host .env; unset keys are omitted so the in-container
+ * default applies (passing `undefined`/empty would override it). Defined in
+ * container/agent-runner/src/providers/opencode.ts. This is the SINGLE source of
+ * truth for the liveness keys — `OPENCODE_HOST_ENV_KEYS` is derived from it so
+ * adding a knob in one place cannot drift from the other.
  */
 const OPENCODE_FORWARDED_LIVENESS_KEYS = [
   'OPENCODE_INACTIVITY_NOTICE_MS',
@@ -53,6 +27,27 @@ const OPENCODE_FORWARDED_LIVENESS_KEYS = [
   'OPENCODE_CONTINUATION_FAILURE_LIMIT',
   'OPENCODE_MODEL_PROVIDER_TIMEOUT_MS',
 ] as const;
+
+const OPENCODE_BASE_HOST_ENV_KEYS = [
+  'ONECLI_URL',
+  'ONECLI_API_KEY',
+  'ONECLI_GATEWAY_URL',
+  'GWS_PROXY_URL',
+  'MSGVAULT_PROXY_URL',
+  'FAMILIAR_PROXY_URL',
+  'NYNE_PROXY_URL',
+  'NO_PROXY',
+  'no_proxy',
+  'OPENCODE_PROVIDER',
+  'OPENCODE_MODEL',
+  'OPENCODE_SMALL_MODEL',
+  'OPENCODE_VISION_MODEL',
+] as const;
+
+// Derived: base connection/model keys + every forwarded liveness knob. Keeping
+// the liveness keys in one list means a new knob is read AND forwarded without
+// editing two lists.
+const OPENCODE_HOST_ENV_KEYS = [...OPENCODE_BASE_HOST_ENV_KEYS, ...OPENCODE_FORWARDED_LIVENESS_KEYS] as const;
 
 registerProviderContainerConfig('opencode', ({ hostEnv, sessionDir, groupModel }) => {
   const mergedHostEnv = { ...readEnvFile([...OPENCODE_HOST_ENV_KEYS]), ...hostEnv };

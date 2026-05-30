@@ -152,12 +152,16 @@ function rowToProviderSideEffect(row: LedgerRow): ProviderSideEffect {
   };
 }
 
-function queryLedger(opts: { authoritativeOnly: boolean; routeKey?: string }): ProviderSideEffect[] {
+function queryLedger(opts: { authoritativeOnly: boolean; routeKey?: string; inputId?: string }): ProviderSideEffect[] {
   const db = getOutboundDb();
   const rows = db.prepare('SELECT * FROM side_effect_ledger').all() as Array<LedgerRow & { validation_json: string }>;
   const out: ProviderSideEffect[] = [];
   for (const row of rows) {
     if (opts.routeKey && row.route_key && row.route_key !== opts.routeKey) continue;
+    // Input correlation: when an active inputId is supplied, only that turn's
+    // entries surface (entries with a row input_id that differs are excluded).
+    // A null row input_id is never assumed to belong to the active turn.
+    if (opts.inputId && row.input_id !== opts.inputId) continue;
     let authoritative = false;
     try {
       authoritative = Boolean((JSON.parse(row.validation_json) as { authoritative?: boolean }).authoritative);
@@ -175,8 +179,8 @@ function queryLedger(opts: { authoritativeOnly: boolean; routeKey?: string }): P
  * Validated, authoritative side effects available to recovery construction
  * BEFORE any provider-observed tool event. Optionally route-scoped.
  */
-export function getAuthoritativeSideEffects(opts: { routeKey?: string } = {}): ProviderSideEffect[] {
-  return queryLedger({ authoritativeOnly: true, routeKey: opts.routeKey });
+export function getAuthoritativeSideEffects(opts: { routeKey?: string; inputId?: string } = {}): ProviderSideEffect[] {
+  return queryLedger({ authoritativeOnly: true, routeKey: opts.routeKey, inputId: opts.inputId });
 }
 
 /**
@@ -184,6 +188,6 @@ export function getAuthoritativeSideEffects(opts: { routeKey?: string } = {}): P
  * authoritative; surfaced only for diagnostics, never to satisfy recovery or
  * final-success assertions.
  */
-export function getSideEffectHints(opts: { routeKey?: string } = {}): ProviderSideEffect[] {
-  return queryLedger({ authoritativeOnly: false, routeKey: opts.routeKey });
+export function getSideEffectHints(opts: { routeKey?: string; inputId?: string } = {}): ProviderSideEffect[] {
+  return queryLedger({ authoritativeOnly: false, routeKey: opts.routeKey, inputId: opts.inputId });
 }

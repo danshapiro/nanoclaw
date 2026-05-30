@@ -23,7 +23,11 @@ import {
 } from './types.js';
 import { buildRelayOpenCodeToolConfig, mcpServersToOpenCodeConfig } from './mcp-to-opencode.js';
 import { OpenCodeEventPump, type OpenCodePumpClock, type OpenCodeLivenessSnapshot } from './opencode-events.js';
-import { isMissingOpenCodeSessionError, isMissingSessionResultError } from './opencode-errors.js';
+import {
+  classifyContinuation,
+  isMissingOpenCodeSessionError,
+  isMissingSessionResultError,
+} from './opencode-errors.js';
 import {
   detectNativeQuestionPart,
   detectNativeQuestionPermission,
@@ -317,8 +321,12 @@ export function runtimeConfigKey(options: ProviderOptions, opts: BuildOpenCodeCo
   });
 }
 
-/** Real production controller: owns one opencode server proc + client + stream. */
-class RealOpenCodeRuntimeController implements OpenCodeRuntimeController {
+/**
+ * Real production controller: owns one opencode server proc + client + stream.
+ * Exported for the quiesce-before-kill ordering test; not part of the public
+ * provider API.
+ */
+export class RealOpenCodeRuntimeController implements OpenCodeRuntimeController {
   constructor(
     readonly proc: ChildProcess,
     readonly client: OpencodeClient,
@@ -708,35 +716,10 @@ export class OpenCodeProvider implements AgentProvider {
     this.controllerInit = null;
   }
 
-  /**
-   * Positive existence-check seam for the AUTHORITATIVE continuation classifier
-   * (`classifyContinuation`). Backed by the SDK existence check
-   * `client.session.get({ path: { id } })`.
-   */
-  async sessionExists(id: string): Promise<boolean> {
-    try {
-      const rt = await this.ensureRuntime();
-      return rt.sessionExists(id);
-    } catch {
-      return true;
-    }
-  }
-
-  /**
-   * Construct a separate relay runtime for a bounded Yente-authored status
-   * relay. The relay has its OWN process/client/event pump/session id, no
-   * continuation, no mutation tools, and its own route-locked MCP server. It is
-   * NEVER the original runtime, and destroying it never affects the original
-   * turn.
-   */
-  async createRelayRuntime(routeKey: string, deadlineMs: number): Promise<OpenCodeRuntimeController> {
-    return this.runtimeFactory.createRelayRuntime(this.options, {
-      allowedTools: ['send_message'],
-      deniedNativeTools: relayDeniedNativeToolIds(),
-      routeKey,
-      deadlineMs,
-    });
-  }
+  // The AUTHORITATIVE positive existence check is reached through the per-turn
+  // controller (`rt.sessionExists(...)` in gen()'s terminal handler), so no
+  // provider-level `sessionExists`/`createRelayRuntime` wrappers exist; the
+  // relay path calls `self.runtimeFactory.createRelayRuntime(...)` directly.
 
   query(input: QueryInput): AgentQuery {
     const self = this;
@@ -996,12 +979,69 @@ export class OpenCodeProvider implements AgentProvider {
                   }),
                 );
                 clearActiveTools();
+
+                // Authoritative continuation clear, mechanism (b): a
+                // transport/read/ended terminal interruption with an attempted
+                // continuation TRIGGERS the positive existence check on the EXACT
+                // attempted session id (Invariant 151/152). The check itself —
+                // never any transport/timeout/not-found error TEXT — decides:
+                //   - DEFINITIVE not-found (classifyContinuation ⇒ policy 'clear',
+                //     reason session-missing) ⇒ emit clear-continuation now and
+                //     clear the interruption's continuation policy.
+                //   - inconclusive (existence check errors/transport-fails, or the
+                //     session still exists) ⇒ keep 'preserve'; the bounded zombie
+                //     limit remains the self-correcting backstop.
+                // We consult the existence check on THIS controller BEFORE tearing
+                // it down so the probe still has a usable client; a failed check
+                // is correctly inconclusive ⇒ preserve.
+                let continuationPolicy = err.continuationPolicy;
+                const attempted = input.continuation;
+                if (
+                  !relayMode &&
+                  attempted &&
+                  (err.classification === 'transport-timeout' ||
+                    err.classification === 'stream-read-error' ||
+                    err.classification === 'stream-ended')
+                ) {
+                  // A throwing/transport-failing existence check is inconclusive,
+                  // never a clear: swallow to 'preserve' (self-correcting via the
+                  // bounded zombie backstop).
+                  let classified: { policy: ProviderContinuationPolicy; reason?: string } = { policy: 'preserve' };
+                  try {
+                    classified = await classifyContinuation({
+                      attemptedContinuation: attempted,
+                      sessionExists: (id) => rt.sessionExists(id),
+                    });
+                  } catch {
+                    classified = { policy: 'preserve' };
+                  }
+                  if (classified.policy === 'clear') {
+                    log(
+                      JSON.stringify({
+                        severity: 'info',
+                        event: 'opencode_continuation_cleared',
+                        reason: classified.reason ?? 'session-missing',
+                        session_id: attempted,
+                        classification: err.classification,
+                      }),
+                    );
+                    yield {
+                      type: 'clear-continuation',
+                      inputId: turnInputId,
+                      reason: classified.reason ?? 'session_missing',
+                      attemptedContinuation: attempted,
+                    };
+                    setActiveSession(undefined);
+                    continuationPolicy = 'clear';
+                  }
+                }
+
                 terminalInterruption = buildInterruption(
                   `opencode_${err.classification.replace(/-/g, '_')}`,
                   'I was interrupted mid-turn and stopped before finishing. Your request is preserved.',
                   err.fallbackUserMessage,
                   err.liveness,
-                  err.continuationPolicy,
+                  continuationPolicy,
                 );
                 pump.dispose();
                 teardownRuntime(err.classification);
@@ -1284,13 +1324,19 @@ function cappedDeclaredTimeoutMs(
   if (declared == null) return null;
   const safetyMarginMs = 60_000;
   const budget = OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS() - elapsedTurnMs - safetyMarginMs;
-  return Math.max(0, Math.min(OPENCODE_LONG_TOOL_TIMEOUT_MAX_MS(), declared, budget));
+  const capped = Math.min(OPENCODE_LONG_TOOL_TIMEOUT_MAX_MS(), declared, budget);
+  // A non-positive cap (the absolute-ceiling budget went negative) is NOT an
+  // active long tool — never persist a 0-ms widening tool to container_state.
+  // Treat it as null so refreshActiveTool/defaultPersistActiveTool skip it.
+  return capped > 0 ? capped : null;
 }
 
 /** Default container_state writer for the active long tool (Step 8). */
 function defaultPersistActiveTool(tool: ActiveOpenCodeTool | null): void {
   try {
-    if (tool && tool.declaredTimeoutMs != null) {
+    // A non-positive declared timeout (<= 0) is not a widening long tool — clear
+    // rather than persist a 0-ms tool that would falsely claim a tool in flight.
+    if (tool && tool.declaredTimeoutMs != null && tool.declaredTimeoutMs > 0) {
       setContainerToolInFlight(tool.tool, tool.declaredTimeoutMs);
     } else {
       clearContainerToolInFlight();
@@ -1309,7 +1355,6 @@ function defaultPersistActiveTool(tool: ActiveOpenCodeTool | null): void {
  * is absent (no /workspace) or import fails.
  */
 function defaultImportStagedSideEffects(inputId: string): ProviderSideEffect[] {
-  void inputId; // provider-side correlation is stamped by the tool, not here.
   try {
     const ledgerPath = process.env.NANOCLAW_SIDE_EFFECT_LEDGER || '/workspace/side-effects.jsonl';
     const allowedArtifactRoots = (process.env.NANOCLAW_SIDE_EFFECT_ARTIFACT_ROOTS || '')
@@ -1321,7 +1366,11 @@ function defaultImportStagedSideEffects(inputId: string): ProviderSideEffect[] {
       allowedArtifactRoots: allowedArtifactRoots.length > 0 ? allowedArtifactRoots : undefined,
       gwsPublicKey: process.env.GWS_SIDE_EFFECT_VERIFY_KEY || undefined,
     });
-    return getAuthoritativeSideEffects();
+    // Input-correlate the surfaced authoritative entries to the ACTIVE turn so a
+    // follow-up turn's tool completion can never collect an unrelated earlier
+    // authoritative entry into `collectedSideEffects` / a terminal recoverySeed.
+    // A turn-less import (no inputId) returns the unfiltered authoritative set.
+    return inputId ? getAuthoritativeSideEffects({ inputId }) : getAuthoritativeSideEffects();
   } catch {
     return [];
   }

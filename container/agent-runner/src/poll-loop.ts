@@ -694,18 +694,33 @@ async function processQuery(
     } finally {
       relayInFlight = false;
       // If the relay could not deliver anything, send ONE sanitized direct
-      // fallback so the user is not left silent — but only once per turn.
+      // fallback so the user is not left silent — but only once per turn. This
+      // runs in the void-ed child task's finally; a throw from writeMessageOut
+      // would otherwise surface as an UNOBSERVED rejection, so it is wrapped.
+      // `directFallbackSent` is set before the write to keep the once-per-turn
+      // contract even if the write itself fails (the attempt is consumed).
       if (!delivered && !directFallbackSent) {
         directFallbackSent = true;
-        writeMessageOut({
-          id: generateId(),
-          in_reply_to: routing.inReplyTo,
-          kind: 'chat',
-          platform_id: routing.platformId,
-          channel_type: routing.channelType,
-          thread_id: routing.threadId,
-          content: JSON.stringify({ text: notice.fallbackUserMessage }),
-        });
+        try {
+          writeMessageOut({
+            id: generateId(),
+            in_reply_to: routing.inReplyTo,
+            kind: 'chat',
+            platform_id: routing.platformId,
+            channel_type: routing.channelType,
+            thread_id: routing.threadId,
+            content: JSON.stringify({ text: notice.fallbackUserMessage }),
+          });
+        } catch (err) {
+          log(
+            JSON.stringify({
+              severity: 'error',
+              event: 'inactivity_relay_fallback_write_failed',
+              route_key: ledgerCtx.activeRouteKey,
+              error: err instanceof Error ? err.message : String(err),
+            }),
+          );
+        }
       }
     }
   }
@@ -794,7 +809,21 @@ async function processQuery(
         // user rows; never clear continuation.
         if (event.relayRecommended !== false) {
           if (relayCaps?.supportsSeparateRelayRuntime && config) {
-            if (!relayInFlight) void runInactivityRelay(event);
+            // Child task — never awaited here. Attach a .catch so any throw
+            // (including from the finally fallback write) is observed, not an
+            // unhandled rejection; reset relayInFlight defensively.
+            if (!relayInFlight)
+              void runInactivityRelay(event).catch((err) => {
+                relayInFlight = false;
+                log(
+                  JSON.stringify({
+                    severity: 'error',
+                    event: 'inactivity_relay_task_rejected',
+                    route_key: ledgerCtx.activeRouteKey,
+                    error: err instanceof Error ? err.message : String(err),
+                  }),
+                );
+              });
           } else {
             sendDirectInactivityFallback(event);
           }
