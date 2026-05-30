@@ -76,7 +76,7 @@ function createAdapter(): ChannelAdapter {
         server!.once('error', reject);
         server!.listen(sock, () => {
           // Tighten perms so only the owner can connect. Unix socket files
-          // obey filesystem perms — 0700 on the socket means other local
+          // obey filesystem perms — 0600 on the socket means other local
           // users can't send into this agent.
           try {
             fs.chmodSync(sock, 0o600);
