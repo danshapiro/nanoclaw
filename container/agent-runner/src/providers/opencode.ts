@@ -17,9 +17,10 @@ import {
   type QueryInput,
   type QueryTurnInput,
 } from './types.js';
-import { mcpServersToOpenCodeConfig } from './mcp-to-opencode.js';
+import { buildRelayOpenCodeToolConfig, mcpServersToOpenCodeConfig } from './mcp-to-opencode.js';
 import { OpenCodeEventPump, type OpenCodePumpClock } from './opencode-events.js';
 import { isMissingOpenCodeSessionError, isMissingSessionResultError, OpenCodeInterruptionError } from './opencode-errors.js';
+import { NATIVE_QUESTION_TOOL_ID } from './opencode-sdk-surface.js';
 import { sniffImageMime } from '../attachments.js';
 
 function log(msg: string): void {
@@ -28,12 +29,29 @@ function log(msg: string): void {
 
 const SESSION_STATUS_RETRY_ERROR_AFTER = 3;
 
-// Liveness/timeout knobs. The pump enforces the absolute ceiling itself,
-// independent of heartbeat; transport timeout is the no-SSE death window.
-const OPENCODE_TRANSPORT_TIMEOUT_MS = Number(process.env.OPENCODE_TRANSPORT_TIMEOUT_MS) || 30 * 60 * 1000;
-const OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS = Number(process.env.OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS) || 6 * 60 * 60 * 1000;
-const OPENCODE_INACTIVITY_NOTICE_MS = Number(process.env.OPENCODE_INACTIVITY_NOTICE_MS) || 5 * 60 * 1000;
-const OPENCODE_WAIT_TICK_MS = Number(process.env.OPENCODE_WAIT_TICK_MS) || 60 * 1000;
+// Liveness/timeout knobs, env-configurable (forwarded from the host through the
+// container env map — see host src/providers/opencode.ts). The pump enforces the
+// absolute ceiling itself, independent of heartbeat; transport timeout is the
+// no-SSE death window. Each reads `process.env` lazily inside getters so a test
+// that sets the env before calling buildOpenCodeConfig() is honored.
+function envNum(key: string, fallback: number): number {
+  const v = Number(process.env[key]);
+  return Number.isFinite(v) && v > 0 ? v : fallback;
+}
+const OPENCODE_TRANSPORT_TIMEOUT_MS = (): number => envNum('OPENCODE_TRANSPORT_TIMEOUT_MS', 30 * 60 * 1000);
+const OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS = (): number => envNum('OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS', 6 * 60 * 60 * 1000);
+const OPENCODE_INACTIVITY_NOTICE_MS = (): number => envNum('OPENCODE_INACTIVITY_NOTICE_MS', 5 * 60 * 1000);
+const OPENCODE_INACTIVITY_NOTICE_REPEAT_MS = (): number =>
+  envNum('OPENCODE_INACTIVITY_NOTICE_REPEAT_MS', OPENCODE_INACTIVITY_NOTICE_MS());
+const OPENCODE_WAIT_TICK_MS = (): number => envNum('OPENCODE_WAIT_TICK_MS', 15 * 1000);
+const OPENCODE_RELAY_DEADLINE_MS = (): number => envNum('OPENCODE_RELAY_DEADLINE_MS', 30 * 1000);
+const OPENCODE_CONTINUATION_FAILURE_LIMIT = (): number => envNum('OPENCODE_CONTINUATION_FAILURE_LIMIT', 3);
+const OPENCODE_LONG_TOOL_TIMEOUT_MAX_MS = (): number => envNum('OPENCODE_LONG_TOOL_TIMEOUT_MAX_MS', 6 * 60 * 60 * 1000);
+const OPENCODE_NATIVE_QUESTION_CANCEL_GRACE_MS = (): number =>
+  envNum('OPENCODE_NATIVE_QUESTION_CANCEL_GRACE_MS', 15 * 1000);
+// Model-provider request timeout: a large positive ms value (= absolute turn
+// ceiling) under the ACTIVE provider name, NEVER 0 (which means immediate abort).
+const OPENCODE_MODEL_PROVIDER_TIMEOUT_MS = (): number => envNum('OPENCODE_MODEL_PROVIDER_TIMEOUT_MS', 6 * 60 * 60 * 1000);
 
 const KEEPALIVE_EVENT_TYPES = ['server.connected', 'server.heartbeat'];
 
@@ -150,7 +168,17 @@ function wrapPromptWithContext(text: string, systemInstructions?: string): strin
 
 const BUILTIN_AUTH_PROVIDERS = new Set(['anthropic', 'opencode', 'opencode-go', 'opencode-zen']);
 
-export function buildOpenCodeConfig(options: ProviderOptions): Record<string, unknown> {
+export interface BuildOpenCodeConfigOpts {
+  /** Build the restricted relay config (mutation/shell/file/web/question denied). */
+  relayMode?: boolean;
+  /** Locked normalized route for relay output (informational; route-lock is enforced at the MCP server). */
+  relayRouteKey?: string;
+}
+
+export function buildOpenCodeConfig(
+  options: ProviderOptions,
+  opts: BuildOpenCodeConfigOpts = {},
+): Record<string, unknown> {
   const provider = process.env.OPENCODE_PROVIDER || 'anthropic';
   const model = process.env.OPENCODE_MODEL;
   const smallModel = process.env.OPENCODE_SMALL_MODEL;
@@ -158,9 +186,17 @@ export function buildOpenCodeConfig(options: ProviderOptions): Record<string, un
     throw new Error('Custom OpenCode providers are not supported without a OneCLI-managed credential path');
   }
 
-  const providerOptions: Record<string, unknown> = {};
-
   const mcp = mcpServersToOpenCodeConfig(options.mcpServers);
+
+  // Model-provider request timeout under the ACTIVE provider name. In SDK
+  // 1.15.10 there is NO top-level Config.options.timeout — the field is
+  // provider[<activeProvider>].options.timeout (number | false). We set a large
+  // positive ms value (default = absolute turn ceiling) so NanoClaw's liveness
+  // pump is not undercut by the hidden 5-minute provider request abort. NEVER 0
+  // (immediate abort) and NEVER a provider literally named "options".
+  const providerConfig: Record<string, { options: { timeout: number | false } }> = {
+    [provider]: { options: { timeout: OPENCODE_MODEL_PROVIDER_TIMEOUT_MS() } },
+  };
 
   // Load shared base + per-group fragments + per-group memory through OpenCode's
   // native instructions pipeline (session/instruction.ts). Absolute paths with
@@ -172,17 +208,32 @@ export function buildOpenCodeConfig(options: ProviderOptions): Record<string, un
     '/workspace/agent/CLAUDE.local.md',
   ];
 
+  // Native question is disabled through OpenCode TOOL AVAILABILITY (the typed
+  // tools map), NOT through permission.question — SDK 1.15.10 Config.permission
+  // keys are exactly edit|bash|webfetch|doom_loop|external_directory, so a
+  // `question` permission key silently no-ops and leaves the native question
+  // tool reachable. `tools.question = false` is the REAL surface.
+  const tools: Record<string, boolean> = { [NATIVE_QUESTION_TOOL_ID]: false };
+  const permission: Record<string, string> = { '*': 'allow' };
+
+  if (opts.relayMode) {
+    // Relay config: deny mutation/shell/file/web + question via the REAL SDK ids
+    // (permission keys + tools map). Read-only status tools stay enabled; the
+    // only write surface is the route-locked send_message MCP tool.
+    const relay = buildRelayOpenCodeToolConfig();
+    Object.assign(tools, relay.tools);
+    Object.assign(permission, relay.permission);
+  }
+
   return {
     ...(model ? { model } : {}),
     ...(smallModel ? { small_model: smallModel } : {}),
     enabled_providers: [provider],
-    permission: {
-      '*': 'allow',
-      question: 'deny',
-    },
+    permission,
+    tools,
     autoupdate: false,
     snapshot: false,
-    ...(Object.keys(providerOptions).length > 0 ? { provider: providerOptions } : {}),
+    provider: providerConfig,
     instructions,
     mcp,
   };
@@ -554,11 +605,11 @@ export class OpenCodeProvider implements AgentProvider {
       const pump = new OpenCodeEventPump<{ type: string; properties: Record<string, unknown> }>({
         ...realTimerClock(),
         stream,
-        transportTimeoutMs: OPENCODE_TRANSPORT_TIMEOUT_MS,
-        absoluteTurnTimeoutMs: OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS,
-        inactivityNoticeMs: OPENCODE_INACTIVITY_NOTICE_MS,
-        inactivityThrottleMs: OPENCODE_INACTIVITY_NOTICE_MS,
-        waitTickMs: OPENCODE_WAIT_TICK_MS,
+        transportTimeoutMs: OPENCODE_TRANSPORT_TIMEOUT_MS(),
+        absoluteTurnTimeoutMs: OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS(),
+        inactivityNoticeMs: OPENCODE_INACTIVITY_NOTICE_MS(),
+        inactivityThrottleMs: OPENCODE_INACTIVITY_NOTICE_REPEAT_MS(),
+        waitTickMs: OPENCODE_WAIT_TICK_MS(),
         keepaliveTypes: KEEPALIVE_EVENT_TYPES,
         isSessionEvent: (event) => {
           const sid = (event.properties as { sessionID?: string }).sessionID;

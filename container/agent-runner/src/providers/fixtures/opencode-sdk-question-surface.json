@@ -1,0 +1,110 @@
+{
+  "note": "Sanitized OpenCode SDK surface probe — Task 3 Step 6. See opencode-sdk-surface.ts.",
+  "evidenceBoundary": "live-server-probe",
+  "probedAt": "2026-05-30T03:38:24.626Z",
+  "sdkVersion": "1.15.10",
+  "binaryVersionObserved": "1.15.12",
+  "versionSkewNote": "binary 1.15.12 > pinned SDK 1.15.10; both expose the same root native-question surface verified below.",
+  "clientConstruction": "root createOpencodeClient (NOT the ./v2 client)",
+  "nativeQuestionSurface": {
+    "rootClient": {
+      "hasQuestionNamespace": false,
+      "hasQuestionEvents": false,
+      "toolPartEvent": "message.part.updated",
+      "toolPartShape": "ToolPart { id, sessionID, messageID, type:\"tool\", callID, tool, state }",
+      "questionToolId": "question",
+      "permissionEvent": "permission.updated",
+      "permissionShape": "Permission { id, type, sessionID, messageID, callID?, title, metadata, time }",
+      "denyApi": "postSessionIdPermissionsPermissionId({ path:{id,permissionID}, body:{ response:\"reject\" } })",
+      "replyResponses": [
+        "once",
+        "always",
+        "reject"
+      ]
+    },
+    "v2Client": {
+      "hasQuestionNamespace": true,
+      "hasQuestionEvents": true,
+      "questionAskedEvent": "question.asked",
+      "questionNamespace": "client.question (list / reply / reject)",
+      "note": "Provider does NOT use the v2 client; recorded so a future client swap is caught by the static guard."
+    }
+  },
+  "existenceCheck": {
+    "api": "client.session.get({ path: { id } })",
+    "missingSessionErrorName": "NotFoundError",
+    "missingSessionHttpStatus": 404,
+    "missingSessionErrorExample": {
+      "name": "NotFoundError",
+      "data": {
+        "message": "Session not found: ses_doesnotexist_probe"
+      }
+    },
+    "idInMessageNote": "The 1.15.12 binary DID echo the attempted id in data.message, but SDK 1.15.10 NotFoundError.data.message is free-form and not guaranteed to carry the id — string matching is unsound for the false-negative direction, so the positive existence check is authoritative."
+  },
+  "modelProviderTimeout": {
+    "field": "provider[<activeProvider>].options.timeout",
+    "type": "number | false",
+    "default": 300000,
+    "disableSentinel": false,
+    "note": "NO top-level Config.options.timeout. Active provider = process.env.OPENCODE_PROVIDER || \"anthropic\". 0 means immediate abort and is forbidden."
+  },
+  "config": {
+    "permissionKeys": [
+      "edit",
+      "bash",
+      "webfetch",
+      "doom_loop",
+      "external_directory"
+    ],
+    "toolsMapShape": "{ [toolId: string]: boolean }",
+    "questionDisableVia": "tools: { question: false }"
+  },
+  "toolIds": [
+    "invalid",
+    "question",
+    "bash",
+    "read",
+    "glob",
+    "grep",
+    "edit",
+    "write",
+    "task",
+    "webfetch",
+    "todowrite",
+    "websearch",
+    "skill",
+    "apply_patch",
+    "pty_spawn",
+    "pty_write",
+    "pty_read",
+    "pty_list",
+    "pty_kill"
+  ],
+  "toolClassification": {
+    "mutationOrShellOrFileOrWeb": [
+      "bash",
+      "edit",
+      "write",
+      "apply_patch",
+      "webfetch",
+      "websearch",
+      "task",
+      "pty_spawn",
+      "pty_write",
+      "pty_read",
+      "pty_list",
+      "pty_kill"
+    ],
+    "readOnlyStatus": [
+      "read",
+      "glob",
+      "grep",
+      "todowrite",
+      "skill"
+    ],
+    "question": [
+      "question"
+    ]
+  }
+}

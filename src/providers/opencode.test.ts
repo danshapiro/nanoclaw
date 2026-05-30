@@ -153,6 +153,39 @@ describe('opencode provider container config', () => {
     }
   });
 
+  it('forwards a set OPENCODE_* liveness knob into the container env and omits unset ones', () => {
+    const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-opencode-session-'));
+    try {
+      const config = getProviderContainerConfig('opencode');
+      expect(config).toBeDefined();
+      const contribution = config!({
+        sessionDir,
+        agentGroupId: 'ag-discord-yente-dvora',
+        hostEnv: {
+          ONECLI_URL: 'http://onecli.local',
+          ONECLI_API_KEY: 'secret',
+          ONECLI_GATEWAY_URL: 'http://onecli-gateway.local',
+          GWS_PROXY_URL: 'http://yente-gws-proxy.local:8083',
+          MSGVAULT_PROXY_URL: 'http://yente-msgvault-proxy.local:8084',
+          FAMILIAR_PROXY_URL: 'http://yente-familiar-proxy.local:8081',
+          NYNE_PROXY_URL: 'http://yente-nyne-proxy.local:8082',
+          // Operator override set in host env — must be forwarded.
+          OPENCODE_TRANSPORT_TIMEOUT_MS: '2700000',
+          OPENCODE_RELAY_DEADLINE_MS: '45000',
+          // OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS deliberately UNSET — must be omitted
+          // so the in-container default applies.
+        },
+      });
+
+      expect(contribution.env?.OPENCODE_TRANSPORT_TIMEOUT_MS).toBe('2700000');
+      expect(contribution.env?.OPENCODE_RELAY_DEADLINE_MS).toBe('45000');
+      expect(contribution.env).not.toHaveProperty('OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS');
+      expect(contribution.env).not.toHaveProperty('OPENCODE_INACTIVITY_NOTICE_MS');
+    } finally {
+      fs.rmSync(sessionDir, { recursive: true, force: true });
+    }
+  });
+
   it('falls back to hostEnv OPENCODE_MODEL when groupModel is not set', () => {
     const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-opencode-session-'));
     try {

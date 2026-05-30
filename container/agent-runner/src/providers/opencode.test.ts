@@ -56,7 +56,7 @@ function withEnv<T>(env: Record<string, string | undefined>, fn: () => T): T {
 }
 
 describe('OpenCode config', () => {
-  it('denies OpenCode native questions while leaving other tools allowed', () => {
+  it('disables the native question tool through tool availability (tools map), not permission.question', () => {
     const config = buildOpenCodeConfig({
       mcpServers: {
         nanoclaw: {
@@ -70,10 +70,15 @@ describe('OpenCode config', () => {
       },
     });
 
-    expect(config.permission).toEqual({
-      '*': 'allow',
-      question: 'deny',
-    });
+    // Native question is disabled via the typed tools map (the REAL surface),
+    // NOT via permission.question (which is not a valid SDK 1.15.10 permission
+    // key — keys are exactly edit|bash|webfetch|doom_loop|external_directory).
+    expect((config.tools as Record<string, boolean>).question).toBe(false);
+    // The permission map must NOT contain a bogus `question` key.
+    expect(config.permission).not.toHaveProperty('question');
+    // Other tools still allowed by default (permission '*': 'allow').
+    expect((config.permission as Record<string, string>)['*']).toBe('allow');
+
     expect(config.mcp).toEqual({
       nanoclaw: {
         type: 'local',
@@ -85,6 +90,46 @@ describe('OpenCode config', () => {
         enabled: true,
       },
     });
+  });
+
+  it('raises the model-provider request timeout under the ACTIVE provider name (never a provider named "options", never 0)', () => {
+    const config = withEnv({ OPENCODE_PROVIDER: undefined, OPENCODE_MODEL_PROVIDER_TIMEOUT_MS: undefined }, () =>
+      buildOpenCodeConfig({ mcpServers: undefined }),
+    );
+    const provider = config.provider as Record<string, { options?: { timeout?: number | false } }>;
+    // Active provider defaults to 'anthropic'; timeout resolves UNDER that key.
+    expect(provider.anthropic).toBeDefined();
+    const timeout = provider.anthropic.options?.timeout;
+    expect(timeout === false || (typeof timeout === 'number' && timeout > 0)).toBe(true);
+    expect(timeout).not.toBe(0);
+    // A provider literally named "options" is a bug and must NOT exist.
+    expect(provider).not.toHaveProperty('options');
+  });
+
+  it('applies the model-provider timeout under a non-default active provider name', () => {
+    const config = withEnv(
+      { OPENCODE_PROVIDER: 'opencode-go', OPENCODE_MODEL_PROVIDER_TIMEOUT_MS: '12345' },
+      () => buildOpenCodeConfig({ mcpServers: undefined }),
+    );
+    const provider = config.provider as Record<string, { options?: { timeout?: number | false } }>;
+    expect(provider['opencode-go']?.options?.timeout).toBe(12345);
+    expect(provider).not.toHaveProperty('options');
+  });
+
+  it('relay-mode config denies mutation/shell/file/web/question via REAL ids; reachable set = allowlist', () => {
+    const config = buildOpenCodeConfig({ mcpServers: undefined }, { relayMode: true, relayRouteKey: 'discord:dm:1' });
+    const permission = config.permission as Record<string, string>;
+    expect(permission.bash).toBe('deny');
+    expect(permission.webfetch).toBe('deny');
+    expect(permission.edit).toBe('deny');
+    expect(permission.external_directory).toBe('deny');
+    const tools = config.tools as Record<string, boolean>;
+    for (const id of ['bash', 'edit', 'write', 'apply_patch', 'webfetch', 'websearch', 'task', 'question']) {
+      expect(tools[id]).toBe(false);
+    }
+    // Read-only status tools NOT disabled.
+    expect(tools.read).not.toBe(false);
+    expect(tools.grep).not.toBe(false);
   });
 });
 
@@ -162,7 +207,14 @@ describe('OpenCode file parts', () => {
       small_model: 'opencode-go/deepseek-v4-flash',
       enabled_providers: ['opencode-go'],
     });
-    expect(config).not.toHaveProperty('provider');
+    // The ONLY provider override is the long-turn request timeout under the
+    // active provider name — it does NOT inject api/apiKey/auth wiring, so the
+    // built-in OpenCode Go auth path is untouched.
+    const provider = config.provider as Record<string, Record<string, unknown>>;
+    expect(Object.keys(provider)).toEqual(['opencode-go']);
+    expect(provider['opencode-go']).toEqual({ options: { timeout: 21600000 } });
+    expect(provider['opencode-go']).not.toHaveProperty('api');
+    expect(provider['opencode-go']).not.toHaveProperty('apiKey');
   });
 
   it('fails clearly for custom OpenCode providers after raw key removal', () => {
