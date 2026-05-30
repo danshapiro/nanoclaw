@@ -111,7 +111,6 @@ function makePump(opts: {
     now: opts.clock.now,
     schedule: opts.clock.schedule,
     stream: opts.stream as unknown as AsyncGenerator<Ev, void, void>,
-    sessionId: SESSION,
     transportTimeoutMs: opts.transportTimeoutMs ?? 30 * 60 * 1000,
     absoluteTurnTimeoutMs: opts.absoluteTurnTimeoutMs ?? 6 * 60 * 60 * 1000,
     inactivityNoticeMs: opts.inactivityNoticeMs ?? 5 * 60 * 1000,
@@ -260,6 +259,37 @@ describe('OpenCodeEventPump — inactivity notices (non-terminal)', () => {
     );
   });
 
+  it('fires an inactivity-notice even when ONLY keepalives arrive (heartbeat-only Dvora scenario)', async () => {
+    const clock = new FakeClock();
+    const stream = new FakeStream<Ev>();
+    const pump = makePump({
+      clock,
+      stream,
+      waitTickMs: 60_000,
+      inactivityNoticeMs: 5 * 60_000,
+      inactivityThrottleMs: 5 * 60_000,
+      // Transport never dies because heartbeats keep it fresh — exactly the
+      // no-SSE/heartbeat-only long-work case. The inactivity NOTICE must still
+      // fire because no MEANINGFUL event arrived.
+      transportTimeoutMs: 30 * 60_000,
+    });
+
+    let sawNotice = false;
+    // Deliver a heartbeat every minute for 6 minutes. Keepalives keep the
+    // transport alive but must NOT defer the inactivity (no-meaningful-event)
+    // clock, so a notice must fire by ~5 minutes.
+    for (let min = 1; min <= 6; min++) {
+      const p = pump.next();
+      stream.push({ type: 'server.heartbeat', properties: {} });
+      await clock.advance(60_000);
+      const res = await p;
+      if (res.kind === 'inactivity-notice') sawNotice = true;
+      expect(res.kind).not.toBe('transport-timeout');
+      expect(res.kind).not.toBe('ended');
+    }
+    expect(sawNotice).toBe(true);
+  });
+
   it('a later session.idle after inactivity returns normally', async () => {
     const clock = new FakeClock();
     const stream = new FakeStream<Ev>();
@@ -394,7 +424,6 @@ describe('OpenCodeEventPump — bounded queue never drops protected events', () 
       now: clock.now,
       schedule: clock.schedule,
       stream: stream as unknown as AsyncGenerator<Ev, void, void>,
-      sessionId: SESSION,
       transportTimeoutMs: 30 * 60_000,
       absoluteTurnTimeoutMs: 6 * 60 * 60_000,
       inactivityNoticeMs: 60 * 60_000,
@@ -453,5 +482,67 @@ describe('OpenCodeEventPump — bounded queue never drops protected events', () 
     }
     expect(overflowSeen).toBe(true);
     expect(seen).toContain('permission.updated');
+  });
+});
+
+describe('OpenCodeEventPump — stop() settles a parked next() and cancels its armed timers', () => {
+  it('resolves a parked next() and fires no orphaned scheduled callback afterward', async () => {
+    const clock = new FakeClock();
+    const stream = new FakeStream<Ev>();
+    const pump = makePump({ clock, stream, waitTickMs: 60_000, transportTimeoutMs: 30 * 60_000 });
+
+    pump.beginTurn();
+    // Park a next() with armed wait-tick / transport / absolute / inactivity
+    // timers; the stream stays silent.
+    const parked = pump.next();
+    // End the turn while next() is parked.
+    pump.stop();
+
+    // The parked promise must settle cleanly (not hang) with a benign
+    // non-terminal result.
+    const res = await parked;
+    expect(['wait-tick', 'keepalive', 'inactivity-notice']).toContain(res.kind);
+
+    // No orphaned timer: advancing well past every armed deadline must not throw
+    // (a cancelled scheduler callback would otherwise try to settle again).
+    await clock.advance(7 * 60 * 60_000);
+    expect(true).toBe(true);
+  });
+});
+
+describe('OpenCodeEventPump — cross-turn handoff over a shared long-lived stream', () => {
+  it('does not lose the follow-up turn first protected event after a clean turn-1 session.idle + stop()', async () => {
+    const clock = new FakeClock();
+    const stream = new FakeStream<Ev>();
+    // ONE long-lived pump wraps the SAME shared stream for the whole session.
+    const pump = makePump({ clock, stream, waitTickMs: 60_000, transportTimeoutMs: 30 * 60_000 });
+
+    // ── Turn 1: prompt → session.idle → stop() (clean turn end). ──────────────
+    pump.beginTurn();
+    const t1 = pump.next();
+    stream.push({ type: 'session.idle', properties: { sessionID: SESSION } });
+    const r1 = await t1;
+    expect(r1.kind).toBe('event');
+    if (r1.kind !== 'event') return;
+    expect(r1.event.type).toBe('session.idle');
+    // The turn-loop calls stop() on a clean session.idle. With the previous
+    // per-turn-pump design the reader's in-flight read-ahead would consume the
+    // NEXT event into a discarded queue; the long-lived pump must keep it.
+    pump.stop();
+
+    // ── The follow-up turn's FIRST event arrives on the same shared stream. ───
+    // This is a protected native question (permission.updated) — losing it means
+    // a missed native question. It must reach turn 2, not the dead read-ahead.
+    stream.push({ type: 'permission.updated', properties: { sessionID: SESSION, id: 'perm-followup' } });
+    // Let any read-ahead loop settle.
+    for (let i = 0; i < 50; i++) await Promise.resolve();
+
+    // ── Turn 2: begins a new turn over the SAME pump/stream. ──────────────────
+    pump.beginTurn();
+    const r2 = await pump.next();
+    expect(r2.kind).toBe('event');
+    if (r2.kind !== 'event') return;
+    expect(r2.event.type).toBe('permission.updated');
+    expect((r2.event.properties as { id?: string }).id).toBe('perm-followup');
   });
 });

@@ -1,14 +1,35 @@
 /**
- * Single-reader OpenCode SSE event pump.
+ * Single-reader, long-lived OpenCode SSE event pump.
  *
- * This is the ONLY place in the runner that calls `stream.next()` on the
- * OpenCode event stream. It:
+ * ONE pump instance wraps a shared OpenCode event stream for the WHOLE lifetime
+ * of that stream (across many turns), and its single perpetual reader is the
+ * ONLY caller of `stream.next()`. Because there is exactly one `stream.next()`
+ * consumer for the stream's lifetime, a read-ahead past one turn's terminal
+ * event can never be lost across a turn boundary: any already-read follow-up
+ * event stays in this same pump's bounded queue and is delivered to the next
+ * turn once it claims the pump via `beginTurn()`.
+ *
+ * Per-turn lifecycle:
+ *   - `beginTurn()` resets per-turn liveness/timer state (turn start, last-event
+ *     clocks, inactivity schedule) WITHOUT touching the queue or restarting the
+ *     reader. The queue may already hold the follow-up turn's first read-ahead
+ *     event; that event survives the turn boundary.
+ *   - `next()` pulls the next pump result for the active turn.
+ *   - `stop()` ends the current turn: it settles any parked `next()` waiter
+ *     cleanly (cancelling its armed timers) but LEAVES the reader running so the
+ *     stream keeps draining into the queue for the next turn.
+ *   - `dispose()` tears the pump down for good (runtime teardown / abort):
+ *     marks the stream done so the reader exits after its outstanding read
+ *     settles, and settles any parked waiter.
+ *
+ * It also:
  *   - filters events to the active session (other-session events are dropped
  *     and never wake the active waiter),
  *   - classifies keepalives vs meaningful events and tracks liveness,
  *   - emits non-terminal `wait-tick` / `keepalive` / `inactivity-notice`
  *     results so long no-SSE work stays state-preserving past the observed
- *     Dvora gap,
+ *     Dvora gap (the inactivity NOTICE clock tracks MEANINGFUL events only, so a
+ *     heartbeat-only stream still surfaces inactivity),
  *   - enforces the transport timeout AND, independently of heartbeat, the
  *     absolute turn ceiling, returning typed terminal results that all carry
  *     liveness metadata,
@@ -53,7 +74,6 @@ export interface OpenCodePumpClock {
 
 export interface OpenCodeEventPumpConfig<T> extends OpenCodePumpClock {
   stream: AsyncGenerator<T, void, void> | { next(): Promise<IteratorResult<T, void>> };
-  sessionId: string;
   /** No-SSE transport death window (default no active long tool ≥ 30 min). */
   transportTimeoutMs: number;
   /** Hard maximum turn lifetime; the pump enforces this independent of heartbeat. */
@@ -82,7 +102,8 @@ type Pending<T> =
 export class OpenCodeEventPump<T extends { type?: string }> {
   private readonly cfg: OpenCodeEventPumpConfig<T>;
   private readonly maxQueue: number;
-  private readonly startedAt: number;
+  /** Per-turn start; reset by beginTurn(). Drives elapsed/absolute-ceiling. */
+  private startedAt: number;
 
   /** Bounded queue of session-scoped, already-classified pending items. */
   private readonly queue: Pending<T>[] = [];
@@ -91,9 +112,12 @@ export class OpenCodeEventPump<T extends { type?: string }> {
 
   /** The single perpetual background reader loop. */
   private readerLoop: Promise<void> | null = null;
-  private streamDone = false;
+  /** True once the pump is disposed for good (runtime teardown). */
+  private disposed = false;
   /** Resolver that wakes a parked pump.next() when the reader makes progress. */
   private consumerNotify: (() => void) | null = null;
+  /** Cleanup for the currently-parked next() waiter's armed timers, if any. */
+  private activeWaiterCleanup: (() => void) | null = null;
 
   /** Liveness tracking. */
   private lastEventType: string | null = null;
@@ -106,9 +130,32 @@ export class OpenCodeEventPump<T extends { type?: string }> {
   constructor(cfg: OpenCodeEventPumpConfig<T>) {
     this.cfg = cfg;
     this.maxQueue = cfg.maxQueue ?? 256;
+    // Seed the first turn's clocks. A caller may call beginTurn() explicitly to
+    // re-seed for a follow-up turn; single-turn callers can skip it.
     this.startedAt = cfg.now();
     this.lastEventAt = this.startedAt;
     this.nextInactivityAt = this.startedAt + cfg.inactivityNoticeMs;
+  }
+
+  /**
+   * Begin a new turn over this long-lived pump. Resets per-turn liveness/timer
+   * state (turn start, last-event clocks, inactivity schedule) so the absolute
+   * ceiling and inactivity notice are measured from the new turn's start. Does
+   * NOT touch the queue (a follow-up turn's first event may already be queued
+   * from read-ahead) and does NOT restart the perpetual reader.
+   */
+  beginTurn(): void {
+    this.resetLiveness();
+  }
+
+  /** Reset the per-turn liveness/timer clocks to "now". */
+  private resetLiveness(): void {
+    const now = this.cfg.now();
+    this.startedAt = now;
+    this.lastEventAt = now;
+    this.lastMeaningfulEventAt = null;
+    this.lastEventType = null;
+    this.nextInactivityAt = now + this.cfg.inactivityNoticeMs;
   }
 
   private elapsed(): number {
@@ -144,27 +191,30 @@ export class OpenCodeEventPump<T extends { type?: string }> {
 
   /**
    * Start (once) the single perpetual reader loop. It is the ONLY caller of
-   * `stream.next()`. It reads ahead into the bounded queue, drops other-session
-   * events, latches terminal conditions, and on overflow evicts the OLDEST
-   * droppable queued event to make room — never a protected one — signalling
-   * overflow rather than silently dropping protected events.
+   * `stream.next()` and stays alive for the WHOLE pump (across turns) so a
+   * read-ahead past one turn's terminal event lands in the shared queue for the
+   * next turn rather than in a discarded per-turn reader. It reads ahead into
+   * the bounded queue, drops other-session events, latches terminal conditions,
+   * and on overflow evicts the OLDEST droppable queued event to make room —
+   * never a protected one — signalling overflow rather than silently dropping
+   * protected events.
    */
   private startReader(): void {
-    if (this.readerLoop || this.streamDone) return;
+    if (this.readerLoop || this.disposed) return;
     this.readerLoop = (async () => {
-      while (!this.streamDone) {
+      while (!this.disposed) {
         let res: IteratorResult<T, void>;
         try {
           res = await this.cfg.stream.next();
         } catch (error) {
           this.terminal = { kind: 'error', error };
-          this.streamDone = true;
+          this.disposed = true;
           this.wakeConsumer();
           return;
         }
         if (res.done) {
           this.terminal = { kind: 'done' };
-          this.streamDone = true;
+          this.disposed = true;
           this.wakeConsumer();
           return;
         }
@@ -216,12 +266,32 @@ export class OpenCodeEventPump<T extends { type?: string }> {
   private recordEvent(event: T): void {
     const now = this.cfg.now();
     this.lastEventType = event.type ?? null;
+    // `lastEventAt` tracks ANY event (incl. keepalives): a heartbeat-only
+    // stream must NOT hit transport-timeout — that is the "no-SSE long work
+    // stays alive" behavior keyed off this clock.
     this.lastEventAt = now;
     if (!this.isKeepalive(event)) {
+      // Only MEANINGFUL events count as activity for liveness AND for deferring
+      // the inactivity notice. Keepalives keep the transport alive but the
+      // inactivity-NOTICE clock tracks the "no-meaningful-event" condition, so a
+      // heartbeat-only session still surfaces inactivity (Task 3 relay trigger).
       this.lastMeaningfulEventAt = now;
+      this.nextInactivityAt = now + this.cfg.inactivityNoticeMs;
     }
-    // Any event activity defers the next inactivity notice.
-    this.nextInactivityAt = now + this.cfg.inactivityNoticeMs;
+  }
+
+  /**
+   * Build an inactivity-notice result and schedule the next throttled notice.
+   * Shared by the drain-time overdue path (a steady keepalive must not suppress
+   * an overdue notice) and the armed-timer path.
+   */
+  private fireInactivityNotice(): Extract<OpenCodePumpResult<T>, { kind: 'inactivity-notice' }> {
+    this.nextInactivityAt = this.cfg.now() + this.cfg.inactivityThrottleMs;
+    const base = this.snapshot();
+    return {
+      kind: 'inactivity-notice',
+      metadata: { ...base, configuredTimeoutMs: base.configuredTimeoutMs, elapsedMs: base.elapsedMs },
+    };
   }
 
   private classifyTerminal(t: { kind: 'done' } | { kind: 'error'; error: unknown }): OpenCodePumpResult<T> {
@@ -245,7 +315,18 @@ export class OpenCodeEventPump<T extends { type?: string }> {
 
     // 1. Drain any already-queued session event first.
     const drained = this.drainQueued();
-    if (drained) return Promise.resolve(drained);
+    if (drained) {
+      // A keepalive keeps the transport alive but does NOT defer the inactivity
+      // (no-meaningful-event) clock. If the inactivity deadline has already
+      // passed by the time we drain a keepalive, surface the overdue
+      // inactivity-notice instead of swallowing it behind a steady heartbeat —
+      // the keepalive's liveness was still recorded by drainQueued(). A
+      // meaningful event resets the clock and is delivered normally.
+      if (drained.kind === 'keepalive' && this.cfg.now() >= this.nextInactivityAt) {
+        return Promise.resolve(this.fireInactivityNotice());
+      }
+      return Promise.resolve(drained);
+    }
 
     // 2. If a terminal condition is latched and the queue is empty, surface it.
     if (this.queue.length === 0 && this.terminal) {
@@ -265,12 +346,20 @@ export class OpenCodeEventPump<T extends { type?: string }> {
           }
         }
         cancels.length = 0;
+        this.consumerNotify = null;
+        this.activeWaiterCleanup = null;
       };
       const settle = (r: OpenCodePumpResult<T>) => {
         if (settled) return;
         settled = true;
         cleanup();
         resolve(r);
+      };
+      // Expose this waiter to stop() so it can cancel armed timers and settle
+      // the parked promise cleanly (no orphaned scheduled callback, no waiter
+      // left unresolved).
+      this.activeWaiterCleanup = () => {
+        settle({ kind: 'wait-tick', metadata: this.snapshot() });
       };
 
       // Absolute ceiling — enforced independent of any heartbeat. Computed from
@@ -296,13 +385,7 @@ export class OpenCodeEventPump<T extends { type?: string }> {
       if (this.nextInactivityAt < this.lastEventAt + this.cfg.transportTimeoutMs) {
         cancels.push(
           this.cfg.schedule(Math.max(0, inactivityRemaining), () => {
-            // Schedule the next throttled notice and surface this one.
-            this.nextInactivityAt = this.cfg.now() + this.cfg.inactivityThrottleMs;
-            const base = this.snapshot();
-            settle({
-              kind: 'inactivity-notice',
-              metadata: { ...base, configuredTimeoutMs: base.configuredTimeoutMs, elapsedMs: base.elapsedMs },
-            });
+            settle(this.fireInactivityNotice());
           }),
         );
       }
@@ -351,13 +434,32 @@ export class OpenCodeEventPump<T extends { type?: string }> {
   }
 
   /**
-   * Stop the pump: mark the stream done so the reader loop exits after its
-   * current outstanding read settles, and wake any parked consumer. The pump is
-   * single-use per turn; the caller stops it when the turn ends. (It does NOT
-   * close the shared stream — that is owned by the runtime controller.)
+   * End the current turn. Settles any parked `next()` waiter cleanly — it
+   * cancels the waiter's armed timers (no orphaned scheduled callback) and
+   * resolves the parked promise with a benign `wait-tick` (no terminal, no
+   * continuation impact) instead of leaving it unresolved. The perpetual reader
+   * KEEPS RUNNING so the shared stream keeps draining into the bounded queue for
+   * the next turn; a follow-up turn's already-read-ahead first event is NOT
+   * lost. (It does NOT close the shared stream — that is owned by the runtime
+   * controller; call `dispose()` to tear the pump down for good.)
    */
   stop(): void {
-    this.streamDone = true;
+    if (this.activeWaiterCleanup) {
+      const settle = this.activeWaiterCleanup;
+      this.activeWaiterCleanup = null;
+      settle();
+    }
+  }
+
+  /**
+   * Tear the pump down for good (runtime teardown / abort). Marks the stream
+   * done so the perpetual reader exits after its current outstanding read
+   * settles, settles any parked waiter, and stops further reads. After this the
+   * pump must not be reused.
+   */
+  dispose(): void {
+    this.disposed = true;
+    this.stop();
     this.wakeConsumer();
   }
 

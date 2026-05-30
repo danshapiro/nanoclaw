@@ -535,6 +535,45 @@ export class OpenCodeProvider implements AgentProvider {
       const rt = await ensureSharedRuntime(self.options);
       const { client, stream } = rt;
 
+      // Single-reader, long-lived pump: the ONLY consumer of the shared OpenCode
+      // event stream for the WHOLE query (all turns). One perpetual reader means
+      // a read-ahead past one turn's terminal `session.idle` lands in the pump's
+      // shared queue for the NEXT turn rather than in a discarded per-turn reader
+      // — so a follow-up turn's first protected event is never lost across a
+      // clean turn boundary. Per turn the loop calls `pump.beginTurn()` to reset
+      // liveness/timer state; `pump.stop()` ends a turn without killing the
+      // reader; `pump.dispose()` tears it down on terminal transport / abort.
+      // It enforces the transport timeout AND, INDEPENDENT of heartbeat, the
+      // absolute turn ceiling, and emits non-terminal wait-tick/keepalive/
+      // inactivity results so long no-SSE work stays state-preserving. Typed
+      // terminal results PRESERVE continuation — they tear down the broken
+      // transport but never clear self.activeSessionId (the authoritative
+      // continuation clear lives in the poll loop). `isSessionEvent` /
+      // `isProtectedEvent` read the LIVE active session so a stale-recovery
+      // session swap filters against the current id.
+      const pump = new OpenCodeEventPump<{ type: string; properties: Record<string, unknown> }>({
+        ...realTimerClock(),
+        stream,
+        transportTimeoutMs: OPENCODE_TRANSPORT_TIMEOUT_MS,
+        absoluteTurnTimeoutMs: OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS,
+        inactivityNoticeMs: OPENCODE_INACTIVITY_NOTICE_MS,
+        inactivityThrottleMs: OPENCODE_INACTIVITY_NOTICE_MS,
+        waitTickMs: OPENCODE_WAIT_TICK_MS,
+        keepaliveTypes: KEEPALIVE_EVENT_TYPES,
+        isSessionEvent: (event) => {
+          const sid = (event.properties as { sessionID?: string }).sessionID;
+          return sid === undefined || sid === self.activeSessionId;
+        },
+        isProtectedEvent: (event) =>
+          event.type === 'session.error' ||
+          event.type === 'session.status' ||
+          event.type === 'session.idle' ||
+          event.type === 'permission.updated' ||
+          event.type === 'message.part.updated' ||
+          event.type === 'message.updated',
+      });
+
+      try {
       while (!aborted) {
         while (pending.length === 0 && !ended && !aborted) {
           await new Promise<void>((resolve) => {
@@ -584,35 +623,10 @@ export class OpenCodeProvider implements AgentProvider {
         const partTextByMessageId = new Map<string, string>();
         const roleByMessageId = new Map<string, string>();
 
-        // Single-reader pump: the ONLY consumer of the shared OpenCode event
-        // stream for this turn. It enforces the transport timeout AND, INDEPENDENT
-        // of heartbeat, the absolute turn ceiling, and emits non-terminal
-        // wait-tick/keepalive/inactivity results so long no-SSE work stays
-        // state-preserving. Typed terminal results PRESERVE continuation — they
-        // tear down the broken transport but never clear self.activeSessionId
-        // (the authoritative continuation clear lives in the poll loop).
-        const pump = new OpenCodeEventPump<{ type: string; properties: Record<string, unknown> }>({
-          ...realTimerClock(),
-          stream,
-          sessionId,
-          transportTimeoutMs: OPENCODE_TRANSPORT_TIMEOUT_MS,
-          absoluteTurnTimeoutMs: OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS,
-          inactivityNoticeMs: OPENCODE_INACTIVITY_NOTICE_MS,
-          inactivityThrottleMs: OPENCODE_INACTIVITY_NOTICE_MS,
-          waitTickMs: OPENCODE_WAIT_TICK_MS,
-          keepaliveTypes: KEEPALIVE_EVENT_TYPES,
-          isSessionEvent: (event) => {
-            const sid = (event.properties as { sessionID?: string }).sessionID;
-            return sid === undefined || sid === sessionId;
-          },
-          isProtectedEvent: (event) =>
-            event.type === 'session.error' ||
-            event.type === 'session.status' ||
-            event.type === 'session.idle' ||
-            event.type === 'permission.updated' ||
-            event.type === 'message.part.updated' ||
-            event.type === 'message.updated',
-        });
+        // Reset the long-lived pump's per-turn liveness/timer state. Any
+        // follow-up event already read-ahead into the pump's shared queue
+        // survives this and is delivered to this turn.
+        pump.beginTurn();
 
         const onTerminalTransport = (err: OpenCodeInterruptionError): never => {
           // Preserve continuation: do NOT clear self.activeSessionId. Tear down
@@ -636,7 +650,7 @@ export class OpenCodeProvider implements AgentProvider {
         try {
           turn: while (true) {
             if (aborted) {
-              pump.stop();
+              pump.dispose();
               return;
             }
 
@@ -670,10 +684,12 @@ export class OpenCodeProvider implements AgentProvider {
             }
 
             // Typed terminal interruptions: preserve continuation, tear down
-            // transport, propagate the sanitized typed error.
+            // transport, propagate the sanitized typed error. The runtime/stream
+            // is destroyed here, so dispose the pump's perpetual reader too.
+            // onTerminalTransport is typed `: never` and always throws.
             if (res.kind !== 'event') {
-              pump.stop();
-              throw onTerminalTransport(res.error);
+              pump.dispose();
+              return onTerminalTransport(res.error);
             }
 
             // res.kind === 'event' — a meaningful, session-scoped event.
@@ -723,7 +739,7 @@ export class OpenCodeProvider implements AgentProvider {
                   st.message
                 ) {
                   self.activeSessionId = undefined;
-                  pump.stop();
+                  pump.dispose();
                   throw new Error(`OpenCode retry limit (${st.attempt}): ${st.message}`);
                 }
                 break;
@@ -732,7 +748,7 @@ export class OpenCodeProvider implements AgentProvider {
                 const props = ev.properties as { sessionID?: string; error?: unknown };
                 if (props.sessionID === sessionId || props.sessionID === undefined) {
                   self.activeSessionId = undefined;
-                  pump.stop();
+                  pump.dispose();
                   throw new Error(sessionErrorMessage(props));
                 }
                 break;
@@ -765,6 +781,13 @@ export class OpenCodeProvider implements AgentProvider {
           inputId: turn.inputId,
           resolvedInputIds: turn.inputId ? [turn.inputId] : [],
         };
+      }
+      } finally {
+        // Tear down the long-lived pump's perpetual reader whenever the
+        // generator exits (normal end, throw, or consumer .return()), so the
+        // single-reader invariant holds for any later pump over the shared
+        // stream. dispose() is idempotent.
+        pump.dispose();
       }
     }
 
