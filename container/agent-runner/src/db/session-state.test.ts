@@ -1,3 +1,4 @@
+import { generateKeyPairSync, sign as edSign } from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -6,9 +7,11 @@ import { beforeEach, describe, expect, test } from 'bun:test';
 
 import { getOutboundDb, initTestSessionDb } from './connection.js';
 import {
+  canonicalSideEffectPayload,
   getAuthoritativeSideEffects,
   getSideEffectHints,
   importSideEffectLedger,
+  verifyGwsSideEffectSignature,
 } from './side-effects.js';
 import {
   appendRecoveryEntry,
@@ -362,6 +365,164 @@ describe('side_effect_ledger import', () => {
     expect(mismatch.map((s) => s.id)).toEqual([]);
     // No filter still returns both (back-compat).
     expect(getAuthoritativeSideEffects().map((s) => s.id).sort()).toEqual(['active-turn', 'other-turn']);
+  });
+});
+
+// ── Task 4B: signed gmail import + cross-copy verifier check (container half) ─
+
+function signedGmailLine(
+  auditId: string,
+  key: ReturnType<typeof generateKeyPairSync>,
+  overrides: { tamper?: boolean } = {},
+): string {
+  const payload = canonicalSideEffectPayload({
+    audit_id: auditId,
+    service: 'gmail',
+    method: 'users.drafts.create',
+    request_class: 'api',
+    api_effect: true,
+    operation_succeeded: true,
+    occurred_at: '2026-05-29T00:00:00.000Z',
+    result_digest: 'r-abc',
+  });
+  const sig = edSign(null, Buffer.from(payload, 'utf8'), key.privateKey).toString('base64');
+  // Tampered: present a DIFFERENT payload than what was signed.
+  const forwardedPayload = overrides.tamper
+    ? canonicalSideEffectPayload({
+        audit_id: auditId,
+        service: 'gmail',
+        method: 'users.drafts.create',
+        request_class: 'api',
+        api_effect: true,
+        operation_succeeded: true,
+        occurred_at: '2026-05-29T00:00:00.000Z',
+        result_digest: 'TAMPERED',
+      })
+    : payload;
+  return JSON.stringify({
+    kind: 'gmail_draft_created',
+    audit_id: auditId,
+    occurred_at: '2026-05-29T00:00:00.000Z',
+    input_id: 'in-1',
+    route_key: 'opencode|discord|chan-1|dm:mg-1',
+    signature: sig,
+    payload: forwardedPayload,
+    evidence: { draft_id: 'r-abc' },
+  });
+}
+
+describe('side_effect_ledger signed gmail import (Task 4B)', () => {
+  test('a validly signed gmail_draft_created is authoritative with the public key', () => {
+    const key = generateKeyPairSync('ed25519');
+    const pem = key.publicKey.export({ format: 'pem', type: 'spki' }).toString();
+    const r = importSideEffectLedger({ jsonl: signedGmailLine('signed-1', key), gwsPublicKey: pem });
+    expect(r.imported).toBe(1);
+    expect(r.validated).toBe(1);
+    expect(getAuthoritativeSideEffects().some((s) => s.id === 'signed-1')).toBe(true);
+  });
+
+  test('idempotency key = audit_id: replaying a genuine signed entry imports one row', () => {
+    const key = generateKeyPairSync('ed25519');
+    const pem = key.publicKey.export({ format: 'pem', type: 'spki' }).toString();
+    const line = signedGmailLine('dup-1', key);
+    importSideEffectLedger({ jsonl: line, gwsPublicKey: pem });
+    importSideEffectLedger({ jsonl: line, gwsPublicKey: pem });
+    const count = (
+      getOutboundDb().prepare("SELECT COUNT(*) AS c FROM side_effect_ledger WHERE id = 'dup-1'").get() as { c: number }
+    ).c;
+    expect(count).toBe(1);
+  });
+
+  test('a forged signature stays an unvalidated hint even with a verify key', () => {
+    const real = generateKeyPairSync('ed25519');
+    const attacker = generateKeyPairSync('ed25519');
+    const pem = real.publicKey.export({ format: 'pem', type: 'spki' }).toString();
+    // Signed by attacker, verified against the real public key.
+    const r = importSideEffectLedger({ jsonl: signedGmailLine('forged-1', attacker), gwsPublicKey: pem });
+    expect(r.imported).toBe(1);
+    expect(getAuthoritativeSideEffects().some((s) => s.id === 'forged-1')).toBe(false);
+    expect(getSideEffectHints().some((s) => s.id === 'forged-1')).toBe(true);
+  });
+
+  test('a tampered payload (genuine sig over different bytes) stays a hint', () => {
+    const key = generateKeyPairSync('ed25519');
+    const pem = key.publicKey.export({ format: 'pem', type: 'spki' }).toString();
+    const r = importSideEffectLedger({ jsonl: signedGmailLine('tamper-1', key, { tamper: true }), gwsPublicKey: pem });
+    expect(r.imported).toBe(1);
+    expect(getAuthoritativeSideEffects().some((s) => s.id === 'tamper-1')).toBe(false);
+    expect(getSideEffectHints().some((s) => s.id === 'tamper-1')).toBe(true);
+  });
+
+  test('no public key ⇒ a signed gmail entry stays an unvalidated hint (feature inactive)', () => {
+    const key = generateKeyPairSync('ed25519');
+    const r = importSideEffectLedger({ jsonl: signedGmailLine('nokey-1', key) });
+    expect(r.imported).toBe(1);
+    expect(getAuthoritativeSideEffects().some((s) => s.id === 'nokey-1')).toBe(false);
+    expect(getSideEffectHints().some((s) => s.id === 'nokey-1')).toBe(true);
+  });
+});
+
+// Container half of the shared cross-copy verifier cross-check. The SAME vectors
+// run through the HOST copy in src/db/side-effects-verify.test.ts; the two
+// side-effects-verify.ts files are byte-identical, so identical vectors must
+// yield identical verify/reject results.
+describe('side-effects-verify cross-check (container copy)', () => {
+  test('verifies/rejects each shared vector exactly', () => {
+    const key = generateKeyPairSync('ed25519');
+    const other = generateKeyPairSync('ed25519');
+    const attacker = generateKeyPairSync('ed25519');
+    const pem = key.publicKey.export({ format: 'pem', type: 'spki' }).toString();
+    const rawB64 = key.publicKey.export({ format: 'der', type: 'spki' }).subarray(12).toString('base64');
+    const otherPem = other.publicKey.export({ format: 'pem', type: 'spki' }).toString();
+
+    const canonical = canonicalSideEffectPayload({
+      audit_id: 'abc123',
+      service: 'gmail',
+      method: 'users.drafts.create',
+      request_class: 'api',
+      api_effect: true,
+      operation_succeeded: true,
+      occurred_at: '2026-05-29T00:00:00.000Z',
+      result_digest: 'deadbeef',
+    });
+    const tampered = canonicalSideEffectPayload({
+      audit_id: 'abc123',
+      service: 'gmail',
+      method: 'users.drafts.create',
+      request_class: 'api',
+      api_effect: true,
+      operation_succeeded: true,
+      occurred_at: '2026-05-29T00:00:00.000Z',
+      result_digest: 'cafef00d',
+    });
+    const goodSig = edSign(null, Buffer.from(canonical, 'utf8'), key.privateKey).toString('base64');
+    const forgedSig = edSign(null, Buffer.from(canonical, 'utf8'), attacker.privateKey).toString('base64');
+
+    expect(verifyGwsSideEffectSignature(canonical, goodSig, pem)).toBe('valid');
+    expect(verifyGwsSideEffectSignature(canonical, goodSig, rawB64)).toBe('valid');
+    expect(verifyGwsSideEffectSignature(tampered, goodSig, pem)).toBe('invalid');
+    expect(verifyGwsSideEffectSignature(canonical, forgedSig, pem)).toBe('invalid');
+    expect(verifyGwsSideEffectSignature(canonical, goodSig, otherPem)).toBe('invalid');
+    expect(verifyGwsSideEffectSignature(canonical, undefined, pem)).toBe('unvalidated');
+    expect(verifyGwsSideEffectSignature(canonical, goodSig, undefined)).toBe('unvalidated');
+    expect(verifyGwsSideEffectSignature(canonical, 'not-base64-!!!', pem)).toBe('invalid');
+  });
+
+  test('canonical payload bytes match the cross-language contract', () => {
+    expect(
+      canonicalSideEffectPayload({
+        audit_id: 'abc123',
+        service: 'gmail',
+        method: 'users.drafts.create',
+        request_class: 'api',
+        api_effect: true,
+        operation_succeeded: true,
+        occurred_at: '2026-05-29T00:00:00.000Z',
+        result_digest: 'deadbeef',
+      }),
+    ).toBe(
+      '{"audit_id":"abc123","service":"gmail","method":"users.drafts.create","request_class":"api","api_effect":true,"operation_succeeded":true,"occurred_at":"2026-05-29T00:00:00.000Z","result_digest":"deadbeef"}',
+    );
   });
 });
 

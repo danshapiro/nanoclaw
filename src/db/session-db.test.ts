@@ -10,10 +10,13 @@ import fs from 'fs';
 import path from 'path';
 import { describe, it, expect, afterEach } from 'vitest';
 
+import { generateKeyPairSync, sign as edSign } from 'crypto';
+
 import { INBOUND_SCHEMA, OUTBOUND_SCHEMA } from './schema.js';
 import {
   countDueMessages,
   countDueMessagesExcludingRecovery,
+  discoverGwsCrashWindowDrafts,
   ensureSchema,
   importHostSideEffects,
   insertMessage,
@@ -21,6 +24,7 @@ import {
   syncProcessingAcks,
   upsertSessionRouting,
 } from './session-db.js';
+import { canonicalSideEffectPayload } from './side-effects-verify.js';
 
 const TEST_DIR = '/tmp/nanoclaw-session-db-test';
 const DB_PATH = path.join(TEST_DIR, 'inbound.db');
@@ -426,5 +430,237 @@ describe('importHostSideEffects container-stop gate', () => {
     const count = (verify.prepare('SELECT COUNT(*) AS c FROM side_effect_ledger').get() as { c: number }).c;
     expect(count).toBe(1);
     verify.close();
+  });
+});
+
+// ── Task 4B: host verifier wiring (signed Gmail import) ──────────────────────
+
+describe('importHostSideEffects gmail Ed25519 verifier wiring', () => {
+  function setupSession(): { sessionPath: string; outPath: string } {
+    freshDir();
+    const sessionPath = path.join(TEST_DIR, 'sess');
+    fs.mkdirSync(sessionPath, { recursive: true });
+    const outPath = path.join(sessionPath, 'outbound.db');
+    const out = new Database(outPath);
+    out.exec(OUTBOUND_SCHEMA);
+    out.close();
+    return { sessionPath, outPath };
+  }
+
+  function writeLedger(sessionDir: string, lines: object[]): void {
+    fs.writeFileSync(
+      path.join(sessionDir, 'side-effects.jsonl'),
+      lines.map((l) => JSON.stringify(l)).join('\n') + '\n',
+    );
+  }
+
+  function signedGmailRecord(auditId: string, key: ReturnType<typeof generateKeyPairSync>): object {
+    const payload = canonicalSideEffectPayload({
+      audit_id: auditId,
+      service: 'gmail',
+      method: 'users.drafts.create',
+      request_class: 'api',
+      api_effect: true,
+      operation_succeeded: true,
+      occurred_at: '2026-05-29T00:00:00.000Z',
+      result_digest: 'r-abc',
+    });
+    const sig = edSign(null, Buffer.from(payload, 'utf8'), key.privateKey).toString('base64');
+    return {
+      kind: 'gmail_draft_created',
+      audit_id: auditId,
+      occurred_at: '2026-05-29T00:00:00.000Z',
+      input_id: 'in-1',
+      route_key: 'opencode|discord|chan-1|dm:mg-1',
+      signature: sig,
+      payload,
+      evidence: { draft_id: 'r-abc' },
+    };
+  }
+
+  it('makes a signed gmail_draft_created authoritative ONLY with the public verify key (host)', () => {
+    const { sessionPath, outPath } = setupSession();
+    const key = generateKeyPairSync('ed25519');
+    const pem = key.publicKey.export({ format: 'pem', type: 'spki' }).toString();
+    writeLedger(sessionPath, [signedGmailRecord('signed-1', key)]);
+
+    const r = importHostSideEffects({
+      sessionDir: sessionPath,
+      containerStopped: true,
+      gwsPublicKey: pem,
+    });
+    expect(r.imported).toBe(1);
+    expect(r.validated).toBe(1); // authoritative because the signature verifies
+
+    const verify = new Database(outPath, { readonly: true });
+    const row = verify.prepare('SELECT validation_json FROM side_effect_ledger WHERE id = ?').get('signed-1') as {
+      validation_json: string;
+    };
+    verify.close();
+    expect(JSON.parse(row.validation_json).authoritative).toBe(true);
+  });
+
+  it('keeps a signed gmail entry an UNVALIDATED hint when no verify key is configured (host)', () => {
+    const { sessionPath, outPath } = setupSession();
+    const key = generateKeyPairSync('ed25519');
+    writeLedger(sessionPath, [signedGmailRecord('nokey-1', key)]);
+
+    const r = importHostSideEffects({ sessionDir: sessionPath, containerStopped: true });
+    expect(r.imported).toBe(1);
+    expect(r.validated).toBe(0); // no key ⇒ stays a hint
+
+    const verify = new Database(outPath, { readonly: true });
+    const row = verify.prepare('SELECT validation_json FROM side_effect_ledger WHERE id = ?').get('nokey-1') as {
+      validation_json: string;
+    };
+    verify.close();
+    expect(JSON.parse(row.validation_json).authoritative).toBe(false);
+  });
+
+  it('keeps a forged gmail entry an UNVALIDATED hint even with a verify key (host)', () => {
+    const { sessionPath, outPath } = setupSession();
+    const realKey = generateKeyPairSync('ed25519');
+    const attacker = generateKeyPairSync('ed25519');
+    // Sign with the attacker key but present the real public key to the verifier.
+    const forged = signedGmailRecord('forged-1', attacker);
+    const pem = realKey.publicKey.export({ format: 'pem', type: 'spki' }).toString();
+    writeLedger(sessionPath, [forged]);
+
+    const r = importHostSideEffects({ sessionDir: sessionPath, containerStopped: true, gwsPublicKey: pem });
+    expect(r.imported).toBe(1);
+    expect(r.validated).toBe(0); // forged ⇒ never authoritative
+
+    const verify = new Database(outPath, { readonly: true });
+    const row = verify.prepare('SELECT validation_json FROM side_effect_ledger WHERE id = ?').get('forged-1') as {
+      validation_json: string;
+    };
+    verify.close();
+    expect(JSON.parse(row.validation_json).authoritative).toBe(false);
+  });
+});
+
+// ── Task 4B: host-only GWS_AUDIT_STORE crash-window discovery ────────────────
+
+describe('discoverGwsCrashWindowDrafts (host-only)', () => {
+  function setupSession(): { sessionPath: string; outPath: string } {
+    freshDir();
+    const sessionPath = path.join(TEST_DIR, 'sess');
+    fs.mkdirSync(sessionPath, { recursive: true });
+    const outPath = path.join(sessionPath, 'outbound.db');
+    const out = new Database(outPath);
+    out.exec(OUTBOUND_SCHEMA);
+    out.close();
+    return { sessionPath, outPath };
+  }
+
+  function writeAuditStore(p: string, entries: object[]): void {
+    fs.writeFileSync(p, entries.map((e) => JSON.stringify(e)).join('\n') + '\n');
+  }
+
+  it('discovers a completed drafts.create with NO JSONL ledger entry and records exactly one non-duplicate row', () => {
+    const { sessionPath, outPath } = setupSession();
+    const auditStore = path.join(TEST_DIR, 'gws-audit.jsonl');
+    // The proxy recorded a completed drafts.create for this input id, but the
+    // tool was SIGKILLed before it could append to the workspace JSONL ledger.
+    writeAuditStore(auditStore, [
+      {
+        audit_id: 'crash-window-1',
+        input_id: 'in-1',
+        route_key: 'opencode|discord|chan-1|dm:mg-1',
+        service: 'gmail',
+        method: 'users.drafts.create',
+        occurred_at: '2026-05-29T00:00:00.000Z',
+      },
+    ]);
+    // No side-effects.jsonl exists (the kill happened before the append).
+
+    const r1 = discoverGwsCrashWindowDrafts({
+      sessionDir: sessionPath,
+      containerStopped: true,
+      auditStorePath: auditStore,
+      inputId: 'in-1',
+      routeKey: 'opencode|discord|chan-1|dm:mg-1',
+    });
+    expect(r1.discovered).toBe(1);
+
+    // Running discovery again must NOT duplicate the draft (idempotent by audit_id).
+    const r2 = discoverGwsCrashWindowDrafts({
+      sessionDir: sessionPath,
+      containerStopped: true,
+      auditStorePath: auditStore,
+      inputId: 'in-1',
+      routeKey: 'opencode|discord|chan-1|dm:mg-1',
+    });
+    expect(r2.discovered).toBe(0);
+
+    const verify = new Database(outPath, { readonly: true });
+    const rows = verify
+      .prepare("SELECT id, kind FROM side_effect_ledger WHERE kind = 'gmail_draft_created'")
+      .all() as Array<{ id: string; kind: string }>;
+    verify.close();
+    expect(rows.length).toBe(1);
+    expect(rows[0].id).toBe('crash-window-1');
+  });
+
+  it('does NOT re-discover a draft already present in the JSONL ledger (no duplication when the tool survived to append)', () => {
+    const { sessionPath, outPath } = setupSession();
+    const auditStore = path.join(TEST_DIR, 'gws-audit.jsonl');
+    writeAuditStore(auditStore, [
+      {
+        audit_id: 'shared-id',
+        input_id: 'in-1',
+        route_key: 'opencode|discord|chan-1|dm:mg-1',
+        service: 'gmail',
+        method: 'users.drafts.create',
+        occurred_at: '2026-05-29T00:00:00.000Z',
+      },
+    ]);
+    // The tool DID append to the JSONL ledger with the same audit_id, so the
+    // normal importer already created the row; discovery must add nothing.
+    fs.writeFileSync(
+      path.join(sessionPath, 'side-effects.jsonl'),
+      JSON.stringify({
+        kind: 'gmail_draft_created',
+        audit_id: 'shared-id',
+        occurred_at: '2026-05-29T00:00:00.000Z',
+        input_id: 'in-1',
+        route_key: 'opencode|discord|chan-1|dm:mg-1',
+        evidence: { draft_id: 'r-1' },
+      }) + '\n',
+    );
+    importHostSideEffects({ sessionDir: sessionPath, containerStopped: true });
+
+    const r = discoverGwsCrashWindowDrafts({
+      sessionDir: sessionPath,
+      containerStopped: true,
+      auditStorePath: auditStore,
+      inputId: 'in-1',
+      routeKey: 'opencode|discord|chan-1|dm:mg-1',
+    });
+    expect(r.discovered).toBe(0);
+
+    const verify = new Database(outPath, { readonly: true });
+    const count = (
+      verify.prepare("SELECT COUNT(*) AS c FROM side_effect_ledger WHERE id = 'shared-id'").get() as { c: number }
+    ).c;
+    verify.close();
+    expect(count).toBe(1);
+  });
+
+  it('is inactive when GWS_AUDIT_STORE is unset (discovery off ⇒ no rows)', () => {
+    const { sessionPath, outPath } = setupSession();
+    const r = discoverGwsCrashWindowDrafts({
+      sessionDir: sessionPath,
+      containerStopped: true,
+      auditStorePath: undefined,
+      inputId: 'in-1',
+      routeKey: 'opencode|discord|chan-1|dm:mg-1',
+    });
+    expect(r.discovered).toBe(0);
+
+    const verify = new Database(outPath, { readonly: true });
+    const count = (verify.prepare('SELECT COUNT(*) AS c FROM side_effect_ledger').get() as { c: number }).c;
+    verify.close();
+    expect(count).toBe(0);
   });
 });

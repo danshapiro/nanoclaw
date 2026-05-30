@@ -11,6 +11,7 @@ import path from 'path';
 import Database from 'better-sqlite3';
 
 import { INBOUND_SCHEMA, OUTBOUND_SCHEMA } from './schema.js';
+import { classifyAndSanitize, parseLedgerLines } from './side-effects-verify.js';
 
 /** Apply the inbound or outbound schema to a DB file. Idempotent. */
 export function ensureSchema(dbPath: string, schema: 'inbound' | 'outbound'): void {
@@ -329,175 +330,17 @@ export interface ImportSideEffectsResult {
   validated: number;
 }
 
-// ── Pure side-effect validation (host) ───────────────────────────────────────
-// Inlined here intentionally: the host TS project (rootDir ./src) cannot import
-// the container module, and a separate host copy of the Ed25519 verifier lands
-// in Task 4B (with the shared cross-check test). Task 1 only needs the host
-// importer's summarize-dnd artifact validation + sanitization, plus the
-// fail-closed Gmail default (no verify key wired yet ⇒ never authoritative).
-
-interface RawSideEffectRecord {
-  kind?: string;
-  audit_id?: string;
-  operation?: string;
-  input_id?: string;
-  route_key?: string;
-  occurred_at?: string;
-  signature?: string;
-  evidence?: Record<string, unknown>;
-  [key: string]: unknown;
-}
-
-interface ValidatedHostSideEffect {
-  id: string;
-  source: string;
-  kind: string;
-  operation: string | null;
-  inputId: string | null;
-  routeKey: string | null;
-  occurredAt: string | null;
-  evidence: Record<string, string | number | boolean | null>;
-  validation: { authoritative: boolean; reason: string };
-  replayPolicy: string;
-}
-
-const MAX_EVIDENCE_KEYS = 12;
-const MAX_EVIDENCE_VALUE_LEN = 256;
-const FORBIDDEN_EVIDENCE_KEYS =
-  /(secret|token|api[_-]?key|password|cookie|authorization|body|transcript|content|email_body|raw)/i;
-
-function isUnderRoot(candidate: string, root: string): boolean {
-  const normalize = (p: string): string[] => p.replace(/\/+$/, '').split('/').filter(Boolean);
-  const c = normalize(candidate);
-  const r = normalize(root);
-  if (c.length < r.length) return false;
-  for (let i = 0; i < r.length; i++) {
-    if (c[i] !== r[i]) return false;
-  }
-  return true;
-}
-
-function sanitizeEvidence(
-  evidence: Record<string, unknown> | undefined,
-  opts: { allowedArtifactRoots?: string[]; allowPathKeys?: string[] },
-): Record<string, string | number | boolean | null> {
-  const out: Record<string, string | number | boolean | null> = {};
-  if (!evidence) return out;
-  const allowPath = new Set(opts.allowPathKeys ?? []);
-  let count = 0;
-  for (const [key, value] of Object.entries(evidence)) {
-    if (count >= MAX_EVIDENCE_KEYS) break;
-    if (FORBIDDEN_EVIDENCE_KEYS.test(key)) continue;
-    const isPathKey = /path|file|dir/i.test(key);
-    if (isPathKey && !allowPath.has(key)) continue;
-    if (isPathKey && typeof value === 'string') {
-      const roots = opts.allowedArtifactRoots ?? [];
-      if (!roots.some((root) => isUnderRoot(value, root))) continue;
-    }
-    if (value === null || typeof value === 'boolean' || typeof value === 'number') {
-      out[key] = value;
-      count++;
-    } else if (typeof value === 'string') {
-      out[key] = value.length > MAX_EVIDENCE_VALUE_LEN ? value.slice(0, MAX_EVIDENCE_VALUE_LEN) : value;
-      count++;
-    }
-  }
-  return out;
-}
-
-function parseLedgerLines(text: string): RawSideEffectRecord[] {
-  const records: RawSideEffectRecord[] = [];
-  for (const line of text.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    try {
-      records.push(JSON.parse(trimmed) as RawSideEffectRecord);
-    } catch {
-      /* skip malformed line */
-    }
-  }
-  return records;
-}
-
-function classifyAndSanitizeHost(
-  raw: RawSideEffectRecord,
-  opts: { allowedArtifactRoots?: string[]; statSize: (p: string) => number | null },
-): ValidatedHostSideEffect | null {
-  const id = typeof raw.audit_id === 'string' && raw.audit_id ? raw.audit_id : null;
-  if (!id) return null;
-  const inputId = typeof raw.input_id === 'string' ? raw.input_id : null;
-  const routeKey = typeof raw.route_key === 'string' ? raw.route_key : null;
-  const operation = typeof raw.operation === 'string' ? raw.operation : null;
-  const occurredAt = typeof raw.occurred_at === 'string' ? raw.occurred_at : null;
-
-  if (raw.kind === 'gmail_draft_created') {
-    // Fail-closed: no verify key wired in Task 1 ⇒ never authoritative.
-    return {
-      id,
-      source: 'gws',
-      kind: 'gmail_draft_created',
-      operation,
-      inputId,
-      routeKey,
-      occurredAt,
-      evidence: sanitizeEvidence(raw.evidence, { allowPathKeys: [] }),
-      validation: { authoritative: false, reason: 'gmail_unvalidated' },
-      replayPolicy: 'no_duplicate_draft',
-    };
-  }
-
-  if (raw.kind === 'summarize_dnd_summary_artifact') {
-    const artifactPath =
-      raw.evidence && typeof raw.evidence.artifact_path === 'string' ? (raw.evidence.artifact_path as string) : null;
-    const declaredSize =
-      raw.evidence && typeof raw.evidence.size_bytes === 'number' ? (raw.evidence.size_bytes as number) : null;
-    let authoritative = false;
-    let reason = 'artifact_not_validated';
-    if (artifactPath && declaredSize != null) {
-      const roots = opts.allowedArtifactRoots ?? [];
-      if (!roots.some((root) => isUnderRoot(artifactPath, root))) {
-        reason = 'artifact_outside_allowed_root';
-      } else {
-        const actualSize = opts.statSize(artifactPath);
-        if (actualSize == null) reason = 'artifact_missing';
-        else if (actualSize !== declaredSize) reason = 'artifact_size_mismatch';
-        else {
-          authoritative = true;
-          reason = 'artifact_exists_size_match';
-        }
-      }
-    }
-    return {
-      id,
-      source: 'summarize_dnd',
-      kind: 'summarize_dnd_summary_artifact',
-      operation,
-      inputId,
-      routeKey,
-      occurredAt,
-      evidence: sanitizeEvidence(raw.evidence, {
-        allowPathKeys: ['artifact_path'],
-        allowedArtifactRoots: opts.allowedArtifactRoots,
-      }),
-      validation: { authoritative, reason },
-      replayPolicy: 'no_redo_summary',
-    };
-  }
-
-  // Unknown / over-detailed → sanitized tool_completed, never authoritative.
-  return {
-    id,
-    source: 'tool',
-    kind: 'tool_completed',
-    operation,
-    inputId,
-    routeKey,
-    occurredAt,
-    evidence: sanitizeEvidence(raw.evidence, { allowPathKeys: [], allowedArtifactRoots: opts.allowedArtifactRoots }),
-    validation: { authoritative: false, reason: 'unknown_kind_sanitized' },
-    replayPolicy: 'none',
-  };
-}
+// ── Side-effect validation (host) ────────────────────────────────────────────
+// The pure, DB-free validation (Ed25519 verify, canonical JSON, classify +
+// sanitize) lives in the host copy `./side-effects-verify.ts`, a byte-equivalent
+// duplicate of the container copy `container/agent-runner/src/db/
+// side-effects-verify.ts`. It is duplicated (not cross-project imported) because
+// the host TS project (rootDir ./src) cannot include the container `src` tree
+// and must not pull in `bun:sqlite`. The host importer below calls
+// `classifyAndSanitize` with the configured PUBLIC verify key, so a signed
+// `gmail_draft_created` becomes authoritative ONLY when the proxy's Ed25519
+// signature verifies; without a key (or for forged/tampered entries) it stays an
+// unvalidated hint. Recovery reads `validation_json.authoritative`.
 
 /**
  * Idempotently import the staged side-effect JSONL for a session into the
@@ -507,10 +350,10 @@ function classifyAndSanitizeHost(
  *
  * Validation matches the container importer (shared pure helper): summarize-dnd
  * entries require artifact existence + size under an allowed root; gmail
- * entries require a valid Ed25519 signature (fail-closed in Task 1, so they
- * stay unvalidated hints). All rows — validated or not — are stored idempotently
- * keyed by id; recovery consults `validation_json.authoritative` to decide what
- * it may rely on.
+ * entries require a valid Ed25519 signature verified with the PUBLIC key (no
+ * key, or forged/tampered ⇒ unvalidated hint). All rows — validated or not — are
+ * stored idempotently keyed by id; recovery consults `validation_json.
+ * authoritative` to decide what it may rely on.
  */
 export function importHostSideEffects(opts: {
   sessionDir: string;
@@ -546,8 +389,9 @@ export function importHostSideEffects(opts: {
     const now = new Date().toISOString();
     db.transaction(() => {
       for (const raw of raws) {
-        const validated = classifyAndSanitizeHost(raw, {
+        const validated = classifyAndSanitize(raw, {
           allowedArtifactRoots: opts.allowedArtifactRoots,
+          gwsPublicKey: opts.gwsPublicKey,
           statSize: (p: string) => (fs.existsSync(p) ? fs.statSync(p).size : null),
         });
         if (!validated) {
@@ -573,6 +417,125 @@ export function importHostSideEffects(opts: {
         });
         result.imported++;
         if (validated.validation.authoritative) result.validated++;
+      }
+    })();
+  } finally {
+    db.close();
+  }
+  return result;
+}
+
+/** One append-only entry the gws-proxy writes to GWS_AUDIT_STORE per call. */
+interface GwsAuditStoreEntry {
+  audit_id?: string;
+  input_id?: string;
+  route_key?: string;
+  service?: string;
+  method?: string;
+  occurred_at?: string;
+}
+
+export interface DiscoverCrashWindowResult {
+  discovered: number;
+}
+
+/**
+ * HOST-ONLY crash-window discovery for GWS draft creation.
+ *
+ * The agent container CANNOT read `GWS_AUDIT_STORE` (it is a root-owned,
+ * host/proxy-co-located file that is NOT mounted into the container), so this
+ * read lives in the host import path (called from host-sweep recovery), never in
+ * the container `side-effects.ts`.
+ *
+ * If the tool process was SIGKILLed BETWEEN a successful `drafts.create` and the
+ * workspace JSONL append, there is no `gmail_draft_created` JSONL entry. The
+ * proxy's append-only audit store still recorded the completed mutation
+ * correlated by `input_id`/`route_key`/time-window. This finds such an orphan
+ * (a completed `drafts.create` whose `audit_id` is not already in the session's
+ * `side_effect_ledger`) and records exactly one non-duplicate row so recovery
+ * knows the draft already exists and does NOT re-create it.
+ *
+ * Gating: `auditStorePath` unset ⇒ discovery is inactive and the no-duplication
+ * guarantee degrades to "no duplication when the tool process survives to
+ * append". Only safe to call after a verified container stop (single-writer
+ * invariant), like importHostSideEffects.
+ */
+export function discoverGwsCrashWindowDrafts(opts: {
+  sessionDir: string;
+  containerStopped: boolean;
+  auditStorePath: string | undefined;
+  inputId?: string;
+  routeKey?: string;
+  notBefore?: string;
+  notAfter?: string;
+}): DiscoverCrashWindowResult {
+  if (opts.containerStopped !== true) {
+    throw new Error(
+      'discoverGwsCrashWindowDrafts: refusing to open outbound DB writable while the container may still be running',
+    );
+  }
+  const result: DiscoverCrashWindowResult = { discovered: 0 };
+  // Gating: no audit store configured ⇒ discovery inactive.
+  if (!opts.auditStorePath || !fs.existsSync(opts.auditStorePath)) return result;
+  const outPath = path.join(opts.sessionDir, 'outbound.db');
+  if (!fs.existsSync(outPath)) return result;
+
+  // Read the proxy's append-only audit store directly (read-only host access),
+  // tolerant of malformed lines.
+  const raw = fs.readFileSync(opts.auditStorePath, 'utf8');
+  const matches: GwsAuditStoreEntry[] = [];
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let e: GwsAuditStoreEntry;
+    try {
+      e = JSON.parse(trimmed) as GwsAuditStoreEntry;
+    } catch {
+      continue;
+    }
+    if (e.service !== 'gmail') continue;
+    if (e.method !== 'users.drafts.create' && e.method !== 'drafts.create') continue;
+    if (opts.inputId && e.input_id !== opts.inputId) continue;
+    if (opts.routeKey && e.route_key !== opts.routeKey) continue;
+    if (opts.notBefore && e.occurred_at && e.occurred_at < opts.notBefore) continue;
+    if (opts.notAfter && e.occurred_at && e.occurred_at > opts.notAfter) continue;
+    if (!e.audit_id) continue;
+    matches.push(e);
+  }
+  if (matches.length === 0) return result;
+
+  const db = openOutboundDbRw(outPath);
+  try {
+    migrateOutboundRouteColumns(db);
+    const existsStmt = db.prepare('SELECT 1 AS ok FROM side_effect_ledger WHERE id = ?');
+    const insertStmt = db.prepare(
+      `INSERT INTO side_effect_ledger
+         (id, source, kind, operation, input_id, route_key, evidence_json, validation_json, replay_policy, occurred_at, imported_at)
+       VALUES (@id, @source, @kind, @operation, @input_id, @route_key, @evidence_json, @validation_json, @replay_policy, @occurred_at, @imported_at)`,
+    );
+    const now = new Date().toISOString();
+    db.transaction(() => {
+      for (const e of matches) {
+        // Idempotent by audit_id: if the JSONL importer already created this row
+        // (the tool survived to append), discovery adds nothing — no duplicate.
+        if (existsStmt.get(e.audit_id!)) continue;
+        insertStmt.run({
+          id: e.audit_id!,
+          source: 'gws',
+          kind: 'gmail_draft_created',
+          operation: e.method ?? null,
+          input_id: e.input_id ?? null,
+          route_key: e.route_key ?? null,
+          evidence_json: JSON.stringify({ discovered_via: 'gws_audit_store' }),
+          // Discovered from the audit store, not from a signed JSONL entry: this
+          // is durable "a draft was created" evidence for no-duplication, but it
+          // is NOT a signature-validated authoritative entry.
+          validation_json: JSON.stringify({ authoritative: false, reason: 'discovered_audit_store_crash_window' }),
+          replay_policy: 'no_duplicate_draft',
+          occurred_at: e.occurred_at ?? null,
+          imported_at: now,
+        });
+        result.discovered++;
       }
     })();
   } finally {

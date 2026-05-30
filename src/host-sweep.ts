@@ -36,6 +36,7 @@ import {
   countDueMessages,
   countDueMessagesExcludingRecovery,
   deleteOrphanProcessingClaims,
+  discoverGwsCrashWindowDrafts,
   getContainerState,
   getMessageForRetry,
   getProcessingClaims,
@@ -467,10 +468,27 @@ export async function recoverAfterKill(inDb: Database.Database, session: Session
       writableOutDb,
       verifyContainerStopped: async () => !isContainerRunning(session.id),
       importSideEffects: ({ containerStopped }) => {
+        const gwsPublicKey = process.env.GWS_SIDE_EFFECT_VERIFY_KEY;
+        const allowedArtifactRoots = process.env.NANOCLAW_ARTIFACT_ROOTS
+          ? process.env.NANOCLAW_ARTIFACT_ROOTS.split(':').filter(Boolean)
+          : undefined;
         try {
-          importHostSideEffects({ sessionDir: dir, containerStopped });
+          importHostSideEffects({ sessionDir: dir, containerStopped, gwsPublicKey, allowedArtifactRoots });
         } catch (err) {
           log.warn('Side-effect import failed during recovery', { sessionId: session.id, err });
+        }
+        // HOST-ONLY GWS audit-store crash-window discovery: detect a completed
+        // drafts.create whose JSONL append was lost to a kill-in-the-window so
+        // recovery does not duplicate the draft. Gated on GWS_AUDIT_STORE; unset
+        // ⇒ inactive (degrades to no-duplication-when-tool-survives).
+        try {
+          discoverGwsCrashWindowDrafts({
+            sessionDir: dir,
+            containerStopped,
+            auditStorePath: process.env.GWS_AUDIT_STORE,
+          });
+        } catch (err) {
+          log.warn('GWS crash-window discovery failed during recovery', { sessionId: session.id, err });
         }
       },
       writeRecovery: () => {

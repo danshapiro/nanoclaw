@@ -59,7 +59,30 @@ case "${1:-}" in
     ;;
 esac
 
-args_json="$(NODE_NO_WARNINGS=1 node -e 'process.stdout.write(JSON.stringify(process.argv.slice(1)))' -- "$@")"
+# Read the poll-loop-written active-input file at INVOCATION time (not from env,
+# which would be stale across follow-ups in this long-lived container). Absent or
+# unparseable ⇒ an uncorrelated diagnostic record (no inputId). The path is
+# overridable for tests via NANOCLAW_ACTIVE_INPUT_FILE.
+active_input_file="${NANOCLAW_ACTIVE_INPUT_FILE:-/workspace/.active-input.json}"
+
+# Build the request body, folding in inputId/routeKey from the active-input file
+# so the proxy's audit store is correlated for crash-window discovery even when a
+# kill happens before the JSONL append. The shim NEVER adds an Authorization
+# header (OneCLI injects it at the gateway).
+request_body="$(
+  NODE_NO_WARNINGS=1 NANOCLAW_ACTIVE_INPUT_FILE="$active_input_file" node -e '
+    const fs = require("fs");
+    const args = process.argv.slice(1);
+    const body = { args };
+    try {
+      const ai = JSON.parse(fs.readFileSync(process.env.NANOCLAW_ACTIVE_INPUT_FILE, "utf8"));
+      if (ai && typeof ai.inputId === "string") body.input_id = ai.inputId;
+      if (ai && typeof ai.routeKey === "string") body.route_key = ai.routeKey;
+    } catch (e) { /* absent/unparseable ⇒ uncorrelated */ }
+    process.stdout.write(JSON.stringify(body));
+  ' -- "$@"
+)"
+
 tmp_headers="$(mktemp)"
 tmp_body="$(mktemp)"
 cleanup() {
@@ -71,7 +94,7 @@ http_code="$(
   curl_with_configured_proxy -sS -o "$tmp_body" -D "$tmp_headers" -w "%{http_code}" \
     -X POST \
     -H "Content-Type: application/json" \
-    -d "{\"args\":$args_json}" \
+    -d "$request_body" \
     "$GWS_PROXY_URL/exec" 2>/dev/null || true
 )"
 
@@ -84,8 +107,90 @@ body="$(cat "$tmp_body")"
 exit_code="$(awk 'BEGIN{IGNORECASE=1} /^X-Exit-Code:/ {gsub("\r","",$2); print $2; exit}' "$tmp_headers")"
 exit_code="${exit_code:-0}"
 
+# Extract the audit-classification headers (case-insensitive; strip CR).
+header_value() {
+  awk -v h="$1" 'BEGIN{IGNORECASE=1} {
+    if (tolower($0) ~ "^" tolower(h) ":") {
+      sub(/^[^:]*:[ \t]*/, "", $0); gsub("\r", "", $0); print; exit
+    }
+  }' "$tmp_headers"
+}
+
 case "$http_code" in
   200)
+    api_effect="$(header_value 'X-GWS-Api-Effect')"
+    op_succeeded="$(header_value 'X-GWS-Operation-Succeeded')"
+    # Stage a sanitized gmail_draft_created ledger record ONLY for a successful
+    # API-effect mutation, AFTER the response and BEFORE printing success. The
+    # shim does NOT verify the signature (it cannot in POSIX sh and staged JSONL
+    # is untrusted anyway) — it forwards sig+payload verbatim for the importer.
+    if [ "$api_effect" = "true" ] && [ "$op_succeeded" = "true" ]; then
+      ledger_path="${NANOCLAW_SIDE_EFFECT_LEDGER:-/workspace/side-effects.jsonl}"
+      audit_id="$(header_value 'X-GWS-Audit-Id')"
+      request_class="$(header_value 'X-GWS-Request-Class')"
+      sig="$(header_value 'X-GWS-Side-Effect-Signature')"
+      payload="$(header_value 'X-GWS-Side-Effect-Payload')"
+      if [ -n "${NANOCLAW_SIDE_EFFECT_LEDGER:-}" ] || [ -e "/workspace" ]; then
+        # Build the sanitized JSONL record with node (robust escaping). Args are
+        # sanitized (method/resource preserved, long body fields redacted); the
+        # stdout is scanned for an optional draft id; NO raw auth header / NO full
+        # email body. Print exactly one line to stdout for the atomic append.
+        record_line="$(
+          NODE_NO_WARNINGS=1 \
+          NC_AUDIT_ID="$audit_id" NC_REQUEST_CLASS="$request_class" \
+          NC_SIG="$sig" NC_PAYLOAD="$payload" NC_BODY="$body" \
+          NANOCLAW_ACTIVE_INPUT_FILE="$active_input_file" \
+          node -e '
+            const fs = require("fs");
+            const args = process.argv.slice(1);
+            const REDACT = /^(--?)(body|message|text|html|content|raw|attachment)$/i;
+            const sanitized = [];
+            for (let i = 0; i < args.length; i++) {
+              const a = args[i];
+              sanitized.push(a);
+              // Redact the VALUE following a long-body flag (preserve the flag name).
+              if (REDACT.test(a) && i + 1 < args.length && !args[i + 1].startsWith("-")) {
+                sanitized.push("[redacted]");
+                i++;
+              }
+            }
+            let inputId = null, routeKey = null;
+            try {
+              const ai = JSON.parse(fs.readFileSync(process.env.NANOCLAW_ACTIVE_INPUT_FILE, "utf8"));
+              if (ai && typeof ai.inputId === "string") inputId = ai.inputId;
+              if (ai && typeof ai.routeKey === "string") routeKey = ai.routeKey;
+            } catch (e) { /* uncorrelated diagnostic */ }
+            // Best-effort draft id from stdout (e.g. "Draft created: r-987654" or JSON id).
+            let draftId = null;
+            const body = process.env.NC_BODY || "";
+            let m = body.match(/\br-[0-9a-zA-Z_-]{4,}\b/);
+            if (!m) m = body.match(/"(?:id|draft_id|draftId)"\s*:\s*"([^"]+)"/);
+            if (m) draftId = m[1] || m[0];
+            const rec = {
+              kind: "gmail_draft_created",
+              audit_id: process.env.NC_AUDIT_ID || null,
+              request_class: process.env.NC_REQUEST_CLASS || null,
+              occurred_at: new Date().toISOString(),
+              input_id: inputId,
+              route_key: routeKey,
+              args: sanitized,
+              signature: process.env.NC_SIG || undefined,
+              payload: process.env.NC_PAYLOAD || undefined,
+              evidence: draftId ? { draft_id: draftId } : {},
+            };
+            process.stdout.write(JSON.stringify(rec));
+          ' -- "$@"
+        )"
+        # TRUE atomic append: a single >> write of the whole line. Never
+        # temp+rename (which would clobber a concurrent appender). If the append
+        # fails AFTER the API mutation already succeeded, emit a structured
+        # partial-success error (audit id only, no raw body) instead of success.
+        if ! printf '%s\n' "$record_line" >> "$ledger_path" 2>/dev/null; then
+          printf 'Error: GWS draft was created (audit_id=%s) but the side-effect ledger append failed. The draft exists; do not recreate it.\n' "$audit_id" >&2
+          exit 75
+        fi
+      fi
+    fi
     printf '%s' "$body"
     exit "$exit_code"
     ;;
