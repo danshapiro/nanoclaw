@@ -85,13 +85,14 @@ export function migrateOutboundRouteColumns(db: Database.Database): void {
  * Self-heals the inbound schema on every host open: a per-session DB created
  * before a column was added (e.g. session_routing.messaging_group_id) is
  * migrated forward here - the single opener every host inbound path funnels
- * through - so no host caller can open an un-migrated inbound DB. Keep BOTH
- * inbound migrations together; splitting them is what regressed pre-existing
- * sessions after the route-columns change. ensureSchema() applies the same
- * migrations at session-creation time; this covers pre-existing sessions on
- * the per-operation hot path. Both helpers are idempotent and
- * column-existence-guarded, so fresh/already-healed DBs incur only the PRAGMA
- * checks.
+ * through - so no host caller can open an un-migrated inbound DB. Keep the
+ * messages_in and session_routing opener-owned migrations together; splitting
+ * them is what regressed pre-existing sessions after the route-columns change.
+ * ensureSchema() applies the same migrations at session-creation time; this
+ * covers pre-existing sessions on the per-operation hot path. The delivered
+ * table migration stays in the delivery path that owns those writes. These
+ * helpers are idempotent and column-existence-guarded, so fresh/already-healed
+ * DBs incur only the PRAGMA checks.
  */
 export function openInboundDb(dbPath: string): Database.Database {
   const db = new Database(dbPath);
