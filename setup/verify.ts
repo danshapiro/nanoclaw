@@ -139,7 +139,7 @@ export async function run(_args: string[]): Promise<void> {
   const envFile = path.join(projectRoot, '.env');
   if (fs.existsSync(envFile)) {
     const envContent = fs.readFileSync(envFile, 'utf-8');
-    if (/^(CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY|ONECLI_URL)=/m.test(envContent)) {
+    if (/^(CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|ONECLI_URL)=/m.test(envContent)) {
       credentials = 'configured';
     }
   }
@@ -186,7 +186,6 @@ export async function run(_args: string[]): Promise<void> {
   if (has('IMESSAGE_ENABLED')) channelAuth.imessage = 'configured';
 
   const configuredChannels = Object.keys(channelAuth);
-  const anyChannelConfigured = configuredChannels.length > 0;
 
   // 5. Check registered groups in v2 central DB (agent_groups + messaging_group_agents)
   let registeredGroups = 0;

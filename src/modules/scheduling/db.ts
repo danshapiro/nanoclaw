@@ -23,19 +23,18 @@ export function insertTask(
     platformId: string | null;
     channelType: string | null;
     threadId: string | null;
+    messagingGroupId?: string | null;
+    isGroup?: 0 | 1 | null;
     content: string;
   },
 ): void {
-  // Scheduled task rows intentionally leave messaging_group_id/is_group NULL:
-  // a scheduling insert has no resolved messaging-group context. Per the
-  // fail-safe route rule, NULL route metadata is never collapsed onto another
-  // route (only matched metadata is), so a task follow-up is treated as its own
-  // distinct route — a missed merge at worst, never a cross-conversation leak.
   db.prepare(
     `INSERT INTO messages_in (id, seq, timestamp, status, tries, process_after, recurrence, kind, platform_id, channel_type, thread_id, messaging_group_id, is_group, content, series_id)
-     VALUES (@id, @seq, datetime('now'), 'pending', 0, @processAfter, @recurrence, 'task', @platformId, @channelType, @threadId, NULL, NULL, @content, @id)`,
+     VALUES (@id, @seq, datetime('now'), 'pending', 0, @processAfter, @recurrence, 'task', @platformId, @channelType, @threadId, @messagingGroupId, @isGroup, @content, @id)`,
   ).run({
     ...task,
+    messagingGroupId: task.messagingGroupId ?? null,
+    isGroup: task.isGroup ?? null,
     seq: nextEvenSeq(db),
   });
 }
@@ -121,6 +120,8 @@ export interface RecurringMessage {
   platform_id: string | null;
   channel_type: string | null;
   thread_id: string | null;
+  messaging_group_id?: string | null;
+  is_group?: 0 | 1 | null;
   series_id: string;
 }
 
@@ -137,8 +138,8 @@ export function insertRecurrence(
   nextRun: string | null,
 ): void {
   db.prepare(
-    `INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, recurrence, platform_id, channel_type, thread_id, content, series_id)
-     VALUES (?, ?, ?, datetime('now'), 'pending', ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, recurrence, platform_id, channel_type, thread_id, messaging_group_id, is_group, content, series_id)
+     VALUES (?, ?, ?, datetime('now'), 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     newId,
     nextEvenSeq(db),
@@ -148,6 +149,8 @@ export function insertRecurrence(
     msg.platform_id,
     msg.channel_type,
     msg.thread_id,
+    msg.messaging_group_id ?? null,
+    msg.is_group ?? null,
     msg.content,
     msg.series_id,
   );

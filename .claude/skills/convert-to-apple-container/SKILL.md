@@ -58,7 +58,7 @@ git remote -v
 If `upstream` is missing, add it:
 
 ```bash
-git remote add upstream https://github.com/qwibitai/nanoclaw.git
+git remote add upstream https://github.com/nanocoai/nanoclaw.git
 ```
 
 ### Merge the skill branch
@@ -170,6 +170,8 @@ cat /tmp/test-rw/new.txt && rm -rf /tmp/test-rw
 Expected: Both operations succeed.
 
 ### Full integration test
+
+Run from your NanoClaw project root:
 
 ```bash
 pnpm run build

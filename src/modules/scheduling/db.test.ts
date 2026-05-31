@@ -54,6 +54,39 @@ describe('insertTask', () => {
     expect(row.series_id).toBe('task-1');
     db.close();
   });
+
+  it('preserves route metadata on insert', () => {
+    const db = freshDb();
+    insertTask(db, {
+      id: 'task-1',
+      processAfter: new Date().toISOString(),
+      recurrence: null,
+      platformId: 'discord-thread-1',
+      channelType: 'discord',
+      threadId: 'thread-1',
+      messagingGroupId: 'mg-discord-1',
+      isGroup: 1,
+      content: JSON.stringify({ prompt: 'noop' }),
+    });
+
+    const row = db
+      .prepare(
+        'SELECT platform_id, channel_type, thread_id, messaging_group_id, is_group FROM messages_in WHERE id = ?',
+      )
+      .get('task-1') as {
+      platform_id: string | null;
+      channel_type: string | null;
+      thread_id: string | null;
+      messaging_group_id: string | null;
+      is_group: number | null;
+    };
+    expect(row.platform_id).toBe('discord-thread-1');
+    expect(row.channel_type).toBe('discord');
+    expect(row.thread_id).toBe('thread-1');
+    expect(row.messaging_group_id).toBe('mg-discord-1');
+    expect(row.is_group).toBe(1);
+    db.close();
+  });
 });
 
 describe('cancelTask / pauseTask / resumeTask series matching', () => {
@@ -277,6 +310,43 @@ describe('insertRecurrence', () => {
       series_id: string;
     };
     expect(row.series_id).toBe('task-orig');
+    db.close();
+  });
+
+  it('copies route metadata forward', () => {
+    const db = freshDb();
+
+    const msg: RecurringMessage = {
+      id: 'task-orig',
+      kind: 'task',
+      content: '{}',
+      recurrence: '0 9 * * *',
+      process_after: null,
+      platform_id: 'discord-thread-1',
+      channel_type: 'discord',
+      thread_id: 'thread-1',
+      messaging_group_id: 'mg-discord-1',
+      is_group: 1,
+      series_id: 'task-orig',
+    };
+    insertRecurrence(db, msg, 'task-next', new Date().toISOString());
+
+    const row = db
+      .prepare(
+        'SELECT platform_id, channel_type, thread_id, messaging_group_id, is_group FROM messages_in WHERE id = ?',
+      )
+      .get('task-next') as {
+      platform_id: string | null;
+      channel_type: string | null;
+      thread_id: string | null;
+      messaging_group_id: string | null;
+      is_group: number | null;
+    };
+    expect(row.platform_id).toBe('discord-thread-1');
+    expect(row.channel_type).toBe('discord');
+    expect(row.thread_id).toBe('thread-1');
+    expect(row.messaging_group_id).toBe('mg-discord-1');
+    expect(row.is_group).toBe(1);
     db.close();
   });
 });

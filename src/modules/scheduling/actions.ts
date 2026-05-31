@@ -34,6 +34,8 @@ export async function handleScheduleTask(
     platformId: (content.platformId as string) ?? null,
     channelType: (content.channelType as string) ?? null,
     threadId: (content.threadId as string) ?? null,
+    messagingGroupId: (content.messagingGroupId as string) ?? null,
+    isGroup: content.isGroup === 0 || content.isGroup === 1 ? content.isGroup : null,
     content: JSON.stringify({ prompt, script }),
   });
   log.info('Scheduled task created', { taskId, processAfter, recurrence });

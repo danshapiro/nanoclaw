@@ -229,7 +229,9 @@ echo '{}' | docker run -i --entrypoint /bin/echo nanoclaw-agent:latest "Containe
 
 ### 7. Restart Service
 
-Rebuild the main app and restart:
+Rebuild the main app and restart.
+
+Run from your NanoClaw project root:
 
 ```bash
 pnpm run build
@@ -240,8 +242,8 @@ launchctl kickstart -k gui/$(id -u)/com.nanoclaw  # macOS
 Wait 3 seconds for service to start, then verify:
 ```bash
 sleep 3
-launchctl list | grep nanoclaw  # macOS
-# Linux: systemctl --user status nanoclaw
+launchctl list | grep "$(. setup/lib/install-slug.sh && launchd_label)"  # macOS
+# Linux: systemctl --user status "$(. setup/lib/install-slug.sh && systemd_unit)"
 ```
 
 ### 8. Test Integration
@@ -275,7 +277,7 @@ Look for: `Parallel AI MCP servers configured`
 - Check agent-runner logs for "Parallel AI MCP servers configured" message
 
 **Task polling not working:**
-- Verify scheduled task was created: `sqlite3 store/messages.db "SELECT * FROM scheduled_tasks"`
+- Verify scheduled task was created: `pnpm exec tsx scripts/q.ts store/messages.db "SELECT * FROM scheduled_tasks"`
 - Check task runs: `tail -f logs/nanoclaw.log | grep "scheduled task"`
 - Ensure task prompt includes proper Parallel MCP tool names
 

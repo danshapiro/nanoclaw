@@ -11,14 +11,15 @@ Run `/update-nanoclaw` in Claude Code.
 
 ## How it works
 
-**Preflight**: checks for clean working tree (`git status --porcelain`). If `upstream` remote is missing, asks you for the URL (defaults to `https://github.com/qwibitai/nanoclaw.git`) and adds it. Detects the upstream branch name (`main` or `master`).
+**Preflight**: checks for clean working tree (`git status --porcelain`). If `upstream` remote is missing, asks you for the URL (defaults to `https://github.com/nanocoai/nanoclaw.git`) and adds it. Detects the upstream branch name (`main` or `master`).
 
 **Backup**: creates a timestamped backup branch and tag (`backup/pre-update-<hash>-<timestamp>`, `pre-update-<hash>-<timestamp>`) before touching anything. Safe to run multiple times.
 
 **Preview**: runs `git log` and `git diff` against the merge base to show upstream changes since your last sync. Groups changed files into categories:
 - **Skills** (`.claude/skills/`): unlikely to conflict unless you edited an upstream skill
-- **Source** (`src/`): may conflict if you modified the same files
-- **Build/config** (`package.json`, `tsconfig*.json`, `container/`): review needed
+- **Host source** (`src/`): may conflict if you modified the same files
+- **Container** (`container/`): triggers container rebuild
+- **Build/config** (`package.json`, `pnpm-lock.yaml`, `tsconfig*.json`): lockfile changes trigger dep install
 
 **Update paths** (you pick one):
 - `merge` (default): `git merge upstream/<branch>`. Resolves all conflicts in one pass.
@@ -68,7 +69,7 @@ If output is non-empty:
 Confirm remotes:
 - `git remote -v`
 If `upstream` is missing:
-- Ask the user for the upstream repo URL (default: `https://github.com/qwibitai/nanoclaw.git`).
+- Ask the user for the upstream repo URL (default: `https://github.com/nanocoai/nanoclaw.git`).
 - Add it: `git remote add upstream <user-provided-url>`
 - Then: `git fetch upstream --prune`
 
@@ -173,6 +174,16 @@ If it gets messy (more than 3 rounds of conflicts):
   - `git rebase --abort`
   - Recommend merge instead.
 
+# Step 4.5: Install dependencies (if lockfiles changed)
+Check if the merge changed any lockfiles or package manifests:
+- `git diff <backup-tag-from-step-1>..HEAD --name-only | grep -E '^(pnpm-lock\.yaml|package\.json)$'`
+  - If matched: `pnpm install`
+- `git diff <backup-tag-from-step-1>..HEAD --name-only | grep -E '^container/agent-runner/(bun\.lock|package\.json)$'`
+  - If matched AND `command -v bun` succeeds: `cd container/agent-runner && bun install`
+  - If bun is not installed on the host, skip — container deps will be installed during `./container/build.sh`
+
+Skip this step if neither lockfile changed.
+
 # Step 5: Validation
 Run:
 - `pnpm run build`
@@ -209,8 +220,10 @@ If one or more `[BREAKING]` lines are found:
 - For each skill the user selects, invoke it using the Skill tool.
 - After all selected skills complete (or if user chose Skip), proceed to Step 7 (skill updates check).
 
-# Step 7: Check for skill updates
-After the summary, check if skills are distributed as branches in this repo:
+# Step 7: Check for skill and channel/provider updates
+
+## 7a: Skill branches
+Check if skills are distributed as branches in this repo:
 - `git branch -r --list 'upstream/skill/*'`
 
 If any `upstream/skill/*` branches exist:
@@ -218,7 +231,21 @@ If any `upstream/skill/*` branches exist:
   - Option 1: "Yes, check for updates" (description: "Runs /update-skills to check for and apply skill branch updates")
   - Option 2: "No, skip" (description: "You can run /update-skills later any time")
 - If user selects yes, invoke `/update-skills` using the Skill tool.
-- After the skill completes (or if user selected no), proceed to Step 8.
+
+## 7b: Channel and provider updates
+Detect installed channels by reading `src/channels/index.ts` and collecting all `import './<name>.js';` lines (excluding `cli`). For providers, check `src/providers/index.ts` the same way.
+
+If any channels/providers are installed AND `upstream/channels` or `upstream/providers` branches exist:
+- List the installed channels/providers.
+- Use AskUserQuestion to ask: "Would you like to update your installed channels/providers? Re-running `/add-<name>` is safe — it only updates code files, credentials and wiring are untouched."
+  - One option per installed channel/provider (e.g., "Update Slack (/add-slack)")
+  - "Skip — I'll update them later"
+  - Set `multiSelect: true`
+- For each selected option, invoke the corresponding `/add-<channel>` or `/add-<provider>` skill.
+
+If no channels/providers are installed, skip silently.
+
+Proceed to Step 8.
 
 # Step 8: Summary + rollback instructions
 Show:

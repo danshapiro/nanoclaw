@@ -38,6 +38,8 @@ Before using this skill, ensure:
 
 ## Quick Start
 
+Run from your NanoClaw project root:
+
 ```bash
 # 1. Setup authentication (interactive)
 pnpm exec dotenv -e .env -- pnpm exec tsx .claude/skills/x-integration/scripts/setup.ts
@@ -270,16 +272,22 @@ cat data/x-auth.json  # Should show {"authenticated": true, ...}
 
 ### 4. Restart Service
 
+Run from your NanoClaw project root:
+
 ```bash
 pnpm run build
 launchctl kickstart -k gui/$(id -u)/com.nanoclaw  # macOS
 # Linux: systemctl --user restart nanoclaw
 ```
 
-**Verify success:**
+**Verify success.**
+
+Run from your NanoClaw project root:
+
 ```bash
-launchctl list | grep nanoclaw  # macOS — should show PID and exit code 0 or -
-# Linux: systemctl --user status nanoclaw
+source setup/lib/install-slug.sh
+launchctl list | grep "$(launchd_label)"  # macOS — should show PID and exit code 0 or -
+# Linux: systemctl --user status $(systemd_unit)
 ```
 
 ## Usage via WhatsApp
@@ -342,6 +350,8 @@ echo '{"content":"Test"}' | pnpm exec tsx .claude/skills/x-integration/scripts/p
 ## Troubleshooting
 
 ### Authentication Expired
+
+Run from your NanoClaw project root:
 
 ```bash
 pnpm exec dotenv -e .env -- pnpm exec tsx .claude/skills/x-integration/scripts/setup.ts

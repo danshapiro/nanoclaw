@@ -82,6 +82,8 @@ export const scheduleTask: McpToolDefinition = {
       platform_id: r.platform_id,
       channel_type: r.channel_type,
       thread_id: r.thread_id,
+      messaging_group_id: r.messaging_group_id,
+      is_group: r.is_group,
       content: JSON.stringify({
         action: 'schedule_task',
         taskId: id,
@@ -89,6 +91,11 @@ export const scheduleTask: McpToolDefinition = {
         script,
         processAfter,
         recurrence,
+        platformId: r.platform_id,
+        channelType: r.channel_type,
+        threadId: r.thread_id,
+        messagingGroupId: r.messaging_group_id,
+        isGroup: r.is_group,
       }),
     });
 

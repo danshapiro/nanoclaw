@@ -71,7 +71,11 @@ AskUserQuestion: "Want periodic wiki health checks?"
 2. **Monthly**
 3. **Skip** — lint manually
 
-If yes, create a NanoClaw scheduled task that runs in the wiki group. This is NOT a Claude Code cron job — it's a NanoClaw group task that runs in the agent container. Insert it into the SQLite database:
+If yes, ask the agent to schedule the lint task using the `schedule_task` MCP tool in conversation.
+
+## Step 6: Restart
+
+Run from your NanoClaw project root:
 
 ```bash
 pnpm exec tsx -e "
