@@ -761,10 +761,15 @@ export class OpenCodeProvider implements AgentProvider {
         self.destroyRuntime(reason);
       }
     };
+    let persistedToolKey = 'none';
     const persistTool = (tool: ActiveOpenCodeTool | null): void => {
       // Relay mode has no mutation/long tools and must not clobber the original
       // turn's container_state.
-      if (!relayMode) self.persistActiveTool(tool);
+      if (relayMode) return;
+      const key = tool ? `${tool.tool}:${tool.declaredTimeoutMs ?? ''}` : 'none';
+      if (key === persistedToolKey) return;
+      persistedToolKey = key;
+      self.persistActiveTool(tool);
     };
 
     async function* gen(): AsyncGenerator<ProviderEvent> {

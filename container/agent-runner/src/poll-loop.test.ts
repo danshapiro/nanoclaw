@@ -11,6 +11,7 @@ import {
   getOutboundDb,
   clearStaleProcessingAcks,
   clearStaleContainerToolState,
+  clearContainerToolInFlight,
   setContainerToolInFlight,
 } from './db/connection.js';
 import {
@@ -898,6 +899,18 @@ describe('messages-in recovery ack lifecycle', () => {
     expect(after.current_tool).toBeNull();
     expect(after.tool_declared_timeout_ms).toBeNull();
     expect(after.tool_started_at).toBeNull();
+  });
+
+  it('clearContainerToolInFlight does not rewrite an already-clear tool row', () => {
+    clearContainerToolInFlight();
+    getOutboundDb().prepare("UPDATE container_state SET updated_at = 'fixed-clear-time' WHERE id = 1").run();
+
+    clearContainerToolInFlight();
+
+    const after = getOutboundDb().prepare('SELECT updated_at FROM container_state WHERE id = 1').get() as {
+      updated_at: string;
+    };
+    expect(after.updated_at).toBe('fixed-clear-time');
   });
 
   // B6 (Step 3 line 541): resolving a recovery entry resolves its owned input

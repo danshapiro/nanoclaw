@@ -39,6 +39,8 @@ function now(): string {
 const TEST_DIR = '/tmp/nanoclaw-test-router';
 const DISCORD_PLATFORM_ID = 'channel';
 const DISCORD_THREAD_ID = 'discord:guild:channel';
+const DISCORD_RAW_CONVERSATION_THREAD_ID = 'thread-123';
+const DISCORD_CANONICAL_CONVERSATION_THREAD_ID = `discord:guild:${DISCORD_PLATFORM_ID}:${DISCORD_RAW_CONVERSATION_THREAD_ID}`;
 let currentUserId: string | null = 'discord:admin';
 
 beforeEach(async () => {
@@ -105,11 +107,15 @@ function grantAdmin(userId: string): void {
     .run(userId, 'admin', 'ag-yente', null, now());
 }
 
-function event(content: string, id = `msg-${Math.random().toString(36).slice(2)}`): InboundEvent {
+function event(
+  content: string,
+  id = `msg-${Math.random().toString(36).slice(2)}`,
+  threadId = DISCORD_THREAD_ID,
+): InboundEvent {
   return {
     channelType: 'discord',
     platformId: DISCORD_PLATFORM_ID,
-    threadId: DISCORD_THREAD_ID,
+    threadId,
     message: {
       id,
       kind: 'chat',
@@ -308,6 +314,24 @@ describe('Yente host command routing', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     const fresh = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
+    expect(getSession(original.id)?.status).toBe('archived');
+    expect(fresh.id).not.toBe(original.id);
+    expect(outboundTexts(fresh.id)[0]).toBe(`Started a fresh session: ${fresh.id}`);
+    expect(cleanupContainerForSessionMock).toHaveBeenCalledWith(original.id, 'yente-session-new');
+  });
+
+  it('routes admin CLI messages with raw Discord thread ids to the existing canonical session', async () => {
+    const { routeInbound } = await import('./router.js');
+
+    await routeInbound(event('hello first', 'msg-normal-thread', DISCORD_CANONICAL_CONVERSATION_THREAD_ID));
+    const original = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_CANONICAL_CONVERSATION_THREAD_ID)!;
+
+    await routeInbound(event('/new', 'msg-admin-cli-raw-thread', DISCORD_RAW_CONVERSATION_THREAD_ID));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const rawSession = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_RAW_CONVERSATION_THREAD_ID);
+    const fresh = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_CANONICAL_CONVERSATION_THREAD_ID)!;
+    expect(rawSession).toBeUndefined();
     expect(getSession(original.id)?.status).toBe('archived');
     expect(fresh.id).not.toBe(original.id);
     expect(outboundTexts(fresh.id)[0]).toBe(`Started a fresh session: ${fresh.id}`);

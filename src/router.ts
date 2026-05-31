@@ -26,13 +26,12 @@ import {
   getMessagingGroupAgents,
   getMessagingGroupWithAgentCount,
 } from './db/messaging-groups.js';
-import { findSessionForAgent } from './db/sessions.js';
+import { findActiveSessionThreadIdEndingWithForAgent, findSessionForAgent, getSession } from './db/sessions.js';
 import { deliverSessionMessages, dropInactiveSessionOutbound, suppressSessionOutbound } from './delivery.js';
 import { startTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { resolveSession, writeSessionMessage, writeOutboundDirect } from './session-manager.js';
 import { cleanupContainerForSession, wakeContainer } from './container-runner.js';
-import { getSession } from './db/sessions.js';
 import type { AgentGroup, MessagingGroup, MessagingGroupAgent, Session } from './types.js';
 import type { InboundEvent } from './channels/adapter.js';
 import { handleYenteHostCommand } from './yente/host-commands.js';
@@ -261,14 +260,15 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
   for (const agent of agents) {
     const agentGroup = getAgentGroup(agent.agent_group_id);
     if (!agentGroup) continue;
+    const agentEvent = eventWithCanonicalThreadIdForExistingSession(agent.agent_group_id, mg, event);
 
-    const engages = evaluateEngage(agent, messageText, isMention, mg, event.threadId);
+    const engages = evaluateEngage(agent, messageText, isMention, mg, agentEvent.threadId);
 
-    const accessOk = engages && (!accessGate || accessGate(event, userId, mg, agent.agent_group_id).allowed);
-    const scopeOk = engages && (!senderScopeGate || senderScopeGate(event, userId, mg, agent).allowed);
+    const accessOk = engages && (!accessGate || accessGate(agentEvent, userId, mg, agent.agent_group_id).allowed);
+    const scopeOk = engages && (!senderScopeGate || senderScopeGate(agentEvent, userId, mg, agent).allowed);
 
     if (engages && accessOk && scopeOk) {
-      await deliverToAgent(agent, agentGroup, mg, event, userId, adapter?.supportsThreads === true, true);
+      await deliverToAgent(agent, agentGroup, mg, agentEvent, userId, adapter?.supportsThreads === true, true);
       engagedCount++;
 
       // Mention-sticky: ask the adapter to subscribe the thread so the
@@ -280,19 +280,23 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
         agent.engage_mode === 'mention-sticky' &&
         adapter?.supportsThreads &&
         adapter.subscribe &&
-        event.threadId !== null &&
+        agentEvent.threadId !== null &&
         mg.is_group !== 0
       ) {
         subscribed = true;
         // Fire-and-forget — subscribe is platform-side bookkeeping and
         // shouldn't block message routing. Errors are logged inside the
         // adapter (or by the promise rejection handler below).
-        void adapter.subscribe(event.platformId, event.threadId).catch((err) => {
-          log.warn('adapter.subscribe failed', { channelType: event.channelType, threadId: event.threadId, err });
+        void adapter.subscribe(agentEvent.platformId, agentEvent.threadId).catch((err) => {
+          log.warn('adapter.subscribe failed', {
+            channelType: agentEvent.channelType,
+            threadId: agentEvent.threadId,
+            err,
+          });
         });
       }
     } else if (agent.ignored_message_policy === 'accumulate') {
-      await deliverToAgent(agent, agentGroup, mg, event, userId, adapter?.supportsThreads === true, false);
+      await deliverToAgent(agent, agentGroup, mg, agentEvent, userId, adapter?.supportsThreads === true, false);
       accumulatedCount++;
     } else {
       log.debug('Message not engaged for agent (drop policy)', {
@@ -316,6 +320,40 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
       agent_group_id: null,
     });
   }
+}
+
+function eventWithCanonicalThreadIdForExistingSession(
+  agentGroupId: string,
+  mg: MessagingGroup,
+  event: InboundEvent,
+): InboundEvent {
+  const threadId = canonicalThreadIdForExistingSession(agentGroupId, mg.id, event);
+  if (!threadId || threadId === event.threadId) return event;
+  log.info('Canonicalized inbound Discord thread id from existing session', {
+    agentGroupId,
+    messagingGroupId: mg.id,
+    platformId: event.platformId,
+    suppliedThreadId: event.threadId,
+    canonicalThreadId: threadId,
+  });
+  return { ...event, threadId };
+}
+
+function canonicalThreadIdForExistingSession(
+  agentGroupId: string,
+  messagingGroupId: string,
+  event: InboundEvent,
+): string | null {
+  if (event.channelType !== 'discord' || !event.threadId || event.threadId.startsWith('discord:')) {
+    return null;
+  }
+  return (
+    findActiveSessionThreadIdEndingWithForAgent(
+      agentGroupId,
+      messagingGroupId,
+      `:${event.platformId}:${event.threadId}`,
+    ) ?? null
+  );
 }
 
 /**

@@ -52,6 +52,25 @@ export function findSessionForAgent(
     .get(agentGroupId, messagingGroupId) as Session | undefined;
 }
 
+export function findActiveSessionThreadIdEndingWithForAgent(
+  agentGroupId: string,
+  messagingGroupId: string,
+  threadIdSuffix: string,
+): string | undefined {
+  const row = getDb()
+    .prepare(
+      `SELECT thread_id FROM sessions
+       WHERE agent_group_id = ?
+         AND messaging_group_id = ?
+         AND thread_id LIKE ? ESCAPE '\\'
+         AND status = 'active'
+       ORDER BY last_active DESC, created_at DESC
+       LIMIT 1`,
+    )
+    .get(agentGroupId, messagingGroupId, `%${escapeLike(threadIdSuffix)}`) as { thread_id: string | null } | undefined;
+  return row?.thread_id ?? undefined;
+}
+
 /** Find an active session scoped to an agent group (ignoring messaging group). */
 export function findSessionByAgentGroup(agentGroupId: string): Session | undefined {
   return getDb()
@@ -97,6 +116,10 @@ export function archiveSession(id: string): void {
 
 export function deleteSession(id: string): void {
   getDb().prepare('DELETE FROM sessions WHERE id = ?').run(id);
+}
+
+function escapeLike(value: string): string {
+  return value.replace(/[\\%_]/g, '\\$&');
 }
 
 // ── Pending Questions ──

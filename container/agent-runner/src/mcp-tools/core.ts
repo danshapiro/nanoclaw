@@ -163,14 +163,29 @@ export const sendFile: McpToolDefinition = {
     fs.mkdirSync(outboxDir, { recursive: true });
     fs.copyFileSync(resolvedPath, path.join(outboxDir, filename));
 
-    writeMessageOut({
-      id,
-      kind: 'chat',
-      platform_id: routing.platform_id,
-      channel_type: routing.channel_type,
-      thread_id: routing.thread_id,
-      content: JSON.stringify({ text: (args.text as string) || '', files: [filename] }),
-    });
+    try {
+      writeMessageOut({
+        id,
+        kind: 'chat',
+        platform_id: routing.platform_id,
+        channel_type: routing.channel_type,
+        thread_id: routing.thread_id,
+        content: JSON.stringify({ text: (args.text as string) || '', files: [filename] }),
+      });
+    } catch (writeErr) {
+      fs.rmSync(outboxDir, { recursive: true, force: true });
+      console.error(
+        JSON.stringify({
+          severity: 'warn',
+          component: 'mcp-tools',
+          event: 'send_file_queue_failed_cleanup',
+          messageId: id,
+          filename,
+          err: writeErr instanceof Error ? writeErr.message : String(writeErr),
+        }),
+      );
+      return err(`Failed to queue file for delivery: ${writeErr instanceof Error ? writeErr.message : String(writeErr)}`);
+    }
 
     log(`send_file: ${id} → ${routing.resolvedName} (${filename})`);
     return ok(`File sent to ${routing.resolvedName} (id: ${id}, filename: ${filename})`);

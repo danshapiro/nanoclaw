@@ -40,32 +40,33 @@ export function getInboundDb(): Database {
 /** Outbound DB — container owns this file (sole writer). */
 export function getOutboundDb(): Database {
   if (!_outbound) {
-    _outbound = new Database(DEFAULT_OUTBOUND_PATH);
-    _outbound.exec('PRAGMA journal_mode = DELETE');
-    _outbound.exec('PRAGMA busy_timeout = 5000');
-    _outbound.exec('PRAGMA foreign_keys = ON');
-    // Lightweight forward-compat: session_state was added after the initial
-    // v2 schema, so older session DBs don't have it. Create it on demand
-    // instead of requiring a formal migration pass. Also handle the case
-    // where an earlier revision of this table existed without updated_at —
-    // ALTER TABLE to add any missing columns.
-    _outbound.exec(`
+    const db = new Database(DEFAULT_OUTBOUND_PATH);
+    try {
+      db.exec('PRAGMA busy_timeout = 5000');
+      db.exec('PRAGMA journal_mode = DELETE');
+      db.exec('PRAGMA foreign_keys = ON');
+      // Lightweight forward-compat: session_state was added after the initial
+      // v2 schema, so older session DBs don't have it. Create it on demand
+      // instead of requiring a formal migration pass. Also handle the case
+      // where an earlier revision of this table existed without updated_at —
+      // ALTER TABLE to add any missing columns.
+      db.exec(`
       CREATE TABLE IF NOT EXISTS session_state (
         key        TEXT PRIMARY KEY,
         value      TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
     `);
-    const cols = new Set(
-      (_outbound.prepare("PRAGMA table_info('session_state')").all() as Array<{ name: string }>).map((c) => c.name),
-    );
-    if (!cols.has('updated_at')) {
-      _outbound.exec(`ALTER TABLE session_state ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''`);
-    }
-    // container_state: tracks the current tool in flight (if any) so the host
-    // sweep can widen its stuck tolerance when Bash is running with a user-
-    // declared long timeout. Forward-compat for older outbound.db files.
-    _outbound.exec(`
+      const cols = new Set(
+        (db.prepare("PRAGMA table_info('session_state')").all() as Array<{ name: string }>).map((c) => c.name),
+      );
+      if (!cols.has('updated_at')) {
+        db.exec(`ALTER TABLE session_state ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''`);
+      }
+      // container_state: tracks the current tool in flight (if any) so the host
+      // sweep can widen its stuck tolerance when Bash is running with a user-
+      // declared long timeout. Forward-compat for older outbound.db files.
+      db.exec(`
       CREATE TABLE IF NOT EXISTS container_state (
         id                       INTEGER PRIMARY KEY CHECK (id = 1),
         current_tool             TEXT,
@@ -74,11 +75,11 @@ export function getOutboundDb(): Database {
         updated_at               TEXT NOT NULL
       );
     `);
-    // side_effect_ledger: validated, imported side effects. The host
-    // src/db/schema.ts is the authoritative creator, but a container opening an
-    // old-schema outbound.db must self-migrate (create-on-demand) so recovery
-    // and import work without a formal migration pass.
-    _outbound.exec(`
+      // side_effect_ledger: validated, imported side effects. The host
+      // src/db/schema.ts is the authoritative creator, but a container opening an
+      // old-schema outbound.db must self-migrate (create-on-demand) so recovery
+      // and import work without a formal migration pass.
+      db.exec(`
       CREATE TABLE IF NOT EXISTS side_effect_ledger (
         id              TEXT PRIMARY KEY,
         source          TEXT NOT NULL,
@@ -93,7 +94,12 @@ export function getOutboundDb(): Database {
         imported_at     TEXT NOT NULL
       );
     `);
-    ensureOutboundRouteColumns(_outbound);
+      ensureOutboundRouteColumns(db);
+      _outbound = db;
+    } catch (err) {
+      db.close();
+      throw err;
+    }
   }
   return _outbound;
 }
@@ -144,6 +150,20 @@ export function setContainerToolInFlight(tool: string, declaredTimeoutMs: number
 
 /** Clear the in-flight tool — called on PostToolUse / PostToolUseFailure. */
 export function clearContainerToolInFlight(): void {
+  const existing = getOutboundDb()
+    .prepare('SELECT current_tool, tool_declared_timeout_ms, tool_started_at FROM container_state WHERE id = 1')
+    .get() as
+    | { current_tool: string | null; tool_declared_timeout_ms: number | null; tool_started_at: string | null }
+    | undefined;
+  if (
+    existing &&
+    existing.current_tool === null &&
+    existing.tool_declared_timeout_ms === null &&
+    existing.tool_started_at === null
+  ) {
+    return;
+  }
+
   const now = new Date().toISOString();
   getOutboundDb()
     .prepare(
