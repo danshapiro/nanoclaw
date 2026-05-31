@@ -21,6 +21,7 @@ import {
   importHostSideEffects,
   insertMessage,
   migrateMessagesInTable,
+  openInboundDb,
   syncProcessingAcks,
   upsertSessionRouting,
 } from './session-db.js';
@@ -243,6 +244,85 @@ describe('route metadata persistence', () => {
     expect(routeCols.has('messaging_group_id')).toBe(true);
     expect(routeCols.has('is_group')).toBe(true);
     db.close();
+  });
+});
+
+describe('openInboundDb host self-heal', () => {
+  it('migrates a pre-existing session_routing (old schema) so upsertSessionRouting works', () => {
+    freshDir();
+    const dbPath = path.join(TEST_DIR, 'inbound.db');
+
+    // Build a PRE-EXISTING inbound.db exactly as it looked before the route
+    // columns were added: messages_in current, but the OLD 4-column
+    // session_routing with NO messaging_group_id / is_group. This is the shape
+    // of every session created before the timeout-hardening upgrade.
+    const legacy = new Database(dbPath);
+    legacy.exec(`
+      CREATE TABLE messages_in (
+        id TEXT PRIMARY KEY, seq INTEGER UNIQUE, kind TEXT NOT NULL, timestamp TEXT NOT NULL,
+        status TEXT DEFAULT 'pending', process_after TEXT, recurrence TEXT, series_id TEXT,
+        tries INTEGER DEFAULT 0, trigger INTEGER NOT NULL DEFAULT 1, platform_id TEXT,
+        platform_message_id TEXT, channel_type TEXT, thread_id TEXT, content TEXT NOT NULL,
+        messaging_group_id TEXT, is_group INTEGER
+      );
+      CREATE TABLE session_routing (
+        id INTEGER PRIMARY KEY CHECK (id = 1), channel_type TEXT, platform_id TEXT, thread_id TEXT
+      );
+    `);
+    legacy.close();
+
+    // Open through the host opener (the production chokepoint) and perform the
+    // exact write that threw in production. Before the fix this throws
+    // "table session_routing has no column named messaging_group_id".
+    const db = openInboundDb(dbPath);
+    try {
+      expect(() =>
+        upsertSessionRouting(db, {
+          channel_type: 'discord',
+          platform_id: 'chan-1',
+          thread_id: null,
+          messaging_group_id: 'mg-dm-1',
+          is_group: 0,
+        }),
+      ).not.toThrow();
+
+      const cols = new Set(
+        (db.prepare("PRAGMA table_info('session_routing')").all() as Array<{ name: string }>).map((c) => c.name),
+      );
+      expect(cols.has('messaging_group_id')).toBe(true);
+      expect(cols.has('is_group')).toBe(true);
+
+      const row = db.prepare('SELECT messaging_group_id, is_group FROM session_routing WHERE id = 1').get() as {
+        messaging_group_id: string | null;
+        is_group: number | null;
+      };
+      expect(row.messaging_group_id).toBe('mg-dm-1');
+      expect(row.is_group).toBe(0);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('is idempotent on a second host open of an already-healed DB', () => {
+    freshDir();
+    const dbPath = path.join(TEST_DIR, 'inbound.db');
+    const legacy = new Database(dbPath);
+    legacy.exec(`
+      CREATE TABLE messages_in (
+        id TEXT PRIMARY KEY, seq INTEGER UNIQUE, kind TEXT NOT NULL, timestamp TEXT NOT NULL,
+        status TEXT DEFAULT 'pending', process_after TEXT, recurrence TEXT, series_id TEXT,
+        tries INTEGER DEFAULT 0, trigger INTEGER NOT NULL DEFAULT 1, platform_id TEXT,
+        platform_message_id TEXT, channel_type TEXT, thread_id TEXT, content TEXT NOT NULL,
+        messaging_group_id TEXT, is_group INTEGER
+      );
+      CREATE TABLE session_routing (
+        id INTEGER PRIMARY KEY CHECK (id = 1), channel_type TEXT, platform_id TEXT, thread_id TEXT
+      );
+    `);
+    legacy.close();
+
+    openInboundDb(dbPath).close(); // first open heals
+    expect(() => openInboundDb(dbPath).close()).not.toThrow(); // second open is a no-op
   });
 });
 

@@ -34,7 +34,6 @@ import {
   openOutboundDbForWrite,
   upsertSessionRouting,
   insertMessage,
-  migrateMessagesInTable,
 } from './db/session-db.js';
 import { log } from './log.js';
 import type { Session } from './types.js';
@@ -220,7 +219,7 @@ export function writeSessionRouting(agentGroupId: string, sessionId: string): vo
   // messaging_groups row (per-wake). This is distinct from the per-message
   // values stamped via writeSessionMessage(): session routing carries the
   // single normalized route active for this wake.
-  let messagingGroupId: string | null = session.messaging_group_id ?? null;
+  const messagingGroupId: string | null = session.messaging_group_id ?? null;
   let isGroup: 0 | 1 | null = null;
   if (session.messaging_group_id) {
     const mg = getMessagingGroup(session.messaging_group_id);
@@ -410,9 +409,9 @@ function attachmentForPrompt(att: MaterializedAttachment): Record<string, unknow
 
 /** Open the inbound DB for a session (host reads/writes). */
 export function openInboundDb(agentGroupId: string, sessionId: string): Database.Database {
-  const db = openInboundDbRaw(inboundDbPath(agentGroupId, sessionId));
-  migrateMessagesInTable(db);
-  return db;
+  // Inbound schema self-heal (messages_in + session_routing) lives in the raw
+  // opener in db/session-db.ts so every host inbound open migrates forward.
+  return openInboundDbRaw(inboundDbPath(agentGroupId, sessionId));
 }
 
 /** Open the outbound DB for a session (host reads only). */
