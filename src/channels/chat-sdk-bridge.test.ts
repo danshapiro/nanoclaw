@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
+import type { Adapter } from 'chat';
 
 import type { ChannelSetup } from './adapter.js';
-import { handleForwardedEvent, serializeChatSdkAttachmentForInbound } from './chat-sdk-bridge.js';
+import { createChatSdkBridge, handleForwardedEvent, serializeChatSdkAttachmentForInbound } from './chat-sdk-bridge.js';
 
 describe('Chat SDK bridge attachments', () => {
   it('downloads attachment data from serialized URLs when fetchData is unavailable', async () => {
@@ -39,6 +40,40 @@ describe('Chat SDK bridge attachments', () => {
       });
     } finally {
       globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+describe('Chat SDK bridge outbound splitting', () => {
+  it('posts oversized text as multiple messages when an adapter limit is configured', async () => {
+    const postMessage = vi
+      .fn()
+      .mockResolvedValueOnce({ id: 'first-message' })
+      .mockResolvedValueOnce({ id: 'second-message' })
+      .mockResolvedValueOnce({ id: 'third-message' });
+    const bridge = createChatSdkBridge({
+      adapter: {
+        name: 'discord',
+        postMessage,
+      } as unknown as Adapter,
+      supportsThreads: true,
+      maxTextLength: 10,
+    });
+
+    const result = await bridge.deliver('discord:guild:channel', null, {
+      kind: 'chat',
+      content: { text: '12345\n\n67890 12345' },
+    });
+
+    expect(result).toBe('first-message');
+    expect(postMessage).toHaveBeenCalledTimes(3);
+    expect(postMessage.mock.calls.map(([, message]) => message)).toEqual([
+      { markdown: '12345' },
+      { markdown: '67890' },
+      { markdown: '12345' },
+    ]);
+    for (const [, message] of postMessage.mock.calls) {
+      expect((message as { markdown: string }).markdown.length).toBeLessThanOrEqual(10);
     }
   });
 });

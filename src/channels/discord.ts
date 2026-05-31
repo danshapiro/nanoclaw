@@ -11,6 +11,7 @@ import { registerChannelAdapter } from './channel-registry.js';
 import { syncYenteDiscordApplicationCommands } from './discord-commands.js';
 
 const DISCORD_API_BASE = 'https://discord.com/api/v10';
+const DISCORD_MESSAGE_TEXT_LIMIT = 2000;
 type DiscordAdapterInstance = ReturnType<typeof createDiscordAdapter>;
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -45,6 +46,7 @@ registerChannelAdapter('discord', {
       botToken,
       extractReplyContext,
       supportsThreads: true,
+      maxTextLength: DISCORD_MESSAGE_TEXT_LIMIT,
       transformOutboundText: (t) => t.replace(/^(\d+)\.$/gm, '$1\\.'),
     });
   },

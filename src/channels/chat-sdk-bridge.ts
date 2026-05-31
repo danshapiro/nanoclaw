@@ -525,6 +525,14 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           config.maxTextLength && text.length > config.maxTextLength
             ? splitForLimit(text, config.maxTextLength)
             : [text];
+        if (chunks.length > 1) {
+          log.info('Outbound text split for adapter limit', {
+            adapter: adapter.name,
+            maxTextLength: config.maxTextLength,
+            textLength: text.length,
+            chunkCount: chunks.length,
+          });
+        }
         let firstId: string | undefined;
         for (let i = 0; i < chunks.length; i++) {
           const chunk = chunks[i];
