@@ -1,9 +1,10 @@
 /**
- * Task DB helpers used by the scheduling module.
+ * Legacy task projection helpers used by the scheduling module.
  *
- * Tasks are `messages_in` rows with `kind='task'`. This module doesn't own
- * its own table — it piggybacks on the core schema. That's why there's no
- * `module-scheduling-*.ts` migration file.
+ * Durable scheduled-task state now lives in the central scheduler ledger
+ * (`ledger.ts`). These helpers remain only for existing action/recurrence
+ * code paths until they are moved to central ledger writes plus explicit
+ * projections.
  *
  * cancel/pause/resume match any live row in the series, not just the exact id.
  * Recurring tasks get a new row per occurrence (see handleRecurrence), all
