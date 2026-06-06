@@ -6,9 +6,26 @@
  */
 import fs from 'fs';
 import path from 'path';
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach } from 'vitest';
 
-import { ensureSchema, openInboundDb } from '../../db/session-db.js';
+import {
+  closeDb,
+  createAgentGroup,
+  createMessagingGroup,
+  createSession,
+  initTestDb,
+  runMigrations,
+} from '../../db/index.js';
+import { countDueMessages, ensureSchema, openInboundDb } from '../../db/session-db.js';
+import type { Session } from '../../types.js';
+import {
+  handleCancelTask,
+  handlePauseTask,
+  handleResumeTask,
+  handleScheduleTask,
+  handleUpdateTask,
+} from './actions.js';
+import { getScheduledTask } from './ledger.js';
 import {
   insertTask,
   insertRecurrence,
@@ -22,6 +39,17 @@ import {
 
 const TEST_DIR = '/tmp/nanoclaw-scheduling-db-test';
 const DB_PATH = path.join(TEST_DIR, 'inbound.db');
+const ACTION_SESSION: Session = {
+  id: 'sess-action',
+  agent_group_id: 'ag-1',
+  messaging_group_id: 'mg-1',
+  thread_id: 'thread-1',
+  agent_provider: null,
+  status: 'active',
+  container_status: 'idle',
+  last_active: null,
+  created_at: '2026-06-05T00:00:00.000Z',
+};
 
 function freshDb() {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
@@ -44,6 +72,172 @@ function insertBasicTask(db: ReturnType<typeof openInboundDb>, id: string, recur
 
 afterEach(() => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+});
+
+describe('delivery action handlers', () => {
+  beforeEach(() => {
+    const central = initTestDb();
+    runMigrations(central);
+    createAgentGroup({
+      id: 'ag-1',
+      name: 'Agent 1',
+      folder: 'agent-1',
+      agent_provider: null,
+      created_at: '2026-06-05T00:00:00.000Z',
+    });
+    createMessagingGroup({
+      id: 'mg-1',
+      channel_type: 'discord',
+      platform_id: 'chan-1',
+      name: 'Yente',
+      is_group: 1,
+      unknown_sender_policy: 'strict',
+      created_at: '2026-06-05T00:00:00.000Z',
+    });
+    createSession(ACTION_SESSION);
+  });
+
+  afterEach(() => {
+    closeDb();
+  });
+
+  function scheduleAction(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      action: 'schedule_task',
+      taskId: 'task-1',
+      prompt: 'heartbeat',
+      script: null,
+      processAfter: '2026-06-06T12:00:00.000Z',
+      recurrence: '0 9 * * *',
+      platformId: 'chan-1',
+      channelType: 'discord',
+      threadId: 'thread-1',
+      messagingGroupId: 'mg-1',
+      isGroup: 1,
+      ...overrides,
+    };
+  }
+
+  async function seedScheduledProjection(db: ReturnType<typeof openInboundDb>) {
+    await handleScheduleTask(scheduleAction(), ACTION_SESSION, db, 'out-schedule');
+  }
+
+  it('schedule_task writes central intent and active projection', async () => {
+    const db = freshDb();
+
+    await handleScheduleTask(scheduleAction(), ACTION_SESSION, db, 'out-schedule');
+
+    expect(getScheduledTask('ag-1', 'task-1')).toMatchObject({
+      status: 'pending',
+      recurrence: '0 9 * * *',
+      process_after: '2026-06-06T12:00:00.000Z',
+      projected_session_id: 'sess-action',
+      projected_message_id: 'task-task-1-g1',
+    });
+    expect(db.prepare("SELECT series_id, status, recurrence FROM messages_in WHERE kind = 'task'").get()).toEqual({
+      series_id: 'task-1',
+      status: 'pending',
+      recurrence: '0 9 * * *',
+    });
+    db.close();
+  });
+
+  it('cancel_task tombstones central intent and retires the active projection', async () => {
+    const db = freshDb();
+    await seedScheduledProjection(db);
+
+    await handleCancelTask({ action: 'cancel_task', taskId: 'task-1' }, ACTION_SESSION, db, 'out-cancel');
+
+    expect(getScheduledTask('ag-1', 'task-1')).toMatchObject({
+      status: 'cancelled',
+      recurrence: null,
+      projected_session_id: null,
+      projected_message_id: null,
+    });
+    expect(db.prepare('SELECT status, recurrence FROM messages_in WHERE series_id = ?').get('task-1')).toEqual({
+      status: 'completed',
+      recurrence: null,
+    });
+    db.close();
+  });
+
+  it('pause_task refreshes the projection as paused and prevents due wakes', async () => {
+    const db = freshDb();
+    await handleScheduleTask(
+      scheduleAction({ processAfter: '2020-01-01T00:00:00.000Z' }),
+      ACTION_SESSION,
+      db,
+      'out-schedule',
+    );
+    expect(countDueMessages(db)).toBe(1);
+
+    await handlePauseTask({ action: 'pause_task', taskId: 'task-1' }, ACTION_SESSION, db, 'out-pause');
+
+    expect(getScheduledTask('ag-1', 'task-1')).toMatchObject({
+      status: 'paused',
+      projected_message_id: 'task-task-1-g2',
+    });
+    expect(db.prepare('SELECT id, status FROM messages_in ORDER BY id').all()).toEqual([
+      { id: 'task-task-1-g1', status: 'completed' },
+      { id: 'task-task-1-g2', status: 'paused' },
+    ]);
+    expect(countDueMessages(db)).toBe(0);
+    db.close();
+  });
+
+  it('resume_task refreshes a paused projection as pending', async () => {
+    const db = freshDb();
+    await seedScheduledProjection(db);
+    await handlePauseTask({ action: 'pause_task', taskId: 'task-1' }, ACTION_SESSION, db, 'out-pause');
+
+    await handleResumeTask({ action: 'resume_task', taskId: 'task-1' }, ACTION_SESSION, db, 'out-resume');
+
+    expect(getScheduledTask('ag-1', 'task-1')).toMatchObject({
+      status: 'pending',
+      projected_message_id: 'task-task-1-g3',
+    });
+    expect(db.prepare('SELECT id, status FROM messages_in ORDER BY id').all()).toEqual([
+      { id: 'task-task-1-g1', status: 'completed' },
+      { id: 'task-task-1-g2', status: 'completed' },
+      { id: 'task-task-1-g3', status: 'pending' },
+    ]);
+    db.close();
+  });
+
+  it('update_task changes central content and refreshes the active projection', async () => {
+    const db = freshDb();
+    await seedScheduledProjection(db);
+
+    await handleUpdateTask(
+      {
+        action: 'update_task',
+        taskId: 'task-1',
+        prompt: 'updated heartbeat',
+        script: 'echo ok',
+        processAfter: '2026-06-07T12:00:00.000Z',
+        recurrence: null,
+      },
+      ACTION_SESSION,
+      db,
+      'out-update',
+    );
+
+    const task = getScheduledTask('ag-1', 'task-1')!;
+    expect(task).toMatchObject({
+      status: 'pending',
+      recurrence: null,
+      process_after: '2026-06-07T12:00:00.000Z',
+      projected_message_id: 'task-task-1-g2',
+    });
+    expect(JSON.parse(task.content)).toEqual({ prompt: 'updated heartbeat', script: 'echo ok' });
+    expect(db.prepare('SELECT id, process_after, recurrence, content FROM messages_in WHERE status = ?').get('pending')).toEqual({
+      id: 'task-task-1-g2',
+      process_after: '2026-06-07T12:00:00.000Z',
+      recurrence: null,
+      content: JSON.stringify({ prompt: 'updated heartbeat', script: 'echo ok' }),
+    });
+    db.close();
+  });
 });
 
 describe('insertTask', () => {

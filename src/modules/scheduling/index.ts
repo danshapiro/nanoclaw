@@ -5,7 +5,8 @@
  *   - Five delivery action handlers: schedule_task, cancel_task, pause_task,
  *     resume_task, update_task. The container's scheduling MCP tools
  *     (container/agent-runner/src/mcp-tools/scheduling.ts) write system
- *     messages with these actions; the host applies them to inbound.db.
+ *     messages with these actions; the host applies them to the central
+ *     scheduler ledger and projects live tasks into inbound.db.
  *
  * Host integration points (filled by MODULE-HOOK markers, validated here
  * with the scheduling module shipping inline):
@@ -15,8 +16,8 @@
  *     runs `applyPreTaskScripts` before the provider call so tasks carrying
  *     a pre-agent script can gate their own execution.
  *
- * No DB migration — tasks are `messages_in` rows with `kind='task'`, so the
- * module piggybacks on the core schema.
+ * Durable scheduler intent lives in central scheduler tables. Per-session
+ * `messages_in.kind='task'` rows are active-session projections.
  */
 import { registerDeliveryAction } from '../../delivery.js';
 import {
