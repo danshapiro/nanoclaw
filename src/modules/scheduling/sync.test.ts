@@ -285,6 +285,62 @@ describe('syncSessionSchedulerState', () => {
     outDb.close();
   });
 
+  it('fails an invalid recurring completion without blocking other projected tasks', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+    const { inDb, outDb } = freshDbs();
+    const s = session();
+
+    await withSchedulerLock((owner) => {
+      const invalidMessageId = seedProjectedTask(inDb, owner, s, {
+        seriesId: 'task-invalid',
+        recurrence: 'not a cron',
+        processAfter: '2025-12-31T17:00:00.000Z',
+      });
+      const validMessageId = seedProjectedTask(inDb, owner, s, {
+        seriesId: 'task-valid',
+        recurrence: '0 9 * * *',
+        processAfter: '2025-12-31T17:00:00.000Z',
+      });
+      insertAck(outDb, invalidMessageId, 'completed');
+      insertAck(outDb, validMessageId, 'completed');
+
+      syncSessionSchedulerState(inDb, outDb, s, owner);
+    });
+
+    expect(getScheduledTask('ag-1', 'task-invalid')).toMatchObject({
+      status: 'failed',
+      projected_session_id: null,
+      projected_message_id: null,
+      last_error: expect.stringContaining('Invalid recurrence'),
+    });
+    expect(getScheduledTask('ag-1', 'task-valid')).toMatchObject({
+      status: 'pending',
+      generation: 2,
+      process_after: '2026-01-01T17:00:00.000Z',
+      projected_session_id: 'sess-1',
+      projected_message_id: 'task-task-valid-g2',
+    });
+    expect(
+      inDb.prepare('SELECT id, status, recurrence FROM messages_in WHERE series_id = ? ORDER BY id').all('task-invalid'),
+    ).toEqual([{ id: 'task-task-invalid-g1', status: 'completed', recurrence: null }]);
+    expect(
+      inDb.prepare('SELECT id, status, recurrence FROM messages_in WHERE series_id = ? ORDER BY id').all('task-valid'),
+    ).toEqual([
+      { id: 'task-task-valid-g1', status: 'completed', recurrence: null },
+      { id: 'task-task-valid-g2', status: 'pending', recurrence: '0 9 * * *' },
+    ]);
+    expect(incidentRows()).toHaveLength(1);
+    expect(incidentRows()[0]).toMatchObject({
+      severity: 'error',
+      status: 'pending',
+      series_id: 'task-invalid',
+    });
+    expect(incidentRows()[0].dedupe_key).toContain('invalid-recurrence');
+    inDb.close();
+    outDb.close();
+  });
+
   it('marks a projected task failed only when the failed ack has terminal notice proof', async () => {
     const { inDb, outDb } = freshDbs();
     const s = session();

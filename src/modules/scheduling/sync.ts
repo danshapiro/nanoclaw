@@ -210,7 +210,9 @@ function syncCompletedProjection(
   task: ScheduledTaskRow,
   owner: RuntimeLockOwner,
 ): void {
-  const nextRun = task.recurrence ? nextScheduledRun(task.recurrence) : null;
+  const nextRun = computeNextRunOrFailTask(inDb, session, row, task, owner);
+  if (nextRun === undefined) return;
+
   completeScheduledTask(
     session.agent_group_id,
     row.series_id,
@@ -232,6 +234,58 @@ function syncCompletedProjection(
     messageId: row.id,
     nextRun,
   });
+}
+
+function computeNextRunOrFailTask(
+  inDb: Database.Database,
+  session: Session,
+  row: ProjectionRow,
+  task: ScheduledTaskRow,
+  owner: RuntimeLockOwner,
+): string | null | undefined {
+  if (!task.recurrence) return null;
+
+  try {
+    return nextScheduledRun(task.recurrence);
+  } catch (err) {
+    const message = `Scheduled task "${row.series_id}" has an invalid recurrence expression and cannot be rescheduled.`;
+    const error = errorMessage(err);
+    failScheduledTask(
+      session.agent_group_id,
+      row.series_id,
+      {
+        sessionId: session.id,
+        messageId: row.id,
+        error: `Invalid recurrence "${task.recurrence}": ${error}`,
+      },
+      owner,
+    );
+    recordSchedulerIncident({
+      owner,
+      dedupeKey: `scheduler-sync:${session.agent_group_id}:${row.series_id}:${row.id}:invalid-recurrence`,
+      severity: 'error',
+      session,
+      seriesId: row.series_id,
+      message,
+      details: {
+        reason: 'invalid-recurrence',
+        messageId: row.id,
+        recurrence: task.recurrence,
+        err: error,
+      },
+    });
+    retireProjection(inDb, row.series_id);
+    clearCompletedProjectionRecurrence(inDb, row.id);
+    log.error('Scheduler projection recurrence invalid', {
+      sessionId: session.id,
+      agentGroupId: session.agent_group_id,
+      seriesId: row.series_id,
+      messageId: row.id,
+      recurrence: task.recurrence,
+      err,
+    });
+    return undefined;
+  }
 }
 
 function repairInvalidFailedProjection(
@@ -258,52 +312,86 @@ export function syncSessionSchedulerState(
   const acks = outDb ? getProcessingAcksForProjectedTasks(outDb, projected.map((row) => row.id)) : new Map();
 
   for (const row of projected) {
-    const task = getScheduledTask(session.agent_group_id, row.series_id);
-    if (!isLiveProjectedTask(task, session, row)) continue;
+    try {
+      const task = getScheduledTask(session.agent_group_id, row.series_id);
+      if (!isLiveProjectedTask(task, session, row)) continue;
 
-    const ack = acks.get(row.id) ?? null;
-    if (ack?.status === 'processing') continue;
+      const ack = acks.get(row.id) ?? null;
+      if (ack?.status === 'processing') continue;
 
-    const inboundCompleted = row.status === 'completed';
-    if (ack?.status === 'failed') {
-      if (!failedAckHasTerminalNotice(outDb, ack.notice_message_out_id)) {
-        recordInvalidSchedulerAck(session, row, ack, owner);
-        repairInvalidFailedProjection(inDb, session, row, owner);
+      const inboundCompleted = row.status === 'completed';
+      if (ack?.status === 'failed') {
+        if (!failedAckHasTerminalNotice(outDb, ack.notice_message_out_id)) {
+          recordInvalidSchedulerAck(session, row, ack, owner);
+          repairInvalidFailedProjection(inDb, session, row, owner);
+          continue;
+        }
+
+        failScheduledTask(
+          session.agent_group_id,
+          row.series_id,
+          {
+            sessionId: session.id,
+            messageId: row.id,
+            error: `Failed ack had terminal notice ${ack.notice_message_out_id}`,
+          },
+          owner,
+        );
+        recordTerminalFailureIncident(session, row, ack, owner);
+        retireProjection(inDb, row.series_id);
+        clearCompletedProjectionRecurrence(inDb, row.id);
+        log.info('Scheduler projection failure synced', {
+          sessionId: session.id,
+          agentGroupId: session.agent_group_id,
+          seriesId: row.series_id,
+          messageId: row.id,
+          noticeMessageOutId: ack.notice_message_out_id,
+        });
         continue;
       }
 
-      failScheduledTask(
-        session.agent_group_id,
-        row.series_id,
-        {
-          sessionId: session.id,
-          messageId: row.id,
-          error: `Failed ack had terminal notice ${ack.notice_message_out_id}`,
-        },
-        owner,
-      );
-      recordTerminalFailureIncident(session, row, ack, owner);
-      retireProjection(inDb, row.series_id);
-      clearCompletedProjectionRecurrence(inDb, row.id);
-      log.info('Scheduler projection failure synced', {
+      if (inboundCompleted || ack?.status === 'completed') {
+        syncCompletedProjection(inDb, session, row, task, owner);
+        continue;
+      }
+
+      if (ack?.status === 'recovery') {
+        recordUnresolvedSchedulerAck(session, row, 'recovery', owner);
+      }
+    } catch (err) {
+      recordProjectionSyncError(session, row, err, owner);
+      log.error('Scheduler projection row sync failed', {
         sessionId: session.id,
         agentGroupId: session.agent_group_id,
         seriesId: row.series_id,
         messageId: row.id,
-        noticeMessageOutId: ack.notice_message_out_id,
+        err,
       });
-      continue;
-    }
-
-    if (inboundCompleted || ack?.status === 'completed') {
-      syncCompletedProjection(inDb, session, row, task, owner);
-      continue;
-    }
-
-    if (ack?.status === 'recovery') {
-      recordUnresolvedSchedulerAck(session, row, 'recovery', owner);
     }
   }
+}
+
+function recordProjectionSyncError(
+  session: Session,
+  row: ProjectionRow,
+  err: unknown,
+  owner: RuntimeLockOwner,
+): void {
+  recordSchedulerIncident({
+    owner,
+    dedupeKey: `scheduler-sync:${session.agent_group_id}:${row.series_id}:${row.id}:row-error`,
+    severity: 'error',
+    session,
+    seriesId: row.series_id,
+    message: `Scheduled task "${row.series_id}" hit an internal sync error; other scheduled tasks will continue syncing.`,
+    details: {
+      reason: 'projection-row-sync-error',
+      messageId: row.id,
+      rowStatus: row.status,
+      recurrence: row.recurrence,
+      err: errorMessage(err),
+    },
+  });
 }
 
 export function resolveProjectionContext(session: Session): ProjectionContext | null {
@@ -408,4 +496,8 @@ export function ensureSessionSchedulerProjections(
     });
   }
   return projected;
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }

@@ -201,6 +201,48 @@ describe('importLegacyActiveTasks', () => {
     }
   });
 
+  it('reports malformed completed recurring rows without blocking other legacy imports', async () => {
+    const { session } = resolveSession('ag-yente', 'mg-discord', 'thread-1', 'per-thread');
+    const inDb = openInboundDb(session.agent_group_id, session.id);
+    try {
+      insertLegacyTask(inDb, {
+        id: 'legacy-invalid-recurring',
+        seriesId: 'series-invalid-recurring',
+        status: 'completed',
+        processAfter: '2025-12-31T17:00:00.000Z',
+        recurrence: 'not a cron',
+        seq: 2,
+      });
+      insertLegacyTask(inDb, {
+        id: 'legacy-still-imported',
+        seriesId: 'series-still-imported',
+        status: 'pending',
+        processAfter: '2026-06-06T12:00:00.000Z',
+        recurrence: null,
+        seq: 3,
+      });
+
+      const imported = await withSchedulerLock((owner) => importLegacyActiveTasks(inDb, session, owner));
+
+      expect(imported).toBe(1);
+      expect(getScheduledTask('ag-yente', 'series-invalid-recurring')).toBeUndefined();
+      expect(getScheduledTask('ag-yente', 'series-still-imported')).toMatchObject({
+        status: 'pending',
+        process_after: '2026-06-06T12:00:00.000Z',
+        projected_session_id: session.id,
+        projected_message_id: 'legacy-still-imported',
+      });
+      expect(incidentKeys()).toEqual([`legacy-invalid-recurrence:${session.id}:legacy-invalid-recurring`]);
+      expect(incidentDetails(`legacy-invalid-recurrence:${session.id}:legacy-invalid-recurring`)).toMatchObject({
+        reason: 'invalid-recurrence',
+        messageId: 'legacy-invalid-recurring',
+        recurrence: 'not a cron',
+      });
+    } finally {
+      inDb.close();
+    }
+  });
+
   it('skips and reports active legacy rows whose central session is missing', async () => {
     const session = fakeSession({ id: 'sess-missing-central' });
     initSessionFolder(session.agent_group_id, session.id);

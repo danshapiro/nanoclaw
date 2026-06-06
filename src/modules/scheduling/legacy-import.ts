@@ -69,7 +69,9 @@ export async function importLegacyActiveTasks(
       continue;
     }
     const completedRecurring = row.status === 'completed';
-    const processAfter = completedRecurring && row.recurrence ? nextScheduledRun(row.recurrence) : row.process_after;
+    const processAfter = completedRecurring
+      ? computeNextLegacyRunOrReport(session, seriesId, row, owner)
+      : row.process_after;
     if (!processAfter) continue;
     const importStatus: 'pending' | 'paused' = row.status === 'paused' ? 'paused' : 'pending';
 
@@ -100,6 +102,41 @@ export async function importLegacyActiveTasks(
     }
   }
   return imported;
+}
+
+function computeNextLegacyRunOrReport(
+  session: Session,
+  seriesId: string,
+  row: LegacyActiveTaskRow,
+  owner: RuntimeLockOwner,
+): string | null {
+  if (!row.recurrence) return null;
+  try {
+    return nextScheduledRun(row.recurrence);
+  } catch (err) {
+    recordSchedulerIncidentWithOwner(
+      {
+        dedupeKey: `legacy-invalid-recurrence:${session.id}:${row.id}`,
+        severity: 'warn',
+        message: `Found completed recurring legacy task ${seriesId} in session ${session.id}, but its recurrence expression is invalid. It was not imported.`,
+        agentGroupId: session.agent_group_id,
+        seriesId,
+        sessionId: session.id,
+        messagingGroupId: row.messaging_group_id ?? session.messaging_group_id,
+        channelType: row.channel_type,
+        platformId: row.platform_id,
+        threadId: row.thread_id ?? session.thread_id,
+        details: {
+          reason: 'invalid-recurrence',
+          messageId: row.id,
+          recurrence: row.recurrence,
+          err: errorMessage(err),
+        },
+      },
+      owner,
+    );
+    return null;
+  }
 }
 
 export async function reportUnsafeLegacyArchivedTask(args: {
@@ -173,4 +210,8 @@ function reportInvalidLegacyTaskRefs(
     },
     owner,
   );
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }

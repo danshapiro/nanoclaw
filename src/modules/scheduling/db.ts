@@ -1,15 +1,15 @@
 /**
- * Legacy task projection helpers used by the scheduling module.
+ * Legacy task projection helpers.
  *
  * Durable scheduled-task state now lives in the central scheduler ledger
- * (`ledger.ts`). These helpers remain only for existing action/recurrence
- * code paths until they are moved to central ledger writes plus explicit
- * projections.
+ * (`ledger.ts`). These functions are retained for compatibility coverage of
+ * the old projection-only task model; production scheduling writes go through
+ * central ledger mutations plus explicit projections.
  *
  * cancel/pause/resume match any live row in the series, not just the exact id.
- * Recurring tasks get a new row per occurrence (see handleRecurrence), all
- * sharing series_id. Matching by id alone would only hit the completed row
- * the agent remembers, missing the live next occurrence.
+ * Historical recurring tasks got a new row per occurrence, all sharing
+ * series_id. Matching by id alone would only hit the completed row the agent
+ * remembers, missing the live next occurrence.
  */
 import type Database from 'better-sqlite3';
 
