@@ -17,6 +17,7 @@ import {
   initSessionFolder,
   openInboundDb,
   resolveSession,
+  sessionDir,
   type SessionMode,
 } from '../../session-manager.js';
 import { createOrReplaceScheduledTask, getScheduledTask } from './ledger.js';
@@ -60,6 +61,15 @@ describe('repairSchedulerProjections', () => {
       projected_session_id: session.id,
       projected_message_id: 'task-task-live-g1',
     });
+  });
+
+  it('skips stale active session rows when the session directory is missing', async () => {
+    const { session } = resolveSession('ag-yente', 'mg-discord', 'thread-1', 'per-thread');
+    fs.rmSync(sessionDir(session.agent_group_id, session.id), { recursive: true, force: true });
+
+    await repairSchedulerProjections();
+
+    expect(incidentKeys()).toEqual([]);
   });
 
   it('does not resurrect archived live rows when central task state is terminal', async () => {

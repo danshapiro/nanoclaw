@@ -34,6 +34,9 @@ export async function repairSchedulerProjections(): Promise<void> {
 async function repairActiveSessionProjections(session: Session): Promise<void> {
   let inDb: Database.Database | null = null;
   try {
+    if (!fs.existsSync(inboundDbPath(session.agent_group_id, session.id))) {
+      return;
+    }
     inDb = openInboundDb(session.agent_group_id, session.id);
     await withRuntimeLock('scheduler-mutator', 120_000, async (owner) => {
       ensureSessionSchedulerProjections(inDb!, session, resolveProjectionContext(session), owner);
