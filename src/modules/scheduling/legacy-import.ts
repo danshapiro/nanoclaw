@@ -112,7 +112,9 @@ function validateSchedulerRefs(
 ): { valid: true } | { valid: false; reason: string } {
   const centralSession = getSession(session.id);
   if (!centralSession) return { valid: false, reason: 'missing-session' };
-  if (centralSession.status !== 'active') return { valid: false, reason: 'session-not-active' };
+  if (centralSession.status !== 'active' && centralSession.status !== 'resetting') {
+    return { valid: false, reason: 'session-not-active' };
+  }
   if (!getAgentGroup(session.agent_group_id)) return { valid: false, reason: 'missing-agent-group' };
 
   const messagingGroupId = row.messaging_group_id ?? session.messaging_group_id;

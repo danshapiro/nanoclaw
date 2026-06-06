@@ -6,6 +6,7 @@ import { withRuntimeLock, type RuntimeLockOwner } from '../db/runtime-locks.js';
 import { createSession, getSession } from '../db/sessions.js';
 import { log } from '../log.js';
 import { drainSchedulingActionsFromStoppedSession } from '../modules/scheduling/drain.js';
+import { importLegacyActiveTasks } from '../modules/scheduling/legacy-import.js';
 import {
   ensureSessionSchedulerProjections,
   resolveProjectionContext,
@@ -300,7 +301,7 @@ async function runSchedulerResetPhases(
   }
 
   if (!phaseAtLeast(phase, 'old-synced')) {
-    syncOldSchedulerState(oldSession, owner);
+    await syncOldSchedulerState(oldSession, owner);
     phase = recordPhase(args, 'old-synced', state);
   }
 
@@ -377,7 +378,7 @@ function ensureFreshSession(
   return fresh;
 }
 
-function syncOldSchedulerState(session: Session, owner: RuntimeLockOwner): void {
+async function syncOldSchedulerState(session: Session, owner: RuntimeLockOwner): Promise<void> {
   const inDb = openInboundDb(session.agent_group_id, session.id);
   let outDb: Database.Database | null = null;
   try {
@@ -388,6 +389,13 @@ function syncOldSchedulerState(session: Session, owner: RuntimeLockOwner): void 
         sessionId: session.id,
         agentGroupId: session.agent_group_id,
         err,
+      });
+    }
+    const imported = await importLegacyActiveTasks(inDb, session, owner);
+    if (imported > 0) {
+      log.info('Imported active legacy scheduled tasks during scheduler reset', {
+        sessionId: session.id,
+        imported,
       });
     }
     syncSessionSchedulerState(inDb, outDb, session, owner);

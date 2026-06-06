@@ -137,6 +137,57 @@ describe('resetYenteSessionPreservingScheduler', () => {
     expect(supersessionPhase(oldSession.id)).toBe('fresh-activated');
   });
 
+  it('imports active legacy scheduled rows before resetting the old session', async () => {
+    const { session: oldSession } = resolveSession('ag-yente', 'mg-discord', 'thread-1', 'per-thread');
+    insertLegacyTask(oldSession.id, {
+      id: 'legacy-reset-row',
+      seriesId: 'legacy-reset-task',
+      processAfter: '2026-06-08T12:00:00.000Z',
+      recurrence: '0 8 * * *',
+      content: JSON.stringify({ prompt: 'legacy survives reset', script: null }),
+    });
+
+    const fresh = await resetYenteSessionPreservingScheduler({
+      command: 'clear',
+      oldSession,
+      sessionMode: 'per-thread',
+      responseAddress: {
+        channelType: 'discord',
+        platformId: 'chan-1',
+        threadId: 'thread-1',
+      },
+    });
+
+    expect(getSession(oldSession.id)?.status).toBe('archived');
+    expect(getSession(fresh.id)?.status).toBe('active');
+    expect(getScheduledTask('ag-yente', 'legacy-reset-task')).toMatchObject({
+      status: 'pending',
+      process_after: '2026-06-08T12:00:00.000Z',
+      recurrence: '0 8 * * *',
+      content: JSON.stringify({ prompt: 'legacy survives reset', script: null }),
+      projected_session_id: fresh.id,
+      projected_message_id: 'task-legacy-reset-task-g1',
+    });
+
+    const freshIn = new Database(inboundDbPath('ag-yente', fresh.id));
+    try {
+      expect(
+        freshIn.prepare("SELECT id, series_id, status, recurrence FROM messages_in WHERE kind = 'task'").all(),
+      ).toEqual([
+        {
+          id: 'task-legacy-reset-task-g1',
+          series_id: 'legacy-reset-task',
+          status: 'pending',
+          recurrence: '0 8 * * *',
+        },
+      ]);
+    } finally {
+      freshIn.close();
+    }
+    expect(supersessionPhase(oldSession.id)).toBe('fresh-activated');
+    expect(incidentKeys()).toEqual([]);
+  });
+
   it('blocks competing route session creation while a supersession is unfinished', () => {
     const { session: oldSession } = resolveSession('ag-yente', 'mg-discord', 'thread-1', 'per-thread');
     updateSession(oldSession.id, { status: 'resetting' });
@@ -338,10 +389,80 @@ function seedRoute(): void {
   });
 }
 
+function insertLegacyTask(
+  sessionId: string,
+  overrides: Partial<{
+    id: string;
+    seriesId: string | null;
+    status: 'pending' | 'paused';
+    processAfter: string;
+    recurrence: string | null;
+    content: string;
+  }> = {},
+): void {
+  const row = {
+    id: 'legacy-task',
+    seriesId: 'legacy-task',
+    status: 'pending' as const,
+    processAfter: '2026-06-06T12:00:00.000Z',
+    recurrence: null,
+    content: JSON.stringify({ prompt: 'legacy heartbeat', script: null }),
+    ...overrides,
+  };
+  const db = new Database(inboundDbPath('ag-yente', sessionId));
+  try {
+    db.prepare(
+      `INSERT INTO messages_in (
+         id,
+         seq,
+         kind,
+         timestamp,
+         status,
+         process_after,
+         recurrence,
+         trigger,
+         platform_id,
+         channel_type,
+         thread_id,
+         messaging_group_id,
+         is_group,
+         content,
+         series_id
+       ) VALUES (
+         @id,
+         2,
+         'task',
+         @timestamp,
+         @status,
+         @processAfter,
+         @recurrence,
+         1,
+         'chan-1',
+         'discord',
+         'thread-1',
+         'mg-discord',
+         1,
+         @content,
+         @seriesId
+       )`,
+    ).run({ ...row, timestamp: now() });
+  } finally {
+    db.close();
+  }
+}
+
 function supersessionPhase(oldSessionId: string): string | undefined {
   return (
     getDb()
       .prepare('SELECT phase FROM scheduler_session_supersessions WHERE old_session_id = ?')
       .get(oldSessionId) as { phase: string } | undefined
   )?.phase;
+}
+
+function incidentKeys(): string[] {
+  return (
+    getDb().prepare('SELECT dedupe_key FROM scheduler_incidents ORDER BY dedupe_key').all() as Array<{
+      dedupe_key: string;
+    }>
+  ).map((row) => row.dedupe_key);
 }
