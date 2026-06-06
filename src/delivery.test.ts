@@ -32,6 +32,7 @@ import { resolveSession, outboundDbPath, inboundDbPath } from './session-manager
 import {
   deliverSessionMessages,
   dropInactiveSessionOutbound,
+  quiesceSessionDelivery,
   setDeliveryAdapter,
   suppressSessionOutbound,
 } from './delivery.js';
@@ -65,6 +66,20 @@ function insertOutbound(agentGroupId: string, sessionId: string, msgId: string, 
     `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, thread_id, content)
      VALUES (?, datetime('now'), 'chat', 'telegram:123', 'telegram', NULL, ?)`,
   ).run(msgId, JSON.stringify({ text }));
+  db.close();
+}
+
+function insertSchedulingOutbound(
+  agentGroupId: string,
+  sessionId: string,
+  msgId: string,
+  action: Record<string, unknown> = { action: 'schedule_task', taskId: 'task-1' },
+): void {
+  const db = new Database(outboundDbPath(agentGroupId, sessionId));
+  db.prepare(
+    `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, thread_id, content)
+     VALUES (?, datetime('now'), 'system', 'telegram:123', 'telegram', NULL, ?)`,
+  ).run(msgId, JSON.stringify(action));
   db.close();
 }
 
@@ -263,6 +278,98 @@ describe('deliverSessionMessages — concurrent invocations', () => {
 
     await expect(dropInactiveSessionOutbound(session.id, 'yente-session-reset')).resolves.toBe(0);
     expect(delivered).toEqual([]);
+  });
+
+  it('quiesces delivery without marking undelivered rows itself', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-1', 'first');
+
+    const deliveryStarted = deferred();
+    const deliveryRelease = deferred();
+    let quiesceResolved = false;
+    setDeliveryAdapter({
+      async deliver() {
+        deliveryStarted.resolve();
+        await deliveryRelease.promise;
+        return 'platform-first';
+      },
+    });
+
+    const delivery = deliverSessionMessages(session);
+    await deliveryStarted.promise;
+
+    const quiesce = quiesceSessionDelivery(session.id, 'scheduler-reset-drain').then(() => {
+      quiesceResolved = true;
+    });
+    await Promise.resolve();
+
+    expect(quiesceResolved).toBe(false);
+    deliveryRelease.resolve();
+    await delivery;
+    await quiesce;
+
+    insertOutbound('ag-1', session.id, 'out-2', 'second');
+    await deliverSessionMessages(session);
+
+    expect(deliveredRows('ag-1', session.id)).toEqual([
+      { message_out_id: 'out-1', platform_message_id: 'platform-first', status: 'delivered' },
+      { message_out_id: 'out-2', platform_message_id: null, status: 'delivered' },
+    ]);
+  });
+
+  it('suppresses remaining in-flight chat rows but preserves scheduler actions for reset drain', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-1', 'first');
+    insertOutbound('ag-1', session.id, 'out-2', 'second');
+    insertSchedulingOutbound('ag-1', session.id, 'out-schedule', {
+      action: 'schedule_task',
+      taskId: 'task-1',
+      prompt: 'heartbeat',
+      processAfter: '2026-06-06T12:00:00.000Z',
+    });
+
+    const deliveryStarted = deferred();
+    const deliveryRelease = deferred();
+    setDeliveryAdapter({
+      async deliver() {
+        deliveryStarted.resolve();
+        await deliveryRelease.promise;
+        return 'platform-first';
+      },
+    });
+
+    const delivery = deliverSessionMessages(session);
+    await deliveryStarted.promise;
+    const quiesce = quiesceSessionDelivery(session.id, 'scheduler-reset-drain');
+    deliveryRelease.resolve();
+    await delivery;
+    await quiesce;
+
+    expect(deliveredRows('ag-1', session.id)).toEqual([
+      { message_out_id: 'out-1', platform_message_id: 'platform-first', status: 'delivered' },
+      { message_out_id: 'out-2', platform_message_id: null, status: 'delivered' },
+    ]);
+  });
+
+  it('does not stale-drop scheduling system actions during inactive suppression', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    archiveSession(session.id);
+    insertOutbound('ag-1', session.id, 'stale-chat', 'stale chat');
+    insertSchedulingOutbound('ag-1', session.id, 'stale-schedule', {
+      action: 'schedule_task',
+      taskId: 'task-1',
+      prompt: 'heartbeat',
+      processAfter: '2026-06-06T12:00:00.000Z',
+    });
+
+    await expect(suppressSessionOutbound(session.id, 'yente-session-reset')).resolves.toBe(1);
+
+    expect(deliveredRows('ag-1', session.id)).toEqual([
+      { message_out_id: 'stale-chat', platform_message_id: null, status: 'delivered' },
+    ]);
   });
 });
 

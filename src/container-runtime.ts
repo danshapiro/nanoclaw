@@ -72,6 +72,26 @@ export function isContainerRunningAsync(name: string): Promise<boolean> {
   });
 }
 
+export function isContainerWithLabelRunningAsync(label: string): Promise<boolean> {
+  if (!/^[a-zA-Z0-9_.-]+=[a-zA-Z0-9_.:-]+$/.test(label)) {
+    return Promise.reject(new Error(`Invalid container label filter: ${label}`));
+  }
+  return new Promise((resolve, reject) => {
+    execFile(
+      CONTAINER_RUNTIME_BIN,
+      ['ps', '--filter', `label=${label}`, '--format', '{{.Names}}'],
+      { timeout: 5000 },
+      (err, stdout) => {
+        if (err) {
+          reject(err);
+          return;
+        }
+        resolve(stdout.trim().split('\n').filter(Boolean).length > 0);
+      },
+    );
+  });
+}
+
 /** Ensure the container runtime is running, starting it if needed. */
 export function ensureContainerRuntimeRunning(): void {
   try {

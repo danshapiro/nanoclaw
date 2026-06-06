@@ -16,6 +16,7 @@ import {
 import { findSessionForAgent, getSession, getSessionsByAgentGroup } from './db/sessions.js';
 import { setDeliveryAdapter } from './delivery.js';
 import { inboundDbPath, outboundDbPath, writeOutboundDirect } from './session-manager.js';
+import { getScheduledTask } from './modules/scheduling/ledger.js';
 
 const cleanupContainerForSessionMock = vi.hoisted(() => vi.fn().mockResolvedValue(true));
 
@@ -25,6 +26,7 @@ vi.mock('./container-runner.js', () => ({
   getActiveContainerCount: vi.fn().mockReturnValue(0),
   killContainer: vi.fn(),
   cleanupContainerForSession: cleanupContainerForSessionMock,
+  isSessionOutboundWriterRunning: vi.fn().mockResolvedValue(false),
 }));
 
 vi.mock('./config.js', async () => {
@@ -485,6 +487,54 @@ describe('Yente host command routing', () => {
       expect(deliveredTexts).not.toContain('late old output');
       expect(deliveredRows(original.id)).toContainEqual({
         message_out_id: 'late-old-session-outbound',
+        platform_message_id: null,
+        status: 'delivered',
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('applies late scheduling actions from the superseded session before stale cleanup', async () => {
+    vi.useFakeTimers();
+    try {
+      const { routeInbound } = await import('./router.js');
+
+      await routeInbound(event('hello first', 'msg-first-before-schedule-drain'));
+      const original = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
+      await routeInbound(event('/new', 'msg-new-schedule-drain'));
+
+      writeOutboundDirect('ag-yente', original.id, {
+        id: 'late-old-session-schedule',
+        kind: 'system',
+        platformId: DISCORD_PLATFORM_ID,
+        channelType: 'discord',
+        threadId: DISCORD_THREAD_ID,
+        content: JSON.stringify({
+          action: 'schedule_task',
+          taskId: 'task-reset-survives',
+          prompt: 'heartbeat',
+          script: null,
+          processAfter: '2026-06-06T12:00:00.000Z',
+          recurrence: null,
+          platformId: DISCORD_PLATFORM_ID,
+          channelType: 'discord',
+          threadId: DISCORD_THREAD_ID,
+          messagingGroupId: 'mg-discord',
+          isGroup: 1,
+        }),
+      });
+
+      await vi.runOnlyPendingTimersAsync();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(getScheduledTask('ag-yente', 'task-reset-survives')).toMatchObject({
+        status: 'pending',
+        process_after: '2026-06-06T12:00:00.000Z',
+      });
+      expect(deliveredRows(original.id)).toContainEqual({
+        message_out_id: 'late-old-session-schedule',
         platform_message_id: null,
         status: 'delivered',
       });

@@ -669,6 +669,22 @@ describe('session wake lifecycle', () => {
     }
   });
 
+  it('labels spawned containers with the owning session id', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      const wake = harness.containerRunner.wakeContainer(harness.session);
+      await harness.oneCliStarted.promise;
+      harness.oneCliRelease.resolve();
+      await wake;
+
+      const args = harness.spawnMock.mock.calls[0][1];
+      expect(args).toContain('--label');
+      expect(args).toContain(`nanoclaw-session=${harness.session.id}`);
+    } finally {
+      harness.close();
+    }
+  });
+
   it('stops the active container for a superseded session asynchronously', async () => {
     const harness = await loadContainerRunnerHarness();
     try {
@@ -689,6 +705,26 @@ describe('session wake lifecycle', () => {
         expect.any(Function),
       );
     } finally {
+      harness.close();
+    }
+  });
+
+  it('finalizes cleanup when Docker reports the stopped container is gone before child close', async () => {
+    const harness = await loadContainerRunnerHarness();
+    const processKill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    try {
+      const wake = harness.containerRunner.wakeContainer(harness.session);
+      await harness.oneCliStarted.promise;
+      harness.oneCliRelease.resolve();
+      await wake;
+
+      await expect(
+        harness.containerRunner.cleanupContainerForSession(harness.session.id, 'yente-session-reset'),
+      ).resolves.toBe(true);
+
+      await expect(harness.containerRunner.isSessionOutboundWriterRunning(harness.session)).resolves.toBe(false);
+    } finally {
+      processKill.mockRestore();
       harness.close();
     }
   });
@@ -741,6 +777,39 @@ describe('session wake lifecycle', () => {
       expect(harness.spawnedProcesses[0].kill).toHaveBeenCalledWith('SIGKILL');
     } finally {
       processKill.mockRestore();
+      harness.close();
+    }
+  });
+
+  it('does not treat stale host process liveness as an outbound writer after Docker verifies stop', async () => {
+    const harness = await loadContainerRunnerHarness();
+    const processKill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    try {
+      const wake = harness.containerRunner.wakeContainer(harness.session);
+      await harness.oneCliStarted.promise;
+      harness.oneCliRelease.resolve();
+      await wake;
+
+      await expect(harness.containerRunner.isSessionOutboundWriterRunning(harness.session)).resolves.toBe(false);
+    } finally {
+      processKill.mockRestore();
+      harness.close();
+    }
+  });
+
+  it('detects session outbound writers by runtime label when the process map is empty', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      harness.execFileMock.mockImplementation((_file, args: string[], _options, cb) => {
+        if (args[0] === 'ps' && args.includes(`label=nanoclaw-session=${harness.session.id}`)) {
+          cb(null, 'nanoclaw-v2-agent-123\n', '');
+          return;
+        }
+        cb(null, '', '');
+      });
+
+      await expect(harness.containerRunner.isSessionOutboundWriterRunning(harness.session)).resolves.toBe(true);
+    } finally {
       harness.close();
     }
   });

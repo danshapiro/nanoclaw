@@ -30,6 +30,7 @@ import type { Session } from './types.js';
 const ACTIVE_POLL_MS = 1000;
 const SWEEP_POLL_MS = 60_000;
 const MAX_DELIVERY_ATTEMPTS = 3;
+const SCHEDULING_ACTIONS = new Set(['schedule_task', 'cancel_task', 'pause_task', 'resume_task', 'update_task']);
 
 /** Track delivery attempt counts. Resets on process restart (gives failed messages a fresh chance). */
 const deliveryAttempts = new Map<string, number>();
@@ -188,6 +189,20 @@ export async function suppressSessionOutbound(sessionId: string, reason: string)
   return dropInactiveSessionOutbound(sessionId, reason);
 }
 
+export async function quiesceSessionDelivery(sessionId: string, reason: string): Promise<void> {
+  suppressedSessionOutbound.add(sessionId);
+  const activeDelivery = inflightDeliveries.get(sessionId);
+  if (activeDelivery) {
+    await activeDelivery.catch((err) => {
+      log.warn('In-flight delivery failed while quiescing session', {
+        sessionId,
+        reason,
+        err,
+      });
+    });
+  }
+}
+
 type DrainSessionOptions = {
   inactiveOnly?: boolean;
   staleReason?: string;
@@ -203,6 +218,17 @@ function shouldDropSessionOutbound(sessionId: string): boolean {
 
 function markStaleOutboundDropped(inDb: Database.Database, messageId: string): void {
   markDelivered(inDb, messageId, null);
+}
+
+function shouldPreserveForSchedulerDrain(msg: { kind: string; content: string }): boolean {
+  if (msg.kind !== 'system') return false;
+  try {
+    const content = JSON.parse(msg.content) as Record<string, unknown>;
+    return typeof content.action === 'string' && SCHEDULING_ACTIONS.has(content.action);
+  } catch (err) {
+    if (err instanceof SyntaxError) return false;
+    throw err;
+  }
 }
 
 function logStaleOutboundDropped(session: Session, count: number, reason: string): void {
@@ -244,16 +270,20 @@ async function drainSession(session: Session, options: DrainSessionOptions = {})
     migrateDeliveredTable(inDb);
 
     if (shouldDropSessionOutbound(session.id)) {
+      let staleDropCount = 0;
       for (const msg of undelivered) {
+        if (shouldPreserveForSchedulerDrain(msg)) continue;
         markStaleOutboundDropped(inDb, msg.id);
+        staleDropCount++;
       }
-      logStaleOutboundDropped(session, undelivered.length, options.staleReason ?? 'inactive-session-delivery');
-      return undelivered.length;
+      logStaleOutboundDropped(session, staleDropCount, options.staleReason ?? 'inactive-session-delivery');
+      return staleDropCount;
     }
 
     let staleDropCount = 0;
     for (const msg of undelivered) {
       if (shouldDropSessionOutbound(session.id)) {
+        if (shouldPreserveForSchedulerDrain(msg)) continue;
         markStaleOutboundDropped(inDb, msg.id);
         staleDropCount++;
         continue;

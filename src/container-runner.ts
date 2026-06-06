@@ -28,6 +28,7 @@ import {
   hostGatewayArgs,
   readonlyMountArgs,
   isContainerRunningAsync,
+  isContainerWithLabelRunningAsync,
   stopContainer,
   stopContainerAsync,
 } from './container-runtime.js';
@@ -63,11 +64,14 @@ import type { AgentGroup, Session } from './types.js';
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
 
 /** Active containers tracked by session ID. */
-const activeContainers = new Map<string, { process: ChildProcess; containerName: string }>();
+type ActiveContainer = { process: ChildProcess; containerName: string };
+const activeContainers = new Map<string, ActiveContainer>();
 const activeMcpBridges = new Map<string, AgentMcpBridge[]>();
 const containerExitWaiters = new Map<string, Set<() => void>>();
 const CONTAINER_SKILLS_BIN = '/app/skills/.bin';
 const AGENT_CONTAINER_PATH = `${CONTAINER_SKILLS_BIN}:/pnpm/bin:/pnpm:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin`;
+const SESSION_CONTAINER_LABEL_KEY = 'nanoclaw-session';
+const CLEANUP_PROCESS_EXIT_TIMEOUT_MS = 30_000;
 
 /**
  * In-flight wake promises, keyed by session id. Deduplicates concurrent
@@ -199,6 +203,7 @@ async function spawnContainer(session: Session): Promise<void> {
     args = await buildContainerArgs(
       mounts,
       containerName,
+      session.id,
       agentGroup,
       containerConfig,
       provider,
@@ -332,6 +337,7 @@ export async function cleanupContainerForSession(sessionId: string, reason: stri
 
   try {
     await stopContainerAsync(entry.containerName);
+    await verifyContainerProcessExited(sessionId, entry, reason);
     return true;
   } catch (stopErr) {
     let killErr: unknown;
@@ -355,6 +361,7 @@ export async function cleanupContainerForSession(sessionId: string, reason: stri
     }
 
     if (!stillRunning) {
+      await verifyContainerProcessExited(sessionId, entry, reason);
       log.info('Superseded session container already exited during cleanup', {
         sessionId,
         reason,
@@ -369,6 +376,100 @@ export async function cleanupContainerForSession(sessionId: string, reason: stri
       { cause: stopErr },
     );
   }
+}
+
+async function verifyContainerProcessExited(sessionId: string, entry: ActiveContainer, reason: string): Promise<void> {
+  if (!activeContainers.has(sessionId)) return;
+  if (await runtimeReportsSessionStopped(sessionId, entry, reason)) {
+    log.info('Container runtime reports stopped before process exit; finalizing process record', {
+      sessionId,
+      reason,
+      containerName: entry.containerName,
+    });
+    finalizeContainerProcess(sessionId, entry.containerName, null);
+    return;
+  }
+
+  if (await waitForContainerExit(sessionId, CLEANUP_PROCESS_EXIT_TIMEOUT_MS)) return;
+
+  if (await runtimeReportsSessionStopped(sessionId, entry, reason)) {
+    log.warn('Container process exit event missing after cleanup; finalizing stale process record', {
+      sessionId,
+      reason,
+      containerName: entry.containerName,
+    });
+    finalizeContainerProcess(sessionId, entry.containerName, null);
+    return;
+  }
+
+  throw new Error(`Failed to verify container process exit for session ${sessionId}`);
+}
+
+async function runtimeReportsSessionStopped(
+  sessionId: string,
+  entry: Pick<ActiveContainer, 'containerName'>,
+  reason: string,
+): Promise<boolean> {
+  const runningByName = await isContainerRunningAsync(entry.containerName).catch((err) => {
+    log.warn('Failed to inspect stopped container by name', {
+      sessionId,
+      reason,
+      containerName: entry.containerName,
+      err,
+    });
+    return true;
+  });
+  if (runningByName) return false;
+
+  const runningByLabel = await isContainerWithLabelRunningAsync(`${SESSION_CONTAINER_LABEL_KEY}=${sessionId}`).catch(
+    (err) => {
+      log.warn('Failed to inspect stopped container by label', {
+        sessionId,
+        reason,
+        containerName: entry.containerName,
+        err,
+      });
+      return true;
+    },
+  );
+  return !runningByLabel;
+}
+
+export async function isSessionOutboundWriterRunning(session: Session): Promise<boolean> {
+  const entry = activeContainers.get(session.id);
+  if (entry) {
+    const runningByName = await isContainerRunningAsync(entry.containerName).catch((err) => {
+      log.warn('Failed to inspect active session container by name', {
+        sessionId: session.id,
+        containerName: entry.containerName,
+        err,
+      });
+      return true;
+    });
+    if (runningByName) return true;
+
+    const runningByLabel = await isContainerWithLabelRunningAsync(`${SESSION_CONTAINER_LABEL_KEY}=${session.id}`).catch(
+      (err) => {
+        log.warn('Failed to inspect active session container by label', {
+          sessionId: session.id,
+          containerName: entry.containerName,
+          err,
+        });
+        return true;
+      },
+    );
+    if (runningByLabel) return true;
+
+    return false;
+  }
+
+  return await isContainerWithLabelRunningAsync(`${SESSION_CONTAINER_LABEL_KEY}=${session.id}`).catch((err) => {
+    log.warn('Failed to inspect session container by label', {
+      sessionId: session.id,
+      err,
+    });
+    return true;
+  });
 }
 
 /**
@@ -819,13 +920,23 @@ export async function resolveAgentImageForRun(
 async function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
+  sessionId: string,
   agentGroup: AgentGroup,
   containerConfig: import('./container-config.js').ContainerConfig,
   _provider: string,
   providerContribution: ProviderContainerContribution,
   agentIdentifier?: string,
 ): Promise<string[]> {
-  const args: string[] = ['run', '--rm', '--name', containerName, '--label', CONTAINER_INSTALL_LABEL];
+  const args: string[] = [
+    'run',
+    '--rm',
+    '--name',
+    containerName,
+    '--label',
+    CONTAINER_INSTALL_LABEL,
+    '--label',
+    `${SESSION_CONTAINER_LABEL_KEY}=${sessionId}`,
+  ];
 
   // Environment — only vars read by code we don't own.
   // Everything NanoClaw-specific is in container.json (read by runner at startup).

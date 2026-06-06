@@ -622,6 +622,7 @@ export function getContainerState(outDb: Database.Database): ContainerState | nu
 
 export interface OutboundMessage {
   id: string;
+  seq: number | null;
   kind: string;
   platform_id: string | null;
   channel_type: string | null;
@@ -634,7 +635,7 @@ export function getDueOutboundMessages(db: Database.Database): OutboundMessage[]
     .prepare(
       `SELECT * FROM messages_out
        WHERE (deliver_after IS NULL OR deliver_after <= datetime('now'))
-       ORDER BY timestamp ASC`,
+       ORDER BY seq IS NULL, seq ASC, timestamp ASC`,
     )
     .all() as OutboundMessage[];
 }

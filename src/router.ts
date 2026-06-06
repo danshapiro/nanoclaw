@@ -27,7 +27,9 @@ import {
   getMessagingGroupWithAgentCount,
 } from './db/messaging-groups.js';
 import { findActiveSessionThreadIdEndingWithForAgent, findSessionForAgent, getSession } from './db/sessions.js';
+import { withRuntimeLock } from './db/runtime-locks.js';
 import { deliverSessionMessages, dropInactiveSessionOutbound, suppressSessionOutbound } from './delivery.js';
+import { drainSchedulingActionsFromStoppedSession } from './modules/scheduling/drain.js';
 import { startTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { resolveSession, writeSessionMessage, writeOutboundDirect } from './session-manager.js';
@@ -568,6 +570,7 @@ function scheduleSupersededSessionCleanup(args: {
   const timer = setTimeout(() => {
     cleanupContainerForSession(args.supersededSessionId!, `yente-session-${args.command}`)
       .then(async (cleaned) => {
+        await drainSupersededSessionSchedulingActions(args.supersededSessionId!);
         await dropInactiveSessionOutbound(
           args.supersededSessionId!,
           `yente-session-${args.command}-post-cleanup`,
@@ -620,6 +623,14 @@ function scheduleSupersededSessionCleanup(args: {
       });
   }, 0);
   timer.unref?.();
+}
+
+async function drainSupersededSessionSchedulingActions(sessionId: string): Promise<number> {
+  const session = getSession(sessionId);
+  if (!session) return 0;
+  return await withRuntimeLock('scheduler-mutator', 120_000, (owner) =>
+    drainSchedulingActionsFromStoppedSession(session, owner),
+  );
 }
 
 /**
