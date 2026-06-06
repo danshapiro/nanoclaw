@@ -91,7 +91,7 @@ describe('repairSchedulerProjections', () => {
     await repairSchedulerProjections();
 
     expect(projectedRows(active.id)).toEqual([]);
-    expect(incidentKeys()).toEqual([expect.stringMatching(/^legacy-archived-task:/)]);
+    expect(incidentKeys()).toEqual([expect.stringMatching(/^legacy-archived:/)]);
     expect(getScheduledTask('ag-yente', 'task-orphan')).toBeUndefined();
   });
 

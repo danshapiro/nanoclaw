@@ -235,6 +235,26 @@ async function sweepSession(session: Session): Promise<void> {
     // are repaired before the wake decision.
     try {
       await withRuntimeLock('scheduler-mutator', 120_000, async (owner) => {
+        try {
+          const { importLegacyActiveTasks } = await import('./modules/scheduling/legacy-import.js');
+          const imported = await importLegacyActiveTasks(inDb, session, owner);
+          if (imported > 0) {
+            log.info('Imported active legacy scheduled tasks', { sessionId: session.id, imported });
+          }
+        } catch (err) {
+          log.error('Legacy scheduler import failed during host sweep', { sessionId: session.id, err });
+          const { reportSchedulerIncident } = await import('./yente/scheduler-alerts.js');
+          await reportSchedulerIncident({
+            dedupeKey: `legacy-import:${session.id}`,
+            severity: 'error',
+            message: `Scheduler legacy import failed for session ${session.id}. Scheduled tasks may be delayed until import succeeds.`,
+            agentGroupId: session.agent_group_id,
+            sessionId: session.id,
+            messagingGroupId: session.messaging_group_id,
+            threadId: session.thread_id,
+            details: { err: err instanceof Error ? err.message : String(err) },
+          });
+        }
         syncSessionSchedulerState(inDb, outDb, session, owner);
         ensureSessionSchedulerProjections(inDb, session, resolveProjectionContext(session), owner);
       });

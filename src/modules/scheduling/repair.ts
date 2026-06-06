@@ -8,6 +8,7 @@ import { log } from '../../log.js';
 import { inboundDbPath, openInboundDb } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { reportSchedulerIncident } from '../../yente/scheduler-alerts.js';
+import { reportUnsafeLegacyArchivedTask } from './legacy-import.js';
 import { getScheduledTask } from './ledger.js';
 import { ensureSessionSchedulerProjections, resolveProjectionContext } from './sync.js';
 
@@ -71,13 +72,10 @@ async function reportUnsafeArchivedSchedulerRows(): Promise<void> {
         const central = getScheduledTask(session.agent_group_id, row.series_id);
         if (central) continue;
 
-        await reportSchedulerIncident({
-          dedupeKey: `legacy-archived-task:${session.id}:${row.id}`,
-          severity: 'warn',
-          message: `Archived session ${session.id} contains live scheduled task row "${row.series_id}" with no central scheduler record. I did not restore it automatically.`,
-          agentGroupId: session.agent_group_id,
+        await reportUnsafeLegacyArchivedTask({
+          session,
           seriesId: row.series_id,
-          sessionId: session.id,
+          messageId: row.id,
           messagingGroupId: row.messaging_group_id ?? session.messaging_group_id,
           channelType: row.channel_type,
           platformId: row.platform_id,

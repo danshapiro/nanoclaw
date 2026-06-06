@@ -44,6 +44,11 @@ export interface CreateScheduledTaskInput {
   sourceMessageId: string;
 }
 
+export interface ImportLegacyScheduledTaskInput extends Omit<CreateScheduledTaskInput, 'sourceMessageId'> {
+  messageId: string;
+  status: 'pending' | 'paused';
+}
+
 export interface ScheduledTaskUpdate {
   prompt?: string;
   script?: string | null;
@@ -297,6 +302,74 @@ export function createOrReplaceScheduledTask(input: CreateScheduledTaskInput, ow
     recordEvent(db, input.agentGroupId, input.seriesId, 'scheduled', input.sessionId, input.sourceMessageId, {
       processAfter: input.processAfter,
       recurrence: input.recurrence,
+    });
+    return 1;
+  });
+}
+
+export function importLegacyScheduledTask(input: ImportLegacyScheduledTaskInput, owner: RuntimeLockOwner): number {
+  return withSchedulerWrite(owner, (db) => {
+    if (eventExists(db, input.agentGroupId, input.seriesId, 'legacy_imported', input.sessionId, input.messageId)) {
+      return 0;
+    }
+
+    const existing = getScheduledTaskInDb(db, input.agentGroupId, input.seriesId);
+    if (existing) return 0;
+
+    const ts = nowIso();
+    const result = db
+      .prepare(
+        `INSERT INTO scheduled_tasks (
+           series_id,
+           agent_group_id,
+           messaging_group_id,
+           thread_id,
+           platform_id,
+           channel_type,
+           is_group,
+           status,
+           process_after,
+           recurrence,
+           content,
+           generation,
+           projected_session_id,
+           projected_message_id,
+           created_by_session_id,
+           updated_by_session_id,
+           created_at,
+           updated_at,
+           completed_at,
+           last_error
+         ) VALUES (
+           @seriesId,
+           @agentGroupId,
+           @messagingGroupId,
+           @threadId,
+           @platformId,
+           @channelType,
+           @isGroup,
+           @status,
+           @processAfter,
+           @recurrence,
+           @content,
+           1,
+           @sessionId,
+           @messageId,
+           @sessionId,
+           @sessionId,
+           @ts,
+           @ts,
+           NULL,
+           NULL
+         )`,
+      )
+      .run({ ...input, ts });
+    if (result.changes !== 1) return 0;
+
+    recordEvent(db, input.agentGroupId, input.seriesId, 'legacy_imported', input.sessionId, input.messageId, {
+      processAfter: input.processAfter,
+      recurrence: input.recurrence,
+      status: input.status,
     });
     return 1;
   });
