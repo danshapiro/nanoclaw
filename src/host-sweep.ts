@@ -33,6 +33,7 @@ import path from 'path';
 
 import { getActiveSessions } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
+import { withRuntimeLock } from './db/runtime-locks.js';
 import {
   countDueMessages,
   countDueMessagesExcludingRecovery,
@@ -57,6 +58,11 @@ import {
   sessionDir,
 } from './session-manager.js';
 import { isContainerRunning, killContainer, wakeContainer } from './container-runner.js';
+import {
+  ensureSessionSchedulerProjections,
+  resolveProjectionContext,
+  syncSessionSchedulerState,
+} from './modules/scheduling/sync.js';
 import type { Session } from './types.js';
 
 /**
@@ -192,7 +198,19 @@ async function sweepSession(session: Session): Promise<void> {
       syncProcessingAcks(inDb, outDb);
     }
 
-    // 2. Wake a container if work is due and nothing is running. Ordered
+    // 2. Sync durable scheduler projection state before due-count so completed
+    // recurring projections fan out centrally and reset-resistant projections
+    // are repaired before the wake decision.
+    try {
+      await withRuntimeLock('scheduler-mutator', 120_000, async (owner) => {
+        syncSessionSchedulerState(inDb, outDb, session, owner);
+        ensureSessionSchedulerProjections(inDb, session, resolveProjectionContext(session), owner);
+      });
+    } catch (err) {
+      log.error('Scheduler sync failed during host sweep', { sessionId: session.id, err });
+    }
+
+    // 3. Wake a container if work is due and nothing is running. Ordered
     // before the crashed-container cleanup so a fresh container gets a chance
     // to clean its own orphan processing_ack rows on startup (see
     // container/agent-runner/src/db/connection.ts). Otherwise the reset path
@@ -211,24 +229,18 @@ async function sweepSession(session: Session): Promise<void> {
 
     const alive = isContainerRunning(session.id);
 
-    // 3. Running-container SLA: absolute ceiling + per-claim stuck rules.
+    // 4. Running-container SLA: absolute ceiling + per-claim stuck rules.
     if (alive && outDb) {
       enforceRunningContainerSla(inDb, outDb, session, agentGroup.id);
     }
 
-    // 4. Crashed-container cleanup: processing rows left behind get retried.
-    // Only fires when wake in step 2 didn't pick up the work (no due messages,
+    // 5. Crashed-container cleanup: processing rows left behind get retried.
+    // Only fires when wake in step 3 didn't pick up the work (no due messages,
     // or wake failed). resetStuckProcessingRows itself is idempotent — it
     // skips messages already scheduled for a future retry.
     if (!alive && outDb) {
       resetStuckProcessingRows(inDb, outDb, session, 'container not running');
     }
-
-    // 5. Recurrence fanout for completed recurring tasks.
-    // MODULE-HOOK:scheduling-recurrence:start
-    const { handleRecurrence } = await import('./modules/scheduling/recurrence.js');
-    await handleRecurrence(inDb, session);
-    // MODULE-HOOK:scheduling-recurrence:end
   } finally {
     inDb.close();
     outDb?.close();
