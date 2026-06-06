@@ -21,7 +21,7 @@ import { ensureSessionSchedulerProjections, resolveProjectionContext } from './s
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-scheduler-legacy-import' };
+  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-scheduler-legacy-import', TIMEZONE: 'America/Los_Angeles' };
 });
 
 const TEST_DIR = '/tmp/nanoclaw-test-scheduler-legacy-import';
@@ -30,7 +30,7 @@ const LOCK_NAME = 'scheduler-mutator';
 interface LegacyTaskSeed {
   id: string;
   seriesId: string | null;
-  status: 'pending' | 'paused';
+  status: 'pending' | 'paused' | 'completed';
   processAfter: string | null;
   recurrence: string | null;
   platformId: string | null;
@@ -60,6 +60,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   clearDeliveryAdapterForTest();
   closeDb();
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
@@ -145,6 +146,55 @@ describe('importLegacyActiveTasks', () => {
       ]);
       expect(eventTypes('series-pending')).toEqual(['legacy_imported', 'projected']);
       expect(eventTypes('series-paused')).toEqual(['legacy_imported', 'projected']);
+      expect(incidentKeys()).toEqual([]);
+    } finally {
+      inDb.close();
+    }
+  });
+
+  it('imports completed recurring legacy rows as the next pending run', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+    const { session } = resolveSession('ag-yente', 'mg-discord', 'thread-1', 'per-thread');
+    const inDb = openInboundDb(session.agent_group_id, session.id);
+    try {
+      insertLegacyTask(inDb, {
+        id: 'legacy-completed',
+        seriesId: 'series-completed',
+        status: 'completed',
+        processAfter: '2025-12-31T17:00:00.000Z',
+        recurrence: '0 9 * * *',
+        platformId: 'channel',
+        channelType: 'discord',
+        threadId: 'thread-1',
+        messagingGroupId: 'mg-discord',
+        isGroup: 1,
+        content: JSON.stringify({ prompt: 'completed heartbeat', script: null }),
+        seq: 2,
+      });
+
+      const result = await withSchedulerLock(async (owner) => {
+        const imported = await importLegacyActiveTasks(inDb, session, owner);
+        const projected = ensureSessionSchedulerProjections(inDb, session, resolveProjectionContext(session), owner);
+        return { imported, projected };
+      });
+
+      expect(result).toEqual({ imported: 1, projected: 1 });
+      expect(getScheduledTask('ag-yente', 'series-completed')).toMatchObject({
+        series_id: 'series-completed',
+        status: 'pending',
+        process_after: '2026-01-01T17:00:00.000Z',
+        recurrence: '0 9 * * *',
+        content: JSON.stringify({ prompt: 'completed heartbeat', script: null }),
+        generation: 1,
+        projected_session_id: session.id,
+        projected_message_id: 'task-series-completed-g1',
+      });
+      expect(projectedRows(inDb)).toEqual([
+        { id: 'legacy-completed', recurrence: null, series_id: 'series-completed', status: 'completed' },
+        { id: 'task-series-completed-g1', recurrence: '0 9 * * *', series_id: 'series-completed', status: 'pending' },
+      ]);
+      expect(eventTypes('series-completed').sort()).toEqual(['legacy_imported', 'projected'].sort());
       expect(incidentKeys()).toEqual([]);
     } finally {
       inDb.close();

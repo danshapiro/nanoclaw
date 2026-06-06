@@ -95,6 +95,26 @@ describe('repairSchedulerProjections', () => {
     expect(getScheduledTask('ag-yente', 'task-orphan')).toBeUndefined();
   });
 
+  it('reports archived completed recurring rows without central proof', async () => {
+    archivedSessionWithLegacyTask('task-orphan-recurring', {
+      status: 'completed',
+      recurrence: '0 9 * * *',
+      processAfter: '2025-12-31T17:00:00.000Z',
+    });
+    const { session: active } = resolveSession('ag-yente', 'mg-discord', 'thread-1', 'per-thread');
+
+    await repairSchedulerProjections();
+
+    expect(projectedRows(active.id)).toEqual([]);
+    expect(incidentKeys()).toEqual([expect.stringMatching(/^legacy-archived:/)]);
+    expect(incidentDetails()).toMatchObject({
+      status: 'completed',
+      recurrence: '0 9 * * *',
+      reason: 'archived-live-task-without-central-proof',
+    });
+    expect(getScheduledTask('ag-yente', 'task-orphan-recurring')).toBeUndefined();
+  });
+
   it('lets central live task proof drive projection instead of trusting the archived row', async () => {
     const archived = archivedSessionWithLegacyTask('task-proven');
     const { session: active } = resolveSession('ag-yente', 'mg-discord', 'thread-1', 'per-thread');
@@ -160,7 +180,16 @@ async function seedCentralTask(seriesId: string, sessionId: string): Promise<voi
   });
 }
 
-function archivedSessionWithLegacyTask(seriesId: string): { id: string } {
+function archivedSessionWithLegacyTask(
+  seriesId: string,
+  overrides: Partial<{ status: string; processAfter: string | null; recurrence: string | null }> = {},
+): { id: string } {
+  const row = {
+    status: 'pending',
+    processAfter: '2026-06-06T12:00:00.000Z',
+    recurrence: null,
+    ...overrides,
+  };
   const { session } = resolveSession('ag-yente', 'mg-discord', 'thread-1', 'per-thread');
   updateSession(session.id, { status: 'archived', container_status: 'stopped' });
   initSessionFolder(session.agent_group_id, session.id);
@@ -189,9 +218,9 @@ function archivedSessionWithLegacyTask(seriesId: string): { id: string } {
            2,
            'task',
            @timestamp,
-           'pending',
-           '2026-06-06T12:00:00.000Z',
-           NULL,
+           @status,
+           @processAfter,
+           @recurrence,
            1,
            'channel',
            'discord',
@@ -205,6 +234,9 @@ function archivedSessionWithLegacyTask(seriesId: string): { id: string } {
       .run({
         id: `legacy-${seriesId}`,
         timestamp: now(),
+        status: row.status,
+        processAfter: row.processAfter,
+        recurrence: row.recurrence,
         content: JSON.stringify({ prompt: 'legacy heartbeat', script: null }),
         seriesId,
       });
@@ -231,4 +263,12 @@ function incidentKeys(): string[] {
       dedupe_key: string;
     }>
   ).map((row) => row.dedupe_key);
+}
+
+function incidentDetails(): Record<string, unknown> {
+  const row = getDb()
+    .prepare('SELECT details_json FROM scheduler_incidents ORDER BY created_at, id LIMIT 1')
+    .get() as { details_json: string } | undefined;
+  if (!row) throw new Error('Missing scheduler incident');
+  return JSON.parse(row.details_json) as Record<string, unknown>;
 }

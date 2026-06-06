@@ -7,10 +7,12 @@ import { getSession } from '../../db/sessions.js';
 import type { Session } from '../../types.js';
 import { recordSchedulerIncidentWithOwner, reportSchedulerIncident } from '../../yente/scheduler-alerts.js';
 import { getScheduledTask, importLegacyScheduledTask } from './ledger.js';
+import { clearCompletedProjectionRecurrence } from './projection.js';
+import { nextScheduledRun } from './recurrence.js';
 
 interface LegacyActiveTaskRow {
   id: string;
-  status: 'pending' | 'paused';
+  status: 'pending' | 'paused' | 'completed';
   process_after: string | null;
   recurrence: string | null;
   platform_id: string | null;
@@ -42,7 +44,10 @@ export async function importLegacyActiveTasks(
               series_id
          FROM messages_in
         WHERE kind = 'task'
-          AND status IN ('pending', 'paused')
+          AND (
+            status IN ('pending', 'paused')
+            OR (status = 'completed' AND recurrence IS NOT NULL)
+          )
         ORDER BY seq ASC, id ASC`,
     )
     .all() as LegacyActiveTaskRow[];
@@ -50,16 +55,25 @@ export async function importLegacyActiveTasks(
   let imported = 0;
   for (const row of rows) {
     const seriesId = row.series_id ?? row.id;
-    if (getScheduledTask(session.agent_group_id, seriesId)) continue;
+    const existing = getScheduledTask(session.agent_group_id, seriesId);
+    if (existing) {
+      if (row.status === 'completed' && row.recurrence !== null && existing.status === 'pending') {
+        clearCompletedProjectionRecurrence(inDb, row.id);
+      }
+      continue;
+    }
 
     const refs = validateSchedulerRefs(session, row);
     if (!refs.valid) {
       reportInvalidLegacyTaskRefs(session, seriesId, row, refs.reason, owner);
       continue;
     }
-    if (!row.process_after) continue;
+    const completedRecurring = row.status === 'completed';
+    const processAfter = completedRecurring && row.recurrence ? nextScheduledRun(row.recurrence) : row.process_after;
+    if (!processAfter) continue;
+    const importStatus: 'pending' | 'paused' = row.status === 'paused' ? 'paused' : 'pending';
 
-    imported += importLegacyScheduledTask(
+    const changed = importLegacyScheduledTask(
       {
         seriesId,
         agentGroupId: session.agent_group_id,
@@ -68,15 +82,22 @@ export async function importLegacyActiveTasks(
         platformId: row.platform_id,
         channelType: row.channel_type,
         isGroup: row.is_group,
-        processAfter: row.process_after,
+        processAfter,
         recurrence: row.recurrence,
         content: row.content,
         sessionId: session.id,
         messageId: row.id,
-        status: row.status,
+        status: importStatus,
+        legacyStatus: row.status,
+        projectedSessionId: completedRecurring ? null : session.id,
+        projectedMessageId: completedRecurring ? null : row.id,
       },
       owner,
     );
+    imported += changed;
+    if (changed > 0 && completedRecurring) {
+      clearCompletedProjectionRecurrence(inDb, row.id);
+    }
   }
   return imported;
 }

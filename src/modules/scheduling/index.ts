@@ -10,8 +10,8 @@
  *
  * Host integration points (filled by MODULE-HOOK markers, validated here
  * with the scheduling module shipping inline):
- *   - `src/host-sweep.ts` → MODULE-HOOK:scheduling-recurrence calls
- *     `handleRecurrence` each sweep tick.
+ *   - `src/host-sweep.ts` syncs completed/failed projected tasks back into
+ *     the central scheduler ledger and projects the next due generation.
  *   - `container/agent-runner/src/poll-loop.ts` → MODULE-HOOK:scheduling-pre-task
  *     runs `applyPreTaskScripts` before the provider call so tasks carrying
  *     a pre-agent script can gate their own execution.

@@ -120,10 +120,13 @@ function listUnsafeLegacyRows(inDb: Database.Database): LegacyTaskRow[] {
               platform_id,
               thread_id,
               messaging_group_id
-         FROM messages_in
+        FROM messages_in
         WHERE kind = 'task'
           AND series_id IS NOT NULL
-          AND status IN ('pending', 'paused', 'processing')
+          AND (
+            status IN ('pending', 'paused', 'processing')
+            OR (status = 'completed' AND recurrence IS NOT NULL)
+          )
         ORDER BY seq ASC, id ASC`,
     )
     .all() as LegacyTaskRow[];

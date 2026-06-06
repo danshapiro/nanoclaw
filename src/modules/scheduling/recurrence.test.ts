@@ -1,4 +1,9 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+
+vi.mock('../../config.js', async () => {
+  const actual = await vi.importActual('../../config.js');
+  return { ...actual, TIMEZONE: 'America/Los_Angeles' };
+});
 
 import { handleRecurrence, nextScheduledRun } from './recurrence.js';
 

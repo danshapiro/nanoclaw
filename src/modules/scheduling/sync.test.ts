@@ -36,6 +36,11 @@ import {
   syncSessionSchedulerState,
 } from './sync.js';
 
+vi.mock('../../config.js', async () => {
+  const actual = await vi.importActual('../../config.js');
+  return { ...actual, TIMEZONE: 'America/Los_Angeles' };
+});
+
 const LOCK_NAME = 'scheduler-mutator';
 const TEST_DIR = '/tmp/nanoclaw-scheduler-sync-test';
 const INBOUND_PATH = path.join(TEST_DIR, 'inbound.db');

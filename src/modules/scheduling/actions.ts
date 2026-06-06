@@ -31,6 +31,7 @@ import { projectScheduledTask, retireProjection } from './projection.js';
 
 const LOCK_NAME = 'scheduler-mutator';
 const LOCK_TTL_MS = 120_000;
+const LOCK_RETRY_MS = 100;
 const LIVE_STATUSES = ['pending', 'paused'] as const;
 
 export interface ApplySchedulingActionOptions {
@@ -174,6 +175,51 @@ function sourceFor(session: Session, sourceMessageId: string) {
   return { sessionId: session.id, messageId: sourceMessageId };
 }
 
+async function withSchedulingActionLock<T>(
+  action: string,
+  session: Session,
+  sourceMessageId: string,
+  fn: (owner: RuntimeLockOwner) => T | Promise<T>,
+): Promise<T> {
+  const deadline = Date.now() + LOCK_TTL_MS;
+  let attempts = 0;
+  for (;;) {
+    try {
+      return await withRuntimeLock(LOCK_NAME, LOCK_TTL_MS, fn);
+    } catch (err) {
+      if (!isSchedulerLockContention(err) || Date.now() >= deadline) {
+        log.error('Scheduling action lock acquisition failed', {
+          action,
+          sessionId: session.id,
+          agentGroupId: session.agent_group_id,
+          sourceMessageId,
+          attempts,
+          err,
+        });
+        throw err;
+      }
+      attempts += 1;
+      if (attempts === 1) {
+        log.warn('Scheduling action waiting for scheduler mutator lock', {
+          action,
+          sessionId: session.id,
+          agentGroupId: session.agent_group_id,
+          sourceMessageId,
+        });
+      }
+      await sleep(LOCK_RETRY_MS);
+    }
+  }
+}
+
+function isSchedulerLockContention(err: unknown): boolean {
+  return err instanceof Error && err.message.includes(`Runtime lock "${LOCK_NAME}" is already held`);
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export function applyScheduleTaskAction(
   content: Record<string, unknown>,
   session: Session,
@@ -241,7 +287,7 @@ export async function handleScheduleTask(
   inDb: Database.Database,
   sourceMessageId: string,
 ): Promise<void> {
-  await withRuntimeLock(LOCK_NAME, LOCK_TTL_MS, async (owner) => {
+  await withSchedulingActionLock('schedule_task', session, sourceMessageId, async (owner) => {
     applyScheduleTaskAction(content, session, inDb, owner, { source: 'delivery', sourceMessageId });
   });
 }
@@ -274,7 +320,7 @@ export async function handleCancelTask(
   inDb: Database.Database,
   sourceMessageId: string,
 ): Promise<void> {
-  await withRuntimeLock(LOCK_NAME, LOCK_TTL_MS, async (owner) => {
+  await withSchedulingActionLock('cancel_task', session, sourceMessageId, async (owner) => {
     applyCancelTaskAction(content, session, inDb, owner, { source: 'delivery', sourceMessageId });
   });
 }
@@ -308,7 +354,7 @@ export async function handlePauseTask(
   inDb: Database.Database,
   sourceMessageId: string,
 ): Promise<void> {
-  await withRuntimeLock(LOCK_NAME, LOCK_TTL_MS, async (owner) => {
+  await withSchedulingActionLock('pause_task', session, sourceMessageId, async (owner) => {
     applyPauseTaskAction(content, session, inDb, owner, { source: 'delivery', sourceMessageId });
   });
 }
@@ -342,7 +388,7 @@ export async function handleResumeTask(
   inDb: Database.Database,
   sourceMessageId: string,
 ): Promise<void> {
-  await withRuntimeLock(LOCK_NAME, LOCK_TTL_MS, async (owner) => {
+  await withSchedulingActionLock('resume_task', session, sourceMessageId, async (owner) => {
     applyResumeTaskAction(content, session, inDb, owner, { source: 'delivery', sourceMessageId });
   });
 }
@@ -396,7 +442,7 @@ export async function handleUpdateTask(
   sourceMessageId: string,
 ): Promise<void> {
   let matchedLiveBefore = false;
-  await withRuntimeLock(LOCK_NAME, LOCK_TTL_MS, async (owner) => {
+  await withSchedulingActionLock('update_task', session, sourceMessageId, async (owner) => {
     ({ matchedLiveBefore } = applyUpdateTaskAction(content, session, inDb, owner, {
       source: 'delivery',
       sourceMessageId,

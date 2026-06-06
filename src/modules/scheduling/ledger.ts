@@ -47,6 +47,9 @@ export interface CreateScheduledTaskInput {
 export interface ImportLegacyScheduledTaskInput extends Omit<CreateScheduledTaskInput, 'sourceMessageId'> {
   messageId: string;
   status: 'pending' | 'paused';
+  legacyStatus?: 'pending' | 'paused' | 'completed';
+  projectedSessionId?: string | null;
+  projectedMessageId?: string | null;
 }
 
 export interface ScheduledTaskUpdate {
@@ -353,8 +356,8 @@ export function importLegacyScheduledTask(input: ImportLegacyScheduledTaskInput,
            @recurrence,
            @content,
            1,
-           @sessionId,
-           @messageId,
+           @projectedSessionId,
+           @projectedMessageId,
            @sessionId,
            @sessionId,
            @ts,
@@ -363,13 +366,18 @@ export function importLegacyScheduledTask(input: ImportLegacyScheduledTaskInput,
            NULL
          )`,
       )
-      .run({ ...input, ts });
+      .run({
+        ...input,
+        projectedSessionId: input.projectedSessionId === undefined ? input.sessionId : input.projectedSessionId,
+        projectedMessageId: input.projectedMessageId === undefined ? input.messageId : input.projectedMessageId,
+        ts,
+      });
     if (result.changes !== 1) return 0;
 
     recordEvent(db, input.agentGroupId, input.seriesId, 'legacy_imported', input.sessionId, input.messageId, {
       processAfter: input.processAfter,
       recurrence: input.recurrence,
-      status: input.status,
+      status: input.legacyStatus ?? input.status,
     });
     return 1;
   });
