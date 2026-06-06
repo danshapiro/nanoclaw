@@ -824,6 +824,56 @@ describe('session wake lifecycle', () => {
       harness.close();
     }
   });
+
+  it('reset stop verification fails when the runtime label still reports a writer', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      harness.execFileMock.mockImplementation((_file, args: string[], _options, cb) => {
+        if (args[0] === 'ps' && args.includes(`label=nanoclaw-session=${harness.session.id}`)) {
+          cb(null, 'nanoclaw-v2-agent-stray\n', '');
+          return;
+        }
+        cb(null, '', '');
+      });
+
+      await expect(
+        harness.containerRunner.stopContainerAndVerify(harness.session.id, 'yente-session-reset'),
+      ).rejects.toThrow('runtime label still reports a writer');
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('reset stop verification checks the runtime label after tracked cleanup succeeds', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      const wake = harness.containerRunner.wakeContainer(harness.session);
+      await harness.oneCliStarted.promise;
+      harness.oneCliRelease.resolve();
+      await wake;
+
+      let labelInspectCount = 0;
+      harness.execFileMock.mockImplementation((_file, args: string[], _options, cb) => {
+        if (args[0] === 'stop') {
+          cb(null, '', '');
+          return;
+        }
+        if (args[0] === 'ps' && args.includes(`label=nanoclaw-session=${harness.session.id}`)) {
+          labelInspectCount++;
+          cb(null, labelInspectCount === 1 ? '' : 'nanoclaw-v2-agent-stray\n', '');
+          return;
+        }
+        cb(null, '', '');
+      });
+
+      await expect(
+        harness.containerRunner.stopContainerAndVerify(harness.session.id, 'yente-session-reset'),
+      ).rejects.toThrow('runtime label still reports a writer');
+      expect(labelInspectCount).toBeGreaterThanOrEqual(2);
+    } finally {
+      harness.close();
+    }
+  });
 });
 
 describe('local skills mount', () => {

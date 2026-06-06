@@ -1,6 +1,8 @@
 import { gateCommand } from '../command-gate.js';
-import { rollActiveSession, type SessionMode } from '../session-manager.js';
+import type { DeliveryAddress } from '../channels/adapter.js';
+import { type SessionMode } from '../session-manager.js';
 import type { AgentGroup, MessagingGroup, Session } from '../types.js';
+import { resetYenteSessionPreservingScheduler } from './scheduler-reset.js';
 
 export type YenteHostCommandName = 'help' | 'status' | 'new' | 'clear' | 'compact';
 
@@ -11,6 +13,7 @@ export interface YenteHostCommandContext {
   messagingGroup: MessagingGroup;
   session: Session;
   sessionMode: SessionMode;
+  responseAddress: DeliveryAddress;
 }
 
 export type YenteHostCommandResult =
@@ -21,6 +24,7 @@ export type YenteHostCommandResult =
       sessionForOutbound: Session;
       supersededSessionId?: string;
       command: YenteHostCommandName;
+      deliveryMode?: 'session-outbound' | 'host-adapter';
     };
 
 const COMMANDS = new Set<YenteHostCommandName>(['help', 'status', 'new', 'clear', 'compact']);
@@ -39,7 +43,7 @@ export function parseYenteHostCommandFromContent(content: string): YenteHostComm
   return isYenteCommand(bare) ? bare : null;
 }
 
-export function handleYenteHostCommand(context: YenteHostCommandContext): YenteHostCommandResult {
+export async function handleYenteHostCommand(context: YenteHostCommandContext): Promise<YenteHostCommandResult> {
   const command = parseYenteHostCommandFromContent(context.content);
   if (!command) return { handled: false };
 
@@ -87,20 +91,20 @@ export function handleYenteHostCommand(context: YenteHostCommandContext): YenteH
     return denied(command, context.session);
   }
 
-  const supersededSessionId = context.session.id;
-  const fresh = rollActiveSession({
-    agentGroupId: context.agentGroup.id,
-    messagingGroupId: context.messagingGroup.id,
-    threadId: context.session.thread_id,
+  const fresh = await resetYenteSessionPreservingScheduler({
+    command,
+    oldSession: context.session,
     sessionMode: context.sessionMode,
+    responseAddress: context.responseAddress,
   });
 
   return {
     handled: true,
     command,
     sessionForOutbound: fresh,
-    supersededSessionId,
+    supersededSessionId: context.session.id,
     outboundText: `Started a fresh session: ${fresh.id}`,
+    deliveryMode: 'host-adapter',
   };
 }
 

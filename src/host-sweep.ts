@@ -160,9 +160,20 @@ async function sweep(): Promise<void> {
   if (!running) return;
 
   try {
+    const { resumeUnfinishedSchedulerSupersessions } = await import('./yente/scheduler-reset-repair.js');
+    await resumeUnfinishedSchedulerSupersessions();
+  } catch (err) {
+    log.error('Scheduler reset repair pass failed', { err });
+  }
+
+  try {
     const sessions = getActiveSessions();
     for (const session of sessions) {
-      await sweepSession(session);
+      try {
+        await sweepSession(session);
+      } catch (err) {
+        log.error('Host sweep session error', { sessionId: session.id, err });
+      }
     }
   } catch (err) {
     log.error('Host sweep error', { err });

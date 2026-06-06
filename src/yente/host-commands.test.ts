@@ -13,6 +13,11 @@ import {
   type YenteHostCommandContext,
 } from './host-commands.js';
 
+vi.mock('../container-runner.js', () => ({
+  stopContainerAndVerify: vi.fn().mockResolvedValue(undefined),
+  isSessionOutboundWriterRunning: vi.fn().mockResolvedValue(false),
+}));
+
 vi.mock('../config.js', async () => {
   const actual = await vi.importActual('../config.js');
   return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-host-commands' };
@@ -76,6 +81,11 @@ function context(content: string, userId: string | null = 'discord:admin'): Yent
     messagingGroup,
     session,
     sessionMode: 'per-thread',
+    responseAddress: {
+      channelType: messagingGroup.channel_type,
+      platformId: messagingGroup.platform_id,
+      threadId: 'thread-1',
+    },
   };
 }
 
@@ -109,14 +119,14 @@ describe('parseYenteHostCommandFromContent', () => {
 });
 
 describe('handleYenteHostCommand', () => {
-  it('returns host-authored help and status responses without asking for a container wake', () => {
+  it('returns host-authored help and status responses without asking for a container wake', async () => {
     grantAdmin('discord:admin');
 
-    const help = handleYenteHostCommand(context(JSON.stringify({ text: '/help' })));
+    const help = await handleYenteHostCommand(context(JSON.stringify({ text: '/help' })));
     expect(help.handled).toBe(true);
     expect(help.handled && help.outboundText).toContain('/status');
 
-    const status = handleYenteHostCommand(context('/status'));
+    const status = await handleYenteHostCommand(context('/status'));
     expect(status.handled).toBe(true);
     if (status.handled) {
       expect(status.outboundText).toContain('Uptime:');
@@ -126,11 +136,11 @@ describe('handleYenteHostCommand', () => {
     }
   });
 
-  it('archives the addressed active session and creates a fresh one for /new and /clear', () => {
+  it('archives the addressed active session and creates a fresh one for /new and /clear', async () => {
     grantAdmin('discord:admin');
     const original = context('/new').session;
 
-    const result = handleYenteHostCommand({
+    const result = await handleYenteHostCommand({
       ...context('/new'),
       session: original,
     });
@@ -142,7 +152,7 @@ describe('handleYenteHostCommand', () => {
     expect(result.handled && result.sessionForOutbound.messaging_group_id).toBe(messagingGroup.id);
     expect(result.handled && result.sessionForOutbound.thread_id).toBe('thread-1');
 
-    const clear = handleYenteHostCommand({
+    const clear = await handleYenteHostCommand({
       ...context('/clear'),
       session: result.handled ? result.sessionForOutbound : original,
     });
@@ -151,16 +161,16 @@ describe('handleYenteHostCommand', () => {
     expect(clear.handled && clear.supersededSessionId).toBe(result.handled && result.sessionForOutbound.id);
   });
 
-  it('uses the generic admin policy for denied and authorized admin commands', () => {
-    const denied = handleYenteHostCommand(context('/new', 'discord:member'));
+  it('uses the generic admin policy for denied and authorized admin commands', async () => {
+    const denied = await handleYenteHostCommand(context('/new', 'discord:member'));
     expect(denied).toMatchObject({
       handled: true,
       outboundText: 'Permission denied: /new requires admin access.',
     });
     expect(denied.handled && 'supersededSessionId' in denied).toBe(false);
 
-    const deniedNew = handleYenteHostCommand(context('/new', 'discord:member'));
-    const deniedClear = handleYenteHostCommand(context('/clear', 'discord:member'));
+    const deniedNew = await handleYenteHostCommand(context('/new', 'discord:member'));
+    const deniedClear = await handleYenteHostCommand(context('/clear', 'discord:member'));
     expect(deniedNew).toMatchObject({ handled: true, outboundText: 'Permission denied: /new requires admin access.' });
     expect(deniedClear).toMatchObject({
       handled: true,
@@ -168,7 +178,7 @@ describe('handleYenteHostCommand', () => {
     });
 
     grantAdmin('discord:admin');
-    const compact = handleYenteHostCommand(context('/compact', 'discord:admin'));
+    const compact = await handleYenteHostCommand(context('/compact', 'discord:admin'));
     expect(compact).toEqual({ handled: false });
   });
 });

@@ -169,7 +169,7 @@ export async function deliverSessionMessages(session: Session): Promise<void> {
 export async function dropInactiveSessionOutbound(sessionId: string, reason: string): Promise<number> {
   const session = getSession(sessionId);
   if (!session || session.status === 'active') return 0;
-  return drainSession(session, { inactiveOnly: true, staleReason: reason });
+  return drainSession(session, { inactiveOnly: true, staleReason: reason, requireDbOpen: true });
 }
 
 export async function suppressSessionOutbound(sessionId: string, reason: string): Promise<number> {
@@ -206,6 +206,7 @@ export async function quiesceSessionDelivery(sessionId: string, reason: string):
 type DrainSessionOptions = {
   inactiveOnly?: boolean;
   staleReason?: string;
+  requireDbOpen?: boolean;
 };
 
 function isSessionActive(sessionId: string): boolean {
@@ -245,16 +246,27 @@ async function drainSession(session: Session, options: DrainSessionOptions = {})
   if (options.inactiveOnly && isSessionActive(session.id)) return 0;
 
   const agentGroup = getAgentGroup(session.agent_group_id);
-  if (!agentGroup) return 0;
+  if (!agentGroup) {
+    if (options.requireDbOpen) {
+      throw new Error(`Cannot inspect outbound for session ${session.id}: agent group ${session.agent_group_id} is missing`);
+    }
+    return 0;
+  }
 
-  let outDb: Database.Database;
-  let inDb: Database.Database;
+  let outDb: Database.Database | null = null;
+  let inDb: Database.Database | null = null;
   try {
     outDb = openOutboundDb(agentGroup.id, session.id);
     inDb = openInboundDb(agentGroup.id, session.id);
-  } catch {
+  } catch (err) {
+    outDb?.close();
+    inDb?.close();
+    if (options.requireDbOpen) {
+      throw new Error(`Cannot inspect outbound for inactive session ${session.id}`, { cause: err });
+    }
     return 0; // DBs might not exist yet
   }
+  if (!outDb || !inDb) return 0;
 
   try {
     // Read all due messages from outbound.db (read-only)

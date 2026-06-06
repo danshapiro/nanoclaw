@@ -43,6 +43,7 @@ import {
   materializeAttachmentData,
   type MaterializedAttachment,
 } from './yente/attachments.js';
+import { assertNoRouteResetInProgress } from './yente/scheduler-supersessions.js';
 
 /** Root directory for all session data. */
 export function sessionsBaseDir(): string {
@@ -113,6 +114,13 @@ export function resolveSession(
       return { session: existing, created: false };
     }
   }
+
+  assertNoRouteResetInProgress({
+    agentGroupId,
+    messagingGroupId,
+    threadId,
+    sessionMode,
+  });
 
   const id = generateId();
   const lookupThreadId = sessionMode === 'per-thread' ? threadId : null;

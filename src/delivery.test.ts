@@ -280,6 +280,17 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     expect(delivered).toEqual([]);
   });
 
+  it('fails inactive-session suppression when the old outbox cannot be inspected', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    archiveSession(session.id);
+    fs.rmSync(outboundDbPath('ag-1', session.id), { force: true });
+
+    await expect(dropInactiveSessionOutbound(session.id, 'yente-session-reset')).rejects.toThrow(
+      'Cannot inspect outbound for inactive session',
+    );
+  });
+
   it('quiesces delivery without marking undelivered rows itself', async () => {
     seedAgentAndChannel();
     const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');

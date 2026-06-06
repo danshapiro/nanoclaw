@@ -1,3 +1,4 @@
+import Database from 'better-sqlite3';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 
 import {
@@ -69,6 +70,55 @@ describe('migrations', () => {
     runMigrations(db);
     // Running again should not throw
     runMigrations(db);
+  });
+
+  it('adds supersession response-address columns to DBs that already applied scheduler-ledger', () => {
+    const db = new Database(':memory:');
+    try {
+      db.exec(`
+        CREATE TABLE schema_version (
+          version INTEGER PRIMARY KEY,
+          name    TEXT NOT NULL,
+          applied TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX idx_schema_version_name ON schema_version(name);
+        INSERT INTO schema_version (version, name, applied)
+        VALUES (1, 'scheduler-ledger', '2026-06-05T00:00:00.000Z');
+
+        CREATE TABLE scheduler_session_supersessions (
+          old_session_id      TEXT PRIMARY KEY,
+          new_session_id      TEXT,
+          agent_group_id      TEXT NOT NULL,
+          messaging_group_id  TEXT,
+          thread_id           TEXT,
+          session_mode        TEXT NOT NULL,
+          phase               TEXT NOT NULL,
+          command             TEXT NOT NULL,
+          started_at          TEXT NOT NULL,
+          updated_at          TEXT NOT NULL,
+          finished_at         TEXT,
+          error_json          TEXT
+        );
+      `);
+
+      runMigrations(db);
+
+      const columns = new Set(
+        (
+          db.prepare("PRAGMA table_info('scheduler_session_supersessions')").all() as Array<{ name: string }>
+        ).map((row) => row.name),
+      );
+      expect(columns.has('response_channel_type')).toBe(true);
+      expect(columns.has('response_platform_id')).toBe(true);
+      expect(columns.has('response_thread_id')).toBe(true);
+      expect(
+        db
+          .prepare("SELECT name FROM schema_version WHERE name = 'scheduler-supersession-response-address'")
+          .get(),
+      ).toEqual({ name: 'scheduler-supersession-response-address' });
+    } finally {
+      db.close();
+    }
   });
 });
 
@@ -168,7 +218,14 @@ describe('scheduler central schema', () => {
 
   it('creates planned reset and incident fields', () => {
     const supersessionColumns = tableColumns('scheduler_session_supersessions');
-    for (const column of ['command', 'finished_at', 'error_json']) {
+    for (const column of [
+      'command',
+      'finished_at',
+      'error_json',
+      'response_channel_type',
+      'response_platform_id',
+      'response_thread_id',
+    ]) {
       expect(supersessionColumns.has(column), column).toBe(true);
     }
     expect(tableColumn('scheduler_session_supersessions', 'session_mode')).toMatchObject({ notnull: 1 });

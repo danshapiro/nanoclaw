@@ -378,6 +378,27 @@ export async function cleanupContainerForSession(sessionId: string, reason: stri
   }
 }
 
+export async function stopContainerAndVerify(sessionId: string, reason: string): Promise<void> {
+  const cleanedTrackedContainer = await cleanupContainerForSession(sessionId, reason);
+  await assertNoSessionContainerWriterByLabel(sessionId);
+
+  if (!cleanedTrackedContainer) {
+    log.info('No active container process found while verifying stopped session', { sessionId, reason });
+  }
+}
+
+async function assertNoSessionContainerWriterByLabel(sessionId: string): Promise<void> {
+  try {
+    const runningByLabel = await isContainerWithLabelRunningAsync(`${SESSION_CONTAINER_LABEL_KEY}=${sessionId}`);
+    if (runningByLabel) {
+      throw new Error(`Failed to stop container for session ${sessionId}: runtime label still reports a writer`);
+    }
+  } catch (err) {
+    if (err instanceof Error && err.message.includes('runtime label still reports a writer')) throw err;
+    throw new Error(`Failed to verify stopped container for session ${sessionId}`, { cause: err });
+  }
+}
+
 async function verifyContainerProcessExited(sessionId: string, entry: ActiveContainer, reason: string): Promise<void> {
   if (!activeContainers.has(sessionId)) return;
   if (await runtimeReportsSessionStopped(sessionId, entry, reason)) {

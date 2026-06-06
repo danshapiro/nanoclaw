@@ -26,6 +26,7 @@ vi.mock('./container-runner.js', () => ({
   getActiveContainerCount: vi.fn().mockReturnValue(0),
   killContainer: vi.fn(),
   cleanupContainerForSession: cleanupContainerForSessionMock,
+  stopContainerAndVerify: cleanupContainerForSessionMock,
   isSessionOutboundWriterRunning: vi.fn().mockResolvedValue(false),
 }));
 
@@ -212,6 +213,13 @@ describe('Yente host command routing', () => {
     const { wakeContainer } = await import('./container-runner.js');
     const wakeMock = wakeContainer as unknown as ReturnType<typeof vi.fn>;
     wakeMock.mockClear();
+    const deliveredTexts: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        deliveredTexts.push(JSON.parse(content).text);
+        return `platform-${deliveredTexts.length}`;
+      },
+    });
 
     await routeInbound(event('hello first', 'msg-first'));
     const original = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
@@ -222,8 +230,9 @@ describe('Yente host command routing', () => {
 
     expect(getSession(original.id)?.status).toBe('archived');
     expect(afterNew.id).not.toBe(original.id);
-    expect(outboundTexts(afterNew.id)[0]).toBe(`Started a fresh session: ${afterNew.id}`);
-    expect(cleanupContainerForSessionMock).toHaveBeenCalledWith(original.id, 'yente-session-new');
+    expect(outboundTexts(afterNew.id)).toEqual([]);
+    expect(deliveredTexts).toContain(`Started a fresh session: ${afterNew.id}`);
+    expect(cleanupContainerForSessionMock).toHaveBeenCalledWith(original.id, 'yente-session-new-scheduler-preserve');
     expect(inboundTexts(original.id)).not.toContain('/new');
     expect(inboundTexts(afterNew.id)).toEqual([]);
 
@@ -233,8 +242,9 @@ describe('Yente host command routing', () => {
 
     expect(getSession(afterNew.id)?.status).toBe('archived');
     expect(afterClear.id).not.toBe(afterNew.id);
-    expect(outboundTexts(afterClear.id)[0]).toBe(`Started a fresh session: ${afterClear.id}`);
-    expect(cleanupContainerForSessionMock).toHaveBeenCalledWith(afterNew.id, 'yente-session-clear');
+    expect(outboundTexts(afterClear.id)).toEqual([]);
+    expect(deliveredTexts).toContain(`Started a fresh session: ${afterClear.id}`);
+    expect(cleanupContainerForSessionMock).toHaveBeenCalledWith(afterNew.id, 'yente-session-clear-scheduler-preserve');
     expect(wakeMock).toHaveBeenCalledTimes(1);
   });
 
@@ -318,8 +328,8 @@ describe('Yente host command routing', () => {
     const fresh = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
     expect(getSession(original.id)?.status).toBe('archived');
     expect(fresh.id).not.toBe(original.id);
-    expect(outboundTexts(fresh.id)[0]).toBe(`Started a fresh session: ${fresh.id}`);
-    expect(cleanupContainerForSessionMock).toHaveBeenCalledWith(original.id, 'yente-session-new');
+    expect(outboundTexts(fresh.id)).toEqual([]);
+    expect(cleanupContainerForSessionMock).toHaveBeenCalledWith(original.id, 'yente-session-new-scheduler-preserve');
   });
 
   it('routes admin CLI messages with raw Discord thread ids to the existing canonical session', async () => {
@@ -336,8 +346,8 @@ describe('Yente host command routing', () => {
     expect(rawSession).toBeUndefined();
     expect(getSession(original.id)?.status).toBe('archived');
     expect(fresh.id).not.toBe(original.id);
-    expect(outboundTexts(fresh.id)[0]).toBe(`Started a fresh session: ${fresh.id}`);
-    expect(cleanupContainerForSessionMock).toHaveBeenCalledWith(original.id, 'yente-session-new');
+    expect(outboundTexts(fresh.id)).toEqual([]);
+    expect(cleanupContainerForSessionMock).toHaveBeenCalledWith(original.id, 'yente-session-new-scheduler-preserve');
   });
 
   it('does not deliver reset success until old-session delivery suppression is complete', async () => {
@@ -389,7 +399,49 @@ describe('Yente host command routing', () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
   });
 
-  it('reports cleanup failure after the success response is delivered', async () => {
+  it('does not deliver duplicate reset success when repair overlaps the host response', async () => {
+    const { routeInbound } = await import('./router.js');
+    const { resumeSchedulerSupersession } = await import('./yente/scheduler-reset-repair.js');
+    const resetDeliveryStarted = deferred();
+    const resetDeliveryRelease = deferred();
+    const deliveredTexts: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        const text = JSON.parse(content).text as string;
+        deliveredTexts.push(text);
+        if (text.startsWith('Started a fresh session:')) {
+          resetDeliveryStarted.resolve();
+          await resetDeliveryRelease.promise;
+        }
+        return `platform-${deliveredTexts.length}`;
+      },
+    });
+
+    await routeInbound(event('hello first', 'msg-first-before-overlap-repair'));
+    const original = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
+
+    const reset = routeInbound(event('/new', 'msg-new-overlap-repair'));
+    await resetDeliveryStarted.promise;
+
+    const repair = resumeSchedulerSupersession(original.id);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(deliveredTexts).toHaveLength(1);
+
+    resetDeliveryRelease.resolve();
+    await reset;
+    await repair;
+
+    const fresh = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
+    expect(deliveredTexts).toEqual([`Started a fresh session: ${fresh.id}`]);
+    expect(
+      getDb()
+        .prepare('SELECT phase FROM scheduler_session_supersessions WHERE old_session_id = ?')
+        .get(original.id),
+    ).toEqual({ phase: 'response-delivered' });
+    expect(getDb().prepare('SELECT COUNT(*) AS count FROM scheduler_incidents').get()).toEqual({ count: 0 });
+  });
+
+  it('reports reset failure through the host adapter when verified stop fails', async () => {
     vi.useFakeTimers();
     try {
       const { routeInbound } = await import('./router.js');
@@ -403,144 +455,125 @@ describe('Yente host command routing', () => {
       });
 
       await routeInbound(event('/clear', 'msg-clear-cleanup-fails'));
-      const fresh = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
-      await vi.runOnlyPendingTimersAsync();
-      await Promise.resolve();
-      await Promise.resolve();
 
-      expect(outboundTexts(fresh.id)).toContain('Error: old session cleanup failed.');
-      expect(deliveredTexts).toEqual([`Started a fresh session: ${fresh.id}`, 'Error: old session cleanup failed.']);
+      expect(findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)).toBeUndefined();
+      expect(deliveredTexts).toEqual([
+        'Error: session reset hit a problem after the old session was disturbed. I recorded it for repair.',
+      ]);
+      expect(
+        getDb()
+          .prepare("SELECT status FROM scheduler_incidents WHERE dedupe_key LIKE 'scheduler-reset:%'")
+          .get(),
+      ).toEqual({ status: 'pending' });
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it('holds cleanup-error delivery behind a slow success delivery attempt', async () => {
-    vi.useFakeTimers();
-    try {
-      const { routeInbound } = await import('./router.js');
-      cleanupContainerForSessionMock.mockRejectedValueOnce(new Error('docker failed'));
-      const successStarted = deferred();
-      const successRelease = deferred();
-      const deliveredTexts: string[] = [];
-      setDeliveryAdapter({
-        async deliver(_channelType, _platformId, _threadId, _kind, content) {
-          const text = JSON.parse(content).text as string;
-          deliveredTexts.push(text);
-          if (text.startsWith('Started a fresh session:')) {
-            successStarted.resolve();
-            await successRelease.promise;
-          }
-          return `platform-${deliveredTexts.length}`;
-        },
-      });
+  it('suppresses old outbound during scheduler-aware reset', async () => {
+    const { routeInbound } = await import('./router.js');
+    const deliveredTexts: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        deliveredTexts.push(JSON.parse(content).text);
+        return `platform-${deliveredTexts.length}`;
+      },
+    });
 
-      const route = routeInbound(event('/clear', 'msg-clear-slow-success'));
-      await successStarted.promise;
-      await vi.runOnlyPendingTimersAsync();
-      await Promise.resolve();
+    await routeInbound(event('hello first', 'msg-first-before-drain'));
+    const original = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
+    writeOutboundDirect('ag-yente', original.id, {
+      id: 'late-old-session-outbound',
+      kind: 'chat',
+      platformId: DISCORD_PLATFORM_ID,
+      channelType: 'discord',
+      threadId: DISCORD_THREAD_ID,
+      content: JSON.stringify({ text: 'late old output' }),
+    });
 
-      expect(deliveredTexts).toHaveLength(1);
-      successRelease.resolve();
-      await route;
-      await Promise.resolve();
-      await Promise.resolve();
+    await routeInbound(event('/new', 'msg-new-drain'));
+    const fresh = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
 
-      const fresh = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
-      expect(deliveredTexts).toEqual([`Started a fresh session: ${fresh.id}`, 'Error: old session cleanup failed.']);
-    } finally {
-      vi.useRealTimers();
-    }
+    expect(fresh.id).not.toBe(original.id);
+    expect(deliveredTexts).not.toContain('late old output');
+    expect(deliveredRows(original.id)).toContainEqual({
+      message_out_id: 'late-old-session-outbound',
+      platform_message_id: null,
+      status: 'delivered',
+    });
   });
 
-  it('drains late outbound from the superseded session during reset cleanup', async () => {
-    vi.useFakeTimers();
-    try {
-      const { routeInbound } = await import('./router.js');
-      const deliveredTexts: string[] = [];
-      setDeliveryAdapter({
-        async deliver(_channelType, _platformId, _threadId, _kind, content) {
-          deliveredTexts.push(JSON.parse(content).text);
-          return `platform-${deliveredTexts.length}`;
-        },
-      });
+  it('does not mark reset response delivered when old outbound suppression fails', async () => {
+    const delivery = await import('./delivery.js');
+    const suppressSpy = vi.spyOn(delivery, 'suppressSessionOutbound').mockRejectedValueOnce(new Error('suppress failed'));
+    const { routeInbound } = await import('./router.js');
+    const deliveredTexts: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        deliveredTexts.push(JSON.parse(content).text);
+        return `platform-${deliveredTexts.length}`;
+      },
+    });
 
-      await routeInbound(event('hello first', 'msg-first-before-drain'));
+    try {
+      await routeInbound(event('hello first', 'msg-first-before-suppress-failure'));
       const original = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
-      await routeInbound(event('/new', 'msg-new-drain'));
+
+      await routeInbound(event('/new', 'msg-new-suppress-failure'));
       const fresh = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
-
-      writeOutboundDirect('ag-yente', original.id, {
-        id: 'late-old-session-outbound',
-        kind: 'chat',
-        platformId: DISCORD_PLATFORM_ID,
-        channelType: 'discord',
-        threadId: DISCORD_THREAD_ID,
-        content: JSON.stringify({ text: 'late old output' }),
-      });
-
-      await vi.runOnlyPendingTimersAsync();
-      await Promise.resolve();
-      await Promise.resolve();
 
       expect(fresh.id).not.toBe(original.id);
-      expect(deliveredTexts).not.toContain('late old output');
-      expect(deliveredRows(original.id)).toContainEqual({
-        message_out_id: 'late-old-session-outbound',
-        platform_message_id: null,
-        status: 'delivered',
-      });
+      expect(deliveredTexts).toEqual([
+        'Error: session reset finished but old output cleanup failed. I recorded it for repair.',
+      ]);
+      expect(
+        getDb()
+          .prepare('SELECT phase FROM scheduler_session_supersessions WHERE old_session_id = ?')
+          .get(original.id),
+      ).toEqual({ phase: 'fresh-activated' });
     } finally {
-      vi.useRealTimers();
+      suppressSpy.mockRestore();
     }
   });
 
   it('applies late scheduling actions from the superseded session before stale cleanup', async () => {
-    vi.useFakeTimers();
-    try {
-      const { routeInbound } = await import('./router.js');
+    const { routeInbound } = await import('./router.js');
 
-      await routeInbound(event('hello first', 'msg-first-before-schedule-drain'));
-      const original = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
-      await routeInbound(event('/new', 'msg-new-schedule-drain'));
+    await routeInbound(event('hello first', 'msg-first-before-schedule-drain'));
+    const original = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
 
-      writeOutboundDirect('ag-yente', original.id, {
-        id: 'late-old-session-schedule',
-        kind: 'system',
+    writeOutboundDirect('ag-yente', original.id, {
+      id: 'late-old-session-schedule',
+      kind: 'system',
+      platformId: DISCORD_PLATFORM_ID,
+      channelType: 'discord',
+      threadId: DISCORD_THREAD_ID,
+      content: JSON.stringify({
+        action: 'schedule_task',
+        taskId: 'task-reset-survives',
+        prompt: 'heartbeat',
+        script: null,
+        processAfter: '2026-06-06T12:00:00.000Z',
+        recurrence: null,
         platformId: DISCORD_PLATFORM_ID,
         channelType: 'discord',
         threadId: DISCORD_THREAD_ID,
-        content: JSON.stringify({
-          action: 'schedule_task',
-          taskId: 'task-reset-survives',
-          prompt: 'heartbeat',
-          script: null,
-          processAfter: '2026-06-06T12:00:00.000Z',
-          recurrence: null,
-          platformId: DISCORD_PLATFORM_ID,
-          channelType: 'discord',
-          threadId: DISCORD_THREAD_ID,
-          messagingGroupId: 'mg-discord',
-          isGroup: 1,
-        }),
-      });
+        messagingGroupId: 'mg-discord',
+        isGroup: 1,
+      }),
+    });
 
-      await vi.runOnlyPendingTimersAsync();
-      await Promise.resolve();
-      await Promise.resolve();
+    await routeInbound(event('/new', 'msg-new-schedule-drain'));
 
-      expect(getScheduledTask('ag-yente', 'task-reset-survives')).toMatchObject({
-        status: 'pending',
-        process_after: '2026-06-06T12:00:00.000Z',
-      });
-      expect(deliveredRows(original.id)).toContainEqual({
-        message_out_id: 'late-old-session-schedule',
-        platform_message_id: null,
-        status: 'delivered',
-      });
-    } finally {
-      vi.useRealTimers();
-    }
+    expect(getScheduledTask('ag-yente', 'task-reset-survives')).toMatchObject({
+      status: 'pending',
+      process_after: '2026-06-06T12:00:00.000Z',
+    });
+    expect(deliveredRows(original.id)).toContainEqual({
+      message_out_id: 'late-old-session-schedule',
+      platform_message_id: null,
+      status: 'delivered',
+    });
   });
 });
 

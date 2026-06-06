@@ -26,17 +26,28 @@ import {
   getMessagingGroupAgents,
   getMessagingGroupWithAgentCount,
 } from './db/messaging-groups.js';
-import { findActiveSessionThreadIdEndingWithForAgent, findSessionForAgent, getSession } from './db/sessions.js';
 import { withRuntimeLock } from './db/runtime-locks.js';
-import { deliverSessionMessages, dropInactiveSessionOutbound, suppressSessionOutbound } from './delivery.js';
-import { drainSchedulingActionsFromStoppedSession } from './modules/scheduling/drain.js';
+import { findActiveSessionThreadIdEndingWithForAgent, findSessionForAgent, getSession } from './db/sessions.js';
+import { deliverSessionMessages, getDeliveryAdapter, suppressSessionOutbound } from './delivery.js';
 import { startTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { resolveSession, writeSessionMessage, writeOutboundDirect } from './session-manager.js';
-import { cleanupContainerForSession, wakeContainer } from './container-runner.js';
+import { wakeContainer } from './container-runner.js';
 import type { AgentGroup, MessagingGroup, MessagingGroupAgent, Session } from './types.js';
 import type { InboundEvent } from './channels/adapter.js';
 import { handleYenteHostCommand } from './yente/host-commands.js';
+import {
+  markSchedulerResetOldOutboundSuppressed,
+  markSchedulerResetResponseDelivered,
+  recordSchedulerResetIncident,
+  SchedulerResetError,
+} from './yente/scheduler-reset.js';
+import { RouteResetInProgressError } from './yente/scheduler-reset-repair.js';
+import {
+  getSchedulerSupersession,
+  phaseAtLeast,
+  recordSchedulerSupersessionError,
+} from './yente/scheduler-supersessions.js';
 
 function generateId(): string {
   return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -429,8 +440,6 @@ async function deliverToAgent(
     effectiveSessionMode = 'per-thread';
   }
 
-  const { session, created } = resolveSession(agent.agent_group_id, mg.id, event.threadId, effectiveSessionMode);
-
   // The inbound row's (channel_type, platform_id, thread_id) is the address
   // the agent's reply will be delivered to. Normally it mirrors the source
   // (stamped from the event). When the caller supplied `replyTo` (CLI admin
@@ -441,16 +450,62 @@ async function deliverToAgent(
     threadId: event.threadId,
   };
 
+  let session: Session;
+  let created: boolean;
+  try {
+    ({ session, created } = resolveSession(agent.agent_group_id, mg.id, event.threadId, effectiveSessionMode));
+  } catch (err) {
+    if (err instanceof RouteResetInProgressError) {
+      await deliverHostText(
+        deliveryAddr,
+        'Session reset is still finishing; I will be ready in a moment.',
+        'route-reset-in-progress',
+      );
+      log.info('Refused to create competing session during scheduler-aware reset', {
+        agentGroupId: agent.agent_group_id,
+        messagingGroupId: mg.id,
+        threadId: event.threadId,
+      });
+      return;
+    }
+    throw err;
+  }
+
   if (event.message.kind === 'chat' || event.message.kind === 'chat-sdk') {
-    const hostCommand = handleYenteHostCommand({
-      content: event.message.content,
-      userId,
-      agentGroup,
-      messagingGroup: mg,
-      session,
-      sessionMode: effectiveSessionMode,
-    });
+    let hostCommand;
+    try {
+      hostCommand = await handleYenteHostCommand({
+        content: event.message.content,
+        userId,
+        agentGroup,
+        messagingGroup: mg,
+        session,
+        sessionMode: effectiveSessionMode,
+        responseAddress: deliveryAddr,
+      });
+    } catch (err) {
+      if (err instanceof SchedulerResetError) {
+        await deliverSchedulerResetFailure(err, deliveryAddr);
+        return;
+      }
+      throw err;
+    }
     if (hostCommand.handled) {
+      if (hostCommand.deliveryMode === 'host-adapter') {
+        await finishSchedulerAwareResetHostCommand(hostCommand, deliveryAddr);
+        log.info('Yente host command handled', {
+          command: hostCommand.command,
+          sessionId: hostCommand.sessionForOutbound.id,
+          supersededSessionId: hostCommand.supersededSessionId,
+          agentGroupId: agent.agent_group_id,
+          messagingGroupId: mg.id,
+          platformId: deliveryAddr.platformId,
+          threadId: deliveryAddr.threadId,
+          userId,
+        });
+        return;
+      }
+
       if (hostCommand.supersededSessionId && hostCommand.supersededSessionId !== hostCommand.sessionForOutbound.id) {
         await suppressSessionOutbound(
           hostCommand.supersededSessionId,
@@ -476,13 +531,6 @@ async function deliverToAgent(
         userId,
       });
       const successDelivery = deliverSessionMessages(hostCommand.sessionForOutbound);
-      scheduleSupersededSessionCleanup({
-        command: hostCommand.command,
-        supersededSessionId: hostCommand.supersededSessionId,
-        freshSession: hostCommand.sessionForOutbound,
-        deliveryAddr,
-        successDelivery,
-      });
       await successDelivery;
       return;
     }
@@ -550,86 +598,126 @@ async function deliverToAgent(
   }
 }
 
-function scheduleSupersededSessionCleanup(args: {
-  command: string;
-  supersededSessionId: string | undefined;
-  freshSession: Session;
-  deliveryAddr: { channelType: string; platformId: string; threadId: string | null };
-  successDelivery: Promise<void>;
-}): void {
-  if (!args.supersededSessionId || args.supersededSessionId === args.freshSession.id) return;
+async function finishSchedulerAwareResetHostCommand(
+  hostCommand: Extract<Awaited<ReturnType<typeof handleYenteHostCommand>>, { handled: true }>,
+  deliveryAddr: { channelType: string; platformId: string; threadId: string | null },
+): Promise<void> {
+  const oldSessionId = hostCommand.supersededSessionId;
+  if (!oldSessionId) {
+    await deliverHostText(deliveryAddr, hostCommand.outboundText, `yente-host-command-${hostCommand.command}`);
+    return;
+  }
 
-  void dropInactiveSessionOutbound(args.supersededSessionId, `yente-session-${args.command}-pre-cleanup`).catch((err) =>
-    log.warn('Failed to drain inactive session outbound before cleanup', {
-      command: args.command,
-      supersededSessionId: args.supersededSessionId,
-      err,
-    }),
-  );
+  await withSchedulerMutatorLockForResetFinish(async () => {
+    let row = getSchedulerSupersession(oldSessionId);
+    if (!row || row.phase === 'response-delivered' || row.phase === 'failed') return;
 
-  const timer = setTimeout(() => {
-    cleanupContainerForSession(args.supersededSessionId!, `yente-session-${args.command}`)
-      .then(async (cleaned) => {
-        await drainSupersededSessionSchedulingActions(args.supersededSessionId!);
-        await dropInactiveSessionOutbound(
-          args.supersededSessionId!,
-          `yente-session-${args.command}-post-cleanup`,
-        ).catch((err) =>
-          log.warn('Failed to drain inactive session outbound after cleanup', {
-            command: args.command,
-            supersededSessionId: args.supersededSessionId,
+    if (!phaseAtLeast(row.phase, 'old-outbound-suppressed')) {
+      try {
+        await suppressSessionOutbound(oldSessionId, `yente-session-${hostCommand.command}-post-reset`);
+        markSchedulerResetOldOutboundSuppressed(oldSessionId);
+      } catch (err) {
+        recordSchedulerSupersessionError(oldSessionId, row.phase, err);
+        const oldSession = getSession(oldSessionId);
+        if (oldSession) {
+          recordSchedulerResetIncident({
+            oldSession,
+            freshSessionId: hostCommand.sessionForOutbound.id,
+            command: hostCommand.command,
+            phase: 'old-outbound-suppressed',
             err,
-          }),
-        );
-        log.info('Yente session reset cleanup finished', {
-          command: args.command,
-          supersededSessionId: args.supersededSessionId,
-          freshSessionId: args.freshSession.id,
-          cleaned,
+          });
+        }
+        log.error('Failed to suppress old outbound after scheduler-aware reset', { oldSessionId, err });
+        await deliverHostText(
+          deliveryAddr,
+          'Error: session reset finished but old output cleanup failed. I recorded it for repair.',
+          `yente-host-command-${hostCommand.command}-suppression-failed`,
+        ).catch((deliveryErr) => {
+          log.error('Failed to deliver scheduler-aware reset suppression failure response', {
+            oldSessionId,
+            deliveryErr,
+          });
         });
-      })
-      .catch(async (err) => {
-        await dropInactiveSessionOutbound(
-          args.supersededSessionId!,
-          `yente-session-${args.command}-cleanup-failed`,
-        ).catch((drainErr) =>
-          log.warn('Failed to drain inactive session outbound after cleanup failure', {
-            command: args.command,
-            supersededSessionId: args.supersededSessionId,
-            drainErr,
-          }),
-        );
-        log.error('Yente session reset cleanup failed', {
-          command: args.command,
-          supersededSessionId: args.supersededSessionId,
-          freshSessionId: args.freshSession.id,
+        return;
+      }
+      row = getSchedulerSupersession(oldSessionId);
+      if (!row || row.phase === 'response-delivered' || row.phase === 'failed') return;
+    }
+
+    try {
+      await deliverHostText(deliveryAddr, hostCommand.outboundText, `yente-host-command-${hostCommand.command}`);
+      markSchedulerResetResponseDelivered(oldSessionId);
+    } catch (err) {
+      const oldSession = getSession(oldSessionId);
+      if (oldSession) {
+        recordSchedulerResetIncident({
+          oldSession,
+          freshSessionId: hostCommand.sessionForOutbound.id,
+          command: hostCommand.command,
+          phase: 'response-delivered',
           err,
         });
-        writeOutboundDirect(args.freshSession.agent_group_id, args.freshSession.id, {
-          id: `cleanup-error-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          kind: 'chat',
-          platformId: args.deliveryAddr.platformId,
-          channelType: args.deliveryAddr.channelType,
-          threadId: args.deliveryAddr.threadId,
-          content: JSON.stringify({ text: 'Error: old session cleanup failed.' }),
-        });
-        await args.successDelivery.catch(() => undefined);
-        void deliverSessionMessages(args.freshSession).catch((deliveryErr) =>
-          log.error('Failed to deliver Yente cleanup error', {
-            sessionId: args.freshSession.id,
-            deliveryErr,
-          }),
-        );
-      });
-  }, 0);
-  timer.unref?.();
+      }
+      log.error('Failed to deliver scheduler-aware reset response', { oldSessionId, err });
+    }
+  });
 }
 
-async function drainSupersededSessionSchedulingActions(sessionId: string): Promise<number> {
-  const session = getSession(sessionId);
-  if (!session) return 0;
-  return await withRuntimeLock('scheduler-mutator', 120_000, (owner) =>
-    drainSchedulingActionsFromStoppedSession(session, owner),
+async function withSchedulerMutatorLockForResetFinish<T>(fn: () => Promise<T>): Promise<T> {
+  const deadline = Date.now() + 120_000;
+  for (;;) {
+    try {
+      return await withRuntimeLock('scheduler-mutator', 120_000, fn);
+    } catch (err) {
+      if (!isSchedulerLockContention(err) || Date.now() >= deadline) {
+        throw err;
+      }
+      await sleep(100);
+    }
+  }
+}
+
+function isSchedulerLockContention(err: unknown): boolean {
+  return err instanceof Error && err.message.includes('Runtime lock "scheduler-mutator" is already held');
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function deliverSchedulerResetFailure(
+  err: SchedulerResetError,
+  deliveryAddr: { channelType: string; platformId: string; threadId: string | null },
+): Promise<void> {
+  const text = err.oldSessionRemainsActive
+    ? 'Error: session reset failed before scheduled jobs could be preserved. The old session remains active.'
+    : 'Error: session reset hit a problem after the old session was disturbed. I recorded it for repair.';
+  await deliverHostText(deliveryAddr, text, `yente-reset-failure-${err.phase}`).catch((deliveryErr) => {
+    log.error('Failed to deliver scheduler-aware reset failure response', {
+      oldSessionId: err.oldSessionId,
+      freshSessionId: err.freshSessionId,
+      phase: err.phase,
+      deliveryErr,
+    });
+  });
+}
+
+async function deliverHostText(
+  deliveryAddr: { channelType: string; platformId: string; threadId: string | null },
+  text: string,
+  reason: string,
+): Promise<string | undefined> {
+  const adapter = getDeliveryAdapter();
+  if (!adapter) {
+    throw new Error(`Cannot deliver host response for ${reason}: delivery adapter is not ready`);
+  }
+  return await adapter.deliver(
+    deliveryAddr.channelType,
+    deliveryAddr.platformId,
+    deliveryAddr.threadId,
+    'chat',
+    JSON.stringify({ text }),
   );
 }
 
