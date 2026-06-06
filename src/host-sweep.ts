@@ -159,11 +159,34 @@ export function stopHostSweep(): void {
 async function sweep(): Promise<void> {
   if (!running) return;
 
+  await runHostSweepPass();
+  setTimeout(sweep, SWEEP_INTERVAL_MS);
+}
+
+export async function runHostSweepPassForTest(): Promise<void> {
+  await runHostSweepPass();
+}
+
+async function runHostSweepPass(): Promise<void> {
+  try {
+    const { deliverDueSchedulerIncidents } = await import('./yente/scheduler-alerts.js');
+    await deliverDueSchedulerIncidents();
+  } catch (err) {
+    log.error('Scheduler incident delivery pass failed', { err });
+  }
+
   try {
     const { resumeUnfinishedSchedulerSupersessions } = await import('./yente/scheduler-reset-repair.js');
     await resumeUnfinishedSchedulerSupersessions();
   } catch (err) {
     log.error('Scheduler reset repair pass failed', { err });
+  }
+
+  try {
+    const { repairSchedulerProjections } = await import('./modules/scheduling/repair.js');
+    await repairSchedulerProjections();
+  } catch (err) {
+    log.error('Scheduler repair pass failed', { err });
   }
 
   try {
@@ -178,8 +201,6 @@ async function sweep(): Promise<void> {
   } catch (err) {
     log.error('Host sweep error', { err });
   }
-
-  setTimeout(sweep, SWEEP_INTERVAL_MS);
 }
 
 async function sweepSession(session: Session): Promise<void> {

@@ -1,11 +1,11 @@
 import type Database from 'better-sqlite3';
-import { randomUUID } from 'node:crypto';
 
 import { getChannelAdapter } from '../../channels/channel-registry.js';
 import { getDb } from '../../db/connection.js';
 import { assertRuntimeLockOwner, type RuntimeLockOwner } from '../../db/runtime-locks.js';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
+import { recordSchedulerIncidentWithOwner } from '../../yente/scheduler-alerts.js';
 import {
   clearCompletedProjectionRecurrence,
   projectScheduledTask,
@@ -20,7 +20,6 @@ import {
   listLiveScheduledTasksForSession,
   type ScheduledTaskRow,
 } from './ledger.js';
-import { logSchedulerEvent } from './log.js';
 
 const LOCK_NAME = 'scheduler-mutator';
 
@@ -64,84 +63,20 @@ function assertSchedulerOwner(owner: RuntimeLockOwner): void {
 }
 
 function recordSchedulerIncident(input: IncidentInput): void {
-  const now = new Date().toISOString();
-  getDb()
-    .transaction(() => {
-      assertSchedulerOwner(input.owner);
-      getDb()
-        .prepare(
-          `INSERT INTO scheduler_incidents (
-             id,
-             dedupe_key,
-             severity,
-             status,
-             agent_group_id,
-             series_id,
-             session_id,
-             messaging_group_id,
-             channel_type,
-             platform_id,
-             thread_id,
-             message,
-             details_json,
-             created_at,
-             next_attempt_at,
-             attempt_count,
-             last_attempt_at,
-             last_error,
-             reported_at
-           ) VALUES (
-             @id,
-             @dedupeKey,
-             @severity,
-             'pending',
-             @agentGroupId,
-             @seriesId,
-             @sessionId,
-             @messagingGroupId,
-             @channelType,
-             @platformId,
-             @threadId,
-             @message,
-             @detailsJson,
-             @createdAt,
-             NULL,
-             0,
-             NULL,
-             NULL,
-             NULL
-           )
-           ON CONFLICT(dedupe_key) DO UPDATE SET
-             severity = excluded.severity,
-             details_json = excluded.details_json,
-             message = excluded.message,
-             last_error = NULL`,
-        )
-        .run({
-          id: `sched-inc-${randomUUID()}`,
-          dedupeKey: input.dedupeKey,
-          severity: input.severity,
-          agentGroupId: input.session.agent_group_id,
-          seriesId: input.seriesId,
-          sessionId: input.session.id,
-          messagingGroupId: input.session.messaging_group_id,
-          channelType: null,
-          platformId: null,
-          threadId: input.session.thread_id,
-          message: input.message,
-          detailsJson: JSON.stringify(input.details),
-          createdAt: now,
-        });
-    })();
-
-  logSchedulerEvent(input.severity, 'scheduler_sync_incident', {
-    dedupeKey: input.dedupeKey,
-    agentGroupId: input.session.agent_group_id,
-    sessionId: input.session.id,
-    seriesId: input.seriesId,
-    message: input.message,
-    ...input.details,
-  });
+  recordSchedulerIncidentWithOwner(
+    {
+      dedupeKey: input.dedupeKey,
+      severity: input.severity,
+      agentGroupId: input.session.agent_group_id,
+      seriesId: input.seriesId,
+      sessionId: input.session.id,
+      messagingGroupId: input.session.messaging_group_id,
+      threadId: input.session.thread_id,
+      message: input.message,
+      details: input.details,
+    },
+    input.owner,
+  );
 }
 
 export function getProcessingAcksForProjectedTasks(

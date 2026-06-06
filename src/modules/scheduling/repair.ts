@@ -1,0 +1,136 @@
+import type Database from 'better-sqlite3';
+import fs from 'fs';
+
+import { getDb } from '../../db/connection.js';
+import { getActiveSessions } from '../../db/sessions.js';
+import { withRuntimeLock } from '../../db/runtime-locks.js';
+import { log } from '../../log.js';
+import { inboundDbPath, openInboundDb } from '../../session-manager.js';
+import type { Session } from '../../types.js';
+import { reportSchedulerIncident } from '../../yente/scheduler-alerts.js';
+import { getScheduledTask } from './ledger.js';
+import { ensureSessionSchedulerProjections, resolveProjectionContext } from './sync.js';
+
+interface LegacyTaskRow {
+  id: string;
+  series_id: string;
+  status: string;
+  process_after: string | null;
+  recurrence: string | null;
+  channel_type: string | null;
+  platform_id: string | null;
+  thread_id: string | null;
+  messaging_group_id: string | null;
+}
+
+export async function repairSchedulerProjections(): Promise<void> {
+  for (const session of getActiveSessions()) {
+    await repairActiveSessionProjections(session);
+  }
+  await reportUnsafeArchivedSchedulerRows();
+}
+
+async function repairActiveSessionProjections(session: Session): Promise<void> {
+  let inDb: Database.Database | null = null;
+  try {
+    inDb = openInboundDb(session.agent_group_id, session.id);
+    await withRuntimeLock('scheduler-mutator', 120_000, async (owner) => {
+      ensureSessionSchedulerProjections(inDb!, session, resolveProjectionContext(session), owner);
+    });
+  } catch (err) {
+    log.error('Scheduler projection repair failed for session', { sessionId: session.id, err });
+    await reportSchedulerIncident({
+      dedupeKey: `repair:${session.id}`,
+      severity: 'error',
+      message: `Scheduler repair failed for session ${session.id}. Scheduled tasks may be delayed until repair succeeds.`,
+      agentGroupId: session.agent_group_id,
+      sessionId: session.id,
+      messagingGroupId: session.messaging_group_id,
+      threadId: session.thread_id,
+      details: { err: errorMessage(err) },
+    });
+  } finally {
+    inDb?.close();
+  }
+}
+
+async function reportUnsafeArchivedSchedulerRows(): Promise<void> {
+  const sessions = getDb()
+    .prepare("SELECT * FROM sessions WHERE status <> 'active' ORDER BY created_at ASC, id ASC")
+    .all() as Session[];
+
+  for (const session of sessions) {
+    const inPath = inboundDbPath(session.agent_group_id, session.id);
+    if (!fs.existsSync(inPath)) continue;
+
+    let inDb: Database.Database | null = null;
+    try {
+      inDb = openInboundDb(session.agent_group_id, session.id);
+      const rows = listUnsafeLegacyRows(inDb);
+      for (const row of rows) {
+        const central = getScheduledTask(session.agent_group_id, row.series_id);
+        if (central) continue;
+
+        await reportSchedulerIncident({
+          dedupeKey: `legacy-archived-task:${session.id}:${row.id}`,
+          severity: 'warn',
+          message: `Archived session ${session.id} contains live scheduled task row "${row.series_id}" with no central scheduler record. I did not restore it automatically.`,
+          agentGroupId: session.agent_group_id,
+          seriesId: row.series_id,
+          sessionId: session.id,
+          messagingGroupId: row.messaging_group_id ?? session.messaging_group_id,
+          channelType: row.channel_type,
+          platformId: row.platform_id,
+          threadId: row.thread_id ?? session.thread_id,
+          details: {
+            reason: 'archived-live-task-without-central-proof',
+            archivedSessionId: session.id,
+            messageId: row.id,
+            status: row.status,
+            processAfter: row.process_after,
+            recurrence: row.recurrence,
+          },
+        });
+      }
+    } catch (err) {
+      log.error('Archived scheduler row scan failed', { sessionId: session.id, err });
+      await reportSchedulerIncident({
+        dedupeKey: `legacy-archived-scan:${session.id}`,
+        severity: 'error',
+        message: `Scheduler repair could not scan archived session ${session.id}.`,
+        agentGroupId: session.agent_group_id,
+        sessionId: session.id,
+        messagingGroupId: session.messaging_group_id,
+        threadId: session.thread_id,
+        details: { err: errorMessage(err) },
+      });
+    } finally {
+      inDb?.close();
+    }
+  }
+}
+
+function listUnsafeLegacyRows(inDb: Database.Database): LegacyTaskRow[] {
+  return inDb
+    .prepare(
+      `SELECT id,
+              series_id,
+              status,
+              process_after,
+              recurrence,
+              channel_type,
+              platform_id,
+              thread_id,
+              messaging_group_id
+         FROM messages_in
+        WHERE kind = 'task'
+          AND series_id IS NOT NULL
+          AND status IN ('pending', 'paused', 'processing')
+        ORDER BY seq ASC, id ASC`,
+    )
+    .all() as LegacyTaskRow[];
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}

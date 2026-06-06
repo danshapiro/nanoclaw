@@ -14,6 +14,9 @@ const envConfig = readEnvFile([
   'ONECLI_GATEWAY_URL',
   'AGENT_MCP_CONFIG_PATH',
   'NANOCLAW_AGENT_MCP_CONFIG',
+  'YENTE_SCHEDULER_ALERT_CHANNEL_TYPE',
+  'YENTE_SCHEDULER_ALERT_PLATFORM_ID',
+  'YENTE_SCHEDULER_ALERT_THREAD_ID',
   'TZ',
 ]);
 
@@ -55,6 +58,19 @@ export const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '1800000', 10);
 export const MAX_CONCURRENT_CONTAINERS = Math.max(1, parseInt(process.env.MAX_CONCURRENT_CONTAINERS || '5', 10) || 5);
 export const NANOCLAW_ROOT = process.env.NANOCLAW_ROOT || '/srv/nanoclaw';
 export const MANAGED_REPOS_DIR = process.env.NANOCLAW_MANAGED_REPOS_DIR || '';
+
+export function getSchedulerAlertFallbackRoute(): {
+  channelType: string | null;
+  platformId: string | null;
+  threadId: string | null;
+} {
+  return {
+    channelType:
+      process.env.YENTE_SCHEDULER_ALERT_CHANNEL_TYPE || envConfig.YENTE_SCHEDULER_ALERT_CHANNEL_TYPE || null,
+    platformId: process.env.YENTE_SCHEDULER_ALERT_PLATFORM_ID || envConfig.YENTE_SCHEDULER_ALERT_PLATFORM_ID || null,
+    threadId: process.env.YENTE_SCHEDULER_ALERT_THREAD_ID || envConfig.YENTE_SCHEDULER_ALERT_THREAD_ID || null,
+  };
+}
 
 function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');

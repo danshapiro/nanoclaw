@@ -106,6 +106,11 @@ export function setDeliveryAdapter(adapter: ChannelDeliveryAdapter): void {
   }
 }
 
+export function clearDeliveryAdapterForTest(): void {
+  deliveryAdapter = null;
+  setTypingAdapter({});
+}
+
 /** Start the active container poll loop (~1s). */
 export function startActiveDeliveryPoll(): void {
   if (activePolling) return;
