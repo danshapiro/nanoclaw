@@ -24,6 +24,8 @@ import {
   createSession,
   getSession,
   findSession,
+  findSessionForAgent,
+  findSessionByAgentGroup,
   getSessionsByAgentGroup,
   getActiveSessions,
   getRunningSessions,
@@ -506,6 +508,30 @@ describe('sessions', () => {
     createSession({ ...sess(), id: 'sess-idle', container_status: 'idle', thread_id: 'thread-1' });
     createSession({ ...sess(), id: 'sess-stopped', container_status: 'stopped', thread_id: 'thread-2' });
     expect(getRunningSessions()).toHaveLength(2);
+  });
+
+  it('excludes resetting sessions from active and running selectors', () => {
+    createSession({ ...sess(), id: 'sess-active', container_status: 'running' });
+    createSession({
+      ...sess(),
+      id: 'sess-resetting-shared',
+      status: 'resetting',
+      container_status: 'running',
+      thread_id: 'thread-reset-shared',
+    });
+    createSession({
+      ...sess(),
+      id: 'sess-resetting-thread',
+      status: 'resetting',
+      container_status: 'idle',
+      thread_id: 'thread-reset',
+    });
+
+    expect(getActiveSessions().map((s) => s.id)).toEqual(['sess-active']);
+    expect(getRunningSessions().map((s) => s.id)).toEqual(['sess-active']);
+    expect(findSession('mg-1', 'thread-reset')).toBeUndefined();
+    expect(findSessionForAgent('ag-1', 'mg-1', 'thread-reset')).toBeUndefined();
+    expect(findSessionByAgentGroup('ag-1')?.id).toBe('sess-active');
   });
 
   it('should update', () => {

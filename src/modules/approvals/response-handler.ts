@@ -38,23 +38,31 @@ export async function handleApprovalsResponse(payload: ResponsePayload): Promise
     return true;
   }
 
-  await handleRegisteredApproval(approval, payload.value, payload.userId ?? '');
-  return true;
+  return await handleRegisteredApproval(approval, payload.value, payload.userId ?? '');
 }
 
 async function handleRegisteredApproval(
   approval: PendingApproval,
   selectedOption: string,
   userId: string,
-): Promise<void> {
+): Promise<boolean> {
   if (!approval.session_id) {
     deletePendingApproval(approval.approval_id);
-    return;
+    return true;
   }
   const session = getSession(approval.session_id);
   if (!session) {
     deletePendingApproval(approval.approval_id);
-    return;
+    return true;
+  }
+  if (session.status !== 'active') {
+    log.warn('Approval response ignored for inactive session', {
+      approvalId: approval.approval_id,
+      sessionId: approval.session_id,
+      status: session.status,
+    });
+    deletePendingApproval(approval.approval_id);
+    return true;
   }
 
   const notify = (text: string): void => {
@@ -74,7 +82,7 @@ async function handleRegisteredApproval(
     log.info('Approval rejected', { approvalId: approval.approval_id, action: approval.action, userId });
     deletePendingApproval(approval.approval_id);
     await wakeContainer(session);
-    return;
+    return true;
   }
 
   // Approved — dispatch to the module that registered for this action.
@@ -87,7 +95,7 @@ async function handleRegisteredApproval(
     notify(`Your ${approval.action} was approved, but no handler is installed to apply it.`);
     deletePendingApproval(approval.approval_id);
     await wakeContainer(session);
-    return;
+    return true;
   }
 
   const payload = JSON.parse(approval.payload);
@@ -103,4 +111,5 @@ async function handleRegisteredApproval(
 
   deletePendingApproval(approval.approval_id);
   await wakeContainer(session);
+  return true;
 }

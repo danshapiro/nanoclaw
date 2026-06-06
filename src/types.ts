@@ -105,7 +105,7 @@ export interface Session {
   messaging_group_id: string | null;
   thread_id: string | null;
   agent_provider: string | null;
-  status: 'active' | 'archived' | 'closed';
+  status: 'active' | 'resetting' | 'archived' | 'closed';
   container_status: 'running' | 'idle' | 'stopped';
   last_active: string | null;
   created_at: string;
