@@ -667,7 +667,7 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     expect(controller.permissionReplies).toContainEqual({ permissionID: 'perm-x', response: 'always' });
   });
 
-  it('emits a typed terminal interruption (not a raw throw) on session.error, preserving continuation', async () => {
+  it('emits a typed terminal interruption (not a raw throw) on unrecognized session.error, preserving continuation with generic fallback', async () => {
     const stream = new FakeStream();
     const { provider } = makeProvider({ stream });
     const query = provider.query({ inputId: 'in-e', prompt: 'work', cwd: '/workspace/agent', continuation: TEST_SESSION });
@@ -682,11 +682,41 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     stream.push({ type: 'session.error', properties: { sessionID: TEST_SESSION, error: { data: { message: 'boom' } } } });
     await reader;
     const interruption = events.find((e) => e.type === 'interruption') as { classification: string; continuationPolicy: string; fallbackUserMessage: string; terminal: boolean };
-    expect(interruption.classification).toBe('opencode_session_error');
+    expect(interruption.classification).toBe('session-error-unknown');
     expect(interruption.continuationPolicy).toBe('preserve');
     expect(interruption.terminal).toBe(true);
     // Sanitized: no raw provider text in the user-facing fallback.
     expect(interruption.fallbackUserMessage).not.toContain('boom');
+  });
+
+  it('emits an actionable terminal interruption on session.error with known billing error', async () => {
+    const stream = new FakeStream();
+    const { provider } = makeProvider({ stream });
+    const query = provider.query({ inputId: 'in-balance', prompt: 'work', cwd: '/workspace/agent', continuation: TEST_SESSION });
+    const events: ProviderEvent[] = [];
+    const reader = (async () => {
+      for await (const e of query.events) {
+        events.push(e);
+        if (e.type === 'interruption') break;
+      }
+    })();
+    await new Promise((r) => setTimeout(r, 5));
+    stream.push({
+      type: 'session.error',
+      properties: {
+        sessionID: TEST_SESSION,
+        error: { data: { message: 'Insufficient balance. Manage your billing here: https://opencode.ai/workspace/wrk_01K7GPZSP6NGNSHF5ZHKBTVHVF/billing' } },
+      },
+    });
+    await reader;
+    const interruption = events.find((e) => e.type === 'interruption') as { classification: string; fallbackUserMessage: string; agentMessage: string; terminal: boolean };
+    expect(interruption.classification).toBe('session-error-insufficient-balance');
+    expect(interruption.terminal).toBe(true);
+    expect(interruption.fallbackUserMessage).toContain('run out of balance');
+    expect(interruption.fallbackUserMessage).toContain('all Yente agents');
+    expect(interruption.fallbackUserMessage).not.toContain('opencode.ai');
+    expect(interruption.fallbackUserMessage).not.toContain('wrk_');
+    expect(interruption.agentMessage).toContain('operator action required');
   });
 
   it('captures a completed tool as a side-effect reference event before result', async () => {

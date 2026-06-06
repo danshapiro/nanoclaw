@@ -28,6 +28,7 @@ import {
   isMissingOpenCodeSessionError,
   isMissingSessionResultError,
 } from './opencode-errors.js';
+import { classifyActionableError, buildAgentMessage } from './actionable-error-messages.js';
 import {
   detectNativeQuestionPart,
   detectNativeQuestionPermission,
@@ -1194,27 +1195,32 @@ export class OpenCodeProvider implements AgentProvider {
                 case 'session.error': {
                   const props = ev.properties as { sessionID?: string; error?: unknown };
                   if (props.sessionID === sessionId || props.sessionID === undefined) {
+                    const rawMessage = sessionErrorMessage(props);
+                    const actionable = classifyActionableError(props.error);
                     // Invariant 159: typed terminal interruption, input-
                     // correlated, sanitized (no raw provider error text in the
                     // user-facing fallback). Continuation preserved.
                     log(
                       JSON.stringify({
                         severity: 'warn',
-                        event: 'opencode_session_error',
+                        event: actionable.label,
                         session_id: sessionId,
-                        message: sessionErrorMessage(props),
+                        message: rawMessage,
+                        kind: actionable.kind,
+                        operator_action_required: actionable.operatorActionRequired,
+                        retryable: actionable.retryable,
                       }),
                     );
                     clearActiveTools();
                     terminalInterruption = buildInterruption(
-                      'opencode_session_error',
-                      'The model reported an error on this turn and I stopped before finishing. Your request is preserved.',
-                      'Something went wrong on this turn. Your request is preserved — ask me to continue.',
+                      actionable.label,
+                      buildAgentMessage(actionable),
+                      actionable.userMessage,
                       pump.liveness(),
                       'preserve',
                     );
                     pump.dispose();
-                    teardownRuntime('session_error');
+                    teardownRuntime(actionable.label);
                     break turn;
                   }
                   break;
