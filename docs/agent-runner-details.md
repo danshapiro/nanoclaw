@@ -398,7 +398,7 @@ scope:
 - Only rows on the **trigger route** (the route of the wake-triggering message) are claimed into a turn; other-route rows stay pending and are never folded into the active prompt, accumulated context, or recovery — both in the initial batch and in follow-up polling.
 - Recovery is keyed by `provider + normalized route`, stored under the **trigger** route (not the first-row route).
 - Same-route, multi-trigger rows become the recovery entry's ordered `originalTasks`.
-- The agent's own outbound rows (`messages_out`) are stamped with the active route (`route_key`/`messaging_group_id`/`is_group`) so the agent's progress, results, relay messages, and fallbacks are harvestable into route-scoped recovery and never leak across conversations.
+- Same-route outbound rows (`messages_out`) are stamped with the active route (`route_key`/`messaging_group_id`/`is_group`) so the agent's progress, results, relay messages, and fallbacks are harvestable into route-scoped recovery. Cross-destination rows are not stamped with the active route.
 - Null-thread DMs are aliased consistently by the normalizer so a DM's recovery route is stable.
 
 ### Inactivity relay
@@ -618,12 +618,19 @@ interface RoutingContext {
   channelType: string | null;
   threadId: string | null;
   inReplyTo: string | null;  // messages_in.id of the triggering message
+  routeKey?: string | null;
+  messagingGroupId?: string | null;
+  isGroup?: 0 | 1 | null;
 }
 ```
 
-When writing messages_out (either from provider results or MCP tool calls), the agent-runner copies this routing context by default. The agent never sees routing fields — it just produces text. The routing is implicit: "respond to whoever sent the message."
+The agent never sees raw routing fields in the prompt. The runner keeps them as delivery metadata and fills `routeKey`/`messagingGroupId`/`isGroup` from the normalized active route when a provider turn starts.
 
-MCP tools that target a different destination (e.g., `send_to_agent`, `send_message` with explicit channel) override the routing context for that specific messages_out row.
+Provider final text is explicitly routed, not implicitly delivered. The runner sends only `<message to="destination-name">...</message>` blocks from the final provider result. Text outside those blocks, including `<internal>...</internal>`, is scratchpad: it is logged and not sent. Unknown destinations are dropped with a warning and added to scratchpad.
+
+For a final `<message>` addressed to the active route, the runner writes a `messages_out` row with the active reply/thread metadata and the active route stamp so recovery can harvest it as prior progress. For a final `<message>` addressed to another destination, the runner writes to that destination but leaves the active `in_reply_to`, `thread_id`, `route_key`, `messaging_group_id`, and `is_group` fields unset so a cross-destination message cannot be recovered as progress for the triggering conversation.
+
+MCP tools that send to a named destination resolve the name through the `destinations` table. `send_message` applies the same route-stamp rule: current-route messages are stamped for recovery; cross-destination messages are not.
 
 ### Status Management
 
@@ -654,23 +661,22 @@ Send a chat message to the current conversation (or a specified destination).
   name: 'send_message',
   params: {
     text: string,          // message content
-    channel?: string,      // optional: target channel type (default: reply to origin)
-    platformId?: string,   // optional: target platform ID
-    threadId?: string,     // optional: target thread ID
+    to?: string,           // optional destination name
   }
 }
 ```
 
-Implementation: write a `messages_out` row with `kind: 'chat'`. If channel/platformId/threadId are provided, use those as routing. Otherwise, copy from the current routing context.
+Implementation: resolve `to` against the destination map and write a `messages_out` row with `kind: 'chat'`. If `to` is omitted, the tool replies to the session's current conversation when session routing is available; otherwise the legacy single-destination shortcut applies. A same-route send preserves the session thread and is stamped with the active route for recovery. A cross-destination send starts with `thread_id = NULL` and no active route stamp.
 
 #### send_file
 
-Send a file to the current conversation.
+Send a file to the current conversation or a named destination.
 
 ```typescript
 {
   name: 'send_file',
   params: {
+    to?: string,           // optional destination name
     path: string,          // file path (relative to /workspace/agent/ or absolute)
     text?: string,         // optional accompanying message
     filename?: string,     // display name (default: basename of path)
@@ -757,22 +763,9 @@ Add an emoji reaction to a message.
 
 Implementation: write a `messages_out` row with `operation: 'reaction'`.
 
-#### send_to_agent
+#### Agent destinations
 
-Send a message to another agent group.
-
-```typescript
-{
-  name: 'send_to_agent',
-  params: {
-    agentGroupId: string,  // target agent group
-    text: string,          // message content
-    sessionId?: string,    // optional: target specific session
-  }
-}
-```
-
-Implementation: write a `messages_out` row with `channel_type: 'agent'`, `platform_id: agentGroupId`, `thread_id: sessionId`.
+There is no separate `send_to_agent` tool. Agents and channels share the same destination namespace, so sending to another agent group uses `send_message({ to: "<agent-name>", text })`. The destination row resolves to `channel_type: 'agent'` and `platform_id: agentGroupId`.
 
 #### schedule_task
 
