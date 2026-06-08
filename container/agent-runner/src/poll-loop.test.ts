@@ -622,13 +622,14 @@ describe('poll-loop conversational reply accounting', () => {
     expect(out).toHaveLength(1);
     expect(JSON.parse(out[0].content).text).toBe('Done.');
     expect(prompts).toHaveLength(2);
-    expect(prompts[1]).toContain('Do not redo work or call tools');
-    expect(prompts[1]).toContain('Available destinations: discord-current');
+    expect(prompts[1]).toContain('Do not redo work. Do not call tools.');
+    expect(prompts[1]).toContain('address the block to `discord-current`');
+    expect(prompts[1]).toContain('Put this exact answer text inside the block');
 
     await loopPromise.catch(() => {});
   });
 
-  it('falls back to the missing-response error if the unwrapped-output nudge is ignored once', async () => {
+  it('delivers the original bare final text if the unwrapped-output nudge is ignored once', async () => {
     insertChannelDestination('discord-current', 'chan-1');
     insertMessage(
       'ignored-nudge-chat',
@@ -650,8 +651,50 @@ describe('poll-loop conversational reply accounting', () => {
 
     const out = getUndeliveredMessages();
     expect(out).toHaveLength(1);
-    expect(JSON.parse(out[0].content).text).toContain('completed without sending a user-visible response');
+    expect(JSON.parse(out[0].content).text).toBe('Done.');
     expect(prompts).toHaveLength(2);
+
+    await loopPromise.catch(() => {});
+  });
+
+  it('delivers the original bare final text if the unwrapped-output nudge produces only reasoning', async () => {
+    insertChannelDestination('discord-current', 'chan-1');
+    insertMessage(
+      'reasoning-only-nudge-chat',
+      'chat',
+      { sender: 'User', text: 'please respond' },
+      { platformId: 'chan-1', channelType: 'discord', threadId: 'thread-1' },
+    );
+
+    let pushed = false;
+    const provider = new ScriptedProvider(async function* (input) {
+      yield { type: 'input-accepted', inputId: input.inputId, scope: 'initial' };
+      yield { type: 'result', text: 'Done.', resolvedInputIds: [input.inputId] };
+      while (!pushed) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      yield { type: 'input-accepted', inputId: input.inputId, scope: 'followup' };
+      yield { type: 'result', resolvedInputIds: [input.inputId] };
+    });
+    const originalQuery = provider.query.bind(provider);
+    provider.query = (input) => {
+      const query = originalQuery(input);
+      const push = query.push.bind(query);
+      query.push = (turn) => {
+        pushed = true;
+        push(turn);
+      };
+      return query;
+    };
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal);
+
+    await waitFor(() => getAckStatus('reasoning-only-nudge-chat') === 'completed', 1500);
+    controller.abort();
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(JSON.parse(out[0].content).text).toBe('Done.');
 
     await loopPromise.catch(() => {});
   });

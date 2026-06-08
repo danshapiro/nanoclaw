@@ -1,6 +1,6 @@
 import fs from 'fs';
 
-import { findByName, getAllDestinations, type DestinationEntry } from './destinations.js';
+import { findByName, findByRouting, getAllDestinations, type DestinationEntry } from './destinations.js';
 import {
   getPendingMessages,
   markProcessing,
@@ -595,6 +595,7 @@ async function processQuery(
   let relayInFlight = false;
   let directFallbackSent = false;
   let unwrappedOutputNudged = false;
+  let pendingUnwrappedOutputText: string | null = null;
   // Side-effect evidence carried on a terminal interruption's recovery seed, so
   // the accepted-unresolved recovery entry records what already happened.
   const interruptionSideEffects: ProviderRecoveryEntry['sideEffects'] = [];
@@ -816,6 +817,7 @@ async function processQuery(
     log(`Pushing ${newMessages.length} follow-up message(s) into active query (input ${followupInputId})`);
     try {
       unwrappedOutputNudged = false;
+      pendingUnwrappedOutputText = null;
       query.push({ inputId: followupInputId, prompt, attachments });
     } catch (err) {
       log(
@@ -954,15 +956,27 @@ async function processQuery(
         // only those rows.
         const dispatch = event.text ? dispatchResultText(event.text, routing) : { sent: 0, hasUnwrapped: false };
         const resolved = resolveResult(event.resolvedInputIds ?? []);
+        const stillMissingVisibleReply =
+          replyAccounting.requiresUserVisibleReply &&
+          countOutboundVisibleReplyMessages(routing) <= replyAccounting.outboundVisibleReplyCountBefore;
         if (event.text) {
-          const stillMissingVisibleReply =
-            replyAccounting.requiresUserVisibleReply &&
-            countOutboundVisibleReplyMessages(routing) <= replyAccounting.outboundVisibleReplyCountBefore;
           if (dispatch.hasUnwrapped && dispatch.sent === 0 && resolved.length === 1 && !unwrappedOutputNudged && stillMissingVisibleReply) {
             unwrappedOutputNudged = true;
-            query.push({ inputId: resolved[0], prompt: buildUnwrappedOutputNudge() });
+            pendingUnwrappedOutputText = event.text;
+            query.push({ inputId: resolved[0], prompt: buildUnwrappedOutputNudge(routing, event.text) });
             continue;
           }
+        }
+        if (unwrappedOutputNudged && dispatch.sent === 0 && resolved.length === 1 && pendingUnwrappedOutputText && stillMissingVisibleReply) {
+          log(
+            JSON.stringify({
+              severity: 'warn',
+              event: 'unwrapped_output_nudge_ignored_delivering_original',
+              route_key: routing.routeKey ?? null,
+            }),
+          );
+          writeRoutedMessage(routing, pendingUnwrappedOutputText);
+          pendingUnwrappedOutputText = null;
         }
         if (resolved.length > 0) {
           completeResolved(resolved);
@@ -1167,14 +1181,23 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
  * Explicit destination addressing is required even when the agent has exactly
  * one configured destination. Bare final text is scratchpad/log output only.
  */
-function buildUnwrappedOutputNudge(): string {
+function buildUnwrappedOutputNudge(routing: RoutingContext, previousText: string): string {
+  const current = findByRouting(routing.channelType, routing.platformId);
   const destinations = getAllDestinations();
   const names = destinations.map((d) => d.name).join(', ');
-  return (
-    `<system>Your last response was not delivered because it was not wrapped in a <message to="name">...</message> block. ` +
-    `Do not redo work or call tools. Only resend the user-visible answer you already produced, wrapped in the correct destination block. ` +
-    `Available destinations: ${names || '(none)'}. If replying to the current user, use the destination from the inbound message's from="name" attribute.</system>`
-  );
+  const destinationLine = current
+    ? `The current inbound message came from \`${current.name}\`; address the block to \`${current.name}\`.`
+    : `Use the destination from the current inbound message's \`from="name"\` attribute. Available destinations: ${names || '(none)'}.`;
+  return [
+    'Your last answer was not delivered because it was not wrapped in a final `<message to="name">...</message>` block.',
+    'Do not redo work. Do not call tools. Reply now with only the corrected final message block.',
+    destinationLine,
+    '',
+    'Put this exact answer text inside the block:',
+    '<answer>',
+    previousText.trim(),
+    '</answer>',
+  ].join('\n');
 }
 
 function dispatchResultText(text: string, routing: RoutingContext): { sent: number; hasUnwrapped: boolean } {
