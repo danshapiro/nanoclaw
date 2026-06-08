@@ -393,6 +393,7 @@ describe('end-to-end with mock provider', () => {
 
 describe('poll-loop conversational reply accounting', () => {
   it('passes collected attachments on the initial provider turn', async () => {
+    insertChannelDestination('discord-current', 'chan-1');
     const filePath = '/workspace/agent/attachments/discord/msg/photo.png';
     insertMessage(
       'image-chat',
@@ -407,7 +408,7 @@ describe('poll-loop conversational reply accounting', () => {
 
     const provider = new ScriptedProvider(async function* (input) {
       expect(input.attachments).toEqual([{ path: filePath, filename: 'photo.png', mime: 'image/png', sizeBytes: 8 }]);
-      yield { type: 'result', text: 'image received' };
+      yield { type: 'result', text: '<message to="discord-current">image received</message>' };
     });
     const controller = new AbortController();
     const loopPromise = runPollLoop({
@@ -594,7 +595,8 @@ describe('poll-loop conversational reply accounting', () => {
     await loopPromise.catch(() => {});
   });
 
-  it('treats bare final result text as scratchpad and writes the missing-response error', async () => {
+  it('nudges once when bare final result text would otherwise be dropped, then delivers the wrapped resend', async () => {
+    insertChannelDestination('discord-current', 'chan-1');
     insertMessage(
       'bare-final-chat',
       'chat',
@@ -602,9 +604,13 @@ describe('poll-loop conversational reply accounting', () => {
       { platformId: 'chan-1', channelType: 'discord', threadId: 'thread-1' },
     );
 
-    const provider = new ScriptedProvider(async function* () {
-      yield { type: 'init', continuation: 'bare-final-session' };
-      yield { type: 'result', text: 'Done.' };
+    const prompts: string[] = [];
+    const provider = new MockProvider({}, (prompt) => {
+      prompts.push(prompt);
+      if (prompt.includes('Your last response was not delivered')) {
+        return '<message to="discord-current">Done.</message>';
+      }
+      return 'Done.';
     });
     const controller = new AbortController();
     const loopPromise = runPollLoopWithTimeout(provider, controller.signal);
@@ -614,8 +620,38 @@ describe('poll-loop conversational reply accounting', () => {
 
     const out = getUndeliveredMessages();
     expect(out).toHaveLength(1);
+    expect(JSON.parse(out[0].content).text).toBe('Done.');
+    expect(prompts).toHaveLength(2);
+    expect(prompts[1]).toContain('Do not redo work or call tools');
+    expect(prompts[1]).toContain('Available destinations: discord-current');
+
+    await loopPromise.catch(() => {});
+  });
+
+  it('falls back to the missing-response error if the unwrapped-output nudge is ignored once', async () => {
+    insertChannelDestination('discord-current', 'chan-1');
+    insertMessage(
+      'ignored-nudge-chat',
+      'chat',
+      { sender: 'User', text: 'please respond' },
+      { platformId: 'chan-1', channelType: 'discord', threadId: 'thread-1' },
+    );
+
+    const prompts: string[] = [];
+    const provider = new MockProvider({}, (prompt) => {
+      prompts.push(prompt);
+      return 'Done.';
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal);
+
+    await waitFor(() => getAckStatus('ignored-nudge-chat') === 'completed', 1500);
+    controller.abort();
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
     expect(JSON.parse(out[0].content).text).toContain('completed without sending a user-visible response');
-    expect(JSON.parse(out[0].content).text).not.toBe('Done.');
+    expect(prompts).toHaveLength(2);
 
     await loopPromise.catch(() => {});
   });
@@ -1375,6 +1411,7 @@ describe('poll-loop ambiguous result resolution guard', () => {
   // a result with no explicit resolvedInputIds → the one input resolves and its
   // row is completed (the unambiguous one-active-input rule).
   it('one active accepted input resolves a result lacking explicit resolvedInputIds', async () => {
+    insertChannelDestination('discord-test');
     insertMessage('one-active', 'chat', { sender: 'User', text: 'do it' }, {
       platformId: 'chan-1',
       channelType: 'discord',
@@ -1412,6 +1449,7 @@ describe('poll-loop ambiguous result resolution guard', () => {
   // → ambiguous; the guard logs `ambiguous_result_resolution` and completes
   // NOTHING (ambiguous success must never complete the wrong row).
   it('two active accepted inputs with no explicit ids is ambiguous: logs and completes nothing', async () => {
+    insertChannelDestination('discord-test');
     insertMessage('amb-initial', 'chat', { sender: 'User', text: 'first' }, {
       platformId: 'chan-1',
       channelType: 'discord',
@@ -1972,6 +2010,7 @@ describe('poll-loop accepted-but-unresolved terminal recovery', () => {
   // rows stayed in processing_ack.status='recovery' forever and the agent lost the
   // interrupted context. This wires injection-on-wake + resolve-on-success.
   it('injects pending recovery into the next top-level prompt and resolves it (rows completed) only on success', async () => {
+    insertChannelDestination('discord-current', 'chan-1');
     insertMessage('resume-trigger', 'chat', { sender: 'User', text: 'answer that resumes the prior work' }, {
       platformId: 'chan-1',
       channelType: 'discord',
@@ -2019,7 +2058,7 @@ describe('poll-loop accepted-but-unresolved terminal recovery', () => {
       yield { type: 'init', continuation: 'sess-resume' };
       // Mark in_flight observed on acceptance happens in the loop; here, on the
       // FIRST observation, the entry must NOT yet be resolved (accept != consume).
-      yield { type: 'result', text: 'Resumed and finished the earlier task.' };
+      yield { type: 'result', text: '<message to="discord-current">Resumed and finished the earlier task.</message>' };
     });
 
     const controller = new AbortController();

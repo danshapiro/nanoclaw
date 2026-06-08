@@ -102,35 +102,29 @@ function buildDestinationsSection(): string {
     ].join('\n');
   }
 
+  const lines = ['## Sending messages', ''];
   if (all.length === 1) {
     const d = all[0];
     const label = d.displayName && d.displayName !== d.name ? ` (${d.displayName})` : '';
-    return [
-      '## Sending messages',
-      '',
-      `You can send messages to \`${d.name}\`${label}.`,
-      '',
-      `To send a final user-visible response, wrap it in a \`<message to="${d.name}">...</message>\` block.`,
-      'Text outside of `<message>` blocks is scratchpad — logged but not sent anywhere.',
-      'Use `<internal>...</internal>` to make scratchpad intent explicit.',
-      '',
-      'To send a message mid-response (e.g., an acknowledgment before a long task), call the `send_message` MCP tool.',
-    ].join('\n');
+    lines.push(`Your destination is \`${d.name}\`${label}.`);
+  } else {
+    lines.push('You can send messages to the following destinations:', '');
+    for (const d of all) {
+      const label = d.displayName && d.displayName !== d.name ? ` (${d.displayName})` : '';
+      lines.push(`- \`${d.name}\`${label}`);
+    }
   }
-
-  const lines = ['## Sending messages', '', 'You can send messages to the following destinations:', ''];
-  for (const d of all) {
-    const label = d.displayName && d.displayName !== d.name ? ` (${d.displayName})` : '';
-    lines.push(`- \`${d.name}\`${label}`);
-  }
-  lines.push('');
-  lines.push('To send a message, wrap it in a `<message to="name">...</message>` block.');
-  lines.push('You can include multiple `<message>` blocks in one response to send to multiple destinations.');
-  lines.push('Text outside of `<message>` blocks is scratchpad — logged but not sent anywhere.');
-  lines.push('Use `<internal>...</internal>` to make scratchpad intent explicit.');
   lines.push('');
   lines.push(
-    'To send a message mid-response (e.g., an acknowledgment before a long task), call the `send_message` MCP tool with the `to` parameter set to a destination name.',
+    'Wrap each delivered message in a `<message to="name">...</message>` block; include several blocks in one response to address several destinations. `<internal>...</internal>` marks thinking you do not want sent.',
+  );
+  lines.push('');
+  lines.push(
+    'When replying to an incoming message, default to addressing the destination it came `from` (every inbound `<message>` tag carries a `from="name"` attribute). Pick a different destination when the request asks for it (for example, "tell Laura that...").',
+  );
+  lines.push('');
+  lines.push(
+    'The `send_message` MCP tool is the same delivery, available mid-turn for a quick acknowledgment before slow work. Each `send_message` call and each final-response `<message>` block lands as its own message in the conversation, so they read as a sequence rather than as one combined reply.',
   );
   return lines.join('\n');
 }
