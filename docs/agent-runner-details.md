@@ -569,7 +569,7 @@ The agent-runner transforms messages_in rows into a prompt string. The provider 
 
 - **`task`** — task prompt, optionally with script output:
   ```
-  [SCHEDULED TASK]
+  [SCHEDULED TASK from="reminders"]
 
   Script output:
   {"data": ...}
@@ -580,7 +580,7 @@ The agent-runner transforms messages_in rows into a prompt string. The provider 
 
 - **`webhook`** — webhook payload:
   ```
-  [WEBHOOK: github/pull_request]
+  [WEBHOOK from="github-alerts": github/pull_request]
 
   {"action": "opened", "pull_request": {...}}
   ```

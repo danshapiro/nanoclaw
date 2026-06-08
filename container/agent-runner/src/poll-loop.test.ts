@@ -162,18 +162,25 @@ describe('formatter', () => {
   });
 
   it('should format task messages', () => {
-    insertMessage('m1', 'task', { prompt: 'Review open PRs' });
+    insertChannelDestination('discord-test');
+    insertMessage('m1', 'task', { prompt: 'Review open PRs' }, { platformId: 'chan-1', channelType: 'discord' });
     const messages = getPendingMessages();
     const prompt = formatMessages(messages);
-    expect(prompt).toContain('[SCHEDULED TASK]');
+    expect(prompt).toContain('[SCHEDULED TASK from="discord-test"]');
     expect(prompt).toContain('Review open PRs');
   });
 
   it('should format webhook messages', () => {
-    insertMessage('m1', 'webhook', { source: 'github', event: 'push', payload: { ref: 'main' } });
+    insertChannelDestination('discord-test');
+    insertMessage(
+      'm1',
+      'webhook',
+      { source: 'github', event: 'push', payload: { ref: 'main' } },
+      { platformId: 'chan-1', channelType: 'discord' },
+    );
     const messages = getPendingMessages();
     const prompt = formatMessages(messages);
-    expect(prompt).toContain('[WEBHOOK: github/push]');
+    expect(prompt).toContain('[WEBHOOK from="discord-test": github/push]');
   });
 
   it('should format system messages', () => {

@@ -817,8 +817,8 @@ Agent-runner strips routing fields (`platform_id`, `channel_type`, `thread_id`) 
 
 - **`chat`** — format into `<messages>` XML block
 - **`chat-sdk`** — extract text, author, attachments from serialized message; format into `<messages>` XML
-- **`task`** — format as `[SCHEDULED TASK]` prefix + prompt. Run pre-script if present.
-- **`webhook`** — format as `[WEBHOOK: source/event]` + JSON payload
+- **`task`** — format as `[SCHEDULED TASK from="destination"]` prefix + prompt. Run pre-script if present.
+- **`webhook`** — format as `[WEBHOOK from="destination": source/event]` + JSON payload
 - **`system`** — host action results (e.g., "register_group succeeded"). Format as system context, not chat.
 
 Mixed batches (e.g., a chat message + a system result both pending) are combined into one prompt with clear delimiters.
@@ -845,7 +845,6 @@ MCP tools write directly to the session DB.
 | `ask_user_question` | Write `messages_out` with question card. Hold tool call open, poll `messages_in` for response matching `questionId`. Return selection as tool result. |
 | `edit_message` | Write `messages_out` with `operation: 'edit'` |
 | `add_reaction` | Write `messages_out` with `operation: 'reaction'` |
-| `send_to_agent` | Write `messages_out` with `channel_type: 'agent'`, `platform_id: '{target}'` |
 | `send_card` | Write `messages_out` with card structure |
 
 See [agent-runner-details.md](agent-runner-details.md) for full MCP tool parameter definitions.
@@ -886,7 +885,7 @@ Pre-scripts: if a task message has a `script` field, run it first. If `wakeAgent
 
 ### Agent-to-Agent Messaging
 
-**Outbound:** Agent calls `send_to_agent` tool → agent-runner writes messages_out with `channel_type: 'agent'`, `platform_id` = target agent group ID. Host validates permissions and writes to target session's messages_in.
+**Outbound:** Agent calls `send_message` with `to` set to another agent's destination name. Agent-runner writes messages_out with `channel_type: 'agent'`, `platform_id` = target agent group ID. Host validates permissions and writes to target session's messages_in.
 
 **Inbound:** Messages from other agents arrive as normal `chat` messages_in rows. The content includes `sender` and `senderId` (e.g., `"senderId": "agent:pr-admin"`). No special formatting — the agent sees it as a chat message.
 

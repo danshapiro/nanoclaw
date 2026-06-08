@@ -169,23 +169,14 @@ function formatSingleChat(msg: MessageInRow): string {
   const replyPrefix = formatReplyContext(content.replyTo);
   const attachmentsSuffix = formatAttachments(content.attachments);
 
-  // Look up the destination name for the origin (reverse map lookup).
-  // If not found, fall back to a raw channel:platform_id marker so nothing
-  // gets silently dropped — this should only happen if the destination was
-  // removed between when the message was received and when it's being processed.
-  const fromDest = findByRouting(msg.channel_type, msg.platform_id);
-  const fromAttr = fromDest
-    ? ` from="${escapeXml(fromDest.name)}"`
-    : msg.channel_type || msg.platform_id
-      ? ` from="unknown:${escapeXml(msg.channel_type || '')}:${escapeXml(msg.platform_id || '')}"`
-      : '';
+  const fromAttr = formatOriginDestinationAttr(msg);
 
   return `<message${idAttr}${fromAttr} sender="${escapeXml(sender)}" time="${escapeXml(time)}"${replyAttr}>${replyPrefix}${escapeXml(text)}${attachmentsSuffix}</message>`;
 }
 
 function formatTaskMessage(msg: MessageInRow): string {
   const content = parseContent(msg.content);
-  const parts = ['[SCHEDULED TASK]'];
+  const parts = [`[SCHEDULED TASK${formatOriginDestinationAttr(msg)}]`];
   if (content.scriptOutput) {
     parts.push('', 'Script output:', JSON.stringify(content.scriptOutput, null, 2));
   }
@@ -197,12 +188,25 @@ function formatWebhookMessage(msg: MessageInRow): string {
   const content = parseContent(msg.content);
   const source = content.source || 'unknown';
   const event = content.event || 'unknown';
-  return `[WEBHOOK: ${source}/${event}]\n\n${JSON.stringify(content.payload || content, null, 2)}`;
+  return `[WEBHOOK${formatOriginDestinationAttr(msg)}: ${source}/${event}]\n\n${JSON.stringify(content.payload || content, null, 2)}`;
 }
 
 function formatSystemMessage(msg: MessageInRow): string {
   const content = parseContent(msg.content);
   return `[SYSTEM RESPONSE]\n\nAction: ${content.action || 'unknown'}\nStatus: ${content.status || 'unknown'}\nResult: ${JSON.stringify(content.result || null)}`;
+}
+
+function formatOriginDestinationAttr(msg: MessageInRow): string {
+  // Look up the destination name for the origin (reverse map lookup).
+  // If not found, fall back to a raw channel:platform_id marker so nothing
+  // gets silently dropped — this should only happen if the destination was
+  // removed between when the message was received and when it's being processed.
+  const fromDest = findByRouting(msg.channel_type, msg.platform_id);
+  if (fromDest) return ` from="${escapeXml(fromDest.name)}"`;
+  if (msg.channel_type || msg.platform_id) {
+    return ` from="unknown:${escapeXml(msg.channel_type || '')}:${escapeXml(msg.platform_id || '')}"`;
+  }
+  return '';
 }
 
 /**
