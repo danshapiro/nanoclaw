@@ -100,6 +100,7 @@ const DVORA_SUMMARY_DONE = '5/19 summary complete';
 const FRUMA_PROMPT = 'Actually create a draft in my gmail';
 const FRUMA_ANSWER = "Matt Van Horn's email is matt@example.com.";
 const FRUMA_DRAFT_DONE = 'Draft created in Gmail.';
+const REPLAY_DESTINATION = 'incident-replay';
 
 // 2.56 GB recording metadata (plan line 1449). selection/download is a FAKED SDK
 // tool-call leaf (no real download, NO summarize_dnd_recording_cached producer).
@@ -330,6 +331,15 @@ function insertMessage(
     isGroup?: 0 | 1 | null;
   } = {},
 ): void {
+  const platformId = opts.platformId ?? 'chan-x';
+  const channelType = opts.channelType ?? 'discord';
+  getInboundDb()
+    .prepare(
+      `INSERT OR REPLACE INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+       VALUES (?, ?, 'channel', ?, ?, NULL)`,
+    )
+    .run(REPLAY_DESTINATION, REPLAY_DESTINATION, channelType, platformId);
+
   getInboundDb()
     .prepare(
       `INSERT INTO messages_in (id, kind, timestamp, status, process_after, trigger, platform_id, channel_type, thread_id, messaging_group_id, is_group, content)
@@ -338,8 +348,8 @@ function insertMessage(
     .run(
       id,
       opts.trigger ?? 1,
-      opts.platformId ?? 'chan-x',
-      opts.channelType ?? 'discord',
+      platformId,
+      channelType,
       opts.messagingGroupId ?? null,
       opts.isGroup ?? 0,
       JSON.stringify({ sender: 'User', text }),
@@ -691,6 +701,10 @@ function assistantText(sessionId: string, messageId: string, text: string): Ev[]
   ];
 }
 
+function visibleAssistantText(text: string): string {
+  return `<message to="${REPLAY_DESTINATION}">${text}</message>`;
+}
+
 function toolCallLeaf(sessionId: string, callId: string, tool: string, input?: Record<string, unknown>): Ev[] {
   return [
     {
@@ -827,7 +841,7 @@ describe('Task 6 Step 1 — replay harness integrity', () => {
       provider,
       drive: async () => {
         await sleep(40);
-        for (const e of assistantText(DVORA_SESSION_1, 'm1', 'hi there')) stream.push(e);
+        for (const e of assistantText(DVORA_SESSION_1, 'm1', visibleAssistantText('hi there'))) stream.push(e);
         stream.push(sessionIdle(DVORA_SESSION_1));
       },
       until: () => outboundTexts().includes('hi there'),
@@ -887,7 +901,8 @@ describe('Task 6 Steps 3-4 — Dvora 5/19 recording → summary replay', () => {
           streamA.push(e);
         }
         recordingLeafSeen = true;
-        for (const e of assistantText(DVORA_SESSION_1, 'm-progress', DVORA_PROGRESS_LINE)) streamA.push(e);
+        for (const e of assistantText(DVORA_SESSION_1, 'm-progress', visibleAssistantText(DVORA_PROGRESS_LINE)))
+          streamA.push(e);
         streamA.push(sessionIdle(DVORA_SESSION_1));
       },
       until: () => outboundTexts().some((t) => t === DVORA_PROGRESS_LINE),
@@ -1048,7 +1063,11 @@ describe('Task 6 Steps 3-4 — Dvora 5/19 recording → summary replay', () => {
       // The side effect is in the ledger BEFORE we deliver final text.
       expect(outboundTexts().some((t) => t.includes(DVORA_SUMMARY_DONE))).toBe(false);
 
-      for (const e of assistantText(DVORA_SESSION_2, 'm-done', `${DVORA_SUMMARY_DONE}. The summary is ready.`))
+      for (const e of assistantText(
+        DVORA_SESSION_2,
+        'm-done',
+        visibleAssistantText(`${DVORA_SUMMARY_DONE}. The summary is ready.`),
+      ))
         stream.push(e);
       stream.push(sessionIdle(DVORA_SESSION_2));
       await waitFor(() => outboundTexts().some((t) => t.includes(DVORA_SUMMARY_DONE)), 4000);
@@ -1238,7 +1257,8 @@ describe('Task 6 Step 6 — Fruma Gmail draft: help probe, native question, sign
         // The side effect exists BEFORE the final assistant text.
         expect(outboundTexts().some((t) => t.includes(FRUMA_DRAFT_DONE))).toBe(false);
 
-        for (const e of assistantText('ses_fruma_restart', 'm-fruma-done', FRUMA_DRAFT_DONE)) streamB.push(e);
+        for (const e of assistantText('ses_fruma_restart', 'm-fruma-done', visibleAssistantText(FRUMA_DRAFT_DONE)))
+          streamB.push(e);
         streamB.push(sessionIdle('ses_fruma_restart'));
         await waitFor(() => outboundTexts().some((t) => t.includes(FRUMA_DRAFT_DONE)), 4000);
       } finally {
@@ -1348,7 +1368,8 @@ describe('Task 6 Step 7 — non-cancellable native question → clear-continuati
         );
         for (const e of toolCallLeaf('ses_fruma_restart2', 'gws-draft', 'bash')) streamB.push(e);
         await waitFor(() => getAuthoritativeSideEffects().some((s) => s.kind === 'gmail_draft_created'), 4000);
-        for (const e of assistantText('ses_fruma_restart2', 'm-done', FRUMA_DRAFT_DONE)) streamB.push(e);
+        for (const e of assistantText('ses_fruma_restart2', 'm-done', visibleAssistantText(FRUMA_DRAFT_DONE)))
+          streamB.push(e);
         streamB.push(sessionIdle('ses_fruma_restart2'));
         await waitFor(() => outboundTexts().some((t) => t.includes(FRUMA_DRAFT_DONE)), 4000);
       } finally {
@@ -1459,7 +1480,7 @@ describe('Task 6 Step 8 — terminal after side effect: no duplication, recovery
             for (const e of assistantText(
               'ses_se_draft',
               'm-resume',
-              `The draft already exists in Gmail. ${FRUMA_DRAFT_DONE}`,
+              visibleAssistantText(`The draft already exists in Gmail. ${FRUMA_DRAFT_DONE}`),
             ))
               s.push(e);
             s.push(sessionIdle('ses_se_draft'));
@@ -1752,7 +1773,11 @@ describe('Task 6 Step 9 — direct transport/terminal taxonomy', () => {
         // The resume turn's active session is the PRESERVED continuation when one
         // survived, otherwise a freshly created session (controllerB.sessionId).
         const resumeSession = getContinuation('opencode') ?? 'ses_tax_resumed';
-        for (const e of assistantText(resumeSession, 'm-cont', 'Resumed and finished the taxonomy task.'))
+        for (const e of assistantText(
+          resumeSession,
+          'm-cont',
+          visibleAssistantText('Resumed and finished the taxonomy task.'),
+        ))
           streamB.push(e);
         streamB.push(sessionIdle(resumeSession));
         await waitFor(() => outboundTexts().some((t) => t.includes('Resumed and finished')), 4000);

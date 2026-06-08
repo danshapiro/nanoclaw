@@ -37,6 +37,19 @@ function destinationList(): string {
   return all.map((d) => d.name).join(', ');
 }
 
+interface ResolvedRouting {
+  channel_type: string;
+  platform_id: string;
+  thread_id: string | null;
+  resolvedName: string;
+}
+
+interface RouteStamp {
+  route_key: string;
+  messaging_group_id: string | null;
+  is_group: 0 | 1 | null;
+}
+
 /**
  * Resolve a destination name to routing fields.
  *
@@ -50,9 +63,7 @@ function destinationList(): string {
  */
 function resolveRouting(
   to: string | undefined,
-):
-  | { channel_type: string; platform_id: string; thread_id: string | null; resolvedName: string }
-  | { error: string } {
+): ResolvedRouting | { error: string } {
   if (!to) {
     // Default: reply to whatever thread/channel this session is bound to.
     const session = getSessionRouting();
@@ -95,6 +106,47 @@ function resolveRouting(
   return { channel_type: 'agent', platform_id: dest.agentGroupId!, thread_id: null, resolvedName: to };
 }
 
+function activeInputPath(): string {
+  return process.env.NANOCLAW_ACTIVE_INPUT_PATH || '/workspace/.active-input.json';
+}
+
+function readActiveRouteKey(): string | null {
+  const relayRouteKey = process.env.NANOCLAW_RELAY_ROUTE_KEY;
+  if (relayRouteKey) return relayRouteKey;
+
+  try {
+    const raw = fs.readFileSync(activeInputPath(), 'utf8');
+    const parsed = JSON.parse(raw) as { routeKey?: unknown };
+    return typeof parsed.routeKey === 'string' && parsed.routeKey ? parsed.routeKey : null;
+  } catch {
+    return null;
+  }
+}
+
+function isSameSessionRoute(routing: ResolvedRouting, session: ReturnType<typeof getSessionRouting>): boolean {
+  return (
+    !!session.channel_type &&
+    !!session.platform_id &&
+    routing.channel_type === session.channel_type &&
+    routing.platform_id === session.platform_id &&
+    (routing.thread_id ?? null) === (session.thread_id ?? null)
+  );
+}
+
+function routeStampForCurrentSession(routing: ResolvedRouting): RouteStamp | null {
+  const session = getSessionRouting();
+  if (!isSameSessionRoute(routing, session)) return null;
+
+  const routeKey = readActiveRouteKey();
+  if (!routeKey) return null;
+
+  return {
+    route_key: routeKey,
+    messaging_group_id: session.messaging_group_id,
+    is_group: session.is_group,
+  };
+}
+
 export const sendMessage: McpToolDefinition = {
   tool: {
     name: 'send_message',
@@ -117,12 +169,16 @@ export const sendMessage: McpToolDefinition = {
     if ('error' in routing) return err(routing.error);
 
     const id = generateId();
+    const routeStamp = routeStampForCurrentSession(routing);
     const seq = writeMessageOut({
       id,
       kind: 'chat',
       platform_id: routing.platform_id,
       channel_type: routing.channel_type,
       thread_id: routing.thread_id,
+      route_key: routeStamp?.route_key ?? null,
+      messaging_group_id: routeStamp?.messaging_group_id ?? null,
+      is_group: routeStamp?.is_group ?? null,
       content: JSON.stringify({ text }),
     });
 

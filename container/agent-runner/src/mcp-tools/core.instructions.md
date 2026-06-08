@@ -1,6 +1,6 @@
 ## Sending messages
 
-Your final response is delivered via the `## Sending messages` rules in your runtime system prompt (single-destination: just write; multi-destination: use `<message to="name">...</message>` blocks). See that section for the current destination list.
+Your final user-visible response is delivered only by `<message to="name">...</message>` blocks, even when there is one destination. Text outside `<message>` blocks is scratchpad/log output and is not sent. See the runtime `## Sending messages` section for the current destination list.
 
 ### Mid-turn updates (`send_message`)
 
@@ -13,6 +13,8 @@ Use the `mcp__nanoclaw__send_message` tool to send a message while you're still 
 **Never narrate micro-steps.** "I'm going to read the file now… okay, I'm reading it… now I'm parsing it…" is noise. Updates should mark meaningful transitions, not every tool call.
 
 **Outcomes, not play-by-play.** When the turn is done, the final message should be about the result, not a transcript of what you did.
+
+If a mid-turn `send_message` fully answered the user and there is no additional user-visible content, leave the final output empty or internal-only; do not write a second bare-text conclusion.
 
 ### Sending files (`send_file`)
 

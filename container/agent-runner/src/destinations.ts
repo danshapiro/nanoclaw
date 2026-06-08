@@ -102,16 +102,17 @@ function buildDestinationsSection(): string {
     ].join('\n');
   }
 
-  // Single-destination shortcut: the agent just writes its response normally.
   if (all.length === 1) {
     const d = all[0];
     const label = d.displayName && d.displayName !== d.name ? ` (${d.displayName})` : '';
     return [
       '## Sending messages',
       '',
-      `Your messages are delivered to \`${d.name}\`${label}. Just write your response directly — no special wrapping needed.`,
+      `You can send messages to \`${d.name}\`${label}.`,
       '',
-      'To mark something as scratchpad (logged but not sent), wrap it in `<internal>...</internal>`.',
+      `To send a final user-visible response, wrap it in a \`<message to="${d.name}">...</message>\` block.`,
+      'Text outside of `<message>` blocks is scratchpad — logged but not sent anywhere.',
+      'Use `<internal>...</internal>` to make scratchpad intent explicit.',
       '',
       'To send a message mid-response (e.g., an acknowledgment before a long task), call the `send_message` MCP tool.',
     ].join('\n');

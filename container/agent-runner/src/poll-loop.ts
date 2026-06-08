@@ -1,6 +1,6 @@
 import fs from 'fs';
 
-import { findByName, getAllDestinations, type DestinationEntry } from './destinations.js';
+import { findByName, type DestinationEntry } from './destinations.js';
 import {
   getPendingMessages,
   markProcessing,
@@ -1132,11 +1132,8 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
  * (including <internal>...</internal>) is normally scratchpad — logged but
  * not sent.
  *
- * Single-destination shortcut: if the agent has exactly one configured
- * destination AND the output contains zero <message> blocks, the entire
- * cleaned text (with <internal> tags stripped) is sent to that destination.
- * This preserves the simple case of one user on one channel — the agent
- * doesn't need to know about wrapping syntax at all.
+ * Explicit destination addressing is required even when the agent has exactly
+ * one configured destination. Bare final text is scratchpad/log output only.
  */
 function dispatchResultText(text: string, routing: RoutingContext): void {
   const MESSAGE_RE = /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g;
@@ -1168,23 +1165,6 @@ function dispatchResultText(text: string, routing: RoutingContext): void {
   }
 
   const scratchpad = stripInternalTags(scratchpadParts.join(''));
-
-  // Single-destination shortcut: the agent wrote plain text — send to
-  // the session's originating channel (from session_routing) if available,
-  // otherwise fall back to the single destination.
-  if (sent === 0 && scratchpad) {
-    if (routing.channelType && routing.platformId) {
-      // Reply to the channel/thread the message came from, stamped with the
-      // active route so recovery can harvest the agent's own progress/result.
-      writeRoutedMessage(routing, scratchpad);
-      return;
-    }
-    const all = getAllDestinations();
-    if (all.length === 1) {
-      sendToDestination(all[0], scratchpad, routing);
-      return;
-    }
-  }
 
   if (scratchpad) {
     log(`[scratchpad] ${scratchpad.slice(0, 500)}${scratchpad.length > 500 ? '…' : ''}`);

@@ -17,6 +17,10 @@ export interface MessageOutRow {
   platform_id: string | null;
   channel_type: string | null;
   thread_id: string | null;
+  input_id: string | null;
+  route_key: string | null;
+  messaging_group_id: string | null;
+  is_group: 0 | 1 | null;
   content: string;
 }
 

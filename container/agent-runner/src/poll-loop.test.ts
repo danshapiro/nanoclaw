@@ -78,6 +78,15 @@ function insertMessage(
     );
 }
 
+function insertChannelDestination(name: string, platformId = 'chan-1', channelType = 'discord'): void {
+  getInboundDb()
+    .prepare(
+      `INSERT OR REPLACE INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+       VALUES (?, ?, 'channel', ?, ?, NULL)`,
+    )
+    .run(name, name, channelType, platformId);
+}
+
 class ScriptedProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = false;
   calls = 0;
@@ -578,7 +587,33 @@ describe('poll-loop conversational reply accounting', () => {
     await loopPromise.catch(() => {});
   });
 
-  it('counts an MCP send_message output as the user-visible response for an empty final result', async () => {
+  it('treats bare final result text as scratchpad and writes the missing-response error', async () => {
+    insertMessage(
+      'bare-final-chat',
+      'chat',
+      { sender: 'User', text: 'please respond' },
+      { platformId: 'chan-1', channelType: 'discord', threadId: 'thread-1' },
+    );
+
+    const provider = new ScriptedProvider(async function* () {
+      yield { type: 'init', continuation: 'bare-final-session' };
+      yield { type: 'result', text: 'Done.' };
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal);
+
+    await waitFor(() => getAckStatus('bare-final-chat') === 'completed', 1500);
+    controller.abort();
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(JSON.parse(out[0].content).text).toContain('completed without sending a user-visible response');
+    expect(JSON.parse(out[0].content).text).not.toBe('Done.');
+
+    await loopPromise.catch(() => {});
+  });
+
+  it('counts an MCP send_message output as the user-visible response and does not send a bare final result', async () => {
     insertMessage(
       'mcp-chat',
       'chat',
@@ -597,7 +632,7 @@ describe('poll-loop conversational reply accounting', () => {
         thread_id: 'thread-2',
         content: JSON.stringify({ text: 'Working on it.' }),
       });
-      yield { type: 'result', text: null };
+      yield { type: 'result', text: 'Done.' };
     });
     const controller = new AbortController();
     const loopPromise = runPollLoopWithTimeout(provider, controller.signal);
@@ -609,6 +644,43 @@ describe('poll-loop conversational reply accounting', () => {
     expect(out).toHaveLength(1);
     expect(out[0].id).toBe('mcp-visible-response');
     expect(JSON.parse(out[0].content).text).toBe('Working on it.');
+
+    await loopPromise.catch(() => {});
+  });
+
+  it('allows an MCP send_message update followed by an explicit final response', async () => {
+    insertChannelDestination('discord-current', 'chan-2');
+    insertMessage(
+      'mcp-explicit-final-chat',
+      'chat',
+      { sender: 'User', text: 'do a long thing' },
+      { platformId: 'chan-2', channelType: 'discord', threadId: 'thread-2' },
+    );
+
+    const provider = new ScriptedProvider(async function* () {
+      yield { type: 'init', continuation: 'mcp-explicit-final-session' };
+      writeMessageOut({
+        id: 'mcp-progress-response',
+        in_reply_to: 'mcp-explicit-final-chat',
+        kind: 'chat',
+        platform_id: 'chan-2',
+        channel_type: 'discord',
+        thread_id: 'thread-2',
+        content: JSON.stringify({ text: 'Working on it.' }),
+      });
+      yield { type: 'result', text: '<message to="discord-current">Done.</message>' };
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal);
+
+    await waitFor(() => getAckStatus('mcp-explicit-final-chat') === 'completed', 1500);
+    controller.abort();
+
+    const out = getUndeliveredMessages();
+    const texts = out.map((m) => JSON.parse(m.content).text);
+    expect(texts).toContain('Working on it.');
+    expect(texts).toContain('Done.');
+    expect(out).toHaveLength(2);
 
     await loopPromise.catch(() => {});
   });
@@ -641,6 +713,7 @@ describe('poll-loop conversational reply accounting', () => {
   });
 
   it('does not handle /clear inside the runner', async () => {
+    insertChannelDestination('discord-test');
     insertMessage(
       'clear-1',
       'chat',
@@ -650,7 +723,7 @@ describe('poll-loop conversational reply accounting', () => {
     const provider = new ScriptedProvider(async function* (input) {
       expect(input.prompt).toContain('/clear');
       yield { type: 'init', continuation: 'runner-clear-still-provider-owned' };
-      yield { type: 'result', text: 'provider saw clear' };
+      yield { type: 'result', text: '<message to="discord-test">provider saw clear</message>' };
     });
 
     const controller = new AbortController();
@@ -732,6 +805,7 @@ describe('poll-loop conversational reply accounting', () => {
   });
 
   it('does not pass host-owned reset commands as provider-native slash commands', async () => {
+    insertChannelDestination('discord-test');
     insertMessage(
       'clear-native',
       'chat',
@@ -749,7 +823,7 @@ describe('poll-loop conversational reply accounting', () => {
       expect(input.prompt).toContain('/clear');
       expect(input.prompt).toContain('/new');
       expect(input.prompt.trim()).not.toBe('/clear\n\n/new');
-      yield { type: 'result', text: 'provider saw host-owned commands as text' };
+      yield { type: 'result', text: '<message to="discord-test">provider saw host-owned commands as text</message>' };
     });
 
     const controller = new AbortController();
@@ -1635,15 +1709,15 @@ describe('poll-loop accepted-but-unresolved terminal recovery', () => {
     await loopPromise.catch(() => {});
   });
 
-  // Regression (Task 6 exposed): the poll loop's OWN user-visible output — a
-  // result-text reply (and relay/inactivity fallback) — must be stamped with the
-  // active route_key/messaging_group_id/is_group. Previously dispatchResultText /
-  // sendToDestination wrote it with route_key=NULL, so harvestRouteScopedProgress
-  // (which filters on route_key) could never recover the agent's own progress
-  // line on a terminal interruption — the Dvora "recovery must include the
-  // harvested progress line" contract was unreachable through the real result
-  // path. This drives the REAL result path (not a hand-stamped writeMessageOut).
+  // Regression (Task 6 exposed): the poll loop's OWN user-visible output — an
+  // explicitly-addressed result reply (and relay/inactivity fallback) — must be
+  // stamped with the active route_key/messaging_group_id/is_group. Previously
+  // dispatchResultText / sendToDestination wrote it with route_key=NULL, so
+  // harvestRouteScopedProgress (which filters on route_key) could never recover
+  // the agent's own progress line on a terminal interruption. This drives the
+  // REAL result path (not a hand-stamped writeMessageOut).
   it('stamps the active route metadata on a result-text reply so it is harvestable into recovery', async () => {
+    insertChannelDestination('discord-routed');
     insertMessage('routed-init', 'chat', { sender: 'User', text: 'report a progress line then get interrupted' }, {
       platformId: 'chan-1',
       channelType: 'discord',
@@ -1682,11 +1756,11 @@ describe('poll-loop accepted-but-unresolved terminal recovery', () => {
             yield { type: 'init', continuation: 'sess-routed' };
             yield { type: 'input-accepted', inputId: (input as QueryInput).inputId, scope: 'initial' };
             // A user-visible progress segment delivered through the REAL result
-            // path (plain text → dispatchResultText → routed reply). This resolves
-            // the initial input and writes the routed progress row.
+            // path (explicit <message> → dispatchResultText → routed reply). This
+            // resolves the initial input and writes the routed progress row.
             yield {
               type: 'result',
-              text: 'Working on it — partial progress delivered.',
+              text: '<message to="discord-routed">Working on it — partial progress delivered.</message>',
               inputId: (input as QueryInput).inputId,
               resolvedInputIds: [(input as QueryInput).inputId],
             };
@@ -2118,6 +2192,7 @@ function getAckStatus(messageId: string): string | null {
 
 describe('poll-loop inactivity relay and terminal recovery', () => {
   function dmMsg(id: string, text: string): void {
+    insertChannelDestination('relay-current');
     insertMessage(id, 'chat', { sender: 'User', text }, {
       platformId: 'chan-1',
       channelType: 'discord',
@@ -2192,7 +2267,12 @@ describe('poll-loop inactivity relay and terminal recovery', () => {
             await new Promise<void>((resolve) => {
               releaseMain = resolve;
             });
-            yield { type: 'result', text: 'done at last', inputId: input.inputId, resolvedInputIds: [input.inputId] };
+            yield {
+              type: 'result',
+              text: '<message to="relay-current">done at last</message>',
+              inputId: input.inputId,
+              resolvedInputIds: [input.inputId],
+            };
           })(),
         };
       }
@@ -2262,7 +2342,12 @@ describe('poll-loop inactivity relay and terminal recovery', () => {
             await new Promise<void>((resolve) => {
               releaseMain = resolve;
             });
-            yield { type: 'result', text: 'done at last', inputId: input.inputId, resolvedInputIds: [input.inputId] };
+            yield {
+              type: 'result',
+              text: '<message to="relay-current">done at last</message>',
+              inputId: input.inputId,
+              resolvedInputIds: [input.inputId],
+            };
           })(),
         };
       }
