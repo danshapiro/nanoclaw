@@ -1096,7 +1096,7 @@ function countOutboundVisibleReplyMessages(routing: RoutingContext): number {
 }
 
 function writeMissingVisibleReplyError(routing: RoutingContext): void {
-  writeRoutedMessage(routing, 'Error: agent completed without sending a user-visible response. Please try again.');
+  writeRoutedMessage(routing, 'Error: agent completed without sending a user-visible response in this conversation.');
 }
 
 function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
@@ -1162,6 +1162,7 @@ function dispatchResultText(text: string, routing: RoutingContext): void {
 
   let match: RegExpExecArray | null;
   let sent = 0;
+  let messageBlocks = 0;
   let lastIndex = 0;
   const scratchpadParts: string[] = [];
 
@@ -1171,6 +1172,7 @@ function dispatchResultText(text: string, routing: RoutingContext): void {
     }
     const toName = match[2];
     const body = match[3].trim();
+    messageBlocks++;
     lastIndex = MESSAGE_RE.lastIndex;
 
     const dest = findByName(toName);
@@ -1193,7 +1195,11 @@ function dispatchResultText(text: string, routing: RoutingContext): void {
   }
 
   if (sent === 0 && text.trim()) {
-    log(`WARNING: agent output had no <message to="..."> blocks — nothing was sent`);
+    if (messageBlocks > 0) {
+      log(`WARNING: agent output had <message to="..."> blocks, but none resolved to a known destination — nothing was sent`);
+    } else {
+      log(`WARNING: agent output had no <message to="..."> blocks — nothing was sent`);
+    }
   }
 }
 
