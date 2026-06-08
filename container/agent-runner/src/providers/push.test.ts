@@ -81,6 +81,41 @@ describe('provider input-accepted/result contract', () => {
     expect(accepted).toMatchObject({ type: 'input-accepted', inputId: 'claude-initial', scope: 'initial' });
     query.end();
   });
+
+  it('claude provider translates compact boundaries as progress without resolving input', async () => {
+    mock.module('@anthropic-ai/claude-agent-sdk', () => ({
+      query: ({ prompt }: { prompt: AsyncIterable<{ message: { content: string } }> }) =>
+        (async function* () {
+          for await (const _msg of prompt) {
+            yield { type: 'system', subtype: 'compact_boundary', compact_metadata: { pre_tokens: 165000 } };
+            yield { type: 'result', result: 'ok' };
+            return;
+          }
+        })(),
+    }));
+
+    const { ClaudeProvider } = await import('./claude.js');
+    const provider = new ClaudeProvider();
+    const query = provider.query({ inputId: 'claude-compact', prompt: 'hello', cwd: '/tmp' });
+    const iter = query.events[Symbol.asyncIterator]();
+
+    await expect(nextEvent(iter, 'input-accepted')).resolves.toMatchObject({
+      type: 'input-accepted',
+      inputId: 'claude-compact',
+      scope: 'initial',
+    });
+    await expect(nextEvent(iter, 'progress')).resolves.toMatchObject({
+      type: 'progress',
+      inputId: 'claude-compact',
+      message: 'Context compacted (165,000 tokens compacted).',
+    });
+    await expect(nextEvent(iter, 'result')).resolves.toMatchObject({
+      type: 'result',
+      inputId: 'claude-compact',
+      resolvedInputIds: ['claude-compact'],
+    });
+    query.end();
+  });
 });
 
 describe('provider push attachment compatibility', () => {

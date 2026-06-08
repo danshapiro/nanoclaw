@@ -620,6 +620,34 @@ describe('poll-loop conversational reply accounting', () => {
     await loopPromise.catch(() => {});
   });
 
+  it('does not settle conversational reply accounting for provider progress before the final result', async () => {
+    insertChannelDestination('discord-current', 'chan-2');
+    insertMessage(
+      'compact-chat',
+      'chat',
+      { sender: 'User', text: 'please keep working through compaction' },
+      { platformId: 'chan-2', channelType: 'discord', threadId: 'thread-2' },
+    );
+
+    const provider = new ScriptedProvider(async function* () {
+      yield { type: 'init', continuation: 'compact-session' };
+      yield { type: 'progress', inputId: 'ignored-by-scripted-provider', message: 'Context compacted.' };
+      yield { type: 'result', text: '<message to="discord-current">Done after compaction.</message>' };
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal);
+
+    await waitFor(() => getAckStatus('compact-chat') === 'completed', 1500);
+    controller.abort();
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(out[0].in_reply_to).toBe('compact-chat');
+    expect(JSON.parse(out[0].content).text).toBe('Done after compaction.');
+
+    await loopPromise.catch(() => {});
+  });
+
   it('counts an MCP send_message output as the user-visible response and does not send a bare final result', async () => {
     const routeKey = normalizeRoute('test', {
       platformId: 'chan-2',
