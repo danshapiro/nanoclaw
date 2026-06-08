@@ -685,6 +685,41 @@ describe('poll-loop conversational reply accounting', () => {
     await loopPromise.catch(() => {});
   });
 
+  it('does not route-stamp or thread cross-destination final message rows', async () => {
+    insertChannelDestination('discord-current', 'chan-1');
+    insertChannelDestination('other-channel', 'chan-2');
+    insertMessage('cross-final-chat', 'chat', { sender: 'User', text: 'send a note elsewhere' }, {
+      platformId: 'chan-1',
+      channelType: 'discord',
+      threadId: 'thread-1',
+      messagingGroupId: 'mg-current',
+      isGroup: 1,
+    });
+
+    const provider = new ScriptedProvider(async function* () {
+      yield { type: 'init', continuation: 'cross-final-session' };
+      yield { type: 'result', text: '<message to="other-channel">Heads up.</message>' };
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal);
+
+    await waitFor(() => getAckStatus('cross-final-chat') === 'completed', 1500);
+    controller.abort();
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(JSON.parse(out[0].content).text).toBe('Heads up.');
+    expect(out[0].platform_id).toBe('chan-2');
+    expect(out[0].channel_type).toBe('discord');
+    expect(out[0].in_reply_to).toBeNull();
+    expect(out[0].thread_id).toBeNull();
+    expect(out[0].route_key).toBeNull();
+    expect(out[0].messaging_group_id).toBeNull();
+    expect(out[0].is_group).toBeNull();
+
+    await loopPromise.catch(() => {});
+  });
+
   it('writes a visible error when the provider throws', async () => {
     insertMessage(
       'throwing-chat',

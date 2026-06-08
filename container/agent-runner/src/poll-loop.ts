@@ -1178,20 +1178,20 @@ function dispatchResultText(text: string, routing: RoutingContext): void {
 function sendToDestination(dest: DestinationEntry, body: string, routing: RoutingContext): void {
   const platformId = dest.type === 'channel' ? dest.platformId! : dest.agentGroupId!;
   const channelType = dest.type === 'channel' ? dest.channelType! : 'agent';
-  // Inherit thread_id from the inbound routing context so replies land in the
-  // same thread the conversation is in. For non-threaded adapters the router
-  // strips thread_id at ingest, so this will already be null. Stamp the active
-  // route metadata so the row is harvestable into route-scoped recovery.
+  const sameRoute = routing.channelType === channelType && routing.platformId === platformId;
+  // Only the active route can inherit reply/thread metadata and recovery stamps.
+  // Cross-destination final messages are delivered as new outbound messages, not
+  // harvested as progress for the conversation that triggered this turn.
   writeMessageOut({
     id: generateId(),
-    in_reply_to: routing.inReplyTo,
+    in_reply_to: sameRoute ? routing.inReplyTo : null,
     kind: 'chat',
     platform_id: platformId,
     channel_type: channelType,
-    thread_id: routing.threadId,
-    route_key: routing.routeKey ?? null,
-    messaging_group_id: routing.messagingGroupId ?? null,
-    is_group: routing.isGroup ?? null,
+    thread_id: sameRoute ? routing.threadId : null,
+    route_key: sameRoute ? (routing.routeKey ?? null) : null,
+    messaging_group_id: sameRoute ? (routing.messagingGroupId ?? null) : null,
+    is_group: sameRoute ? (routing.isGroup ?? null) : null,
     content: JSON.stringify({ text: body }),
   });
 }
