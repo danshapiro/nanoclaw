@@ -220,12 +220,16 @@ export const sendFile: McpToolDefinition = {
     fs.copyFileSync(resolvedPath, path.join(outboxDir, filename));
 
     try {
+      const routeStamp = routeStampForCurrentSession(routing);
       writeMessageOut({
         id,
         kind: 'chat',
         platform_id: routing.platform_id,
         channel_type: routing.channel_type,
         thread_id: routing.thread_id,
+        route_key: routeStamp?.route_key ?? null,
+        messaging_group_id: routeStamp?.messaging_group_id ?? null,
+        is_group: routeStamp?.is_group ?? null,
         content: JSON.stringify({ text: (args.text as string) || '', files: [filename] }),
       });
     } catch (writeErr) {

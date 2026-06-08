@@ -32,7 +32,7 @@ function insertMessage(
       `INSERT INTO messages_in (id, kind, timestamp, status, platform_id, channel_type, thread_id, content)
        VALUES (?, 'chat', datetime('now'), 'pending', ?, ?, ?, ?)`,
     )
-    .run(id, opts?.platformId ?? null, opts?.channelType ?? null, opts?.threadId ?? null, JSON.stringify(content));
+    .run(id, opts?.platformId ?? 'chan-1', opts?.channelType ?? 'discord', opts?.threadId ?? null, JSON.stringify(content));
 }
 
 describe('poll loop integration', () => {

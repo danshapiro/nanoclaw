@@ -320,6 +320,27 @@ function makeProvider(opts: {
 
 // ── Inbound-row + route helpers ──────────────────────────────────────────────
 
+function ensureReplayDestination(channelType: string, platformId: string): void {
+  const existing = getInboundDb()
+    .prepare('SELECT channel_type, platform_id FROM destinations WHERE name = ?')
+    .get(REPLAY_DESTINATION) as { channel_type: string | null; platform_id: string | null } | undefined;
+  if (existing) {
+    if (existing.channel_type !== channelType || existing.platform_id !== platformId) {
+      throw new Error(
+        `Replay destination already points at ${existing.channel_type}:${existing.platform_id}; cannot replace it with ${channelType}:${platformId}`,
+      );
+    }
+    return;
+  }
+
+  getInboundDb()
+    .prepare(
+      `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+       VALUES (?, ?, 'channel', ?, ?, NULL)`,
+    )
+    .run(REPLAY_DESTINATION, REPLAY_DESTINATION, channelType, platformId);
+}
+
 function insertMessage(
   id: string,
   text: string,
@@ -333,12 +354,7 @@ function insertMessage(
 ): void {
   const platformId = opts.platformId ?? 'chan-x';
   const channelType = opts.channelType ?? 'discord';
-  getInboundDb()
-    .prepare(
-      `INSERT OR REPLACE INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
-       VALUES (?, ?, 'channel', ?, ?, NULL)`,
-    )
-    .run(REPLAY_DESTINATION, REPLAY_DESTINATION, channelType, platformId);
+  ensureReplayDestination(channelType, platformId);
 
   getInboundDb()
     .prepare(

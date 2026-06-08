@@ -398,7 +398,7 @@ scope:
 - Only rows on the **trigger route** (the route of the wake-triggering message) are claimed into a turn; other-route rows stay pending and are never folded into the active prompt, accumulated context, or recovery — both in the initial batch and in follow-up polling.
 - Recovery is keyed by `provider + normalized route`, stored under the **trigger** route (not the first-row route).
 - Same-route, multi-trigger rows become the recovery entry's ordered `originalTasks`.
-- Same-route outbound rows (`messages_out`) are stamped with the active route (`route_key`/`messaging_group_id`/`is_group`) so the agent's progress, results, relay messages, and fallbacks are harvestable into route-scoped recovery. Cross-destination rows are not stamped with the active route.
+- Same-route chat output rows (`messages_out`) are stamped with the active route (`route_key`/`messaging_group_id`/`is_group`) so the agent's progress, results, relay messages, fallbacks, and message/file MCP output are harvestable into route-scoped recovery. Cross-destination rows are not stamped with the active route.
 - Null-thread DMs are aliased consistently by the normalizer so a DM's recovery route is stable.
 
 ### Inactivity relay
@@ -630,7 +630,7 @@ Provider final text is explicitly routed, not implicitly delivered. The runner s
 
 For a final `<message>` addressed to the active route, the runner writes a `messages_out` row with the active reply/thread metadata and the active route stamp so recovery can harvest it as prior progress. For a final `<message>` addressed to another destination, the runner writes to that destination but leaves the active `in_reply_to`, `thread_id`, `route_key`, `messaging_group_id`, and `is_group` fields unset so a cross-destination message cannot be recovered as progress for the triggering conversation.
 
-MCP tools that send to a named destination resolve the name through the `destinations` table. `send_message` applies the same route-stamp rule: current-route messages are stamped for recovery; cross-destination messages are not.
+MCP tools that send to a named destination resolve the name through the `destinations` table. `send_message` and `send_file` apply the same route-stamp rule: current-route messages are stamped for recovery; cross-destination messages are not.
 
 ### Status Management
 
@@ -688,7 +688,7 @@ Implementation:
 1. Generate a message ID
 2. Create `outbox/{messageId}/` directory
 3. Copy the file into the outbox directory
-4. Write a `messages_out` row with `files: [filename]` in the content
+4. Write a `messages_out` row with `files: [filename]` in the content, using the same route-stamp rule as `send_message`
 
 #### send_card
 

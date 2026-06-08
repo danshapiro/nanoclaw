@@ -614,6 +614,13 @@ describe('poll-loop conversational reply accounting', () => {
   });
 
   it('counts an MCP send_message output as the user-visible response and does not send a bare final result', async () => {
+    const routeKey = normalizeRoute('test', {
+      platformId: 'chan-2',
+      channelType: 'discord',
+      threadId: 'thread-2',
+      messagingGroupId: null,
+      isGroup: null,
+    }).routeKey;
     insertMessage(
       'mcp-chat',
       'chat',
@@ -630,6 +637,7 @@ describe('poll-loop conversational reply accounting', () => {
         platform_id: 'chan-2',
         channel_type: 'discord',
         thread_id: 'thread-2',
+        route_key: routeKey,
         content: JSON.stringify({ text: 'Working on it.' }),
       });
       yield { type: 'result', text: 'Done.' };
@@ -649,6 +657,13 @@ describe('poll-loop conversational reply accounting', () => {
   });
 
   it('allows an MCP send_message update followed by an explicit final response', async () => {
+    const routeKey = normalizeRoute('test', {
+      platformId: 'chan-2',
+      channelType: 'discord',
+      threadId: 'thread-2',
+      messagingGroupId: null,
+      isGroup: null,
+    }).routeKey;
     insertChannelDestination('discord-current', 'chan-2');
     insertMessage(
       'mcp-explicit-final-chat',
@@ -666,6 +681,7 @@ describe('poll-loop conversational reply accounting', () => {
         platform_id: 'chan-2',
         channel_type: 'discord',
         thread_id: 'thread-2',
+        route_key: routeKey,
         content: JSON.stringify({ text: 'Working on it.' }),
       });
       yield { type: 'result', text: '<message to="discord-current">Done.</message>' };
@@ -681,6 +697,32 @@ describe('poll-loop conversational reply accounting', () => {
     expect(texts).toContain('Working on it.');
     expect(texts).toContain('Done.');
     expect(out).toHaveLength(2);
+
+    await loopPromise.catch(() => {});
+  });
+
+  it('accepts single-quoted destination names in explicit final message tags', async () => {
+    insertChannelDestination('discord-current', 'chan-2');
+    insertMessage(
+      'single-quote-final-chat',
+      'chat',
+      { sender: 'User', text: 'finish this' },
+      { platformId: 'chan-2', channelType: 'discord', threadId: 'thread-2' },
+    );
+
+    const provider = new ScriptedProvider(async function* () {
+      yield { type: 'init', continuation: 'single-quote-final-session' };
+      yield { type: 'result', text: "<message to='discord-current'>Done.</message>" };
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal);
+
+    await waitFor(() => getAckStatus('single-quote-final-chat') === 'completed', 1500);
+    controller.abort();
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(JSON.parse(out[0].content).text).toBe('Done.');
 
     await loopPromise.catch(() => {});
   });
@@ -707,15 +749,33 @@ describe('poll-loop conversational reply accounting', () => {
     controller.abort();
 
     const out = getUndeliveredMessages();
-    expect(out).toHaveLength(1);
-    expect(JSON.parse(out[0].content).text).toBe('Heads up.');
-    expect(out[0].platform_id).toBe('chan-2');
-    expect(out[0].channel_type).toBe('discord');
-    expect(out[0].in_reply_to).toBeNull();
-    expect(out[0].thread_id).toBeNull();
-    expect(out[0].route_key).toBeNull();
-    expect(out[0].messaging_group_id).toBeNull();
-    expect(out[0].is_group).toBeNull();
+    expect(out).toHaveLength(2);
+    const rowsByText = new Map(out.map((m) => [JSON.parse(m.content).text as string, m]));
+    const crossRow = rowsByText.get('Heads up.');
+    expect(crossRow).toBeDefined();
+    expect(crossRow!.platform_id).toBe('chan-2');
+    expect(crossRow!.channel_type).toBe('discord');
+    expect(crossRow!.in_reply_to).toBeNull();
+    expect(crossRow!.thread_id).toBeNull();
+    expect(crossRow!.route_key).toBeNull();
+    expect(crossRow!.messaging_group_id).toBeNull();
+    expect(crossRow!.is_group).toBeNull();
+
+    const errorRow = out.find((m) => JSON.parse(m.content).text.includes('completed without sending a user-visible response'));
+    expect(errorRow).toBeDefined();
+    expect(errorRow!.platform_id).toBe('chan-1');
+    expect(errorRow!.channel_type).toBe('discord');
+    expect(errorRow!.route_key).toBe(
+      normalizeRoute('test', {
+        platformId: 'chan-1',
+        channelType: 'discord',
+        threadId: 'thread-1',
+        messagingGroupId: 'mg-current',
+        isGroup: 1,
+      }).routeKey,
+    );
+    expect(errorRow!.messaging_group_id).toBe('mg-current');
+    expect(errorRow!.is_group).toBe(1);
 
     await loopPromise.catch(() => {});
   });

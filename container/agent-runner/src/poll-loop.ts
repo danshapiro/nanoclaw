@@ -436,7 +436,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const processingIds = ids.filter((id) => !skippedSet.has(id));
     const replyAccounting = {
       requiresUserVisibleReply: requiresUserVisibleReply(keep),
-      outboundNonSystemCountBefore: countOutboundNonSystemMessages(),
+      outboundVisibleReplyCountBefore: countOutboundVisibleReplyMessages({
+        ...routing,
+        routeKey: activeRouteScope.routeKey,
+      }),
     };
     try {
       const result = await processQuery(
@@ -538,7 +541,7 @@ interface QueryResult {
 
 interface ReplyAccounting {
   requiresUserVisibleReply: boolean;
-  outboundNonSystemCountBefore: number;
+  outboundVisibleReplyCountBefore: number;
 }
 
 interface InputLedgerEntry {
@@ -686,7 +689,7 @@ async function processQuery(
     if (
       resolvedAtLeastOne &&
       replyAccounting.requiresUserVisibleReply &&
-      countOutboundNonSystemMessages() <= replyAccounting.outboundNonSystemCountBefore
+      countOutboundVisibleReplyMessages(routing) <= replyAccounting.outboundVisibleReplyCountBefore
     ) {
       writeMissingVisibleReplyError(routing);
     }
@@ -1066,8 +1069,27 @@ function requiresUserVisibleReply(messages: MessageInRow[]): boolean {
   return messages.some((m) => (m.kind === 'chat' || m.kind === 'chat-sdk') && m.trigger === 1);
 }
 
-function countOutboundNonSystemMessages(): number {
-  const row = getOutboundDb().prepare("SELECT COUNT(*) AS count FROM messages_out WHERE kind <> 'system'").get() as {
+function countOutboundVisibleReplyMessages(routing: RoutingContext): number {
+  const row = getOutboundDb()
+    .prepare(
+      `SELECT COUNT(*) AS count FROM messages_out
+       WHERE kind <> 'system'
+         AND (
+           ($route_key IS NOT NULL AND route_key = $route_key)
+           OR (
+             route_key IS NULL
+             AND (channel_type = $channel_type OR (channel_type IS NULL AND $channel_type IS NULL))
+             AND (platform_id = $platform_id OR (platform_id IS NULL AND $platform_id IS NULL))
+             AND (thread_id = $thread_id OR (thread_id IS NULL AND $thread_id IS NULL))
+           )
+         )`,
+    )
+    .get({
+      $route_key: routing.routeKey ?? null,
+      $channel_type: routing.channelType ?? null,
+      $platform_id: routing.platformId ?? null,
+      $thread_id: routing.threadId ?? null,
+    }) as {
     count: number;
   };
   return row.count;
@@ -1136,7 +1158,7 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
  * one configured destination. Bare final text is scratchpad/log output only.
  */
 function dispatchResultText(text: string, routing: RoutingContext): void {
-  const MESSAGE_RE = /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g;
+  const MESSAGE_RE = /<message\s+to=(["'])([^"']+)\1\s*>([\s\S]*?)<\/message>/g;
 
   let match: RegExpExecArray | null;
   let sent = 0;
@@ -1147,8 +1169,8 @@ function dispatchResultText(text: string, routing: RoutingContext): void {
     if (match.index > lastIndex) {
       scratchpadParts.push(text.slice(lastIndex, match.index));
     }
-    const toName = match[1];
-    const body = match[2].trim();
+    const toName = match[2];
+    const body = match[3].trim();
     lastIndex = MESSAGE_RE.lastIndex;
 
     const dest = findByName(toName);
