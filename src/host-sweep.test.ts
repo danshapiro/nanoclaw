@@ -15,8 +15,10 @@ import { OUTBOUND_SCHEMA } from './db/schema.js';
 import {
   ABSOLUTE_CEILING_MS,
   CLAIM_STUCK_MS,
+  IDLE_RECYCLE_GRACE_MS,
   OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS,
   clearProviderToolState,
+  decideSkillRecycle,
   decideStuckAction,
   discoverGwsCrashWindowDraftsScoped,
   effectiveCeilingMs,
@@ -761,5 +763,43 @@ describe('spawn skill generation marker', () => {
   it('returns an empty string when no marker has been written', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-skillgen-'));
     expect(readSpawnSkillGeneration(dir)).toBe('');
+  });
+});
+
+describe('decideSkillRecycle', () => {
+  const idleArgs = {
+    now: BASE,
+    heartbeatMtimeMs: BASE - IDLE_RECYCLE_GRACE_MS - 1_000, // idle past the grace window
+    claims: [] as Array<{ message_id: string; status_changed: string }>,
+    currentGeneration: 'g2',
+    spawnGeneration: 'g1',
+  };
+
+  it('recycles an idle container whose skill generation is stale', () => {
+    expect(decideSkillRecycle(idleArgs)).toEqual({
+      action: 'recycle-skills',
+      currentGeneration: 'g2',
+      spawnGeneration: 'g1',
+    });
+  });
+
+  it('does not recycle when the generation is unchanged', () => {
+    expect(decideSkillRecycle({ ...idleArgs, currentGeneration: 'g1' })).toEqual({ action: 'ok' });
+  });
+
+  it('does not recycle while a message is being processed', () => {
+    expect(decideSkillRecycle({ ...idleArgs, claims: [claim('m1', 1_000)] })).toEqual({ action: 'ok' });
+  });
+
+  it('does not recycle until the container has been idle past the grace window', () => {
+    expect(decideSkillRecycle({ ...idleArgs, heartbeatMtimeMs: BASE - 5_000 })).toEqual({ action: 'ok' });
+  });
+
+  it('does not recycle a brand-new container that has not ticked a heartbeat yet', () => {
+    expect(decideSkillRecycle({ ...idleArgs, heartbeatMtimeMs: 0 })).toEqual({ action: 'ok' });
+  });
+
+  it('recycles a pre-feature container that never recorded a spawn generation', () => {
+    expect(decideSkillRecycle({ ...idleArgs, spawnGeneration: '' }).action).toBe('recycle-skills');
   });
 });

@@ -91,6 +91,9 @@ export const OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS =
 // Stuck tolerance window applied per 'processing' claim — "did we see any
 // signs of life since this message was claimed?"
 export const CLAIM_STUCK_MS = 60 * 1000;
+// A container whose skill generation is stale is recycled only once it has been
+// quiet at least this long — confident it is between turns, not mid-flush.
+export const IDLE_RECYCLE_GRACE_MS = 60 * 1000;
 const MAX_TRIES = 5;
 const BACKOFF_BASE_MS = 5000;
 
@@ -98,6 +101,10 @@ export type StuckDecision =
   | { action: 'ok' }
   | { action: 'kill-ceiling'; heartbeatAgeMs: number; ceilingMs: number }
   | { action: 'kill-claim'; messageId: string; claimAgeMs: number; toleranceMs: number };
+
+export type SkillRecycleDecision =
+  | { action: 'ok' }
+  | { action: 'recycle-skills'; currentGeneration: string; spawnGeneration: string };
 
 /**
  * Pure decision for whether a running container should be killed this sweep
@@ -142,6 +149,29 @@ export function decideStuckAction(args: {
   }
 
   return { action: 'ok' };
+}
+
+/**
+ * Pure decision for whether an idle running container should be recycled to
+ * pick up redeployed skills. Recycle ONLY when the deployed skill generation
+ * differs from what this container spawned with AND the container is idle:
+ * no in-flight processing claim, and the heartbeat has been quiet past the
+ * grace window (a brand-new container with no heartbeat yet is left alone).
+ * Filesystem/DB reads happen in the caller.
+ */
+export function decideSkillRecycle(args: {
+  now: number;
+  heartbeatMtimeMs: number; // 0 when heartbeat file absent
+  claims: Array<{ message_id: string; status_changed: string }>;
+  currentGeneration: string;
+  spawnGeneration: string;
+}): SkillRecycleDecision {
+  const { now, heartbeatMtimeMs, claims, currentGeneration, spawnGeneration } = args;
+  if (currentGeneration === spawnGeneration) return { action: 'ok' };
+  if (claims.length > 0) return { action: 'ok' };
+  if (heartbeatMtimeMs === 0) return { action: 'ok' };
+  if (now - heartbeatMtimeMs < IDLE_RECYCLE_GRACE_MS) return { action: 'ok' };
+  return { action: 'recycle-skills', currentGeneration, spawnGeneration };
 }
 
 let running = false;
