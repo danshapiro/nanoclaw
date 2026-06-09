@@ -55,9 +55,11 @@ import {
   openOutboundDbRw,
   inboundDbPath,
   heartbeatPath,
+  readSpawnSkillGeneration,
   sessionDir,
 } from './session-manager.js';
 import { isContainerRunning, killContainer, wakeContainer } from './container-runner.js';
+import { currentManagedSkillGeneration } from './yente/managed-skills.js';
 import {
   ensureSessionSchedulerProjections,
   resolveProjectionContext,
@@ -370,14 +372,15 @@ function enforceRunningContainerSla(
   session: Session,
   agentGroupId: string,
 ): void {
+  const now = Date.now();
+  const heartbeat = heartbeatMtimeMs(agentGroupId, session.id);
+  const claims = getProcessingClaims(outDb);
   const decision = decideStuckAction({
-    now: Date.now(),
-    heartbeatMtimeMs: heartbeatMtimeMs(agentGroupId, session.id),
+    now,
+    heartbeatMtimeMs: heartbeat,
     containerState: getContainerState(outDb),
-    claims: getProcessingClaims(outDb),
+    claims,
   });
-
-  if (decision.action === 'ok') return;
 
   if (decision.action === 'kill-ceiling') {
     log.warn('Killing container past absolute ceiling', {
@@ -390,14 +393,37 @@ function enforceRunningContainerSla(
     return;
   }
 
-  log.warn('Killing container — message claimed then silent', {
-    sessionId: session.id,
-    messageId: decision.messageId,
-    claimAgeMs: decision.claimAgeMs,
-    toleranceMs: decision.toleranceMs,
+  if (decision.action === 'kill-claim') {
+    log.warn('Killing container — message claimed then silent', {
+      sessionId: session.id,
+      messageId: decision.messageId,
+      claimAgeMs: decision.claimAgeMs,
+      toleranceMs: decision.toleranceMs,
+    });
+    killContainer(session.id, 'claim-stuck');
+    resetStuckProcessingRows(inDb, outDb, session, 'claim-stuck');
+    return;
+  }
+
+  // Nothing is stuck. If skills were redeployed since this container spawned
+  // and it is idle, recycle it so the next message respawns with fresh skills.
+  // No processing rows are reset here: the idle gate means there are no claims
+  // to recover, and the next inbound message (or due-message wake) respawns it.
+  const recycle = decideSkillRecycle({
+    now,
+    heartbeatMtimeMs: heartbeat,
+    claims,
+    currentGeneration: currentManagedSkillGeneration(process.env),
+    spawnGeneration: readSpawnSkillGeneration(sessionDir(agentGroupId, session.id)),
   });
-  killContainer(session.id, 'claim-stuck');
-  resetStuckProcessingRows(inDb, outDb, session, 'claim-stuck');
+  if (recycle.action === 'recycle-skills') {
+    log.info('Recycling idle container to pick up redeployed skills', {
+      sessionId: session.id,
+      currentGeneration: recycle.currentGeneration,
+      spawnGeneration: recycle.spawnGeneration,
+    });
+    killContainer(session.id, 'skills-stale');
+  }
 }
 
 /**

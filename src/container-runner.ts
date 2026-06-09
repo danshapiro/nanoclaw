@@ -58,6 +58,7 @@ import {
   markContainerStopped,
   sessionDir,
   writeSessionRouting,
+  writeSpawnSkillGeneration,
 } from './session-manager.js';
 import type { AgentGroup, Session } from './types.js';
 
@@ -195,10 +196,12 @@ async function spawnContainer(session: Session): Promise<void> {
   let bridges: AgentMcpBridge[] = [];
   let args: string[];
   let managedSkillsRoot = '';
+  let skillGeneration = '';
   try {
     const buildResult = buildMounts(agentGroup, session, containerConfig, contribution);
     const mounts = buildResult.mounts;
     managedSkillsRoot = buildResult.managedSkillsRoot;
+    skillGeneration = buildResult.skillGeneration;
     bridges = await attachAgentMcpBridges(agentGroup, containerConfig, mounts);
     args = await buildContainerArgs(
       mounts,
@@ -238,6 +241,9 @@ async function spawnContainer(session: Session): Promise<void> {
     activeMcpBridges.set(session.id, bridges);
   }
   markContainerRunning(session.id);
+  // Record the deployed skill generation this container mounted, so host-sweep
+  // can recycle it after a later skill deploy. Best-effort inside the helper.
+  writeSpawnSkillGeneration(sessionDir(agentGroup.id, session.id), skillGeneration);
 
   // Log stderr
   container.stderr?.on('data', (data) => {
@@ -706,7 +712,7 @@ function buildMounts(
   session: Session,
   containerConfig: import('./container-config.js').ContainerConfig,
   providerContribution: ProviderContainerContribution,
-): { mounts: VolumeMount[]; managedSkillsRoot: string } {
+): { mounts: VolumeMount[]; managedSkillsRoot: string; skillGeneration: string } {
   const projectRoot = process.cwd();
 
   // Per-group filesystem state lives forever after first creation. Init is
@@ -812,7 +818,7 @@ function buildMounts(
       mounts.push(...providerContribution.mounts);
     }
 
-    return { mounts, managedSkillsRoot: managedSkills.root };
+    return { mounts, managedSkillsRoot: managedSkills.root, skillGeneration: managedSkills.generation };
   } catch (_err) {
     cleanupTempSkillRoot(tempRoot);
     throw _err;
