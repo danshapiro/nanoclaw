@@ -1099,6 +1099,12 @@ function countOutboundVisibleReplyMessages(routing: RoutingContext): number {
       `SELECT COUNT(*) AS count FROM messages_out
        WHERE kind <> 'system'
          AND (
+           CASE
+             WHEN json_valid(content) THEN json_extract(content, '$.operation') IS NULL
+             ELSE 1
+           END
+         )
+         AND (
            ($route_key IS NOT NULL AND route_key = $route_key)
            OR (
              route_key IS NULL

@@ -770,6 +770,48 @@ describe('poll-loop conversational reply accounting', () => {
     await loopPromise.catch(() => {});
   });
 
+  it('does not count a reaction-only MCP output as the user-visible response for bare final recovery', async () => {
+    insertChannelDestination('discord-current', 'chan-1');
+    insertMessage(
+      'reaction-before-bare-final-chat',
+      'chat',
+      { sender: 'User', text: 'please respond' },
+      { platformId: 'chan-1', channelType: 'discord', threadId: 'thread-1' },
+    );
+
+    const prompts: string[] = [];
+    let calls = 0;
+    const provider = new MockProvider({}, (prompt) => {
+      prompts.push(prompt);
+      calls += 1;
+      if (calls === 1) {
+        writeMessageOut({
+          id: 'reaction-only-progress',
+          kind: 'chat',
+          platform_id: 'chan-1',
+          channel_type: 'discord',
+          thread_id: 'thread-1',
+          content: JSON.stringify({ operation: 'reaction', messageId: 'platform-msg-1', emoji: 'white_check_mark' }),
+        });
+        return 'Done.';
+      }
+      return '<message to="discord-current">Done.</message>';
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal);
+
+    await waitFor(() => getAckStatus('reaction-before-bare-final-chat') === 'completed', 1500);
+    controller.abort();
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(2);
+    expect(JSON.parse(out[0].content).operation).toBe('reaction');
+    expect(JSON.parse(out[1].content).text).toBe('Done.');
+    expect(prompts).toHaveLength(2);
+
+    await loopPromise.catch(() => {});
+  });
+
   it('allows an MCP send_message update followed by an explicit final response', async () => {
     const routeKey = normalizeRoute('test', {
       platformId: 'chan-2',
