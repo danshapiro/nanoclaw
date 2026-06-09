@@ -34,6 +34,12 @@ time, and the generated rebuild Dockerfile fails closed if package installation
 creates another executable `gws` anywhere on `PATH` other than
 `/usr/local/bin/gws`, including the explicit `/pnpm/gws` bypass shape.
 
+`YENTE_BROWSER_HANDOFF_URL` is the agent-facing browser broker endpoint. Agent
+containers receive that non-secret URL and the local `superpowers-chrome` helper;
+OneCLI injects the `Yente Browser Handoff` authorization header. Broker secrets,
+the VNC password, the Chromium profile, and direct CDP/VNC sockets stay outside
+the agent container.
+
 ## Lockfiles
 
 | Tree | Lockfile | Manager | Regenerate after dep change |
@@ -88,6 +94,7 @@ Any failure fails the PR.
 - **No tsc build step in the container image.** Re-adding one would reintroduce the ~200-500ms per-session-wake cost we removed.
 - **Global container CLIs stay on pnpm, not Bun.** `agent-browser`, `@anthropic-ai/claude-code`, `vercel` and any future Node CLIs the agent invokes should be pinned versions under the Dockerfile's pnpm global-install block. `bun install -g` would bypass the pnpm supply-chain policy.
 - **GWS stays mediated.** The agent image must expose `/usr/local/bin/gws` as the policy-proxy shim, must not install the real Google Workspace CLI, and must not create or receive a Google OAuth config path. The trusted `gws-proxy` service owns the real CLI and OAuth state.
+- **Browser handoff stays mediated.** Agents receive only `YENTE_BROWSER_HANDOFF_URL` and the skill helper. OneCLI owns broker authorization, and the browser handoff service owns the VNC password, profile, and CDP socket.
 
 ## Migration history
 

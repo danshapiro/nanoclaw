@@ -151,10 +151,31 @@ async function loadContainerRunnerHarness(
   });
   vi.doMock('./providers/index.js', () => ({}));
   vi.doMock('./yente/service-env.js', () => ({
+    YENTE_LOCAL_PROXY_HOSTNAMES: [
+      'yente-gws-proxy.local',
+      'yente-msgvault-proxy.local',
+      'yente-familiar-proxy.local',
+      'yente-nyne-proxy.local',
+      'yente-browser-handoff.local',
+    ],
     assertOneCliApplied(applied: boolean): void {
       if (!applied) throw new Error('OneCLI gateway did not apply container credentials');
     },
     ensureOneCliAgentSecretAccess: vi.fn().mockResolvedValue(undefined),
+    requireYenteHostEnv: vi.fn().mockReturnValue({
+      containerEnv: {
+        GWS_PROXY_URL: 'http://yente-gws-proxy.local:8083',
+        MSGVAULT_PROXY_URL: 'http://yente-msgvault-proxy.local:8084',
+        MSGVAULT_API_URL: 'http://yente-msgvault-proxy.local:8084',
+        FAMILIAR_PROXY_URL: 'http://yente-familiar-proxy.local:8081',
+        FAMILIAR_API_URL: 'http://yente-familiar-proxy.local:8081',
+        NYNE_PROXY_URL: 'http://yente-nyne-proxy.local:8082',
+        NYNE_API_URL: 'http://yente-nyne-proxy.local:8082',
+        YENTE_BROWSER_HANDOFF_URL: 'http://yente-browser-handoff.local:6081',
+        NO_PROXY: 'localhost,127.0.0.1,registry.npmjs.org',
+        no_proxy: 'localhost,127.0.0.1,registry.npmjs.org',
+      },
+    }),
   }));
 
   const db = await import('./db/index.js');
@@ -669,6 +690,26 @@ describe('session wake lifecycle', () => {
     }
   });
 
+  it('exposes Yente local service env and host aliases for Codex sessions', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      harness.sessions.updateSession(harness.session.id, { agent_provider: 'codex' });
+
+      const wake = harness.containerRunner.wakeContainer(harness.session);
+      await harness.oneCliStarted.promise;
+      harness.oneCliRelease.resolve();
+      await wake;
+
+      const args = harness.spawnMock.mock.calls[0][1];
+      expect(args).toContain('YENTE_BROWSER_HANDOFF_URL=http://yente-browser-handoff.local:6081');
+      expect(args).toContain('GWS_PROXY_URL=http://yente-gws-proxy.local:8083');
+      expect(args).toContain('--add-host=yente-browser-handoff.local:host-gateway');
+      expect(args).toContain('--add-host=yente-gws-proxy.local:host-gateway');
+    } finally {
+      harness.close();
+    }
+  });
+
   it('labels spawned containers with the owning session id', async () => {
     const harness = await loadContainerRunnerHarness();
     try {
@@ -1095,6 +1136,17 @@ describe('side-effect ledger container env', () => {
       // The flat docker-run arg list is ['-e', 'KEY=VALUE', ...].
       // Verify the exact static value is present as a discrete arg.
       expect(args).toContain('NANOCLAW_SIDE_EFFECT_LEDGER=/workspace/side-effects.jsonl');
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('passes the owning agent group identity for local skills', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      const args = await buildArgs(harness);
+      expect(args).toContain('NANOCLAW_AGENT_GROUP_ID=ag-1');
+      expect(args).toContain('NANOCLAW_AGENT_GROUP_FOLDER=agent');
     } finally {
       harness.close();
     }

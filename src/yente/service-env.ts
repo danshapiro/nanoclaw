@@ -1,10 +1,26 @@
+export const YENTE_LOCAL_PROXY_HOSTS = {
+  gws: 'yente-gws-proxy.local',
+  msgvault: 'yente-msgvault-proxy.local',
+  familiar: 'yente-familiar-proxy.local',
+  nyne: 'yente-nyne-proxy.local',
+  browserHandoff: 'yente-browser-handoff.local',
+} as const;
+export const YENTE_LOCAL_PROXY_HOSTNAMES = Object.values(YENTE_LOCAL_PROXY_HOSTS);
+export const YENTE_BROWSER_HANDOFF_PRODUCTION_URL = `http://${YENTE_LOCAL_PROXY_HOSTS.browserHandoff}:6081`;
+
 export const REQUIRED_YENTE_PROXY_URLS = [
   { service: 'gws', urlEnv: 'GWS_PROXY_URL', apiUrlEnv: undefined, compatibilityKeyEnv: undefined },
   { service: 'msgvault', urlEnv: 'MSGVAULT_PROXY_URL', apiUrlEnv: 'MSGVAULT_API_URL', compatibilityKeyEnv: undefined },
   { service: 'familiar', urlEnv: 'FAMILIAR_PROXY_URL', apiUrlEnv: 'FAMILIAR_API_URL', compatibilityKeyEnv: undefined },
   { service: 'nyne', urlEnv: 'NYNE_PROXY_URL', apiUrlEnv: 'NYNE_API_URL', compatibilityKeyEnv: undefined },
+  {
+    service: 'browserHandoff',
+    urlEnv: 'YENTE_BROWSER_HANDOFF_URL',
+    apiUrlEnv: undefined,
+    compatibilityKeyEnv: undefined,
+  },
 ] as const satisfies readonly {
-  service: 'gws' | 'msgvault' | 'familiar' | 'nyne';
+  service: 'gws' | 'msgvault' | 'familiar' | 'nyne' | 'browserHandoff';
   urlEnv: string;
   apiUrlEnv?: string;
   compatibilityKeyEnv?: string;
@@ -13,6 +29,7 @@ export const REQUIRED_YENTE_PROXY_URLS = [
 export const REQUIRED_YENTE_ONECLI_SECRET_NAMES = [
   'Yente GWS Proxy',
   'Yente Msgvault Proxy',
+  'Yente Browser Handoff',
   'NanoClaw Anthropic',
   'NanoClaw OpenAI',
   'NanoClaw Gemini',
@@ -22,14 +39,6 @@ export const REQUIRED_YENTE_ONECLI_SECRET_NAMES = [
   'Vercel',
 ] as const;
 export const ONECLI_MANAGED_PLACEHOLDER = 'onecli-managed';
-export const YENTE_LOCAL_PROXY_HOSTS = {
-  gws: 'yente-gws-proxy.local',
-  msgvault: 'yente-msgvault-proxy.local',
-  familiar: 'yente-familiar-proxy.local',
-  nyne: 'yente-nyne-proxy.local',
-} as const;
-export const YENTE_LOCAL_PROXY_HOSTNAMES = Object.values(YENTE_LOCAL_PROXY_HOSTS);
-
 function requireEnvValue(env: NodeJS.ProcessEnv, key: string): string {
   const value = env[key]?.trim();
   if (!value) {

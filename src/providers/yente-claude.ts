@@ -10,6 +10,7 @@ const YENTE_HOST_ENV_KEYS = [
   'MSGVAULT_PROXY_URL',
   'FAMILIAR_PROXY_URL',
   'NYNE_PROXY_URL',
+  'YENTE_BROWSER_HANDOFF_URL',
   'NO_PROXY',
   'no_proxy',
 ] as const;

@@ -25,6 +25,7 @@ describe('opencode provider container config', () => {
           MSGVAULT_PROXY_URL: 'http://yente-msgvault-proxy.local:8084',
           FAMILIAR_PROXY_URL: 'http://yente-familiar-proxy.local:8081',
           NYNE_PROXY_URL: 'http://yente-nyne-proxy.local:8082',
+          YENTE_BROWSER_HANDOFF_URL: 'http://yente-browser-handoff.local:6081',
         },
       });
 
@@ -32,7 +33,9 @@ describe('opencode provider container config', () => {
       expect(fs.statSync(opencodeXdgDir).isDirectory()).toBe(true);
       expect(contribution.env?.XDG_DATA_HOME).toBe('/opencode-xdg');
       expect(contribution.env?.GWS_PROXY_URL).toBe('http://yente-gws-proxy.local:8083');
+      expect(contribution.env?.YENTE_BROWSER_HANDOFF_URL).toBe('http://yente-browser-handoff.local:6081');
       expect(contribution.extraHosts).toContain('yente-gws-proxy.local');
+      expect(contribution.extraHosts).toContain('yente-browser-handoff.local');
       expect(contribution.mounts).toContainEqual({
         hostPath: opencodeXdgDir,
         containerPath: '/opencode-xdg',
@@ -58,6 +61,7 @@ describe('opencode provider container config', () => {
         'MSGVAULT_PROXY_URL=http://yente-msgvault-proxy.local:8084',
         'FAMILIAR_PROXY_URL=http://yente-familiar-proxy.local:8081',
         'NYNE_PROXY_URL=http://yente-nyne-proxy.local:8082',
+        'YENTE_BROWSER_HANDOFF_URL=http://yente-browser-handoff.local:6081',
         'OPENCODE_PROVIDER=opencode-go',
         'OPENCODE_MODEL=opencode-go/test-model',
         'OPENCODE_SMALL_MODEL=opencode-go/test-small',
@@ -77,6 +81,7 @@ describe('opencode provider container config', () => {
       });
 
       expect(contribution.env?.GWS_PROXY_URL).toBe('http://yente-gws-proxy.local:8083');
+      expect(contribution.env?.YENTE_BROWSER_HANDOFF_URL).toBe('http://yente-browser-handoff.local:6081');
       expect(contribution.env?.OPENCODE_PROVIDER).toBe('opencode-go');
       expect(contribution.env?.OPENCODE_MODEL).toBe('opencode-go/test-model');
       expect(contribution.env?.OPENCODE_SMALL_MODEL).toBe('opencode-go/test-small');
@@ -106,6 +111,7 @@ describe('opencode provider container config', () => {
           MSGVAULT_PROXY_URL: 'http://yente-msgvault-proxy.local:8084',
           FAMILIAR_PROXY_URL: 'http://yente-familiar-proxy.local:8081',
           NYNE_PROXY_URL: 'http://yente-nyne-proxy.local:8082',
+          YENTE_BROWSER_HANDOFF_URL: 'http://yente-browser-handoff.local:6081',
           OPENCODE_PROVIDER: 'opencode-go',
           OPENCODE_MODEL: 'opencode-go/deepseek-v4-pro',
           OPENCODE_SMALL_MODEL: 'opencode-go/deepseek-v4-flash',
@@ -142,6 +148,7 @@ describe('opencode provider container config', () => {
           MSGVAULT_PROXY_URL: 'http://yente-msgvault-proxy.local:8084',
           FAMILIAR_PROXY_URL: 'http://yente-familiar-proxy.local:8081',
           NYNE_PROXY_URL: 'http://yente-nyne-proxy.local:8082',
+          YENTE_BROWSER_HANDOFF_URL: 'http://yente-browser-handoff.local:6081',
           OPENCODE_MODEL: 'opencode-go/deepseek-v4-pro',
         },
         groupModel: 'opencode-go/deepseek-v4-flash',
@@ -171,6 +178,7 @@ describe('opencode provider container config', () => {
           MSGVAULT_PROXY_URL: 'http://yente-msgvault-proxy.local:8084',
           FAMILIAR_PROXY_URL: 'http://yente-familiar-proxy.local:8081',
           NYNE_PROXY_URL: 'http://yente-nyne-proxy.local:8082',
+          YENTE_BROWSER_HANDOFF_URL: 'http://yente-browser-handoff.local:6081',
           OPENCODE_PROVIDER: 'opencode-go',
           OPENCODE_MODEL: 'opencode-go/deepseek-v4-pro',
         },
@@ -206,6 +214,7 @@ describe('opencode provider container config', () => {
           MSGVAULT_PROXY_URL: 'http://yente-msgvault-proxy.local:8084',
           FAMILIAR_PROXY_URL: 'http://yente-familiar-proxy.local:8081',
           NYNE_PROXY_URL: 'http://yente-nyne-proxy.local:8082',
+          YENTE_BROWSER_HANDOFF_URL: 'http://yente-browser-handoff.local:6081',
           // Operator override set in host env — must be forwarded.
           OPENCODE_TRANSPORT_TIMEOUT_MS: '2700000',
           OPENCODE_RELAY_DEADLINE_MS: '45000',
@@ -240,6 +249,7 @@ describe('opencode provider container config', () => {
           MSGVAULT_PROXY_URL: 'http://yente-msgvault-proxy.local:8084',
           FAMILIAR_PROXY_URL: 'http://yente-familiar-proxy.local:8081',
           NYNE_PROXY_URL: 'http://yente-nyne-proxy.local:8082',
+          YENTE_BROWSER_HANDOFF_URL: 'http://yente-browser-handoff.local:6081',
           OPENCODE_MODEL: 'opencode-go/deepseek-v4-pro',
         },
       });

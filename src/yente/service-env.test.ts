@@ -4,6 +4,7 @@ import {
   assertOneCliApplied,
   buildNoProxy,
   ensureOneCliAgentSecretAccess,
+  YENTE_BROWSER_HANDOFF_PRODUCTION_URL,
   REQUIRED_YENTE_PROXY_URLS,
   requireYenteHostEnv,
   YENTE_LOCAL_PROXY_HOSTS,
@@ -17,6 +18,7 @@ const COMPLETE_ENV: NodeJS.ProcessEnv = {
   MSGVAULT_PROXY_URL: `http://${YENTE_LOCAL_PROXY_HOSTS.msgvault}:8084`,
   FAMILIAR_PROXY_URL: `http://${YENTE_LOCAL_PROXY_HOSTS.familiar}:8081`,
   NYNE_PROXY_URL: `http://${YENTE_LOCAL_PROXY_HOSTS.nyne}:8082`,
+  YENTE_BROWSER_HANDOFF_URL: YENTE_BROWSER_HANDOFF_PRODUCTION_URL,
 };
 
 describe('Yente service env contract', () => {
@@ -31,7 +33,13 @@ describe('Yente service env contract', () => {
   });
 
   it('requires every mediated local service URL', () => {
-    expect(REQUIRED_YENTE_PROXY_URLS.map((entry) => entry.service)).toEqual(['gws', 'msgvault', 'familiar', 'nyne']);
+    expect(REQUIRED_YENTE_PROXY_URLS.map((entry) => entry.service)).toEqual([
+      'gws',
+      'msgvault',
+      'familiar',
+      'nyne',
+      'browserHandoff',
+    ]);
 
     for (const entry of REQUIRED_YENTE_PROXY_URLS) {
       expect(() => requireYenteHostEnv({ ...COMPLETE_ENV, [entry.urlEnv]: '' })).toThrow(
@@ -48,6 +56,8 @@ describe('Yente service env contract', () => {
       GWS_PROXY_KEY: 'raw-gws-proxy-key',
       MSGVAULT_PROXY_KEY: 'raw-msgvault-proxy-key',
       MSGVAULT_API_KEY: 'raw-msgvault-api-key',
+      YENTE_BROWSER_HANDOFF_BROKER_SECRET: 'raw-broker-secret',
+      YENTE_BROWSER_HANDOFF_VNC_PASSWORD: 'raw-vnc-password',
     });
 
     expect(result.onecliUrl).toBe('https://onecli.local');
@@ -60,6 +70,7 @@ describe('Yente service env contract', () => {
       FAMILIAR_API_URL: `http://${YENTE_LOCAL_PROXY_HOSTS.familiar}:8081`,
       NYNE_PROXY_URL: `http://${YENTE_LOCAL_PROXY_HOSTS.nyne}:8082`,
       NYNE_API_URL: `http://${YENTE_LOCAL_PROXY_HOSTS.nyne}:8082`,
+      YENTE_BROWSER_HANDOFF_URL: YENTE_BROWSER_HANDOFF_PRODUCTION_URL,
       NO_PROXY: 'localhost,127.0.0.1,registry.npmjs.org',
       no_proxy: 'localhost,127.0.0.1,registry.npmjs.org',
     });
@@ -68,12 +79,14 @@ describe('Yente service env contract', () => {
     expect(result.containerEnv).not.toHaveProperty('GWS_PROXY_KEY');
     expect(result.containerEnv).not.toHaveProperty('MSGVAULT_PROXY_KEY');
     expect(result.containerEnv).not.toHaveProperty('MSGVAULT_API_KEY');
+    expect(result.containerEnv).not.toHaveProperty('YENTE_BROWSER_HANDOFF_BROKER_SECRET');
+    expect(result.containerEnv).not.toHaveProperty('YENTE_BROWSER_HANDOFF_VNC_PASSWORD');
   });
 
   it('does not bypass OneCLI for mediated local service hosts', () => {
     const entries = buildNoProxy({
       ...COMPLETE_ENV,
-      NO_PROXY: `localhost,127.0.0.1,${YENTE_LOCAL_PROXY_HOSTS.gws},${YENTE_LOCAL_PROXY_HOSTS.msgvault}:8084,internal.example`,
+      NO_PROXY: `localhost,127.0.0.1,${YENTE_LOCAL_PROXY_HOSTS.gws},${YENTE_LOCAL_PROXY_HOSTS.msgvault}:8084,${YENTE_LOCAL_PROXY_HOSTS.browserHandoff}:6081,internal.example`,
     }).split(',');
 
     expect(entries).toEqual(expect.arrayContaining(['localhost', '127.0.0.1', 'internal.example']));
@@ -81,6 +94,7 @@ describe('Yente service env contract', () => {
     expect(entries).not.toContain(`${YENTE_LOCAL_PROXY_HOSTS.msgvault}:8084`);
     expect(entries).not.toContain(YENTE_LOCAL_PROXY_HOSTS.familiar);
     expect(entries).not.toContain(YENTE_LOCAL_PROXY_HOSTS.nyne);
+    expect(entries).not.toContain(`${YENTE_LOCAL_PROXY_HOSTS.browserHandoff}:6081`);
   });
 
   it('throws when OneCLI reports that gateway config was not applied', () => {
@@ -100,6 +114,7 @@ describe('Yente service env contract', () => {
           { id: 'secret-anthropic', name: 'NanoClaw Anthropic' },
           { id: 'secret-gws', name: 'Yente GWS Proxy' },
           { id: 'secret-msgvault', name: 'Yente Msgvault Proxy' },
+          { id: 'secret-browser-handoff', name: 'Yente Browser Handoff' },
           { id: 'secret-openai', name: 'NanoClaw OpenAI' },
           { id: 'secret-gemini', name: 'NanoClaw Gemini' },
           { id: 'secret-opencode-go', name: 'NanoClaw OpenCode Go' },
@@ -138,6 +153,7 @@ describe('Yente service env contract', () => {
           'secret-anthropic',
           'secret-gws',
           'secret-msgvault',
+          'secret-browser-handoff',
           'secret-openai',
           'secret-gemini',
           'secret-opencode-go',
@@ -157,6 +173,7 @@ describe('Yente service env contract', () => {
         return Response.json([
           { id: 'secret-gws', name: 'Yente GWS Proxy' },
           { id: 'secret-msgvault', name: 'Yente Msgvault Proxy' },
+          { id: 'secret-browser-handoff', name: 'Yente Browser Handoff' },
           { id: 'secret-anthropic', name: 'NanoClaw Anthropic' },
           { id: 'secret-openai', name: 'NanoClaw OpenAI' },
           { id: 'secret-gemini', name: 'NanoClaw Gemini' },
@@ -206,7 +223,7 @@ describe('Yente service env contract', () => {
         fetchImpl,
       }),
     ).rejects.toThrow(
-      'Missing OneCLI secret(s): NanoClaw Anthropic, NanoClaw OpenAI, NanoClaw Gemini, NanoClaw OpenCode Go, NanoClaw OpenCode Go Messages, AssemblyAI, Vercel',
+      'Missing OneCLI secret(s): Yente Browser Handoff, NanoClaw Anthropic, NanoClaw OpenAI, NanoClaw Gemini, NanoClaw OpenCode Go, NanoClaw OpenCode Go Messages, AssemblyAI, Vercel',
     );
   });
 });

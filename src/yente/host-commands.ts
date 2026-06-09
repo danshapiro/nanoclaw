@@ -154,6 +154,7 @@ function tokenAvailabilitySummary(): string {
     'MSGVAULT_PROXY_URL',
     'FAMILIAR_PROXY_URL',
     'NYNE_PROXY_URL',
+    'YENTE_BROWSER_HANDOFF_URL',
   ].filter((key) => Boolean(process.env[key]));
   if (known.length === 0) return 'unknown';
   return `${known.length} configured`;

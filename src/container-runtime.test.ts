@@ -46,11 +46,14 @@ describe('readonlyMountArgs', () => {
 
 describe('hostGatewayArgs', () => {
   it('maps distinct local proxy hostnames to the Docker host gateway', () => {
-    expect(hostGatewayArgs(['yente-msgvault-proxy.local', 'yente-gws-proxy.local'])).toEqual(
+    expect(
+      hostGatewayArgs(['yente-msgvault-proxy.local', 'yente-gws-proxy.local', 'yente-browser-handoff.local']),
+    ).toEqual(
       expect.arrayContaining([
         '--add-host=host.docker.internal:host-gateway',
         '--add-host=yente-msgvault-proxy.local:host-gateway',
         '--add-host=yente-gws-proxy.local:host-gateway',
+        '--add-host=yente-browser-handoff.local:host-gateway',
       ]),
     );
   });

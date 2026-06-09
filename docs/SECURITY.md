@@ -79,9 +79,17 @@ Each NanoClaw group gets its own OneCLI agent identity. This allows different cr
 **GWS policy proxy:**
 Yente agents use `GWS_PROXY_URL` and the `/usr/local/bin/gws` shim for Google Workspace access. The shim forwards command argv to `gws-proxy` through the configured OneCLI proxy environment; OneCLI injects the proxy authorization header. Agent containers must not receive `GWS_PROXY_KEY`, must not mount `/srv/nanoclaw/shared/gws-config`, and must not include Google OAuth files or the real Google Workspace CLI. Per-agent `install_packages` rebuilds preserve the same boundary: `gws` is reserved for the shim, direct `@googleworkspace/cli` package requests are rejected before approval, and image rebuilds fail closed if a package creates another executable `gws` anywhere on `PATH` other than `/usr/local/bin/gws` or at `/pnpm/gws`. The trusted `gws-proxy` service boundary may hold the real CLI, OAuth state, recipient policy, and audit logs.
 
+**Browser handoff broker:**
+Yente agents use `YENTE_BROWSER_HANDOFF_URL` plus the local `superpowers-chrome`
+skill helper to reach the shared browser broker through OneCLI. The
+`Yente Browser Handoff` OneCLI secret grants the broker authorization header;
+agent containers must not receive the broker token, VNC password, Chromium
+profile, or direct VNC/CDP access.
+
 **NOT Mounted:**
 - Channel auth sessions (`store/auth/`) — host only
 - GWS OAuth config (`/srv/nanoclaw/shared/gws-config`) — trusted `gws-proxy` only
+- Browser handoff secrets and Chromium profile — trusted browser handoff service only
 - Mount allowlist — external, never mounted
 - Any credentials matching blocked patterns
 - `.env` is shadowed with `/dev/null` in the project root mount

@@ -42,7 +42,12 @@ import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
 import { cleanupStaleTempRoots, resolveManagedSkillRoot, syncManagedSkillSymlinks } from './yente/managed-skills.js';
-import { assertOneCliApplied, ensureOneCliAgentSecretAccess } from './yente/service-env.js';
+import {
+  assertOneCliApplied,
+  ensureOneCliAgentSecretAccess,
+  requireYenteHostEnv,
+  YENTE_LOCAL_PROXY_HOSTNAMES,
+} from './yente/service-env.js';
 // Provider host-side config barrel — each provider that needs host-side
 // container setup self-registers on import.
 import './providers/index.js';
@@ -978,6 +983,13 @@ async function buildContainerArgs(
   // input-accepted. We only need /workspace writable by the poll loop and
   // readable by tools, which the workspace mount already provides.
   args.push('-e', 'NANOCLAW_SIDE_EFFECT_LEDGER=/workspace/side-effects.jsonl');
+  args.push('-e', `NANOCLAW_AGENT_GROUP_ID=${agentGroup.id}`);
+  args.push('-e', `NANOCLAW_AGENT_GROUP_FOLDER=${agentGroup.folder}`);
+
+  const yenteHostEnv = requireYenteHostEnv(process.env);
+  for (const [key, value] of Object.entries(yenteHostEnv.containerEnv)) {
+    args.push('-e', `${key}=${value}`);
+  }
 
   // Ed25519 PUBLIC verify key only — verification grants no forging power, so
   // it is safe in the agent container. The private signing key lives only in
@@ -1004,7 +1016,9 @@ async function buildContainerArgs(
   });
 
   // Host gateway
-  args.push(...hostGatewayArgs(providerContribution.extraHosts));
+  args.push(
+    ...hostGatewayArgs([...new Set([...YENTE_LOCAL_PROXY_HOSTNAMES, ...(providerContribution.extraHosts ?? [])])]),
+  );
 
   // User mapping
   const hostUid = process.getuid?.();
