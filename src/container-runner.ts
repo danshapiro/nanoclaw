@@ -531,6 +531,7 @@ function resolveProviderContribution(
         agentGroupId: agentGroup.id,
         hostEnv: process.env,
         groupModel: containerConfig.model,
+        groupReasoningEffort: containerConfig.reasoningEffort,
       })
     : {};
   return { provider, contribution };

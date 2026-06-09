@@ -64,6 +64,8 @@ export interface ContainerConfig {
   maxMessagesPerPrompt?: number;
   /** Per-group model override. When set, overrides the global OPENCODE_MODEL for this group only. */
   model?: string;
+  /** Per-group OpenCode reasoning effort override, passed through to the build agent when set. */
+  reasoningEffort?: string;
 }
 
 function emptyConfig(): ContainerConfig {
@@ -104,6 +106,7 @@ export function readContainerConfig(folder: string): ContainerConfig {
       skills: raw.skills ?? 'all',
       provider: raw.provider,
       model: raw.model,
+      reasoningEffort: raw.reasoningEffort,
       groupName: raw.groupName,
       assistantName: raw.assistantName,
       agentGroupId: raw.agentGroupId,

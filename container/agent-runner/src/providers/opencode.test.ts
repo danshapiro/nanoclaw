@@ -123,6 +123,32 @@ describe('OpenCode config', () => {
     expect(provider).not.toHaveProperty('options');
   });
 
+  it('allows OpenAI through OpenCode and passes reasoning effort as a model option', () => {
+    const config = withEnv(
+      {
+        OPENCODE_PROVIDER: 'openai',
+        OPENCODE_MODEL: 'openai/gpt-5.5',
+        OPENCODE_SMALL_MODEL: undefined,
+        OPENCODE_REASONING_EFFORT: 'xhigh',
+      },
+      () => buildOpenCodeConfig({ mcpServers: undefined }),
+    );
+
+    expect(config).toMatchObject({
+      model: 'openai/gpt-5.5',
+      enabled_providers: ['openai'],
+    });
+    const provider = config.provider as Record<
+      string,
+      {
+        options?: { timeout?: number | false };
+        models?: Record<string, { options?: { reasoningEffort?: string } }>;
+      }
+    >;
+    expect(provider.openai?.options?.timeout).toBe(21600000);
+    expect(provider.openai?.models?.['gpt-5.5']?.options?.reasoningEffort).toBe('xhigh');
+  });
+
   it('relay-mode config denies mutation/shell/file/web/question via REAL ids; reachable set = allowlist', () => {
     const config = buildOpenCodeConfig({ mcpServers: undefined }, { relayMode: true, relayRouteKey: 'discord:dm:1' });
     const permission = config.permission as Record<string, string>;

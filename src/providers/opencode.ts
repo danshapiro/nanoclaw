@@ -42,6 +42,7 @@ const OPENCODE_BASE_HOST_ENV_KEYS = [
   'OPENCODE_MODEL',
   'OPENCODE_SMALL_MODEL',
   'OPENCODE_VISION_MODEL',
+  'OPENCODE_REASONING_EFFORT',
 ] as const;
 
 // Derived: base connection/model keys + every forwarded liveness knob. Keeping
@@ -49,12 +50,33 @@ const OPENCODE_BASE_HOST_ENV_KEYS = [
 // editing two lists.
 const OPENCODE_HOST_ENV_KEYS = [...OPENCODE_BASE_HOST_ENV_KEYS, ...OPENCODE_FORWARDED_LIVENESS_KEYS] as const;
 
-registerProviderContainerConfig('opencode', ({ hostEnv, sessionDir, groupModel }) => {
+function providerIdFromModel(model: string | undefined): string | undefined {
+  if (!model) return undefined;
+  const slash = model.indexOf('/');
+  if (slash <= 0) return undefined;
+  return model.slice(0, slash);
+}
+
+function modelForProvider(model: string | undefined, provider: string): string | undefined {
+  return providerIdFromModel(model) === provider ? model : undefined;
+}
+
+registerProviderContainerConfig('opencode', ({ hostEnv, sessionDir, groupModel, groupReasoningEffort }) => {
   const mergedHostEnv = { ...readEnvFile([...OPENCODE_HOST_ENV_KEYS]), ...hostEnv };
   const yente = requireYenteHostEnv(mergedHostEnv);
   const opencodeXdgDir = path.join(sessionDir, 'opencode-xdg');
 
   const resolvedModel = groupModel ?? mergedHostEnv.OPENCODE_MODEL ?? 'opencode-go/deepseek-v4-pro';
+  const resolvedProvider = providerIdFromModel(resolvedModel) ?? mergedHostEnv.OPENCODE_PROVIDER ?? 'opencode-go';
+  const resolvedSmallModel = modelForProvider(
+    mergedHostEnv.OPENCODE_SMALL_MODEL ?? 'opencode-go/deepseek-v4-flash',
+    resolvedProvider,
+  );
+  const resolvedVisionModel = modelForProvider(
+    mergedHostEnv.OPENCODE_VISION_MODEL ?? 'opencode-go/qwen3.6-plus',
+    resolvedProvider,
+  );
+  const resolvedReasoningEffort = groupReasoningEffort ?? mergedHostEnv.OPENCODE_REASONING_EFFORT;
   fs.mkdirSync(opencodeXdgDir, { recursive: true });
 
   // Forward present liveness-knob overrides; omit unset keys so the in-container
@@ -76,11 +98,13 @@ registerProviderContainerConfig('opencode', ({ hostEnv, sessionDir, groupModel }
     env: {
       ...yente.containerEnv,
       XDG_DATA_HOME: '/opencode-xdg',
-      OPENCODE_PROVIDER: mergedHostEnv.OPENCODE_PROVIDER ?? 'opencode-go',
+      OPENCODE_PROVIDER: resolvedProvider,
       OPENCODE_MODEL: resolvedModel,
-      OPENCODE_SMALL_MODEL: mergedHostEnv.OPENCODE_SMALL_MODEL ?? 'opencode-go/deepseek-v4-flash',
-      OPENCODE_VISION_MODEL: mergedHostEnv.OPENCODE_VISION_MODEL ?? 'opencode-go/qwen3.6-plus',
+      ...(resolvedSmallModel ? { OPENCODE_SMALL_MODEL: resolvedSmallModel } : {}),
+      ...(resolvedVisionModel ? { OPENCODE_VISION_MODEL: resolvedVisionModel } : {}),
       OPENCODE_API_KEY: OPENCODE_ONECLI_PLACEHOLDER,
+      ...(resolvedProvider === 'openai' ? { OPENAI_API_KEY: OPENCODE_ONECLI_PLACEHOLDER } : {}),
+      ...(resolvedReasoningEffort ? { OPENCODE_REASONING_EFFORT: resolvedReasoningEffort } : {}),
       ...forwardedLiveness,
     },
     extraHosts: YENTE_LOCAL_PROXY_HOSTNAMES,

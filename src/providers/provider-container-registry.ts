@@ -31,6 +31,8 @@ export interface ProviderContainerContext {
   hostEnv: NodeJS.ProcessEnv;
   /** Per-group model override from container.json. When set, takes precedence over hostEnv.OPENCODE_MODEL. */
   groupModel?: string;
+  /** Per-group OpenCode reasoning effort override from container.json. */
+  groupReasoningEffort?: string;
 }
 
 export interface ProviderContainerContribution {

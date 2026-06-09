@@ -147,7 +147,44 @@ describe('opencode provider container config', () => {
         groupModel: 'opencode-go/deepseek-v4-flash',
       });
 
+      expect(contribution.env?.OPENCODE_PROVIDER).toBe('opencode-go');
       expect(contribution.env?.OPENCODE_MODEL).toBe('opencode-go/deepseek-v4-flash');
+    } finally {
+      fs.rmSync(sessionDir, { recursive: true, force: true });
+    }
+  });
+
+  it('derives the OpenCode API provider and reasoning effort from per-group config', () => {
+    const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-opencode-session-'));
+    try {
+      const config = getProviderContainerConfig('opencode');
+
+      expect(config).toBeDefined();
+      const contribution = config!({
+        sessionDir,
+        agentGroupId: 'ag-discord-yente-chava',
+        hostEnv: {
+          ONECLI_URL: 'http://onecli.local',
+          ONECLI_API_KEY: 'secret',
+          ONECLI_GATEWAY_URL: 'http://onecli-gateway.local',
+          GWS_PROXY_URL: 'http://yente-gws-proxy.local:8083',
+          MSGVAULT_PROXY_URL: 'http://yente-msgvault-proxy.local:8084',
+          FAMILIAR_PROXY_URL: 'http://yente-familiar-proxy.local:8081',
+          NYNE_PROXY_URL: 'http://yente-nyne-proxy.local:8082',
+          OPENCODE_PROVIDER: 'opencode-go',
+          OPENCODE_MODEL: 'opencode-go/deepseek-v4-pro',
+        },
+        groupModel: 'openai/gpt-5.5',
+        groupReasoningEffort: 'xhigh',
+      });
+
+      expect(contribution.env?.OPENCODE_PROVIDER).toBe('openai');
+      expect(contribution.env?.OPENCODE_MODEL).toBe('openai/gpt-5.5');
+      expect(contribution.env?.OPENCODE_REASONING_EFFORT).toBe('xhigh');
+      expect(contribution.env?.OPENAI_API_KEY).toBe('onecli-managed');
+      expect(contribution.env?.OPENCODE_API_KEY).toBe('onecli-managed');
+      expect(contribution.env).not.toHaveProperty('OPENCODE_SMALL_MODEL');
+      expect(contribution.env).not.toHaveProperty('OPENCODE_VISION_MODEL');
     } finally {
       fs.rmSync(sessionDir, { recursive: true, force: true });
     }

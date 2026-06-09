@@ -184,7 +184,7 @@ function wrapPromptWithContext(text: string, systemInstructions?: string): strin
   return out;
 }
 
-const BUILTIN_AUTH_PROVIDERS = new Set(['anthropic', 'opencode', 'opencode-go', 'opencode-zen']);
+const BUILTIN_AUTH_PROVIDERS = new Set(['anthropic', 'opencode', 'opencode-go', 'opencode-zen', 'openai']);
 
 export interface BuildOpenCodeConfigOpts {
   /** Build the restricted relay config (mutation/shell/file/web/question denied). */
@@ -200,6 +200,7 @@ export function buildOpenCodeConfig(
   const provider = process.env.OPENCODE_PROVIDER || 'anthropic';
   const model = process.env.OPENCODE_MODEL;
   const smallModel = process.env.OPENCODE_SMALL_MODEL;
+  const reasoningEffort = process.env.OPENCODE_REASONING_EFFORT;
   if (!BUILTIN_AUTH_PROVIDERS.has(provider)) {
     throw new Error('Custom OpenCode providers are not supported without a OneCLI-managed credential path');
   }
@@ -212,8 +213,28 @@ export function buildOpenCodeConfig(
   // positive ms value (default = absolute turn ceiling) so NanoClaw's liveness
   // pump is not undercut by the hidden 5-minute provider request abort. NEVER 0
   // (immediate abort) and NEVER a provider literally named "options".
-  const providerConfig: Record<string, { options: { timeout: number | false } }> = {
-    [provider]: { options: { timeout: OPENCODE_MODEL_PROVIDER_TIMEOUT_MS() } },
+  const selectedModel = splitOpenCodeModel(model);
+  const providerConfig: Record<
+    string,
+    {
+      options: { timeout: number | false };
+      models?: Record<string, { options: Record<string, string> }>;
+    }
+  > = {
+    [provider]: {
+      options: { timeout: OPENCODE_MODEL_PROVIDER_TIMEOUT_MS() },
+      ...(reasoningEffort && selectedModel?.providerID === provider
+        ? {
+            models: {
+              [selectedModel.modelID]: {
+                options: {
+                  reasoningEffort,
+                },
+              },
+            },
+          }
+        : {}),
+    },
   };
 
   // Load shared base + per-group fragments + per-group memory through OpenCode's
@@ -314,6 +335,7 @@ export function runtimeConfigKey(options: ProviderOptions, opts: BuildOpenCodeCo
     mcp: mcpServersToOpenCodeConfig(options.mcpServers),
     model: process.env.OPENCODE_MODEL,
     small: process.env.OPENCODE_SMALL_MODEL,
+    reasoningEffort: process.env.OPENCODE_REASONING_EFFORT,
     op: process.env.OPENCODE_PROVIDER,
     // Relay differs only in denied tools, so it MUST get a distinct config key
     // or it would collide on the normal runtime and a destroy would kill both.
