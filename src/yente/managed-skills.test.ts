@@ -6,9 +6,9 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import {
   clearManagedSkillRootCache,
+  computeManagedSkillGeneration,
   currentManagedSkillGeneration,
   managedSkillRootsFromEnv,
-  readManagedSkillGeneration,
   resolveManagedSkillRoot,
   syncManagedSkillSymlinks,
 } from './managed-skills.js';
@@ -331,17 +331,71 @@ describe('syncManagedSkillSymlinks', () => {
   });
 });
 
-describe('managed skill generation', () => {
-  it('joins .skill-generation markers across managed roots in declared order', () => {
+describe('managed skill generation (content digest)', () => {
+  it('is deterministic for identical content', () => {
     const a = makeTempDir();
-    const b = makeTempDir();
-    fs.writeFileSync(path.join(a, '.skill-generation'), 'genA\n');
-    fs.writeFileSync(path.join(b, '.skill-generation'), 'genB\n');
-    expect(readManagedSkillGeneration([a, b])).toBe('genA\ngenB');
+    makeSkill(a, 'alpha');
+    expect(computeManagedSkillGeneration([a])).toBe(computeManagedSkillGeneration([a]));
   });
 
-  it('returns an empty string when no markers are present', () => {
-    expect(readManagedSkillGeneration([makeTempDir()])).toBe('');
+  it("depends only on content, not the root's absolute path", () => {
+    const a = makeTempDir();
+    const b = makeTempDir();
+    makeSkill(a, 'alpha'); // both create <root>/alpha/SKILL.md with identical content
+    makeSkill(b, 'alpha');
+    expect(computeManagedSkillGeneration([a])).toBe(computeManagedSkillGeneration([b]));
+  });
+
+  it('changes when a skill is added to the FIRST managed root', () => {
+    const a = makeTempDir();
+    makeSkill(a, 'alpha');
+    const before = computeManagedSkillGeneration([a]);
+    makeSkill(a, 'beta');
+    expect(computeManagedSkillGeneration([a])).not.toBe(before);
+  });
+
+  // Regression for the shipped bug: the local-skills root is the SECOND managed
+  // root and never carried a `.skill-generation` marker, so deploying a local
+  // skill (e.g. ntfy) left the generation unchanged and long-lived sessions
+  // never recycled to pick it up. A content digest MUST react to it.
+  it('changes when a skill is added to the SECOND (local) managed root', () => {
+    const shared = makeTempDir();
+    const local = makeTempDir();
+    makeSkill(shared, 'alpha');
+    const before = computeManagedSkillGeneration([shared, local]);
+    makeSkill(local, 'ntfy');
+    expect(computeManagedSkillGeneration([shared, local])).not.toBe(before);
+  });
+
+  it("changes when an existing skill's body changes", () => {
+    const a = makeTempDir();
+    const skill = makeSkill(a, 'alpha');
+    const before = computeManagedSkillGeneration([a]);
+    fs.writeFileSync(path.join(skill, 'SKILL.md'), '# alpha\nedited body\n');
+    expect(computeManagedSkillGeneration([a])).not.toBe(before);
+  });
+
+  it('changes when a nested file inside a skill changes (recurses subdirectories)', () => {
+    const a = makeTempDir();
+    const skill = makeSkill(a, 'alpha');
+    const before = computeManagedSkillGeneration([a]);
+    fs.mkdirSync(path.join(skill, 'scripts'), { recursive: true });
+    fs.writeFileSync(path.join(skill, 'scripts', 'helper.sh'), '#!/bin/bash\necho hi\n');
+    expect(computeManagedSkillGeneration([a])).not.toBe(before);
+  });
+
+  it('ignores the .skill-generation marker and skill-runtime-manifest.json', () => {
+    const a = makeTempDir();
+    makeSkill(a, 'alpha');
+    const before = computeManagedSkillGeneration([a]);
+    fs.writeFileSync(path.join(a, '.skill-generation'), 'deadbeef\n');
+    fs.writeFileSync(path.join(a, 'skill-runtime-manifest.json'), '{"generatedAt":"2026-06-08T00:00:00Z"}\n');
+    expect(computeManagedSkillGeneration([a])).toBe(before);
+  });
+
+  it('skips a non-existent root and returns empty when all roots are missing', () => {
+    const missing = path.join(makeTempDir(), 'does-not-exist');
+    expect(computeManagedSkillGeneration([missing])).toBe('');
   });
 
   it('managedSkillRootsFromEnv splits NANOCLAW_MANAGED_SKILLS_DIRS on the path delimiter', () => {
@@ -351,19 +405,18 @@ describe('managed skill generation', () => {
     expect(managedSkillRootsFromEnv({})).toEqual([]);
   });
 
-  it('currentManagedSkillGeneration reads the marker from the env-configured managed roots', () => {
+  it('currentManagedSkillGeneration digests the env-configured managed roots', () => {
     const a = makeTempDir();
-    fs.writeFileSync(path.join(a, '.skill-generation'), 'gen1\n');
-    expect(currentManagedSkillGeneration({ NANOCLAW_MANAGED_SKILLS_DIRS: a })).toBe('gen1');
+    makeSkill(a, 'alpha');
+    expect(currentManagedSkillGeneration({ NANOCLAW_MANAGED_SKILLS_DIRS: a })).toBe(computeManagedSkillGeneration([a]));
   });
 
-  it('resolveManagedSkillRoot returns the managed generation marker', () => {
+  it('resolveManagedSkillRoot returns the content-digest generation of its managed roots', () => {
     const projectRoot = makeTempDir();
     const dataDir = makeTempDir();
     const managedRoot = makeTempDir();
     makeSkill(path.join(projectRoot, 'container', 'skills'), 'bundled-one');
     makeSkill(managedRoot, 'managed-one');
-    fs.writeFileSync(path.join(managedRoot, '.skill-generation'), 'deadbeef\n');
 
     const result = resolveManagedSkillRoot({
       projectRoot,
@@ -371,6 +424,8 @@ describe('managed skill generation', () => {
       env: { NANOCLAW_MANAGED_SKILLS_DIRS: managedRoot },
     });
 
-    expect(result.generation).toBe('deadbeef');
+    // Generation covers ONLY the env managed roots, not the bundled source.
+    expect(result.generation).toBe(computeManagedSkillGeneration([managedRoot]));
+    expect(result.generation).not.toBe('');
   });
 });

@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
@@ -14,8 +15,9 @@ export interface ManagedSkill {
 export interface ManagedSkillRoot {
   root: string;
   skills: ManagedSkill[];
-  /** Opaque token identifying the deployed managed-skill set this root was
-   *  assembled from. Empty when no managed root carries a marker. */
+  /** Content digest of the managed skill roots this set was assembled from
+   *  (see computeManagedSkillGeneration). Changes whenever any managed root's
+   *  skill files change; empty only when every managed root is absent. */
   generation: string;
 }
 
@@ -124,7 +126,7 @@ export function resolveManagedSkillRoot(args: {
   copyRuntimeManifests(sources, root);
   synthesizeSkillBinLinks(root, skills);
 
-  const generation = readManagedSkillGeneration(managedSkillRootsFromEnv(env));
+  const generation = computeManagedSkillGeneration(managedSkillRootsFromEnv(env));
   return { root, skills, generation };
 }
 
@@ -415,38 +417,114 @@ function pathExistsNoFollow(entryPath: string): boolean {
 /**
  * Managed skill roots from NANOCLAW_MANAGED_SKILLS_DIRS, in declared order.
  * Intentionally covers ONLY the env-derived managed roots — NOT the `local`
- * (writable) or `bundled` (container/skills) sources that resolveManagedSkillRoot
- * also merges and realpath-dedups. The generation marker is a deploy-written,
- * managed-skill concept: bundled skills change only with a runtime redeploy
- * (which restarts everything) and writable local skills are out of scope (see
- * non-goals). Do NOT "fix" this to mirror the full merged source set. Both the
- * spawn read and the host-sweep read call this same helper on the same
- * process.env, so spawn-gen and current-gen stay symmetric by construction.
+ * (writable-source) or `bundled` (container/skills) classifications that
+ * resolveManagedSkillRoot also merges and realpath-dedups. Bundled skills change
+ * only with a runtime redeploy (which restarts everything), so they need no
+ * recycle coverage. NOTE: the live env lists the local-skills root
+ * (/srv/nanoclaw/shared/repos/local-skills/skills) as a managed root, so its
+ * content IS covered here even though its merge-classification is `local`. Do
+ * NOT expand this to the full merged source set. Both the spawn read
+ * (resolveManagedSkillRoot) and the host-sweep read (currentManagedSkillGeneration)
+ * call this same helper on the same process.env, and computeManagedSkillGeneration
+ * digests the same roots, so spawn-gen and current-gen stay symmetric.
  */
 export function managedSkillRootsFromEnv(env: NodeJS.ProcessEnv): string[] {
   return splitPathList(env.NANOCLAW_MANAGED_SKILLS_DIRS);
 }
 
 /**
- * Read the deploy-written generation marker from each managed root and join
- * the non-empty values in order. Absent markers are skipped, so an old deploy
- * that never wrote one yields '' — which compares equal to a container that
- * also recorded '', i.e. no spurious recycle.
+ * Recursively collect regular files under `root` as POSIX-relative paths,
+ * skipping symlinks (e.g. `.bin/*`). Two volatile files are excluded by
+ * basename at any depth so they cannot perturb the digest, mirroring the
+ * deploy-side `srv/nanoclaw/skill-generation.sh` (`find ! -name ...`), which is
+ * the single source of truth for this algorithm:
+ *   - `.skill-generation` — the deploy-lane generation marker written at the
+ *     managed root (chicken-and-egg). This is NOT the per-session spawn marker
+ *     that writeSpawnSkillGeneration writes into the session dir; that file
+ *     lives outside the managed roots and is never walked here.
+ *   - `skill-runtime-manifest.json` — carries a per-deploy `generatedAt`
+ *     timestamp that would otherwise change the digest on every deploy with no
+ *     real skill change.
+ * The exclusion matches these reserved basenames at any depth (as the bash
+ * reference does); skills do not ship files of these names. Defensive against a
+ * directory vanishing mid-walk during a deploy (errors -> skip).
  */
-export function readManagedSkillGeneration(managedRoots: string[]): string {
+function collectSkillDigestFiles(root: string, rel = ''): string[] {
+  const out: string[] = [];
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(path.join(root, rel), { withFileTypes: true });
+  } catch {
+    return out;
+  }
+  for (const entry of entries) {
+    if (entry.isSymbolicLink()) continue;
+    const relPath = rel ? `${rel}/${entry.name}` : entry.name;
+    if (entry.isDirectory()) {
+      out.push(...collectSkillDigestFiles(root, relPath));
+      continue;
+    }
+    if (!entry.isFile()) continue;
+    if (entry.name === SKILL_GENERATION_FILE || entry.name === SKILL_RUNTIME_MANIFEST) continue;
+    out.push(relPath);
+  }
+  return out;
+}
+
+/**
+ * Per-root content digest: sha256 over every regular file under `root`
+ * (relative path + content) in locale-independent byte-sorted order, so the
+ * digest depends only on the skill *content* — never on the root's absolute
+ * path or readdir order. Returns '' for a non-directory root (skipped by the
+ * caller, matching the old marker-absent behavior). An existing-but-empty root
+ * returns the stable empty-set digest, so adding its first skill changes it.
+ */
+function digestSkillRoot(root: string): string {
+  let isDir = false;
+  try {
+    isDir = fs.statSync(root).isDirectory();
+  } catch {
+    return '';
+  }
+  if (!isDir) return '';
+  const files = collectSkillDigestFiles(root).sort((a, b) => Buffer.from(a).compare(Buffer.from(b)));
+  const hash = createHash('sha256');
+  for (const rel of files) {
+    let content: Buffer;
+    try {
+      content = fs.readFileSync(path.join(root, rel));
+    } catch {
+      continue; // vanished mid-walk during a deploy — skip; next pass re-reads
+    }
+    hash.update(rel, 'utf8');
+    hash.update('\0');
+    hash.update(createHash('sha256').update(content).digest('hex'));
+    hash.update('\n');
+  }
+  return hash.digest('hex');
+}
+
+/**
+ * Content "generation" of the managed skill roots: a digest of each root's
+ * skill files, joined in declared order. REPLACES the old `.skill-generation`
+ * marker read so the generation reflects the ACTUAL deployed skill content of
+ * every managed root — including the local-skills root, whose deploy lane never
+ * wrote a marker. Symmetry by construction: spawn (resolveManagedSkillRoot) and
+ * host-sweep (currentManagedSkillGeneration) call this same helper over the same
+ * env-derived roots, so identical content ⇒ identical generation ⇒ no spurious
+ * recycle, and any skill change in any managed root ⇒ different generation ⇒
+ * idle-recycle on the next sweep.
+ */
+export function computeManagedSkillGeneration(managedRoots: string[]): string {
   const parts: string[] = [];
   for (const root of managedRoots) {
-    try {
-      const value = fs.readFileSync(path.join(root, SKILL_GENERATION_FILE), 'utf8').trim();
-      if (value) parts.push(value);
-    } catch {
-      // Marker absent on this root — skip.
-    }
+    const digest = digestSkillRoot(root);
+    if (digest) parts.push(digest);
   }
   return parts.join('\n');
 }
 
 /** Current managed-skill generation as seen via the process environment. */
 export function currentManagedSkillGeneration(env: NodeJS.ProcessEnv): string {
-  return readManagedSkillGeneration(managedSkillRootsFromEnv(env));
+  return computeManagedSkillGeneration(managedSkillRootsFromEnv(env));
 }
