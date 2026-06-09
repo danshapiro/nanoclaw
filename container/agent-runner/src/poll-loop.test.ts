@@ -607,7 +607,7 @@ describe('poll-loop conversational reply accounting', () => {
     const prompts: string[] = [];
     const provider = new MockProvider({}, (prompt) => {
       prompts.push(prompt);
-      if (prompt.includes('Your last response was not delivered')) {
+      if (prompt.includes('Your last answer was not delivered')) {
         return '<message to="discord-current">Done.</message>';
       }
       return 'Done.';
@@ -808,6 +808,48 @@ describe('poll-loop conversational reply accounting', () => {
     expect(JSON.parse(out[0].content).operation).toBe('reaction');
     expect(JSON.parse(out[1].content).text).toBe('Done.');
     expect(prompts).toHaveLength(2);
+
+    await loopPromise.catch(() => {});
+  });
+
+  it('does not let an earlier visible response satisfy a later bare follow-up reply', async () => {
+    insertChannelDestination('discord-current', 'chan-1');
+    insertMessage(
+      'first-followup-accounting-chat',
+      'chat',
+      { sender: 'User', text: 'first message' },
+      { platformId: 'chan-1', channelType: 'discord', threadId: 'thread-1' },
+    );
+
+    const prompts: string[] = [];
+    const provider = new MockProvider({}, (prompt) => {
+      prompts.push(prompt);
+      if (prompt.includes('Your last answer was not delivered')) {
+        return '<message to="discord-current">SECOND</message>';
+      }
+      if (prompt.includes('second message')) {
+        return 'SECOND';
+      }
+      return '<message to="discord-current">FIRST</message>';
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 4000);
+
+    await waitFor(() => getAckStatus('first-followup-accounting-chat') === 'completed', 1500);
+    insertMessage(
+      'second-followup-accounting-chat',
+      'chat',
+      { sender: 'User', text: 'second message' },
+      { platformId: 'chan-1', channelType: 'discord', threadId: 'thread-1' },
+    );
+    await waitFor(() => getAckStatus('second-followup-accounting-chat') === 'completed', 3000);
+    controller.abort();
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(2);
+    expect(JSON.parse(out[0].content).text).toBe('FIRST');
+    expect(JSON.parse(out[1].content).text).toBe('SECOND');
+    expect(prompts.some((prompt) => prompt.includes('Your last answer was not delivered'))).toBe(true);
 
     await loopPromise.catch(() => {});
   });

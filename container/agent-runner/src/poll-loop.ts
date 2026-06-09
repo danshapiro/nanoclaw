@@ -435,7 +435,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const skippedSet = new Set(skipped);
     const processingIds = ids.filter((id) => !skippedSet.has(id));
     const replyAccounting = {
-      requiresUserVisibleReply: requiresUserVisibleReply(keep),
+      initialRequiresUserVisibleReply: requiresUserVisibleReply(keep),
       outboundVisibleReplyCountBefore: countOutboundVisibleReplyMessages({
         ...routing,
         routeKey: activeRouteScope.routeKey,
@@ -540,7 +540,7 @@ interface QueryResult {
 }
 
 interface ReplyAccounting {
-  requiresUserVisibleReply: boolean;
+  initialRequiresUserVisibleReply: boolean;
   outboundVisibleReplyCountBefore: number;
 }
 
@@ -552,6 +552,8 @@ interface InputLedgerEntry {
   scope: 'initial' | 'followup';
   /** Prompt text for this input, used to seed recovery acceptedUnresolvedInputs. */
   prompt: string;
+  requiresUserVisibleReply: boolean;
+  outboundVisibleReplyCountBefore: number;
 }
 
 async function processQuery(
@@ -610,6 +612,8 @@ async function processQuery(
     state: 'queued',
     scope: 'initial',
     prompt: ledgerCtx.originalTasks.map((t) => t.text).join('\n') || '(initial turn)',
+    requiresUserVisibleReply: replyAccounting.initialRequiresUserVisibleReply,
+    outboundVisibleReplyCountBefore: replyAccounting.outboundVisibleReplyCountBefore,
   });
 
   if (signal?.aborted) {
@@ -684,15 +688,23 @@ async function processQuery(
     if (idsToComplete.length > 0) markCompleted(idsToComplete);
   }
 
-  function settleInitialBatch(resolvedAtLeastOne: boolean): void {
+  function hasMissingVisibleReply(inputIds: string[]): boolean {
+    const outboundVisibleReplyCountAfter = countOutboundVisibleReplyMessages(routing);
+    return inputIds.some((inputId) => {
+      const entry = ledger.get(inputId);
+      return Boolean(
+        entry?.requiresUserVisibleReply &&
+          outboundVisibleReplyCountAfter <= entry.outboundVisibleReplyCountBefore,
+      );
+    });
+  }
+
+  function settleInitialBatch(topLevelResolved: boolean): void {
     if (initialBatchSettled) return;
+    if (!topLevelResolved) return;
     initialBatchSettled = true;
 
-    if (
-      resolvedAtLeastOne &&
-      replyAccounting.requiresUserVisibleReply &&
-      countOutboundVisibleReplyMessages(routing) <= replyAccounting.outboundVisibleReplyCountBefore
-    ) {
+    if (hasMissingVisibleReply([ledgerCtx.topLevelInputId])) {
       writeMissingVisibleReplyError(routing);
     }
   }
@@ -805,6 +817,7 @@ async function processQuery(
 
     const newIds = newMessages.map((m) => m.id);
     const followupInputId = generateInputId('followup');
+    const outboundVisibleReplyCountBefore = countOutboundVisibleReplyMessages(routing);
     markProcessing(newIds);
 
     const prompt = formatMessages(newMessages);
@@ -842,10 +855,12 @@ async function processQuery(
       state: 'queued',
       scope: 'followup',
       prompt: newMessages.map(textOfMessage).join('\n'),
+      requiresUserVisibleReply: requiresUserVisibleReply(newMessages),
+      outboundVisibleReplyCountBefore,
     });
   }
 
-  let resolvedAtLeastOne = false;
+  let topLevelResolvedAtLeastOnce = false;
   try {
     for await (const event of query.events) {
       handleEvent(event, routing);
@@ -951,14 +966,12 @@ async function processQuery(
         }
       } else if (event.type === 'result') {
         // A result — with or without text — means a turn segment is done.
-        // Dispatch text first so reply accounting sees direct result text and
-        // MCP send_message rows. Then resolve the exact input ids and complete
-        // only those rows.
-        const dispatch = event.text ? dispatchResultText(event.text, routing) : { sent: 0, hasUnwrapped: false };
+        // Resolve exact input ids first without mutating the ledger, then dispatch
+        // text so reply accounting sees direct result text and MCP send_message
+        // rows before deciding whether this input still needs recovery.
         const resolved = resolveResult(event.resolvedInputIds ?? []);
-        const stillMissingVisibleReply =
-          replyAccounting.requiresUserVisibleReply &&
-          countOutboundVisibleReplyMessages(routing) <= replyAccounting.outboundVisibleReplyCountBefore;
+        const dispatch = event.text ? dispatchResultText(event.text, routing) : { sent: 0, hasUnwrapped: false };
+        const stillMissingVisibleReply = hasMissingVisibleReply(resolved);
         if (event.text) {
           if (dispatch.hasUnwrapped && dispatch.sent === 0 && resolved.length === 1 && !unwrappedOutputNudged && stillMissingVisibleReply) {
             unwrappedOutputNudged = true;
@@ -980,17 +993,19 @@ async function processQuery(
         }
         if (resolved.length > 0) {
           completeResolved(resolved);
-          resolvedAtLeastOne = true;
+          if (resolved.includes(ledgerCtx.topLevelInputId)) {
+            topLevelResolvedAtLeastOnce = true;
+          }
         }
         // A successful result on this continuation resets the zombie backstop —
         // the session proved live.
         if (queryContinuation) resetZombieCounter(providerName, queryContinuation);
-        settleInitialBatch(resolvedAtLeastOne);
+        settleInitialBatch(resolved.includes(ledgerCtx.topLevelInputId));
       }
     }
 
     // Stream ended. Settle reply accounting for the initial batch.
-    settleInitialBatch(resolvedAtLeastOne);
+    settleInitialBatch(topLevelResolvedAtLeastOnce);
   } finally {
     done = true;
     clearInterval(pollHandle);
