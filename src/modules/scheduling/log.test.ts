@@ -38,9 +38,7 @@ describe('scheduler JSONL log helper', () => {
       parseSchedulerLogLine('\u001b[31m{"timestamp":"2026-06-05T12:00:00.000Z","severity":"info","event":"x"}\n'),
     ).toThrow(/not valid JSON/);
     expect(() => parseSchedulerLogLine('{"severity":"info","event":"x"}\n')).toThrow(/timestamp/);
-    expect(() => parseSchedulerLogLine('{"timestamp":"2026-06-05T12:00:00.000Z","event":"x"}\n')).toThrow(
-      /severity/,
-    );
+    expect(() => parseSchedulerLogLine('{"timestamp":"2026-06-05T12:00:00.000Z","event":"x"}\n')).toThrow(/severity/);
     expect(() => parseSchedulerLogLine('{"timestamp":"2026-06-05T12:00:00.000Z","severity":"info"}\n')).toThrow(
       /event/,
     );

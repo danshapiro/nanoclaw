@@ -132,7 +132,9 @@ describe('repairSchedulerProjections', () => {
 
     await repairSchedulerProjections();
 
-    expect(projectedRows(active.id)).toEqual([{ id: 'task-task-proven-g1', series_id: 'task-proven', status: 'pending' }]);
+    expect(projectedRows(active.id)).toEqual([
+      { id: 'task-task-proven-g1', series_id: 'task-proven', status: 'pending' },
+    ]);
     expect(incidentKeys()).toEqual([]);
   });
 });
@@ -276,9 +278,9 @@ function incidentKeys(): string[] {
 }
 
 function incidentDetails(): Record<string, unknown> {
-  const row = getDb()
-    .prepare('SELECT details_json FROM scheduler_incidents ORDER BY created_at, id LIMIT 1')
-    .get() as { details_json: string } | undefined;
+  const row = getDb().prepare('SELECT details_json FROM scheduler_incidents ORDER BY created_at, id LIMIT 1').get() as
+    | { details_json: string }
+    | undefined;
   if (!row) throw new Error('Missing scheduler incident');
   return JSON.parse(row.details_json) as Record<string, unknown>;
 }

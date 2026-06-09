@@ -6,11 +6,7 @@ import { assertRuntimeLockOwner, type RuntimeLockOwner } from '../../db/runtime-
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
 import { recordSchedulerIncidentWithOwner } from '../../yente/scheduler-alerts.js';
-import {
-  clearCompletedProjectionRecurrence,
-  projectScheduledTask,
-  retireProjection,
-} from './projection.js';
+import { clearCompletedProjectionRecurrence, projectScheduledTask, retireProjection } from './projection.js';
 import { nextScheduledRun } from './recurrence.js';
 import {
   clearTaskProjection,
@@ -309,7 +305,12 @@ export function syncSessionSchedulerState(
   assertSchedulerOwner(owner);
 
   const projected = projectionRowsForSession(inDb);
-  const acks = outDb ? getProcessingAcksForProjectedTasks(outDb, projected.map((row) => row.id)) : new Map();
+  const acks = outDb
+    ? getProcessingAcksForProjectedTasks(
+        outDb,
+        projected.map((row) => row.id),
+      )
+    : new Map();
 
   for (const row of projected) {
     try {
@@ -371,12 +372,7 @@ export function syncSessionSchedulerState(
   }
 }
 
-function recordProjectionSyncError(
-  session: Session,
-  row: ProjectionRow,
-  err: unknown,
-  owner: RuntimeLockOwner,
-): void {
+function recordProjectionSyncError(session: Session, row: ProjectionRow, err: unknown, owner: RuntimeLockOwner): void {
   recordSchedulerIncident({
     owner,
     dedupeKey: `scheduler-sync:${session.agent_group_id}:${row.series_id}:${row.id}:row-error`,

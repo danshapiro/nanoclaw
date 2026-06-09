@@ -199,9 +199,7 @@ describe('resetYenteSessionPreservingScheduler', () => {
       phase: 'old-resetting',
     });
 
-    expect(() => resolveSession('ag-yente', 'mg-discord', 'thread-1', 'per-thread')).toThrow(
-      RouteResetInProgressError,
-    );
+    expect(() => resolveSession('ag-yente', 'mg-discord', 'thread-1', 'per-thread')).toThrow(RouteResetInProgressError);
   });
 
   it('resumes an unfinished supersession forward to exactly one active session', async () => {
@@ -453,9 +451,9 @@ function insertLegacyTask(
 
 function supersessionPhase(oldSessionId: string): string | undefined {
   return (
-    getDb()
-      .prepare('SELECT phase FROM scheduler_session_supersessions WHERE old_session_id = ?')
-      .get(oldSessionId) as { phase: string } | undefined
+    getDb().prepare('SELECT phase FROM scheduler_session_supersessions WHERE old_session_id = ?').get(oldSessionId) as
+      | { phase: string }
+      | undefined
   )?.phase;
 }
 

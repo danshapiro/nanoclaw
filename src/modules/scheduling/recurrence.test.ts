@@ -9,9 +9,7 @@ import { handleRecurrence, nextScheduledRun } from './recurrence.js';
 
 describe('nextScheduledRun', () => {
   it('interprets cron expressions in the configured user timezone', () => {
-    expect(nextScheduledRun('0 9 * * *', new Date('2026-01-01T00:00:00.000Z'))).toBe(
-      '2026-01-01T17:00:00.000Z',
-    );
+    expect(nextScheduledRun('0 9 * * *', new Date('2026-01-01T00:00:00.000Z'))).toBe('2026-01-01T17:00:00.000Z');
   });
 });
 

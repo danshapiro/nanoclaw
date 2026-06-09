@@ -65,8 +65,7 @@ export function getSchedulerAlertFallbackRoute(): {
   threadId: string | null;
 } {
   return {
-    channelType:
-      process.env.YENTE_SCHEDULER_ALERT_CHANNEL_TYPE || envConfig.YENTE_SCHEDULER_ALERT_CHANNEL_TYPE || null,
+    channelType: process.env.YENTE_SCHEDULER_ALERT_CHANNEL_TYPE || envConfig.YENTE_SCHEDULER_ALERT_CHANNEL_TYPE || null,
     platformId: process.env.YENTE_SCHEDULER_ALERT_PLATFORM_ID || envConfig.YENTE_SCHEDULER_ALERT_PLATFORM_ID || null,
     threadId: process.env.YENTE_SCHEDULER_ALERT_THREAD_ID || envConfig.YENTE_SCHEDULER_ALERT_THREAD_ID || null,
   };

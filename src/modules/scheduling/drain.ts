@@ -137,29 +137,27 @@ function recordDrainedActionIntent(
   content: Record<string, unknown>,
   owner: RuntimeLockOwner,
 ): void {
-  getDb()
-    .transaction(() => {
-      assertRuntimeLockOwner(owner);
-      getDb()
-        .prepare(
-          `INSERT OR IGNORE INTO scheduler_drained_actions
+  getDb().transaction(() => {
+    assertRuntimeLockOwner(owner);
+    getDb()
+      .prepare(
+        `INSERT OR IGNORE INTO scheduler_drained_actions
              (old_session_id, message_out_id, action, status, intent_at, applied_at, details_json)
            VALUES (?, ?, ?, 'intent', ?, NULL, ?)`,
-        )
-        .run(oldSessionId, messageOutId, action, new Date().toISOString(), JSON.stringify(content));
-    })();
+      )
+      .run(oldSessionId, messageOutId, action, new Date().toISOString(), JSON.stringify(content));
+  })();
 }
 
 function markDrainedActionApplied(oldSessionId: string, messageOutId: string, owner: RuntimeLockOwner): void {
-  getDb()
-    .transaction(() => {
-      assertRuntimeLockOwner(owner);
-      getDb()
-        .prepare(
-          `UPDATE scheduler_drained_actions
+  getDb().transaction(() => {
+    assertRuntimeLockOwner(owner);
+    getDb()
+      .prepare(
+        `UPDATE scheduler_drained_actions
            SET status = 'applied', applied_at = ?
            WHERE old_session_id = ? AND message_out_id = ?`,
-        )
-        .run(new Date().toISOString(), oldSessionId, messageOutId);
-    })();
+      )
+      .run(new Date().toISOString(), oldSessionId, messageOutId);
+  })();
 }

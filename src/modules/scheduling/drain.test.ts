@@ -18,14 +18,7 @@ vi.mock('../../config.js', async () => {
   return { ...actual, DATA_DIR: mocks.testDir };
 });
 
-import {
-  closeDb,
-  createAgentGroup,
-  createMessagingGroup,
-  getDb,
-  initTestDb,
-  runMigrations,
-} from '../../db/index.js';
+import { closeDb, createAgentGroup, createMessagingGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { withRuntimeLock, type RuntimeLockOwner } from '../../db/runtime-locks.js';
 import { deliverSessionMessages, setDeliveryAdapter } from '../../delivery.js';
 import { inboundDbPath, outboundDbPath, resolveSession } from '../../session-manager.js';
@@ -100,9 +93,11 @@ function insertOutbound(
 function deliveredRows(session: Session): string[] {
   const db = new Database(inboundDbPath(session.agent_group_id, session.id));
   try {
-    return (db.prepare('SELECT message_out_id FROM delivered ORDER BY message_out_id').all() as Array<{
-      message_out_id: string;
-    }>).map((row) => row.message_out_id);
+    return (
+      db.prepare('SELECT message_out_id FROM delivered ORDER BY message_out_id').all() as Array<{
+        message_out_id: string;
+      }>
+    ).map((row) => row.message_out_id);
   } finally {
     db.close();
   }
@@ -271,13 +266,7 @@ describe('drainSchedulingActionsFromStoppedSession', () => {
 
   it('applies order-dependent scheduling actions by outbound seq, not timestamp ties', async () => {
     const session = freshSession();
-    insertOutbound(
-      session,
-      'out-schedule',
-      'system',
-      scheduleAction(),
-      "'2026-06-05T00:00:02.000Z'",
-    );
+    insertOutbound(session, 'out-schedule', 'system', scheduleAction(), "'2026-06-05T00:00:02.000Z'");
     insertOutbound(
       session,
       'out-update',

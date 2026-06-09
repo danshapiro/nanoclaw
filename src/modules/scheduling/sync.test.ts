@@ -30,11 +30,7 @@ import {
   type CreateScheduledTaskInput,
 } from './ledger.js';
 import { projectScheduledTask } from './projection.js';
-import {
-  ensureSessionSchedulerProjections,
-  resolveProjectionContext,
-  syncSessionSchedulerState,
-} from './sync.js';
+import { ensureSessionSchedulerProjections, resolveProjectionContext, syncSessionSchedulerState } from './sync.js';
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
@@ -265,9 +261,7 @@ describe('syncSessionSchedulerState', () => {
       projected_session_id: 'sess-1',
       projected_message_id: 'task-task-1-g2',
     });
-    expect(
-      inDb.prepare('SELECT id, status, recurrence, process_after FROM messages_in ORDER BY id').all(),
-    ).toEqual([
+    expect(inDb.prepare('SELECT id, status, recurrence, process_after FROM messages_in ORDER BY id').all()).toEqual([
       {
         id: 'task-task-1-g1',
         status: 'completed',
@@ -322,7 +316,9 @@ describe('syncSessionSchedulerState', () => {
       projected_message_id: 'task-task-valid-g2',
     });
     expect(
-      inDb.prepare('SELECT id, status, recurrence FROM messages_in WHERE series_id = ? ORDER BY id').all('task-invalid'),
+      inDb
+        .prepare('SELECT id, status, recurrence FROM messages_in WHERE series_id = ? ORDER BY id')
+        .all('task-invalid'),
     ).toEqual([{ id: 'task-task-invalid-g1', status: 'completed', recurrence: null }]);
     expect(
       inDb.prepare('SELECT id, status, recurrence FROM messages_in WHERE series_id = ? ORDER BY id').all('task-valid'),
@@ -388,9 +384,7 @@ describe('syncSessionSchedulerState', () => {
       projected_session_id: 'sess-1',
       projected_message_id: 'task-task-1-g2',
     });
-    expect(
-      inDb.prepare('SELECT id, status, recurrence FROM messages_in ORDER BY id').all(),
-    ).toEqual([
+    expect(inDb.prepare('SELECT id, status, recurrence FROM messages_in ORDER BY id').all()).toEqual([
       { id: 'task-task-1-g1', status: 'completed', recurrence: null },
       { id: 'task-task-1-g2', status: 'pending', recurrence: null },
     ]);
@@ -489,12 +483,14 @@ describe('syncSessionSchedulerState', () => {
       trigger: 1,
     });
     expect(
-      inDb.prepare(
-        `SELECT COUNT(*) AS c FROM messages_in
+      inDb
+        .prepare(
+          `SELECT COUNT(*) AS c FROM messages_in
          WHERE status = 'pending'
            AND trigger = 1
            AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))`,
-      ).get(),
+        )
+        .get(),
     ).toEqual({ c: 0 });
     inDb.close();
     outDb.close();

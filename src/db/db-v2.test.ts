@@ -42,15 +42,19 @@ function now() {
 }
 
 function tableColumns(table: string): Set<string> {
-  return new Set((getDb().prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((row) => row.name));
+  return new Set(
+    (getDb().prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((row) => row.name),
+  );
 }
 
 function tableColumn(table: string, column: string): { notnull: 0 | 1; dflt_value: string | null } | undefined {
-  return (getDb().prepare(`PRAGMA table_info(${table})`).all() as Array<{
-    name: string;
-    notnull: 0 | 1;
-    dflt_value: string | null;
-  }>).find((row) => row.name === column);
+  return (
+    getDb().prepare(`PRAGMA table_info(${table})`).all() as Array<{
+      name: string;
+      notnull: 0 | 1;
+      dflt_value: string | null;
+    }>
+  ).find((row) => row.name === column);
 }
 
 beforeEach(() => {
@@ -104,17 +108,15 @@ describe('migrations', () => {
       runMigrations(db);
 
       const columns = new Set(
-        (
-          db.prepare("PRAGMA table_info('scheduler_session_supersessions')").all() as Array<{ name: string }>
-        ).map((row) => row.name),
+        (db.prepare("PRAGMA table_info('scheduler_session_supersessions')").all() as Array<{ name: string }>).map(
+          (row) => row.name,
+        ),
       );
       expect(columns.has('response_channel_type')).toBe(true);
       expect(columns.has('response_platform_id')).toBe(true);
       expect(columns.has('response_thread_id')).toBe(true);
       expect(
-        db
-          .prepare("SELECT name FROM schema_version WHERE name = 'scheduler-supersession-response-address'")
-          .get(),
+        db.prepare("SELECT name FROM schema_version WHERE name = 'scheduler-supersession-response-address'").get(),
       ).toEqual({ name: 'scheduler-supersession-response-address' });
     } finally {
       db.close();
@@ -167,11 +169,9 @@ describe('scheduler central schema', () => {
 
   it('creates all scheduler ledger and runtime lock tables', () => {
     const tables = new Set(
-      (
-        getDb()
-          .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
-          .all() as Array<{ name: string }>
-      ).map((row) => row.name),
+      (getDb().prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map(
+        (row) => row.name,
+      ),
     );
 
     for (const table of [
@@ -236,11 +236,9 @@ describe('scheduler central schema', () => {
 
   it('creates planned scheduler indexes', () => {
     const indexes = new Set(
-      (
-        getDb()
-          .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
-          .all() as Array<{ name: string }>
-      ).map((row) => row.name),
+      (getDb().prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all() as Array<{ name: string }>).map(
+        (row) => row.name,
+      ),
     );
 
     expect(indexes.has('idx_scheduler_supersessions_new_session')).toBe(true);

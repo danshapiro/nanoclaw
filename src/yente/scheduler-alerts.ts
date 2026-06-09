@@ -61,12 +61,11 @@ export function recordSchedulerIncidentWithOwner(args: SchedulerIncidentInput, o
   }
 
   const now = new Date().toISOString();
-  const inserted = getDb()
-    .transaction(() => {
-      assertRuntimeLockOwner(owner);
-      return getDb()
-        .prepare(
-          `INSERT OR IGNORE INTO scheduler_incidents (
+  const inserted = getDb().transaction(() => {
+    assertRuntimeLockOwner(owner);
+    return getDb()
+      .prepare(
+        `INSERT OR IGNORE INTO scheduler_incidents (
              id,
              dedupe_key,
              severity,
@@ -99,23 +98,23 @@ export function recordSchedulerIncidentWithOwner(args: SchedulerIncidentInput, o
              @now,
              @now
            )`,
-        )
-        .run({
-          id: `sched-inc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          dedupeKey: args.dedupeKey,
-          severity: args.severity,
-          agentGroupId: args.agentGroupId ?? null,
-          seriesId: args.seriesId ?? null,
-          sessionId: args.sessionId ?? null,
-          messagingGroupId: args.messagingGroupId ?? null,
-          channelType: args.channelType ?? null,
-          platformId: args.platformId ?? null,
-          threadId: args.threadId ?? null,
-          message: args.message,
-          detailsJson: JSON.stringify(args.details),
-          now,
-        });
-    })();
+      )
+      .run({
+        id: `sched-inc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        dedupeKey: args.dedupeKey,
+        severity: args.severity,
+        agentGroupId: args.agentGroupId ?? null,
+        seriesId: args.seriesId ?? null,
+        sessionId: args.sessionId ?? null,
+        messagingGroupId: args.messagingGroupId ?? null,
+        channelType: args.channelType ?? null,
+        platformId: args.platformId ?? null,
+        threadId: args.threadId ?? null,
+        message: args.message,
+        detailsJson: JSON.stringify(args.details),
+        now,
+      });
+  })();
 
   if (inserted.changes === 0) {
     logSchedulerEvent('info', 'scheduler_incident_deduped', { dedupeKey: args.dedupeKey });
@@ -196,9 +195,9 @@ export async function deliverPendingSchedulerIncident(dedupeKey: string): Promis
 }
 
 function getSchedulerIncident(dedupeKey: string): SchedulerIncidentRow | undefined {
-  return getDb()
-    .prepare('SELECT * FROM scheduler_incidents WHERE dedupe_key = ?')
-    .get(dedupeKey) as SchedulerIncidentRow | undefined;
+  return getDb().prepare('SELECT * FROM scheduler_incidents WHERE dedupe_key = ?').get(dedupeKey) as
+    | SchedulerIncidentRow
+    | undefined;
 }
 
 function chooseAlertRoute(incident: SchedulerIncidentRow): AlertRoute | null {
@@ -294,41 +293,39 @@ function routeFromConfiguredFallback(): AlertRoute | null {
 async function markIncidentReported(dedupeKey: string): Promise<void> {
   const now = new Date().toISOString();
   await withSchedulerMutation((owner) => {
-    getDb()
-      .transaction(() => {
-        assertRuntimeLockOwner(owner);
-        getDb()
-          .prepare(
-            `UPDATE scheduler_incidents
+    getDb().transaction(() => {
+      assertRuntimeLockOwner(owner);
+      getDb()
+        .prepare(
+          `UPDATE scheduler_incidents
                 SET status = 'reported',
                     reported_at = @now,
                     last_attempt_at = @now,
                     last_error = NULL
               WHERE dedupe_key = @dedupeKey
                 AND status = 'pending'`,
-          )
-          .run({ dedupeKey, now });
-      })();
+        )
+        .run({ dedupeKey, now });
+    })();
   });
 }
 
 async function markIncidentUnroutable(dedupeKey: string, reason: string): Promise<void> {
   const now = new Date().toISOString();
   await withSchedulerMutation((owner) => {
-    getDb()
-      .transaction(() => {
-        assertRuntimeLockOwner(owner);
-        getDb()
-          .prepare(
-            `UPDATE scheduler_incidents
+    getDb().transaction(() => {
+      assertRuntimeLockOwner(owner);
+      getDb()
+        .prepare(
+          `UPDATE scheduler_incidents
                 SET status = 'unroutable',
                     last_attempt_at = @now,
                     last_error = @reason
               WHERE dedupe_key = @dedupeKey
                 AND status = 'pending'`,
-          )
-          .run({ dedupeKey, now, reason });
-      })();
+        )
+        .run({ dedupeKey, now, reason });
+    })();
   });
 }
 
@@ -342,12 +339,11 @@ async function recordIncidentDeliveryFailure(
     Date.now() + Math.min(300_000, 10_000 * Math.max(1, previousAttemptCount + 1)),
   ).toISOString();
   await withSchedulerMutation((owner) => {
-    getDb()
-      .transaction(() => {
-        assertRuntimeLockOwner(owner);
-        getDb()
-          .prepare(
-            `UPDATE scheduler_incidents
+    getDb().transaction(() => {
+      assertRuntimeLockOwner(owner);
+      getDb()
+        .prepare(
+          `UPDATE scheduler_incidents
                 SET status = 'pending',
                     attempt_count = attempt_count + 1,
                     last_attempt_at = @now,
@@ -355,9 +351,9 @@ async function recordIncidentDeliveryFailure(
                     last_error = @error
               WHERE dedupe_key = @dedupeKey
                 AND status = 'pending'`,
-          )
-          .run({ dedupeKey, now, nextAttempt, error });
-      })();
+        )
+        .run({ dedupeKey, now, nextAttempt, error });
+    })();
   });
 }
 

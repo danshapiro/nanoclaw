@@ -161,7 +161,11 @@ export async function withRuntimeLock<T>(
     releaseRuntimeLock(owner);
     if (renewalLost) {
       operation.catch((err: unknown) => {
-        log.error('Runtime lock operation failed after renewal loss', { name: owner.name, ownerId: owner.ownerId, err });
+        log.error('Runtime lock operation failed after renewal loss', {
+          name: owner.name,
+          ownerId: owner.ownerId,
+          err,
+        });
       });
     }
   }

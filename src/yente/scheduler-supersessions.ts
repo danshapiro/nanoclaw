@@ -75,12 +75,12 @@ export function recordSchedulerSupersessionPhaseInDb(input: SupersessionPhaseInp
     const restartingFailedSupersession = existing?.phase === 'failed' && input.phase === 'started';
     const phase = restartingFailedSupersession ? input.phase : nextSupersessionPhase(existing?.phase, input.phase);
     const phaseAdvanced = existing === undefined || phase !== existing.phase;
-    const finishedAt = terminalPhase(phase) ? existing?.finished_at ?? now : null;
+    const finishedAt = terminalPhase(phase) ? (existing?.finished_at ?? now) : null;
     const errorJson =
       input.error === undefined
         ? phaseAdvanced
           ? null
-          : existing?.error_json ?? null
+          : (existing?.error_json ?? null)
         : JSON.stringify(errorDetails(input.error));
 
     getDb()
@@ -198,9 +198,9 @@ export function recordSchedulerSupersessionError(
 
 export function getSchedulerSupersession(oldSessionId: string): SchedulerSupersessionRow | undefined {
   if (!hasTable(getDb(), 'scheduler_session_supersessions')) return undefined;
-  return getDb()
-    .prepare('SELECT * FROM scheduler_session_supersessions WHERE old_session_id = ?')
-    .get(oldSessionId) as SchedulerSupersessionRow | undefined;
+  return getDb().prepare('SELECT * FROM scheduler_session_supersessions WHERE old_session_id = ?').get(oldSessionId) as
+    | SchedulerSupersessionRow
+    | undefined;
 }
 
 export function listUnfinishedSchedulerSupersessions(): SchedulerSupersessionRow[] {

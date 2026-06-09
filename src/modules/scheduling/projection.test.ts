@@ -3,14 +3,7 @@ import path from 'path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import {
-  closeDb,
-  createAgentGroup,
-  createMessagingGroup,
-  getDb,
-  initTestDb,
-  runMigrations,
-} from '../../db/index.js';
+import { closeDb, createAgentGroup, createMessagingGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { countDueMessages, ensureSchema, openInboundDb } from '../../db/session-db.js';
 import { withRuntimeLock, type RuntimeLockOwner } from '../../db/runtime-locks.js';
 import {
@@ -127,10 +120,9 @@ describe('scheduler projection helpers', () => {
     await withSchedulerLock((owner) => {
       const task = seedTask(owner);
       // Exercise deterministic generation formatting from a non-initial row.
-      getDb().prepare('UPDATE scheduled_tasks SET generation = 2 WHERE agent_group_id = ? AND series_id = ?').run(
-        'ag-1',
-        'task-1',
-      );
+      getDb()
+        .prepare('UPDATE scheduled_tasks SET generation = 2 WHERE agent_group_id = ? AND series_id = ?')
+        .run('ag-1', 'task-1');
       const refreshed = getScheduledTask(task.agent_group_id, task.series_id)!;
 
       const messageId = projectScheduledTask(inDb, refreshed, 'sess-new', owner);
@@ -216,9 +208,7 @@ describe('scheduler projection helpers', () => {
       expect(secondMessageId).toBe('task-task-1-g2');
     });
 
-    expect(
-      inDb.prepare('SELECT id, status, recurrence FROM messages_in ORDER BY id').all(),
-    ).toEqual([
+    expect(inDb.prepare('SELECT id, status, recurrence FROM messages_in ORDER BY id').all()).toEqual([
       { id: 'task-task-1-g1', status: 'completed', recurrence: null },
       { id: 'task-task-1-g2', status: 'paused', recurrence: '0 9 * * *' },
     ]);
@@ -252,10 +242,9 @@ describe('scheduler projection helpers', () => {
 
     await withSchedulerLock((owner) => {
       const task = seedTask(owner);
-      getDb().prepare("UPDATE scheduled_tasks SET status = 'paused' WHERE agent_group_id = ? AND series_id = ?").run(
-        'ag-1',
-        'task-1',
-      );
+      getDb()
+        .prepare("UPDATE scheduled_tasks SET status = 'paused' WHERE agent_group_id = ? AND series_id = ?")
+        .run('ag-1', 'task-1');
 
       projectScheduledTask(inDb, getScheduledTask(task.agent_group_id, task.series_id)!, 'sess-new', owner);
     });
@@ -300,9 +289,7 @@ describe('scheduler projection helpers', () => {
       expect(retireProjection(inDb, 'task-failed')).toBe(1);
     });
 
-    expect(
-      inDb.prepare('SELECT series_id, status, recurrence FROM messages_in ORDER BY series_id').all(),
-    ).toEqual([
+    expect(inDb.prepare('SELECT series_id, status, recurrence FROM messages_in ORDER BY series_id').all()).toEqual([
       { series_id: 'task-cancelled', status: 'completed', recurrence: null },
       { series_id: 'task-completed', status: 'completed', recurrence: null },
       { series_id: 'task-failed', status: 'completed', recurrence: null },

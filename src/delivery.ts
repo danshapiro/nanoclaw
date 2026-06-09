@@ -253,7 +253,9 @@ async function drainSession(session: Session, options: DrainSessionOptions = {})
   const agentGroup = getAgentGroup(session.agent_group_id);
   if (!agentGroup) {
     if (options.requireDbOpen) {
-      throw new Error(`Cannot inspect outbound for session ${session.id}: agent group ${session.agent_group_id} is missing`);
+      throw new Error(
+        `Cannot inspect outbound for session ${session.id}: agent group ${session.agent_group_id} is missing`,
+      );
     }
     return 0;
   }

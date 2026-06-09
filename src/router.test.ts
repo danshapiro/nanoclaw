@@ -434,9 +434,7 @@ describe('Yente host command routing', () => {
     const fresh = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
     expect(deliveredTexts).toEqual([`Started a fresh session: ${fresh.id}`]);
     expect(
-      getDb()
-        .prepare('SELECT phase FROM scheduler_session_supersessions WHERE old_session_id = ?')
-        .get(original.id),
+      getDb().prepare('SELECT phase FROM scheduler_session_supersessions WHERE old_session_id = ?').get(original.id),
     ).toEqual({ phase: 'response-delivered' });
     expect(getDb().prepare('SELECT COUNT(*) AS count FROM scheduler_incidents').get()).toEqual({ count: 0 });
   });
@@ -461,9 +459,7 @@ describe('Yente host command routing', () => {
         'Error: session reset hit a problem after the old session was disturbed. I recorded it for repair.',
       ]);
       expect(
-        getDb()
-          .prepare("SELECT status FROM scheduler_incidents WHERE dedupe_key LIKE 'scheduler-reset:%'")
-          .get(),
+        getDb().prepare("SELECT status FROM scheduler_incidents WHERE dedupe_key LIKE 'scheduler-reset:%'").get(),
       ).toEqual({ status: 'pending' });
     } finally {
       vi.useRealTimers();
@@ -505,7 +501,9 @@ describe('Yente host command routing', () => {
 
   it('does not mark reset response delivered when old outbound suppression fails', async () => {
     const delivery = await import('./delivery.js');
-    const suppressSpy = vi.spyOn(delivery, 'suppressSessionOutbound').mockRejectedValueOnce(new Error('suppress failed'));
+    const suppressSpy = vi
+      .spyOn(delivery, 'suppressSessionOutbound')
+      .mockRejectedValueOnce(new Error('suppress failed'));
     const { routeInbound } = await import('./router.js');
     const deliveredTexts: string[] = [];
     setDeliveryAdapter({
@@ -527,9 +525,7 @@ describe('Yente host command routing', () => {
         'Error: session reset finished but old output cleanup failed. I recorded it for repair.',
       ]);
       expect(
-        getDb()
-          .prepare('SELECT phase FROM scheduler_session_supersessions WHERE old_session_id = ?')
-          .get(original.id),
+        getDb().prepare('SELECT phase FROM scheduler_session_supersessions WHERE old_session_id = ?').get(original.id),
       ).toEqual({ phase: 'fresh-activated' });
     } finally {
       suppressSpy.mockRestore();

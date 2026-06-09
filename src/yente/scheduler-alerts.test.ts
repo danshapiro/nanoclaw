@@ -1,13 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import {
-  closeDb,
-  createAgentGroup,
-  createMessagingGroup,
-  getDb,
-  initTestDb,
-  runMigrations,
-} from '../db/index.js';
+import { closeDb, createAgentGroup, createMessagingGroup, getDb, initTestDb, runMigrations } from '../db/index.js';
 import { createSession } from '../db/sessions.js';
 import { clearDeliveryAdapterForTest, setDeliveryAdapter } from '../delivery.js';
 import type { Session } from '../types.js';
@@ -216,7 +209,9 @@ describe('scheduler alerts', () => {
     await deliverDueSchedulerIncidents(new Date(Date.now() + 300_000));
 
     expect(delivered).toEqual(['first message']);
-    expect(getDb().prepare("SELECT COUNT(*) AS count FROM scheduler_incidents WHERE dedupe_key = 'incident:dedupe'").get()).toEqual({
+    expect(
+      getDb().prepare("SELECT COUNT(*) AS count FROM scheduler_incidents WHERE dedupe_key = 'incident:dedupe'").get(),
+    ).toEqual({
       count: 1,
     });
   });

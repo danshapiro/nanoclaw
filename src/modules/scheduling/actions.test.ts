@@ -69,7 +69,9 @@ describe('scheduling delivery actions', () => {
 
       await sleep(50);
       expect(getScheduledTask('ag-yente', 'task-retry')).toBeUndefined();
-      getDb().prepare('DELETE FROM runtime_locks WHERE name = ? AND owner_token = ?').run(blocker.name, blocker.ownerToken);
+      getDb()
+        .prepare('DELETE FROM runtime_locks WHERE name = ? AND owner_token = ?')
+        .run(blocker.name, blocker.ownerToken);
 
       await action;
 
@@ -79,11 +81,13 @@ describe('scheduling delivery actions', () => {
         projected_session_id: session.id,
         projected_message_id: 'task-task-retry-g1',
       });
-      expect(
-        inDb.prepare("SELECT id, series_id, status FROM messages_in WHERE kind = 'task'").all(),
-      ).toEqual([{ id: 'task-task-retry-g1', series_id: 'task-retry', status: 'pending' }]);
+      expect(inDb.prepare("SELECT id, series_id, status FROM messages_in WHERE kind = 'task'").all()).toEqual([
+        { id: 'task-task-retry-g1', series_id: 'task-retry', status: 'pending' },
+      ]);
     } finally {
-      getDb().prepare('DELETE FROM runtime_locks WHERE name = ? AND owner_token = ?').run(blocker.name, blocker.ownerToken);
+      getDb()
+        .prepare('DELETE FROM runtime_locks WHERE name = ? AND owner_token = ?')
+        .run(blocker.name, blocker.ownerToken);
       inDb.close();
     }
   });

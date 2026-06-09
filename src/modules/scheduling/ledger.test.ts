@@ -1,13 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import {
-  closeDb,
-  createAgentGroup,
-  createMessagingGroup,
-  getDb,
-  initTestDb,
-  runMigrations,
-} from '../../db/index.js';
+import { closeDb, createAgentGroup, createMessagingGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
 import { withRuntimeLock, type RuntimeLockOwner } from '../../db/runtime-locks.js';
 import {
   cancelScheduledTask,
@@ -255,10 +248,34 @@ describe('scheduler ledger', () => {
       expect(getScheduledTask('ag-1', 'task-1')).toMatchObject({ status: 'paused' });
 
       expect(resumeScheduledTask('ag-1', 'task-1', source('out-resume-a'), owner)).toBe(1);
-      expect(updateScheduledTask('ag-1', 'task-1', { processAfter: '2026-06-06T12:00:00.000Z' }, source('out-update-a'), owner)).toBe(1);
-      expect(updateScheduledTask('ag-1', 'task-1', { processAfter: '2026-06-07T12:00:00.000Z' }, source('out-update-b'), owner)).toBe(1);
+      expect(
+        updateScheduledTask(
+          'ag-1',
+          'task-1',
+          { processAfter: '2026-06-06T12:00:00.000Z' },
+          source('out-update-a'),
+          owner,
+        ),
+      ).toBe(1);
+      expect(
+        updateScheduledTask(
+          'ag-1',
+          'task-1',
+          { processAfter: '2026-06-07T12:00:00.000Z' },
+          source('out-update-b'),
+          owner,
+        ),
+      ).toBe(1);
 
-      expect(updateScheduledTask('ag-1', 'task-1', { processAfter: '2026-06-06T12:00:00.000Z' }, source('out-update-a'), owner)).toBe(0);
+      expect(
+        updateScheduledTask(
+          'ag-1',
+          'task-1',
+          { processAfter: '2026-06-06T12:00:00.000Z' },
+          source('out-update-a'),
+          owner,
+        ),
+      ).toBe(0);
       expect(pauseScheduledTask('ag-1', 'task-1', source('out-pause-a'), owner)).toBe(0);
     });
 
@@ -331,8 +348,12 @@ describe('scheduler ledger', () => {
       expect(markTaskProjected('ag-1', 'task-1', 'sess-fresh', 'task-task-1-g3', owner)).toBe(1);
       expect(markTaskProjected('ag-1', 'task-1', 'sess-fresh', 'task-task-1-g3', owner)).toBe(0);
 
-      expect(clearTaskProjection('ag-1', 'task-1', { sessionId: 'sess-fresh', messageId: 'task-task-1-g3' }, owner)).toBe(1);
-      expect(clearTaskProjection('ag-1', 'task-1', { sessionId: 'sess-fresh', messageId: 'task-task-1-g3' }, owner)).toBe(0);
+      expect(
+        clearTaskProjection('ag-1', 'task-1', { sessionId: 'sess-fresh', messageId: 'task-task-1-g3' }, owner),
+      ).toBe(1);
+      expect(
+        clearTaskProjection('ag-1', 'task-1', { sessionId: 'sess-fresh', messageId: 'task-task-1-g3' }, owner),
+      ).toBe(0);
 
       expect(cancelScheduledTask('ag-1', 'task-1', source('out-cancel-1'), owner)).toBe(1);
       expect(cancelScheduledTask('ag-1', 'task-1', source('out-cancel-1'), owner)).toBe(0);
@@ -345,14 +366,7 @@ describe('scheduler ledger', () => {
       projected_message_id: null,
       generation: 4,
     });
-    expect(eventTypes()).toEqual([
-      'scheduled',
-      'paused',
-      'resumed',
-      'projected',
-      'projection_cleared',
-      'cancelled',
-    ]);
+    expect(eventTypes()).toEqual(['scheduled', 'paused', 'resumed', 'projected', 'projection_cleared', 'cancelled']);
   });
 
   it('advances generation before same-session reprojection so stale clears and completions cannot consume it', async () => {
@@ -576,7 +590,9 @@ describe('scheduler ledger', () => {
       markTaskProjected('ag-1', 'task-1', 'sess-old', 'task-task-1-g1', owner);
       markTaskProjected('ag-1', 'task-1', 'sess-fresh', 'task-task-1-g1', owner);
       expect(markTaskProjected('ag-1', 'task-1', 'sess-old', 'task-task-1-g1', owner)).toBe(0);
-      expect(clearTaskProjection('ag-1', 'task-1', { sessionId: 'sess-old', messageId: 'task-task-1-g1' }, owner)).toBe(0);
+      expect(clearTaskProjection('ag-1', 'task-1', { sessionId: 'sess-old', messageId: 'task-task-1-g1' }, owner)).toBe(
+        0,
+      );
 
       expect(
         completeScheduledTask(
@@ -699,9 +715,7 @@ describe('scheduler JSONL log helper', () => {
       parseSchedulerLogLine('\u001b[31m{"timestamp":"2026-06-05T12:00:00.000Z","severity":"info","event":"x"}\n'),
     ).toThrow(/not valid JSON/);
     expect(() => parseSchedulerLogLine('{"severity":"info","event":"x"}\n')).toThrow(/timestamp/);
-    expect(() => parseSchedulerLogLine('{"timestamp":"2026-06-05T12:00:00.000Z","event":"x"}\n')).toThrow(
-      /severity/,
-    );
+    expect(() => parseSchedulerLogLine('{"timestamp":"2026-06-05T12:00:00.000Z","event":"x"}\n')).toThrow(/severity/);
     expect(() => parseSchedulerLogLine('{"timestamp":"2026-06-05T12:00:00.000Z","severity":"info"}\n')).toThrow(
       /event/,
     );

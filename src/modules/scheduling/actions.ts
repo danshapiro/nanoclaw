@@ -98,12 +98,11 @@ function recordSchedulerActionIncident(args: {
   seriesId: string;
 }): void {
   const now = new Date().toISOString();
-  getDb()
-    .transaction(() => {
-      assertRuntimeLockOwner(args.owner);
-      getDb()
-        .prepare(
-          `INSERT OR IGNORE INTO scheduler_incidents (
+  getDb().transaction(() => {
+    assertRuntimeLockOwner(args.owner);
+    getDb()
+      .prepare(
+        `INSERT OR IGNORE INTO scheduler_incidents (
              id,
              dedupe_key,
              severity,
@@ -144,23 +143,23 @@ function recordSchedulerActionIncident(args: {
              NULL,
              NULL
            )`,
-        )
-        .run({
-          id: `sched-inc-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
-          dedupeKey: args.dedupeKey,
-          severity: args.severity,
-          agentGroupId: args.session.agent_group_id,
-          seriesId: args.seriesId,
-          sessionId: args.session.id,
-          messagingGroupId: args.session.messaging_group_id,
-          channelType: null,
-          platformId: null,
-          threadId: args.session.thread_id,
-          message: args.message,
-          detailsJson: JSON.stringify(args.details),
-          createdAt: now,
-        });
-    })();
+      )
+      .run({
+        id: `sched-inc-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+        dedupeKey: args.dedupeKey,
+        severity: args.severity,
+        agentGroupId: args.session.agent_group_id,
+        seriesId: args.seriesId,
+        sessionId: args.session.id,
+        messagingGroupId: args.session.messaging_group_id,
+        channelType: null,
+        platformId: null,
+        threadId: args.session.thread_id,
+        message: args.message,
+        detailsJson: JSON.stringify(args.details),
+        createdAt: now,
+      });
+  })();
   logSchedulerEvent(args.severity, 'scheduler_action_incident', {
     dedupeKey: args.dedupeKey,
     agentGroupId: args.session.agent_group_id,
@@ -300,7 +299,12 @@ export function applyCancelTaskAction(
   options: ApplySchedulingActionOptions,
 ): number {
   const taskId = stringField(content, 'taskId');
-  const changed = cancelScheduledTask(session.agent_group_id, taskId, sourceFor(session, options.sourceMessageId), owner);
+  const changed = cancelScheduledTask(
+    session.agent_group_id,
+    taskId,
+    sourceFor(session, options.sourceMessageId),
+    owner,
+  );
   retireProjection(inDb, taskId);
   log.info('Scheduled task ledger action applied', {
     action: 'cancel_task',
@@ -333,7 +337,12 @@ export function applyPauseTaskAction(
   options: ApplySchedulingActionOptions,
 ): number {
   const taskId = stringField(content, 'taskId');
-  const changed = pauseScheduledTask(session.agent_group_id, taskId, sourceFor(session, options.sourceMessageId), owner);
+  const changed = pauseScheduledTask(
+    session.agent_group_id,
+    taskId,
+    sourceFor(session, options.sourceMessageId),
+    owner,
+  );
   const task = getScheduledTask(session.agent_group_id, taskId);
   if (isLiveTask(task)) projectScheduledTask(inDb, task, session.id, owner);
   log.info('Scheduled task ledger action applied', {
@@ -367,7 +376,12 @@ export function applyResumeTaskAction(
   options: ApplySchedulingActionOptions,
 ): number {
   const taskId = stringField(content, 'taskId');
-  const changed = resumeScheduledTask(session.agent_group_id, taskId, sourceFor(session, options.sourceMessageId), owner);
+  const changed = resumeScheduledTask(
+    session.agent_group_id,
+    taskId,
+    sourceFor(session, options.sourceMessageId),
+    owner,
+  );
   const task = getScheduledTask(session.agent_group_id, taskId);
   if (isLiveTask(task)) projectScheduledTask(inDb, task, session.id, owner);
   log.info('Scheduled task ledger action applied', {

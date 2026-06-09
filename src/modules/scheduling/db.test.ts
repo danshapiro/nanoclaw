@@ -230,7 +230,9 @@ describe('delivery action handlers', () => {
       projected_message_id: 'task-task-1-g2',
     });
     expect(JSON.parse(task.content)).toEqual({ prompt: 'updated heartbeat', script: 'echo ok' });
-    expect(db.prepare('SELECT id, process_after, recurrence, content FROM messages_in WHERE status = ?').get('pending')).toEqual({
+    expect(
+      db.prepare('SELECT id, process_after, recurrence, content FROM messages_in WHERE status = ?').get('pending'),
+    ).toEqual({
       id: 'task-task-1-g2',
       process_after: '2026-06-07T12:00:00.000Z',
       recurrence: null,

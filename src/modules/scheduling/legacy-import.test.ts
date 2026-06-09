@@ -349,7 +349,12 @@ describe('importLegacyActiveTasks', () => {
         },
         owner,
       );
-      cancelScheduledTask('ag-yente', 'series-terminal', { sessionId: session.id, messageId: 'cancel-terminal' }, owner);
+      cancelScheduledTask(
+        'ag-yente',
+        'series-terminal',
+        { sessionId: session.id, messageId: 'cancel-terminal' },
+        owner,
+      );
     });
 
     const inDb = openInboundDb(session.agent_group_id, session.id);

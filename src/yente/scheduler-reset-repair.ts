@@ -153,7 +153,9 @@ async function deliverRepairResetResponse(
 ): Promise<void> {
   const adapter = getDeliveryAdapter();
   if (!adapter) {
-    throw new Error(`Cannot deliver scheduler reset repair response for ${oldSession.id}: delivery adapter is not ready`);
+    throw new Error(
+      `Cannot deliver scheduler reset repair response for ${oldSession.id}: delivery adapter is not ready`,
+    );
   }
   const responseAddress = responseAddressForRepair(oldSession, row);
 

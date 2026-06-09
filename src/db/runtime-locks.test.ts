@@ -20,9 +20,9 @@ function deferred<T = void>() {
 }
 
 function lockRow(name = 'scheduler') {
-  return getDb()
-    .prepare('SELECT owner_id, owner_token, expires_at FROM runtime_locks WHERE name = ?')
-    .get(name) as { owner_id: string; owner_token: string; expires_at: string } | undefined;
+  return getDb().prepare('SELECT owner_id, owner_token, expires_at FROM runtime_locks WHERE name = ?').get(name) as
+    | { owner_id: string; owner_token: string; expires_at: string }
+    | undefined;
 }
 
 function insertLock(name: string, ownerId: string, ownerToken: string, expiresAt: string): void {
