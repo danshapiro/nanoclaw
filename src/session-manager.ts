@@ -71,6 +71,36 @@ export function heartbeatPath(agentGroupId: string, sessionId: string): string {
 }
 
 /**
+ * Path to the per-session marker recording the managed-skill generation the
+ * current container spawned with. Lives beside the heartbeat in the session
+ * dir. Parameterized by an explicit session dir so it is a pure fs wrapper.
+ */
+export function skillGenerationPath(sessionDirPath: string): string {
+  return path.join(sessionDirPath, '.skill-generation');
+}
+
+/** Record the managed-skill generation a container spawned with. Best-effort:
+ *  a write failure must not block the spawn (host-sweep just won't recycle for
+ *  this generation, i.e. it degrades to today's behavior). */
+export function writeSpawnSkillGeneration(sessionDirPath: string, value: string): void {
+  try {
+    fs.mkdirSync(sessionDirPath, { recursive: true });
+    fs.writeFileSync(skillGenerationPath(sessionDirPath), value);
+  } catch {
+    // Non-fatal — see doc comment.
+  }
+}
+
+/** Read the generation a container spawned with ('' when the marker is absent). */
+export function readSpawnSkillGeneration(sessionDirPath: string): string {
+  try {
+    return fs.readFileSync(skillGenerationPath(sessionDirPath), 'utf8').trim();
+  } catch {
+    return '';
+  }
+}
+
+/**
  * @deprecated Use inboundDbPath / outboundDbPath instead.
  * Kept temporarily for test compatibility during migration.
  */

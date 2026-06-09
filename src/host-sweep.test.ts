@@ -24,6 +24,7 @@ import {
   recoverInterruptedTurn,
   resetStuckProcessingRows,
 } from './host-sweep.js';
+import { readSpawnSkillGeneration, skillGenerationPath, writeSpawnSkillGeneration } from './session-manager.js';
 import type { Session } from './types.js';
 
 const BASE = Date.parse('2026-04-20T12:00:00.000Z');
@@ -746,5 +747,19 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
     }>;
     verify.close();
     expect(rows.map((x) => x.id)).toEqual(['draft-this']);
+  });
+});
+
+describe('spawn skill generation marker', () => {
+  it('round-trips the recorded generation for a session dir', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-skillgen-'));
+    writeSpawnSkillGeneration(dir, 'gen-xyz');
+    expect(readSpawnSkillGeneration(dir)).toBe('gen-xyz');
+    expect(fs.existsSync(skillGenerationPath(dir))).toBe(true);
+  });
+
+  it('returns an empty string when no marker has been written', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-skillgen-'));
+    expect(readSpawnSkillGeneration(dir)).toBe('');
   });
 });
