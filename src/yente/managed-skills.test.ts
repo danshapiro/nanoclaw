@@ -4,7 +4,14 @@ import path from 'path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { clearManagedSkillRootCache, resolveManagedSkillRoot, syncManagedSkillSymlinks } from './managed-skills.js';
+import {
+  clearManagedSkillRootCache,
+  currentManagedSkillGeneration,
+  managedSkillRootsFromEnv,
+  readManagedSkillGeneration,
+  resolveManagedSkillRoot,
+  syncManagedSkillSymlinks,
+} from './managed-skills.js';
 
 const tempRoots: string[] = [];
 
@@ -321,5 +328,49 @@ describe('syncManagedSkillSymlinks', () => {
     expect(fs.lstatSync(path.join(claudeDir, 'skills', 'alpha')).isSymbolicLink()).toBe(true);
     expect(fs.readlinkSync(path.join(claudeDir, 'skills', 'alpha'))).toBe('/app/skills/alpha');
     expect(fs.readlinkSync(path.join(claudeDir, 'skills', 'beta'))).toBe('/app/skills/beta');
+  });
+});
+
+describe('managed skill generation', () => {
+  it('joins .skill-generation markers across managed roots in declared order', () => {
+    const a = makeTempDir();
+    const b = makeTempDir();
+    fs.writeFileSync(path.join(a, '.skill-generation'), 'genA\n');
+    fs.writeFileSync(path.join(b, '.skill-generation'), 'genB\n');
+    expect(readManagedSkillGeneration([a, b])).toBe('genA\ngenB');
+  });
+
+  it('returns an empty string when no markers are present', () => {
+    expect(readManagedSkillGeneration([makeTempDir()])).toBe('');
+  });
+
+  it('managedSkillRootsFromEnv splits NANOCLAW_MANAGED_SKILLS_DIRS on the path delimiter', () => {
+    const a = makeTempDir();
+    const b = makeTempDir();
+    expect(managedSkillRootsFromEnv({ NANOCLAW_MANAGED_SKILLS_DIRS: `${a}${path.delimiter}${b}` })).toEqual([a, b]);
+    expect(managedSkillRootsFromEnv({})).toEqual([]);
+  });
+
+  it('currentManagedSkillGeneration reads the marker from the env-configured managed roots', () => {
+    const a = makeTempDir();
+    fs.writeFileSync(path.join(a, '.skill-generation'), 'gen1\n');
+    expect(currentManagedSkillGeneration({ NANOCLAW_MANAGED_SKILLS_DIRS: a })).toBe('gen1');
+  });
+
+  it('resolveManagedSkillRoot returns the managed generation marker', () => {
+    const projectRoot = makeTempDir();
+    const dataDir = makeTempDir();
+    const managedRoot = makeTempDir();
+    makeSkill(path.join(projectRoot, 'container', 'skills'), 'bundled-one');
+    makeSkill(managedRoot, 'managed-one');
+    fs.writeFileSync(path.join(managedRoot, '.skill-generation'), 'deadbeef\n');
+
+    const result = resolveManagedSkillRoot({
+      projectRoot,
+      dataDir,
+      env: { NANOCLAW_MANAGED_SKILLS_DIRS: managedRoot },
+    });
+
+    expect(result.generation).toBe('deadbeef');
   });
 });

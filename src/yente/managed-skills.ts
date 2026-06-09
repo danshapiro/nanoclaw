@@ -14,6 +14,9 @@ export interface ManagedSkill {
 export interface ManagedSkillRoot {
   root: string;
   skills: ManagedSkill[];
+  /** Opaque token identifying the deployed managed-skill set this root was
+   *  assembled from. Empty when no managed root carries a marker. */
+  generation: string;
 }
 
 interface SkillRootSource {
@@ -41,6 +44,7 @@ interface RuntimeManifest {
 const RUNTIME_SHIM_BINS = new Set(['gws']);
 const BASE_RUNTIME_COMMANDS = new Set(['bash', 'sh', 'node', 'python3', 'agent-browser']);
 const SKILL_RUNTIME_MANIFEST = 'skill-runtime-manifest.json';
+export const SKILL_GENERATION_FILE = '.skill-generation';
 
 let _cleanupRan = false;
 
@@ -120,7 +124,8 @@ export function resolveManagedSkillRoot(args: {
   copyRuntimeManifests(sources, root);
   synthesizeSkillBinLinks(root, skills);
 
-  return { root, skills };
+  const generation = readManagedSkillGeneration(managedSkillRootsFromEnv(env));
+  return { root, skills, generation };
 }
 
 export function clearManagedSkillRootCache(): void {
@@ -405,4 +410,43 @@ function pathExistsNoFollow(entryPath: string): boolean {
     }
     throw err;
   }
+}
+
+/**
+ * Managed skill roots from NANOCLAW_MANAGED_SKILLS_DIRS, in declared order.
+ * Intentionally covers ONLY the env-derived managed roots — NOT the `local`
+ * (writable) or `bundled` (container/skills) sources that resolveManagedSkillRoot
+ * also merges and realpath-dedups. The generation marker is a deploy-written,
+ * managed-skill concept: bundled skills change only with a runtime redeploy
+ * (which restarts everything) and writable local skills are out of scope (see
+ * non-goals). Do NOT "fix" this to mirror the full merged source set. Both the
+ * spawn read and the host-sweep read call this same helper on the same
+ * process.env, so spawn-gen and current-gen stay symmetric by construction.
+ */
+export function managedSkillRootsFromEnv(env: NodeJS.ProcessEnv): string[] {
+  return splitPathList(env.NANOCLAW_MANAGED_SKILLS_DIRS);
+}
+
+/**
+ * Read the deploy-written generation marker from each managed root and join
+ * the non-empty values in order. Absent markers are skipped, so an old deploy
+ * that never wrote one yields '' — which compares equal to a container that
+ * also recorded '', i.e. no spurious recycle.
+ */
+export function readManagedSkillGeneration(managedRoots: string[]): string {
+  const parts: string[] = [];
+  for (const root of managedRoots) {
+    try {
+      const value = fs.readFileSync(path.join(root, SKILL_GENERATION_FILE), 'utf8').trim();
+      if (value) parts.push(value);
+    } catch {
+      // Marker absent on this root — skip.
+    }
+  }
+  return parts.join('\n');
+}
+
+/** Current managed-skill generation as seen via the process environment. */
+export function currentManagedSkillGeneration(env: NodeJS.ProcessEnv): string {
+  return readManagedSkillGeneration(managedSkillRootsFromEnv(env));
 }
