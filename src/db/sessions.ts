@@ -71,6 +71,20 @@ export function findActiveSessionThreadIdEndingWithForAgent(
   return row?.thread_id ?? undefined;
 }
 
+export function findActiveNonNullSessionThreadIdsForAgent(agentGroupId: string, messagingGroupId: string): string[] {
+  const rows = getDb()
+    .prepare(
+      `SELECT thread_id FROM sessions
+       WHERE agent_group_id = ?
+         AND messaging_group_id = ?
+         AND thread_id IS NOT NULL
+         AND status = 'active'
+       ORDER BY last_active DESC, created_at DESC`,
+    )
+    .all(agentGroupId, messagingGroupId) as Array<{ thread_id: string | null }>;
+  return rows.map((row) => row.thread_id).filter((threadId): threadId is string => Boolean(threadId));
+}
+
 /** Find an active session scoped to an agent group (ignoring messaging group). */
 export function findSessionByAgentGroup(agentGroupId: string): Session | undefined {
   return getDb()

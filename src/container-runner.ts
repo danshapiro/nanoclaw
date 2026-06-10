@@ -188,12 +188,6 @@ async function spawnContainer(session: Session): Promise<void> {
   // buildMounts and buildContainerArgs so side effects (mkdir, etc.) fire once.
   const { provider, contribution } = resolveProviderContribution(session, agentGroup, containerConfig);
 
-  // Persist resolved provider to container.json so the runner picks it up.
-  if (containerConfig.provider !== provider) {
-    containerConfig.provider = provider;
-    writeContainerConfig(agentGroup.folder, containerConfig);
-  }
-
   const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
   // OneCLI agent identifier is always the agent group id — stable across
   // sessions and reversible via getAgentGroup() for approval routing.
@@ -505,22 +499,31 @@ export async function isSessionOutboundWriterRunning(session: Session): Promise<
 }
 
 /**
- * Resolve the provider name for a session using the precedence documented in
- * the provider-install skills:
- *
- *   sessions.agent_provider
- *     → agent_groups.agent_provider
- *     → container.json `provider`
- *     → 'claude'
- *
- * Pure so the precedence can be unit-tested without a DB or filesystem.
+ * Resolve the provider name for a session. The single authoritative source is
+ * groups/<folder>/container.json; legacy DB provider columns are accepted only
+ * when unset or matching that file, so stale DB rows cannot silently override a
+ * reviewed per-group config change.
  */
 export function resolveProviderName(
   sessionProvider: string | null | undefined,
   agentGroupProvider: string | null | undefined,
   containerConfigProvider: string | null | undefined,
 ): string {
-  return (sessionProvider || agentGroupProvider || containerConfigProvider || 'claude').toLowerCase();
+  const provider = normalizeProviderName(containerConfigProvider) ?? 'claude';
+  const conflicts = [
+    legacyProviderConflict('sessions.agent_provider', sessionProvider, provider),
+    legacyProviderConflict('agent_groups.agent_provider', agentGroupProvider, provider),
+  ].filter((conflict): conflict is string => conflict !== null);
+
+  if (conflicts.length > 0) {
+    throw new Error(
+      `Provider config conflict: container.json resolves to '${provider}', but ${conflicts.join(
+        ' and ',
+      )}. Set provider/model in groups/<folder>/container.json and clear or align the legacy DB provider column.`,
+    );
+  }
+
+  return provider;
 }
 
 function resolveProviderContribution(
@@ -528,7 +531,13 @@ function resolveProviderContribution(
   agentGroup: AgentGroup,
   containerConfig: import('./container-config.js').ContainerConfig,
 ): { provider: string; contribution: ProviderContainerContribution } {
-  const provider = resolveProviderName(session.agent_provider, agentGroup.agent_provider, containerConfig.provider);
+  let provider: string;
+  try {
+    provider = resolveProviderName(session.agent_provider, agentGroup.agent_provider, containerConfig.provider);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(`Agent group ${agentGroup.id} (${agentGroup.folder}) has invalid provider config: ${message}`);
+  }
   const fn = getProviderContainerConfig(provider);
   const contribution = fn
     ? fn({
@@ -540,6 +549,21 @@ function resolveProviderContribution(
       })
     : {};
   return { provider, contribution };
+}
+
+function normalizeProviderName(value: string | null | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed.toLowerCase() : undefined;
+}
+
+function legacyProviderConflict(
+  source: string,
+  value: string | null | undefined,
+  authoritativeProvider: string,
+): string | null {
+  const normalized = normalizeProviderName(value);
+  if (!normalized || normalized === authoritativeProvider) return null;
+  return `${source} is '${normalized}'`;
 }
 
 export function resolveContainerIdentity(): { uid: number; gid: number } {

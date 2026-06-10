@@ -113,7 +113,7 @@ function grantAdmin(userId: string): void {
 function event(
   content: string,
   id = `msg-${Math.random().toString(36).slice(2)}`,
-  threadId = DISCORD_THREAD_ID,
+  threadId: string | null = DISCORD_THREAD_ID,
 ): InboundEvent {
   return {
     channelType: 'discord',
@@ -348,6 +348,70 @@ describe('Yente host command routing', () => {
     expect(fresh.id).not.toBe(original.id);
     expect(outboundTexts(fresh.id)).toEqual([]);
     expect(cleanupContainerForSessionMock).toHaveBeenCalledWith(original.id, 'yente-session-new-scheduler-preserve');
+  });
+
+  it('retargets admin CLI null-thread resets to the sole active Discord thread session', async () => {
+    const { routeInbound } = await import('./router.js');
+    const deliveredTexts: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        deliveredTexts.push(JSON.parse(content).text);
+        return `platform-${deliveredTexts.length}`;
+      },
+    });
+
+    await routeInbound(event('hello first', 'msg-normal-thread-for-null', DISCORD_CANONICAL_CONVERSATION_THREAD_ID));
+    const original = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_CANONICAL_CONVERSATION_THREAD_ID)!;
+
+    await routeInbound(event('/new', 'msg-admin-cli-null-thread', null));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const nullSession = findSessionForAgent('ag-yente', 'mg-discord', null);
+    const fresh = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_CANONICAL_CONVERSATION_THREAD_ID)!;
+    expect(nullSession).toBeUndefined();
+    expect(getSession(original.id)?.status).toBe('archived');
+    expect(fresh.id).not.toBe(original.id);
+    expect(deliveredTexts).toContain(`Started a fresh session: ${fresh.id}`);
+    expect(cleanupContainerForSessionMock).toHaveBeenCalledWith(original.id, 'yente-session-new-scheduler-preserve');
+  });
+
+  it('refuses ambiguous admin CLI null-thread resets when multiple Discord thread sessions are active', async () => {
+    const { routeInbound } = await import('./router.js');
+    const deliveredTexts: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        deliveredTexts.push(JSON.parse(content).text);
+        return `platform-${deliveredTexts.length}`;
+      },
+    });
+
+    await routeInbound(event('hello root thread', 'msg-root-thread', DISCORD_THREAD_ID));
+    await routeInbound(
+      event('hello conversation thread', 'msg-conversation-thread', DISCORD_CANONICAL_CONVERSATION_THREAD_ID),
+    );
+    const rootSession = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
+    const conversationSession = findSessionForAgent(
+      'ag-yente',
+      'mg-discord',
+      DISCORD_CANONICAL_CONVERSATION_THREAD_ID,
+    )!;
+
+    await routeInbound(event('/new', 'msg-ambiguous-null-reset', null));
+
+    expect(findSessionForAgent('ag-yente', 'mg-discord', null)).toBeUndefined();
+    expect(getSession(rootSession.id)?.status).toBe('active');
+    expect(getSession(conversationSession.id)?.status).toBe('active');
+    expect(deliveredTexts).toEqual([
+      expect.stringContaining('Cannot reset a Discord per-thread session without a thread id'),
+    ]);
+    expect(cleanupContainerForSessionMock).not.toHaveBeenCalledWith(
+      rootSession.id,
+      'yente-session-new-scheduler-preserve',
+    );
+    expect(cleanupContainerForSessionMock).not.toHaveBeenCalledWith(
+      conversationSession.id,
+      'yente-session-new-scheduler-preserve',
+    );
   });
 
   it('does not deliver reset success until old-session delivery suppression is complete', async () => {

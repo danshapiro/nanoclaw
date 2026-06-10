@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from 'child_process';
+import { createHash } from 'crypto';
 import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
@@ -23,11 +24,7 @@ import {
 } from './types.js';
 import { buildRelayOpenCodeToolConfig, mcpServersToOpenCodeConfig } from './mcp-to-opencode.js';
 import { OpenCodeEventPump, type OpenCodePumpClock, type OpenCodeLivenessSnapshot } from './opencode-events.js';
-import {
-  classifyContinuation,
-  isMissingOpenCodeSessionError,
-  isMissingSessionResultError,
-} from './opencode-errors.js';
+import { classifyContinuation, isMissingOpenCodeSessionError, isMissingSessionResultError } from './opencode-errors.js';
 import {
   detectNativeQuestionPart,
   detectNativeQuestionPermission,
@@ -63,7 +60,8 @@ const OPENCODE_RELAY_DEADLINE_MS = (): number => envNum('OPENCODE_RELAY_DEADLINE
 const OPENCODE_LONG_TOOL_TIMEOUT_MAX_MS = (): number => envNum('OPENCODE_LONG_TOOL_TIMEOUT_MAX_MS', 6 * 60 * 60 * 1000);
 // Model-provider request timeout: a large positive ms value (= absolute turn
 // ceiling) under the ACTIVE provider name, NEVER 0 (which means immediate abort).
-const OPENCODE_MODEL_PROVIDER_TIMEOUT_MS = (): number => envNum('OPENCODE_MODEL_PROVIDER_TIMEOUT_MS', 6 * 60 * 60 * 1000);
+const OPENCODE_MODEL_PROVIDER_TIMEOUT_MS = (): number =>
+  envNum('OPENCODE_MODEL_PROVIDER_TIMEOUT_MS', 6 * 60 * 60 * 1000);
 // Note: OPENCODE_CONTINUATION_FAILURE_LIMIT (bounded zombie backstop) is owned
 // by the poll loop, which counts consecutive terminal interruptions across
 // wakes; OPENCODE_NATIVE_QUESTION_CANCEL_GRACE_MS is reserved for a future
@@ -98,8 +96,7 @@ function realTimerClock(): OpenCodePumpClock {
  * generic transport "timeout" text — a stalled stream is not stale-session
  * proof.
  */
-const STALE_SESSION_RE =
-  /no conversation found|ENOENT.*\.jsonl|session.*not found/i;
+const STALE_SESSION_RE = /no conversation found|ENOENT.*\.jsonl|session.*not found/i;
 
 function errorText(err: unknown): string {
   if (err instanceof Error) return err.message;
@@ -308,7 +305,9 @@ export interface OpenCodeRuntimeController {
   readonly proc?: ChildProcess;
   readonly client: OpenCodeControllerClient;
   /** Long-lived single-reader event stream for this runtime. */
-  readonly stream: AsyncGenerator<OpenCodeSseEvent, void, void> | { next(): Promise<IteratorResult<OpenCodeSseEvent, void>> };
+  readonly stream:
+    | AsyncGenerator<OpenCodeSseEvent, void, void>
+    | { next(): Promise<IteratorResult<OpenCodeSseEvent, void>> };
   /** Deny (reject) a permission for a native question or tool. */
   denyPermission(sessionId: string, permissionId: string, reason: string): Promise<void>;
   /** Positive existence check for the exact attempted session id. */
@@ -341,6 +340,20 @@ export function runtimeConfigKey(options: ProviderOptions, opts: BuildOpenCodeCo
     // or it would collide on the normal runtime and a destroy would kill both.
     relay: opts.relayMode ? `relay:${opts.relayRouteKey ?? ''}` : 'normal',
   });
+}
+
+export function openCodeContinuationScope(options: ProviderOptions): string | undefined {
+  if (!hasConfiguredOpenCodeRuntimeIdentity()) return undefined;
+  return createHash('sha256').update(runtimeConfigKey(options)).digest('hex').slice(0, 16);
+}
+
+function hasConfiguredOpenCodeRuntimeIdentity(): boolean {
+  return Boolean(
+    process.env.OPENCODE_PROVIDER ||
+    process.env.OPENCODE_MODEL ||
+    process.env.OPENCODE_SMALL_MODEL ||
+    process.env.OPENCODE_REASONING_EFFORT,
+  );
 }
 
 /**
@@ -416,10 +429,7 @@ export const realRuntimeFactory: OpenCodeRuntimeFactory & OpenCodeRelayRuntimeFa
  * nanoclaw MCP server's env so its own subprocess exposes only the route-locked
  * status tool map. The relay never shares the original turn's MCP server.
  */
-function withRelayMcpEnv(
-  servers: ProviderOptions['mcpServers'],
-  routeKey: string,
-): ProviderOptions['mcpServers'] {
+function withRelayMcpEnv(servers: ProviderOptions['mcpServers'], routeKey: string): ProviderOptions['mcpServers'] {
   if (!servers) return servers;
   const out: NonNullable<ProviderOptions['mcpServers']> = {};
   for (const [name, cfg] of Object.entries(servers)) {
@@ -688,6 +698,10 @@ export class OpenCodeProvider implements AgentProvider {
     this.persistActiveTool = seams.persistActiveTool ?? defaultPersistActiveTool;
     this.clockFactory = seams.clockFactory ?? realTimerClock;
     this.importStagedSideEffects = seams.importStagedSideEffects ?? defaultImportStagedSideEffects;
+  }
+
+  get continuationScope(): string | undefined {
+    return openCodeContinuationScope(this.options);
   }
 
   /** Capabilities: OpenCode supports a separate-runtime status relay. */
@@ -971,8 +985,7 @@ export class OpenCodeProvider implements AgentProvider {
                   severity: 'info',
                   agentMessage:
                     "I'm still working on this — it's taking a while but the task is progressing. I'll keep going.",
-                  fallbackUserMessage:
-                    "I'm still working on your request — it's taking a while, but I'm on it.",
+                  fallbackUserMessage: "I'm still working on your request — it's taking a while, but I'm on it.",
                   relayRecommended: true,
                   liveness: {
                     configuredTimeoutMs: res.metadata.configuredTimeoutMs,
@@ -1086,7 +1099,14 @@ export class OpenCodeProvider implements AgentProvider {
                 }
                 case 'message.part.updated': {
                   const part = ev.properties.part as
-                    | { type?: string; messageID?: string; text?: string; tool?: string; callID?: string; state?: unknown }
+                    | {
+                        type?: string;
+                        messageID?: string;
+                        text?: string;
+                        tool?: string;
+                        callID?: string;
+                        state?: unknown;
+                      }
                     | undefined;
                   if (part?.type === 'text' && part.messageID && part.text) {
                     partTextByMessageId.set(part.messageID, part.text);
@@ -1099,7 +1119,9 @@ export class OpenCodeProvider implements AgentProvider {
                   }
                   // Active tool tracking + side-effect enrichment for tool parts.
                   if (part?.type === 'tool' && part.callID && part.tool) {
-                    const st = part.state as { status?: string; time?: { end?: number }; input?: Record<string, unknown> } | undefined;
+                    const st = part.state as
+                      | { status?: string; time?: { end?: number }; input?: Record<string, unknown> }
+                      | undefined;
                     const status = st?.status;
                     if (status === 'completed' || st?.time?.end) {
                       activeTools.delete(part.callID);
@@ -1137,7 +1159,13 @@ export class OpenCodeProvider implements AgentProvider {
                   break;
                 }
                 case 'permission.updated': {
-                  const perm = ev.properties as { id?: string; sessionID?: string; callID?: string; type?: string; title?: string };
+                  const perm = ev.properties as {
+                    id?: string;
+                    sessionID?: string;
+                    callID?: string;
+                    type?: string;
+                    title?: string;
+                  };
                   if (perm.sessionID !== sessionId || !perm.id) break;
                   // Native question permission: DENY via reject and emit a
                   // user-visible recovery interruption naming the blocked
@@ -1147,10 +1175,14 @@ export class OpenCodeProvider implements AgentProvider {
                     try {
                       await rt.denyPermission(sessionId, nq.permissionId, 'native_question_denied');
                     } catch (err) {
-                      log(`Failed to deny native question permission: ${err instanceof Error ? err.message : String(err)}`);
+                      log(
+                        `Failed to deny native question permission: ${err instanceof Error ? err.message : String(err)}`,
+                      );
                     }
                     const questionText =
-                      (nq.callID && questionTextByCallId.get(nq.callID)) || nq.title || 'a question that requires your input';
+                      (nq.callID && questionTextByCallId.get(nq.callID)) ||
+                      nq.title ||
+                      'a question that requires your input';
                     log(
                       JSON.stringify({
                         severity: 'info',
@@ -1163,7 +1195,12 @@ export class OpenCodeProvider implements AgentProvider {
                     // Non-cancellable native question / denial without reuse
                     // proof: clear continuation with a restart-capable recovery
                     // seed that VISIBLY contains the blocked question.
-                    yield { type: 'clear-continuation', inputId: turnInputId, reason: 'native_question_denied', attemptedContinuation: input.continuation };
+                    yield {
+                      type: 'clear-continuation',
+                      inputId: turnInputId,
+                      reason: 'native_question_denied',
+                      attemptedContinuation: input.continuation,
+                    };
                     setActiveSession(undefined);
                     terminalInterruption = buildInterruption(
                       'opencode_native_question',
@@ -1341,10 +1378,7 @@ export class OpenCodeProvider implements AgentProvider {
  * widen host-sweep tolerance beyond the hard ceiling (Invariant 156):
  * min(OPENCODE_LONG_TOOL_TIMEOUT_MAX_MS, ABSOLUTE - elapsed - safetyMargin).
  */
-function cappedDeclaredTimeoutMs(
-  part: { state?: unknown },
-  elapsedTurnMs: number,
-): number | null {
+function cappedDeclaredTimeoutMs(part: { state?: unknown }, elapsedTurnMs: number): number | null {
   const st = part.state as { input?: Record<string, unknown> } | undefined;
   const raw = st?.input?.timeout ?? st?.input?.timeoutMs ?? st?.input?.timeout_ms;
   const declared = typeof raw === 'number' && raw > 0 ? raw : null;

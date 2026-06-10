@@ -109,6 +109,12 @@ triggering turn, so the poll loop can resolve exactly the rows that input owns.
 - **`activity`** — a liveness pulse (`source`: `sdk_event`, `sdk_keepalive`, `provider_wait_tick`, `provider_internal`). Refreshes the host heartbeat; no row effect.
 - **`progress`** — optional, for logging only.
 
+Continuations are stored per provider. A provider may also declare a stable
+runtime scope when its session ids are tied to provider/model/reasoning
+configuration; OpenCode does this from its `OPENCODE_*` runtime identity so a
+model/provider flip starts a fresh OpenCode session instead of resuming an
+incompatible prior one.
+
 **Successful-result input resolution.** When a `result` names `resolvedInputIds`,
 exactly those inputs are resolved. When it names none, the **one-active-input
 fallback** applies: if exactly one input is still unresolved, that input is
@@ -918,7 +924,12 @@ function createProvider(name: ProviderName, config: ProviderConfig): AgentProvid
 }
 ```
 
-The provider name comes from the container's environment (`AGENT_PROVIDER` env var), set by the host based on `agent_groups.agent_provider` or `sessions.agent_provider`.
+The provider name comes from `groups/<folder>/container.json`, mounted into the
+container and exposed as `AGENT_PROVIDER`. Legacy DB provider columns
+(`agent_groups.agent_provider` and `sessions.agent_provider`) are not
+configuration sources; the host only accepts them when unset or matching
+`container.json`, and otherwise fails clearly instead of silently overriding the
+reviewed group config.
 
 `ProviderConfig` contains provider-specific settings (API keys, model overrides, etc.) passed via environment variables — not via the interface. Each provider reads what it needs from `env`.
 

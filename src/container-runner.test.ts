@@ -240,16 +240,9 @@ async function loadContainerRunnerHarness(
 }
 
 describe('resolveProviderName', () => {
-  it('prefers session over group and container.json', () => {
-    expect(resolveProviderName('codex', 'opencode', 'claude')).toBe('codex');
-  });
-
-  it('falls back to group when session is null', () => {
-    expect(resolveProviderName(null, 'codex', 'claude')).toBe('codex');
-  });
-
-  it('falls back to container.json when session and group are null', () => {
+  it('uses container.json as the authoritative provider source', () => {
     expect(resolveProviderName(null, null, 'opencode')).toBe('opencode');
+    expect(resolveProviderName('OpenCode', 'opencode', 'OpenCode')).toBe('opencode');
   });
 
   it('defaults to claude when nothing is set', () => {
@@ -257,14 +250,31 @@ describe('resolveProviderName', () => {
   });
 
   it('lowercases the resolved name', () => {
-    expect(resolveProviderName('CODEX', null, null)).toBe('codex');
-    expect(resolveProviderName(null, 'OpenCode', null)).toBe('opencode');
+    expect(resolveProviderName('OPENCODE', null, 'OpenCode')).toBe('opencode');
     expect(resolveProviderName(null, null, 'Claude')).toBe('claude');
   });
 
-  it('treats empty string as unset (falls through)', () => {
-    expect(resolveProviderName('', 'codex', null)).toBe('codex');
-    expect(resolveProviderName(null, '', 'opencode')).toBe('opencode');
+  it('treats empty strings as unset and still validates legacy DB conflicts', () => {
+    expect(resolveProviderName('', '', 'opencode')).toBe('opencode');
+    expect(() => resolveProviderName('', 'codex', null)).toThrow(/agent_groups\.agent_provider is 'codex'/);
+  });
+
+  it('fails clearly when a stale session provider conflicts with container.json', () => {
+    expect(() => resolveProviderName('codex', null, 'opencode')).toThrow(
+      /container\.json resolves to 'opencode'.*sessions\.agent_provider is 'codex'/,
+    );
+  });
+
+  it('fails clearly when a stale agent group provider would otherwise override container.json', () => {
+    expect(() => resolveProviderName(null, 'opencode', 'claude')).toThrow(
+      /container\.json resolves to 'claude'.*agent_groups\.agent_provider is 'opencode'/,
+    );
+  });
+
+  it('fails clearly on DB-only provider configuration instead of silently overriding the default', () => {
+    expect(() => resolveProviderName(null, 'opencode', undefined)).toThrow(
+      /container\.json resolves to 'claude'.*agent_groups\.agent_provider is 'opencode'/,
+    );
   });
 });
 
@@ -690,10 +700,20 @@ describe('session wake lifecycle', () => {
     }
   });
 
-  it('exposes Yente local service env and host aliases for Codex sessions', async () => {
+  it('exposes Yente local service env and host aliases for configured provider sessions', async () => {
     const harness = await loadContainerRunnerHarness();
     try {
-      harness.sessions.updateSession(harness.session.id, { agent_provider: 'codex' });
+      fs.mkdirSync(path.join(harness.groupsDir, 'agent'), { recursive: true });
+      fs.writeFileSync(
+        path.join(harness.groupsDir, 'agent', 'container.json'),
+        JSON.stringify({
+          mcpServers: {},
+          packages: { apt: [], npm: [] },
+          additionalMounts: [],
+          skills: 'all',
+          provider: 'opencode',
+        }),
+      );
 
       const wake = harness.containerRunner.wakeContainer(harness.session);
       await harness.oneCliStarted.promise;

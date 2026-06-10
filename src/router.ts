@@ -27,7 +27,12 @@ import {
   getMessagingGroupWithAgentCount,
 } from './db/messaging-groups.js';
 import { withRuntimeLock } from './db/runtime-locks.js';
-import { findActiveSessionThreadIdEndingWithForAgent, findSessionForAgent, getSession } from './db/sessions.js';
+import {
+  findActiveNonNullSessionThreadIdsForAgent,
+  findActiveSessionThreadIdEndingWithForAgent,
+  findSessionForAgent,
+  getSession,
+} from './db/sessions.js';
 import { deliverSessionMessages, getDeliveryAdapter, suppressSessionOutbound } from './delivery.js';
 import { startTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
@@ -35,7 +40,7 @@ import { resolveSession, writeSessionMessage, writeOutboundDirect } from './sess
 import { wakeContainer } from './container-runner.js';
 import type { AgentGroup, MessagingGroup, MessagingGroupAgent, Session } from './types.js';
 import type { InboundEvent } from './channels/adapter.js';
-import { handleYenteHostCommand } from './yente/host-commands.js';
+import { handleYenteHostCommand, parseYenteHostCommandFromContent } from './yente/host-commands.js';
 import {
   markSchedulerResetOldOutboundSuppressed,
   markSchedulerResetResponseDelivered,
@@ -440,20 +445,49 @@ async function deliverToAgent(
     effectiveSessionMode = 'per-thread';
   }
 
+  let agentEvent = event;
+  if (effectiveSessionMode === 'per-thread') {
+    const nullThreadReset = resolveDiscordNullThreadReset(agent.agent_group_id, mg, agentEvent);
+    if (nullThreadReset.action === 'refuse') {
+      const deliveryAddr = agentEvent.replyTo ?? {
+        channelType: agentEvent.channelType,
+        platformId: agentEvent.platformId,
+        threadId: agentEvent.threadId,
+      };
+      await deliverHostText(deliveryAddr, nullThreadReset.message, 'discord-null-thread-reset-refused');
+      log.warn('Refused ambiguous Discord null-thread reset command', {
+        agentGroupId: agent.agent_group_id,
+        messagingGroupId: mg.id,
+        platformId: agentEvent.platformId,
+        activeThreadIds: nullThreadReset.activeThreadIds,
+      });
+      return;
+    }
+    if (nullThreadReset.action === 'retarget') {
+      log.info('Retargeted Discord null-thread reset command to sole active thread session', {
+        agentGroupId: agent.agent_group_id,
+        messagingGroupId: mg.id,
+        platformId: agentEvent.platformId,
+        threadId: nullThreadReset.threadId,
+      });
+      agentEvent = { ...agentEvent, threadId: nullThreadReset.threadId };
+    }
+  }
+
   // The inbound row's (channel_type, platform_id, thread_id) is the address
   // the agent's reply will be delivered to. Normally it mirrors the source
   // (stamped from the event). When the caller supplied `replyTo` (CLI admin
   // transport acting on operator intent), the reply is redirected there.
-  const deliveryAddr = event.replyTo ?? {
-    channelType: event.channelType,
-    platformId: event.platformId,
-    threadId: event.threadId,
+  const deliveryAddr = agentEvent.replyTo ?? {
+    channelType: agentEvent.channelType,
+    platformId: agentEvent.platformId,
+    threadId: agentEvent.threadId,
   };
 
   let session: Session;
   let created: boolean;
   try {
-    ({ session, created } = resolveSession(agent.agent_group_id, mg.id, event.threadId, effectiveSessionMode));
+    ({ session, created } = resolveSession(agent.agent_group_id, mg.id, agentEvent.threadId, effectiveSessionMode));
   } catch (err) {
     if (err instanceof RouteResetInProgressError) {
       await deliverHostText(
@@ -464,18 +498,18 @@ async function deliverToAgent(
       log.info('Refused to create competing session during scheduler-aware reset', {
         agentGroupId: agent.agent_group_id,
         messagingGroupId: mg.id,
-        threadId: event.threadId,
+        threadId: agentEvent.threadId,
       });
       return;
     }
     throw err;
   }
 
-  if (event.message.kind === 'chat' || event.message.kind === 'chat-sdk') {
+  if (agentEvent.message.kind === 'chat' || agentEvent.message.kind === 'chat-sdk') {
     let hostCommand;
     try {
       hostCommand = await handleYenteHostCommand({
-        content: event.message.content,
+        content: agentEvent.message.content,
         userId,
         agentGroup,
         messagingGroup: mg,
@@ -539,8 +573,8 @@ async function deliverToAgent(
   // Command gate: classify slash commands before they reach the container.
   // Filtered commands are dropped silently. Denied admin commands get a
   // permission-denied response written directly to messages_out.
-  if (event.message.kind === 'chat' || event.message.kind === 'chat-sdk') {
-    const gate = gateCommand(event.message.content, userId, agent.agent_group_id);
+  if (agentEvent.message.kind === 'chat' || agentEvent.message.kind === 'chat-sdk') {
+    const gate = gateCommand(agentEvent.message.content, userId, agent.agent_group_id);
     if (gate.action === 'filter') {
       log.debug('Filtered command dropped by gate', { agentGroupId: agent.agent_group_id });
       return;
@@ -560,14 +594,14 @@ async function deliverToAgent(
   }
 
   writeSessionMessage(session.agent_group_id, session.id, {
-    id: messageIdForAgent(event.message.id, agent.agent_group_id),
-    kind: event.message.kind,
-    timestamp: event.message.timestamp,
+    id: messageIdForAgent(agentEvent.message.id, agent.agent_group_id),
+    kind: agentEvent.message.kind,
+    timestamp: agentEvent.message.timestamp,
     platformId: deliveryAddr.platformId,
-    platformMessageId: event.message.id || null,
+    platformMessageId: agentEvent.message.id || null,
     channelType: deliveryAddr.channelType,
     threadId: deliveryAddr.threadId,
-    content: event.message.content,
+    content: agentEvent.message.content,
     trigger: wake ? 1 : 0,
     // Host-stamped route identity from the resolved messaging group. Lets the
     // container normalizer collapse DM aliases safely and isolate distinct
@@ -580,7 +614,7 @@ async function deliverToAgent(
     sessionId: session.id,
     agentGroup: agent.agent_group_id,
     engage_mode: agent.engage_mode,
-    kind: event.message.kind,
+    kind: agentEvent.message.kind,
     userId,
     wake,
     created,
@@ -590,12 +624,45 @@ async function deliverToAgent(
   if (wake) {
     // Typing indicator + wake are only for the engaged branch; accumulated
     // messages sit silently until a real trigger fires.
-    startTypingRefresh(session.id, session.agent_group_id, event.channelType, event.platformId, event.threadId);
+    startTypingRefresh(
+      session.id,
+      session.agent_group_id,
+      agentEvent.channelType,
+      agentEvent.platformId,
+      agentEvent.threadId,
+    );
     const freshSession = getSession(session.id);
     if (freshSession) {
       await wakeContainer(freshSession);
     }
   }
+}
+
+type DiscordNullThreadResetResolution =
+  | { action: 'none' }
+  | { action: 'retarget'; threadId: string }
+  | { action: 'refuse'; message: string; activeThreadIds: string[] };
+
+function resolveDiscordNullThreadReset(
+  agentGroupId: string,
+  mg: MessagingGroup,
+  event: InboundEvent,
+): DiscordNullThreadResetResolution {
+  if (event.channelType !== 'discord' || event.threadId !== null || mg.is_group === 0) return { action: 'none' };
+  if (event.message.kind !== 'chat' && event.message.kind !== 'chat-sdk') return { action: 'none' };
+
+  const command = parseYenteHostCommandFromContent(event.message.content);
+  if (command !== 'new' && command !== 'clear') return { action: 'none' };
+
+  const activeThreadIds = findActiveNonNullSessionThreadIdsForAgent(agentGroupId, mg.id);
+  if (activeThreadIds.length === 0) return { action: 'none' };
+  if (activeThreadIds.length === 1) return { action: 'retarget', threadId: activeThreadIds[0] };
+  return {
+    action: 'refuse',
+    activeThreadIds,
+    message:
+      'Cannot reset a Discord per-thread session without a thread id because multiple active sessions exist for this channel. Send /new from the target thread or include the exact thread id.',
+  };
 }
 
 async function finishSchedulerAwareResetHostCommand(

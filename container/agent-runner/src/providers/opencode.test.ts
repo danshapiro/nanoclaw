@@ -17,11 +17,7 @@ import {
   type OpenCodeRuntimeFactory,
   type OpenCodeRelayRuntimeFactory,
 } from './opencode.js';
-import {
-  classifyContinuation,
-  isMissingOpenCodeSessionError,
-  zombieDecision,
-} from './opencode-errors.js';
+import { classifyContinuation, isMissingOpenCodeSessionError, zombieDecision } from './opencode-errors.js';
 import type { OpenCodePumpClock } from './opencode-events.js';
 import type { ProviderEvent } from './types.js';
 
@@ -114,9 +110,8 @@ describe('OpenCode config', () => {
   });
 
   it('applies the model-provider timeout under a non-default active provider name', () => {
-    const config = withEnv(
-      { OPENCODE_PROVIDER: 'opencode-go', OPENCODE_MODEL_PROVIDER_TIMEOUT_MS: '12345' },
-      () => buildOpenCodeConfig({ mcpServers: undefined }),
+    const config = withEnv({ OPENCODE_PROVIDER: 'opencode-go', OPENCODE_MODEL_PROVIDER_TIMEOUT_MS: '12345' }, () =>
+      buildOpenCodeConfig({ mcpServers: undefined }),
     );
     const provider = config.provider as Record<string, { options?: { timeout?: number | false } }>;
     expect(provider['opencode-go']?.options?.timeout).toBe(12345);
@@ -147,6 +142,41 @@ describe('OpenCode config', () => {
     >;
     expect(provider.openai?.options?.timeout).toBe(21600000);
     expect(provider.openai?.models?.['gpt-5.5']?.options?.reasoningEffort).toBe('xhigh');
+  });
+
+  it('scopes continuations by configured OpenCode runtime identity', () => {
+    const scopeA = withEnv(
+      {
+        OPENCODE_PROVIDER: 'openai',
+        OPENCODE_MODEL: 'openai/gpt-5.5',
+        OPENCODE_SMALL_MODEL: undefined,
+        OPENCODE_REASONING_EFFORT: 'xhigh',
+      },
+      () => new OpenCodeProvider({ mcpServers: undefined }).continuationScope,
+    );
+    const scopeB = withEnv(
+      {
+        OPENCODE_PROVIDER: 'opencode-go',
+        OPENCODE_MODEL: 'opencode-go/deepseek-v4-pro',
+        OPENCODE_SMALL_MODEL: undefined,
+        OPENCODE_REASONING_EFFORT: undefined,
+      },
+      () => new OpenCodeProvider({ mcpServers: undefined }).continuationScope,
+    );
+    const unscopedDefault = withEnv(
+      {
+        OPENCODE_PROVIDER: undefined,
+        OPENCODE_MODEL: undefined,
+        OPENCODE_SMALL_MODEL: undefined,
+        OPENCODE_REASONING_EFFORT: undefined,
+      },
+      () => new OpenCodeProvider({ mcpServers: undefined }).continuationScope,
+    );
+
+    expect(scopeA).toMatch(/^[0-9a-f]{16}$/);
+    expect(scopeB).toMatch(/^[0-9a-f]{16}$/);
+    expect(scopeA).not.toBe(scopeB);
+    expect(unscopedDefault).toBeUndefined();
   });
 
   it('relay-mode config denies mutation/shell/file/web/question via REAL ids; reachable set = allowlist', () => {
@@ -430,9 +460,9 @@ describe('isMissingOpenCodeSessionError (trigger-only predicate)', () => {
 
 describe('classifyContinuation (authoritative clear policy)', () => {
   it('clears only when the positive existence check proves the session is gone', async () => {
-    expect(await classifyContinuation({ attemptedContinuation: 'ses_old', sessionExists: async () => false })).toMatchObject(
-      { policy: 'clear', reason: 'session-missing' },
-    );
+    expect(
+      await classifyContinuation({ attemptedContinuation: 'ses_old', sessionExists: async () => false }),
+    ).toMatchObject({ policy: 'clear', reason: 'session-missing' });
   });
 
   it('preserves continuation on a bare 404 when the session still exists', async () => {
@@ -630,8 +660,14 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     // Let prompt() resolve and input-accepted emit, then drive the stream.
     await Promise.resolve();
     await new Promise((r) => setTimeout(r, 5));
-    stream.push({ type: 'message.updated', properties: { info: { id: 'm1', role: 'assistant' }, sessionID: TEST_SESSION } });
-    stream.push({ type: 'message.part.updated', properties: { sessionID: TEST_SESSION, part: { type: 'text', messageID: 'm1', text: 'Done.' } } });
+    stream.push({
+      type: 'message.updated',
+      properties: { info: { id: 'm1', role: 'assistant' }, sessionID: TEST_SESSION },
+    });
+    stream.push({
+      type: 'message.part.updated',
+      properties: { sessionID: TEST_SESSION, part: { type: 'text', messageID: 'm1', text: 'Done.' } },
+    });
     stream.push({ type: 'session.idle', properties: { sessionID: TEST_SESSION } });
     await reader;
 
@@ -659,7 +695,13 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
       type: 'message.part.updated',
       properties: {
         sessionID: TEST_SESSION,
-        part: { type: 'tool', tool: 'question', callID: 'call-1', messageID: 'm1', state: { input: { question: "What is Matt Van Horn's email?" } } },
+        part: {
+          type: 'tool',
+          tool: 'question',
+          callID: 'call-1',
+          messageID: 'm1',
+          state: { input: { question: "What is Matt Van Horn's email?" } },
+        },
       },
     });
     stream.push({
@@ -696,7 +738,12 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
   it('emits a typed terminal interruption (not a raw throw) on session.error, preserving continuation', async () => {
     const stream = new FakeStream();
     const { provider } = makeProvider({ stream });
-    const query = provider.query({ inputId: 'in-e', prompt: 'work', cwd: '/workspace/agent', continuation: TEST_SESSION });
+    const query = provider.query({
+      inputId: 'in-e',
+      prompt: 'work',
+      cwd: '/workspace/agent',
+      continuation: TEST_SESSION,
+    });
     const events: ProviderEvent[] = [];
     const reader = (async () => {
       for await (const e of query.events) {
@@ -705,9 +752,17 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
       }
     })();
     await new Promise((r) => setTimeout(r, 5));
-    stream.push({ type: 'session.error', properties: { sessionID: TEST_SESSION, error: { data: { message: 'boom' } } } });
+    stream.push({
+      type: 'session.error',
+      properties: { sessionID: TEST_SESSION, error: { data: { message: 'boom' } } },
+    });
     await reader;
-    const interruption = events.find((e) => e.type === 'interruption') as { classification: string; continuationPolicy: string; fallbackUserMessage: string; terminal: boolean };
+    const interruption = events.find((e) => e.type === 'interruption') as {
+      classification: string;
+      continuationPolicy: string;
+      fallbackUserMessage: string;
+      terminal: boolean;
+    };
     expect(interruption.classification).toBe('opencode_session_error');
     expect(interruption.continuationPolicy).toBe('preserve');
     expect(interruption.terminal).toBe(true);
@@ -729,11 +784,16 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     await new Promise((r) => setTimeout(r, 5));
     stream.push({
       type: 'message.part.updated',
-      properties: { sessionID: TEST_SESSION, part: { type: 'tool', tool: 'bash', callID: 'c-1', messageID: 'm1', state: { status: 'completed' } } },
+      properties: {
+        sessionID: TEST_SESSION,
+        part: { type: 'tool', tool: 'bash', callID: 'c-1', messageID: 'm1', state: { status: 'completed' } },
+      },
     });
     stream.push({ type: 'session.idle', properties: { sessionID: TEST_SESSION } });
     await reader;
-    const se = events.find((e) => e.type === 'side-effect') as { sideEffect: { kind: string; label: string; inputId: string } } | undefined;
+    const se = events.find((e) => e.type === 'side-effect') as
+      | { sideEffect: { kind: string; label: string; inputId: string } }
+      | undefined;
     expect(se).toBeDefined();
     expect(se!.sideEffect).toMatchObject({ kind: 'tool_completed', label: 'bash', inputId: 'in-s' });
     // Side-effect emitted BEFORE the result.
@@ -756,12 +816,24 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     // A long-running bash with a declared timeout starts (no completion yet).
     stream.push({
       type: 'message.part.updated',
-      properties: { sessionID: TEST_SESSION, part: { type: 'tool', tool: 'bash', callID: 'c-long', messageID: 'm1', state: { status: 'running', input: { timeout: 600000 } } } },
+      properties: {
+        sessionID: TEST_SESSION,
+        part: {
+          type: 'tool',
+          tool: 'bash',
+          callID: 'c-long',
+          messageID: 'm1',
+          state: { status: 'running', input: { timeout: 600000 } },
+        },
+      },
     });
     // It completes.
     stream.push({
       type: 'message.part.updated',
-      properties: { sessionID: TEST_SESSION, part: { type: 'tool', tool: 'bash', callID: 'c-long', messageID: 'm1', state: { status: 'completed' } } },
+      properties: {
+        sessionID: TEST_SESSION,
+        part: { type: 'tool', tool: 'bash', callID: 'c-long', messageID: 'm1', state: { status: 'completed' } },
+      },
     });
     stream.push({ type: 'session.idle', properties: { sessionID: TEST_SESSION } });
     await reader;
@@ -786,16 +858,37 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     // Two overlapping tools: a SHORT one (10 min) and a LONG one (60 min).
     stream.push({
       type: 'message.part.updated',
-      properties: { sessionID: TEST_SESSION, part: { type: 'tool', tool: 'short_tool', callID: 'c-short', messageID: 'm1', state: { status: 'running', input: { timeout: 600000 } } } },
+      properties: {
+        sessionID: TEST_SESSION,
+        part: {
+          type: 'tool',
+          tool: 'short_tool',
+          callID: 'c-short',
+          messageID: 'm1',
+          state: { status: 'running', input: { timeout: 600000 } },
+        },
+      },
     });
     stream.push({
       type: 'message.part.updated',
-      properties: { sessionID: TEST_SESSION, part: { type: 'tool', tool: 'long_tool', callID: 'c-long', messageID: 'm1', state: { status: 'running', input: { timeout: 3600000 } } } },
+      properties: {
+        sessionID: TEST_SESSION,
+        part: {
+          type: 'tool',
+          tool: 'long_tool',
+          callID: 'c-long',
+          messageID: 'm1',
+          state: { status: 'running', input: { timeout: 3600000 } },
+        },
+      },
     });
     // The SHORT tool completes first; the LONG tool is still running.
     stream.push({
       type: 'message.part.updated',
-      properties: { sessionID: TEST_SESSION, part: { type: 'tool', tool: 'short_tool', callID: 'c-short', messageID: 'm1', state: { status: 'completed' } } },
+      properties: {
+        sessionID: TEST_SESSION,
+        part: { type: 'tool', tool: 'short_tool', callID: 'c-short', messageID: 'm1', state: { status: 'completed' } },
+      },
     });
     // Snapshot point: after the short tool completes, the long tool must still be
     // the persisted (widening) active tool.
@@ -803,7 +896,10 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     // Now the long tool completes too.
     stream.push({
       type: 'message.part.updated',
-      properties: { sessionID: TEST_SESSION, part: { type: 'tool', tool: 'long_tool', callID: 'c-long', messageID: 'm1', state: { status: 'completed' } } },
+      properties: {
+        sessionID: TEST_SESSION,
+        part: { type: 'tool', tool: 'long_tool', callID: 'c-long', messageID: 'm1', state: { status: 'completed' } },
+      },
     });
     stream.push({ type: 'session.idle', properties: { sessionID: TEST_SESSION } });
     await reader;
@@ -840,7 +936,16 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     // A tool with a declared timeout starts, but the budget is already negative.
     stream.push({
       type: 'message.part.updated',
-      properties: { sessionID: TEST_SESSION, part: { type: 'tool', tool: 'bash', callID: 'c-cap0', messageID: 'm1', state: { status: 'running', input: { timeout: 600000 } } } },
+      properties: {
+        sessionID: TEST_SESSION,
+        part: {
+          type: 'tool',
+          tool: 'bash',
+          callID: 'c-cap0',
+          messageID: 'm1',
+          state: { status: 'running', input: { timeout: 600000 } },
+        },
+      },
     });
     stream.push({ type: 'session.idle', properties: { sessionID: TEST_SESSION } });
     await reader;
@@ -882,7 +987,9 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     delete process.env.OPENCODE_TRANSPORT_TIMEOUT_MS;
     delete process.env.OPENCODE_WAIT_TICK_MS;
     expect(stop).toBe(true);
-    const notice = events.find((e) => e.type === 'notice') as { classification: string; relayRecommended: boolean; inputId: string } | undefined;
+    const notice = events.find((e) => e.type === 'notice') as
+      | { classification: string; relayRecommended: boolean; inputId: string }
+      | undefined;
     expect(notice).toBeDefined();
     expect(notice!.classification).toBe('inactivity');
     expect(notice!.relayRecommended).toBe(true);
@@ -905,7 +1012,12 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     process.env.OPENCODE_WAIT_TICK_MS = '3600000';
     process.env.OPENCODE_INACTIVITY_NOTICE_MS = '3600000';
     const { provider } = makeProvider({ clock, stream, persistActiveTool: (t) => persisted.push(t) });
-    const query = provider.query({ inputId: 'in-tt', prompt: 'no sse work', cwd: '/workspace/agent', continuation: TEST_SESSION });
+    const query = provider.query({
+      inputId: 'in-tt',
+      prompt: 'no sse work',
+      cwd: '/workspace/agent',
+      continuation: TEST_SESSION,
+    });
     const events: ProviderEvent[] = [];
     const reader = (async () => {
       for await (const e of query.events) {
@@ -917,7 +1029,16 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     // A long tool starts (so we can assert tool state is cleared on timeout).
     stream.push({
       type: 'message.part.updated',
-      properties: { sessionID: TEST_SESSION, part: { type: 'tool', tool: 'bash', callID: 'c-tt', messageID: 'm1', state: { status: 'running', input: { timeout: 600000 } } } },
+      properties: {
+        sessionID: TEST_SESSION,
+        part: {
+          type: 'tool',
+          tool: 'bash',
+          callID: 'c-tt',
+          messageID: 'm1',
+          state: { status: 'running', input: { timeout: 600000 } },
+        },
+      },
     });
     await new Promise((r) => setTimeout(r, 5));
     // No further SSE — advance past the transport-death window.
@@ -927,7 +1048,9 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     delete process.env.OPENCODE_TRANSPORT_TIMEOUT_MS;
     delete process.env.OPENCODE_WAIT_TICK_MS;
     delete process.env.OPENCODE_INACTIVITY_NOTICE_MS;
-    const interruption = events.find((e) => e.type === 'interruption') as { classification: string; continuationPolicy: string; fallbackUserMessage: string } | undefined;
+    const interruption = events.find((e) => e.type === 'interruption') as
+      | { classification: string; continuationPolicy: string; fallbackUserMessage: string }
+      | undefined;
     expect(interruption).toBeDefined();
     expect(interruption!.classification).toBe('opencode_transport_timeout');
     expect(interruption!.continuationPolicy).toBe('preserve');
@@ -947,7 +1070,12 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     // The existence check (client.session.get) proves the attempted session is
     // gone — the ONLY authoritative clear allowed on a transport interruption.
     controller.sessionExistsResult = false;
-    const query = provider.query({ inputId: 'in-clr', prompt: 'no sse work', cwd: '/workspace/agent', continuation: TEST_SESSION });
+    const query = provider.query({
+      inputId: 'in-clr',
+      prompt: 'no sse work',
+      cwd: '/workspace/agent',
+      continuation: TEST_SESSION,
+    });
     const events: ProviderEvent[] = [];
     const reader = (async () => {
       for await (const e of query.events) {
@@ -962,7 +1090,9 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     delete process.env.OPENCODE_TRANSPORT_TIMEOUT_MS;
     delete process.env.OPENCODE_WAIT_TICK_MS;
     delete process.env.OPENCODE_INACTIVITY_NOTICE_MS;
-    const interruption = events.find((e) => e.type === 'interruption') as { classification: string; continuationPolicy: string } | undefined;
+    const interruption = events.find((e) => e.type === 'interruption') as
+      | { classification: string; continuationPolicy: string }
+      | undefined;
     expect(interruption).toBeDefined();
     expect(interruption!.classification).toBe('opencode_transport_timeout');
     // Authoritative existence-check not-found ⇒ clear continuation.
@@ -986,7 +1116,12 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     controller.sessionExists = async () => {
       throw new Error('ECONNRESET while probing session existence');
     };
-    const query = provider.query({ inputId: 'in-incon', prompt: 'no sse work', cwd: '/workspace/agent', continuation: TEST_SESSION });
+    const query = provider.query({
+      inputId: 'in-incon',
+      prompt: 'no sse work',
+      cwd: '/workspace/agent',
+      continuation: TEST_SESSION,
+    });
     const events: ProviderEvent[] = [];
     const reader = (async () => {
       for await (const e of query.events) {
@@ -1044,7 +1179,14 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
 
     // Concurrently run a relay query (relayMode) — it must NOT destroy the main
     // controller and must use its own relay controller.
-    const relayQuery = provider.query({ inputId: 'in-relay', prompt: 'status', cwd: '/workspace/agent', relayMode: true, relayDeadlineMs: 30000, toolPolicy: 'status_only' });
+    const relayQuery = provider.query({
+      inputId: 'in-relay',
+      prompt: 'status',
+      cwd: '/workspace/agent',
+      relayMode: true,
+      relayDeadlineMs: 30000,
+      toolPolicy: 'status_only',
+    });
     const relayReader = (async () => {
       for await (const e of relayQuery.events) {
         if (e.type === 'result') break;
@@ -1107,11 +1249,16 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     await new Promise((r) => setTimeout(r, 5));
     stream.push({
       type: 'message.part.updated',
-      properties: { sessionID: TEST_SESSION, part: { type: 'tool', tool: 'bash', callID: 'gws-1', messageID: 'm1', state: { status: 'completed' } } },
+      properties: {
+        sessionID: TEST_SESSION,
+        part: { type: 'tool', tool: 'bash', callID: 'gws-1', messageID: 'm1', state: { status: 'completed' } },
+      },
     });
     stream.push({ type: 'session.idle', properties: { sessionID: TEST_SESSION } });
     await reader;
-    const sideEffects = events.filter((e) => e.type === 'side-effect') as Array<{ sideEffect: { id: string; kind: string } }>;
+    const sideEffects = events.filter((e) => e.type === 'side-effect') as Array<{
+      sideEffect: { id: string; kind: string };
+    }>;
     // The authoritative imported entry is emitted (kind summarize_dnd_summary_artifact).
     expect(sideEffects.some((e) => e.sideEffect.id === 'audit-validated')).toBe(true);
   });

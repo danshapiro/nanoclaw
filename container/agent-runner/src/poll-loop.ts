@@ -169,15 +169,21 @@ const OPENCODE_CONTINUATION_FAILURE_LIMIT =
  * that only emits bare 404s is not preserved forever. Keyed per provider +
  * continuation. A successful result resets it.
  */
-function zombieCounterKey(providerName: string, continuation: string): string {
-  return `zombie_failures:${providerName.toLowerCase()}:${continuation}`;
+function zombieCounterKey(providerName: string, continuation: string, continuationScope?: string): string {
+  const provider = providerName.toLowerCase();
+  const scope = continuationScope
+    ?.trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '_');
+  const providerKey = scope ? `${provider}:${scope}` : provider;
+  return `zombie_failures:${providerKey}:${continuation}`;
 }
 
-function readZombieCounter(providerName: string, continuation: string): number {
+function readZombieCounter(providerName: string, continuation: string, continuationScope?: string): number {
   try {
     const row = getOutboundDb()
       .prepare('SELECT value FROM session_state WHERE key = ?')
-      .get(zombieCounterKey(providerName, continuation)) as { value: string } | undefined;
+      .get(zombieCounterKey(providerName, continuation, continuationScope)) as { value: string } | undefined;
     const n = row ? Number(row.value) : 0;
     return Number.isFinite(n) && n >= 0 ? n : 0;
   } catch {
@@ -185,19 +191,26 @@ function readZombieCounter(providerName: string, continuation: string): number {
   }
 }
 
-function writeZombieCounter(providerName: string, continuation: string, count: number): void {
+function writeZombieCounter(
+  providerName: string,
+  continuation: string,
+  count: number,
+  continuationScope?: string,
+): void {
   try {
     getOutboundDb()
       .prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
-      .run(zombieCounterKey(providerName, continuation), String(count), new Date().toISOString());
+      .run(zombieCounterKey(providerName, continuation, continuationScope), String(count), new Date().toISOString());
   } catch {
     /* non-fatal */
   }
 }
 
-function resetZombieCounter(providerName: string, continuation: string): void {
+function resetZombieCounter(providerName: string, continuation: string, continuationScope?: string): void {
   try {
-    getOutboundDb().prepare('DELETE FROM session_state WHERE key = ?').run(zombieCounterKey(providerName, continuation));
+    getOutboundDb()
+      .prepare('DELETE FROM session_state WHERE key = ?')
+      .run(zombieCounterKey(providerName, continuation, continuationScope));
   } catch {
     /* non-fatal */
   }
@@ -242,7 +255,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   // provider decides how to use it (Claude resumes a .jsonl transcript,
   // other providers may reload a thread ID, etc.). Keyed per-provider so
   // a Codex thread id never gets handed to Claude or vice versa.
-  let continuation: string | undefined = migrateLegacyContinuation(config.providerName);
+  const continuationScope = config.provider.continuationScope;
+  let continuation: string | undefined = migrateLegacyContinuation(config.providerName, continuationScope);
 
   if (continuation) {
     log(`Resuming agent session ${continuation}`);
@@ -348,8 +362,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // A THROW in the pre-task handler itself (module import / handler crash) is
       // a recoverable pre-query failure handled by the catch below.
       // MODULE-HOOK:scheduling-pre-task:start
-      const runPreTask =
-        config.runPreTaskScripts ?? (await import('./scheduling/task-script.js')).applyPreTaskScripts;
+      const runPreTask = config.runPreTaskScripts ?? (await import('./scheduling/task-script.js')).applyPreTaskScripts;
       const preTask = await runPreTask(activeMessages);
       keep = preTask.keep;
       skipped = preTask.skipped;
@@ -414,8 +427,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         status: 'pending',
         classification: 'pre_query_failure',
         agentMessage: 'A setup step failed before I started working; I will retry.',
-        fallbackUserMessage:
-          'I hit a problem before starting your request and will retry it automatically.',
+        fallbackUserMessage: 'I hit a problem before starting your request and will retry it automatically.',
         originalTasks,
         acceptedUnresolvedInputs: [],
         pendingFollowups: [],
@@ -448,7 +460,13 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         processingIds,
         config.providerName,
         replyAccounting,
-        { topLevelInputId, activeRouteKey, activeRouteScope, originalTasks, resumableRecoveryIds: resumableRecovery.map((e) => e.id) },
+        {
+          topLevelInputId,
+          activeRouteKey,
+          activeRouteScope,
+          originalTasks,
+          resumableRecoveryIds: resumableRecovery.map((e) => e.id),
+        },
         config.inspectAttachmentFile,
         config.signal,
         config,
@@ -459,10 +477,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         // text alone — that comes from the provider as a clear-continuation
         // event or a 'clear' continuationPolicy on a terminal interruption.
         continuation = undefined;
-        clearContinuation(config.providerName);
+        clearContinuation(config.providerName, continuationScope);
       } else if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
-        setContinuation(config.providerName, continuation);
+        setContinuation(config.providerName, continuation, continuationScope);
       }
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
@@ -474,7 +492,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       if (continuation && config.provider.isSessionInvalid(err, { attemptedContinuation: continuation })) {
         log(`Stale session detected (${continuation}) — clearing for next retry`);
         continuation = undefined;
-        clearContinuation(config.providerName);
+        clearContinuation(config.providerName, continuationScope);
       }
 
       // Provider throw is a sanitized recoverable interruption. Write a
@@ -680,7 +698,9 @@ async function processQuery(
     if (topLevelResolved && ledgerCtx.resumableRecoveryIds.length > 0) {
       const entries = listRecoveryEntries(ledgerCtx.activeRouteScope);
       for (const recId of ledgerCtx.resumableRecoveryIds) {
-        const ownedInputIds = (entries.find((e) => e.id === recId)?.acceptedUnresolvedInputs ?? []).map((a) => a.inputId);
+        const ownedInputIds = (entries.find((e) => e.id === recId)?.acceptedUnresolvedInputs ?? []).map(
+          (a) => a.inputId,
+        );
         const res = resolveRecoveryEntry(ledgerCtx.activeRouteScope, recId, { resolvedInputIds: ownedInputIds });
         if (res.resolvedMessageIds.length > 0) markRecoveryCompleted(res.resolvedMessageIds, recId);
       }
@@ -693,8 +713,7 @@ async function processQuery(
     return inputIds.some((inputId) => {
       const entry = ledger.get(inputId);
       return Boolean(
-        entry?.requiresUserVisibleReply &&
-          outboundVisibleReplyCountAfter <= entry.outboundVisibleReplyCountBefore,
+        entry?.requiresUserVisibleReply && outboundVisibleReplyCountAfter <= entry.outboundVisibleReplyCountBefore,
       );
     });
   }
@@ -870,7 +889,7 @@ async function processQuery(
         queryContinuation = event.continuation;
         // Persist immediately so a mid-turn container crash still lets the
         // next wake resume the conversation.
-        setContinuation(providerName, event.continuation);
+        setContinuation(providerName, event.continuation, config?.provider.continuationScope);
       } else if (event.type === 'input-accepted') {
         onInputAccepted(event.inputId);
       } else if (event.type === 'notice') {
@@ -921,7 +940,7 @@ async function processQuery(
           // context — so a dead session that only emits bare 404s is not
           // preserved forever. A successful result resets the counter.
           const cont = (event.attemptedContinuation ?? queryContinuation) as string;
-          const failures = readZombieCounter(providerName, cont) + 1;
+          const failures = readZombieCounter(providerName, cont, config?.provider.continuationScope) + 1;
           const decision = zombieDecision({
             continuation: cont,
             consecutiveTerminalFailures: failures,
@@ -931,7 +950,7 @@ async function processQuery(
             clearContinuationRequested = true;
             queryContinuation = undefined;
             zombieFailureCleared = decision.userVisibleRestart;
-            resetZombieCounter(providerName, cont);
+            resetZombieCounter(providerName, cont, config?.provider.continuationScope);
             log(
               JSON.stringify({
                 severity: 'warn',
@@ -941,7 +960,7 @@ async function processQuery(
               }),
             );
           } else {
-            writeZombieCounter(providerName, cont, failures);
+            writeZombieCounter(providerName, cont, failures, config?.provider.continuationScope);
           }
         }
         // Seed the recovery payload with any provider-collected side effects so
@@ -973,14 +992,26 @@ async function processQuery(
         const dispatch = event.text ? dispatchResultText(event.text, routing) : { sent: 0, hasUnwrapped: false };
         const stillMissingVisibleReply = hasMissingVisibleReply(resolved);
         if (event.text) {
-          if (dispatch.hasUnwrapped && dispatch.sent === 0 && resolved.length === 1 && !unwrappedOutputNudged && stillMissingVisibleReply) {
+          if (
+            dispatch.hasUnwrapped &&
+            dispatch.sent === 0 &&
+            resolved.length === 1 &&
+            !unwrappedOutputNudged &&
+            stillMissingVisibleReply
+          ) {
             unwrappedOutputNudged = true;
             pendingUnwrappedOutputText = event.text;
             query.push({ inputId: resolved[0], prompt: buildUnwrappedOutputNudge(routing, event.text) });
             continue;
           }
         }
-        if (unwrappedOutputNudged && dispatch.sent === 0 && resolved.length === 1 && pendingUnwrappedOutputText && stillMissingVisibleReply) {
+        if (
+          unwrappedOutputNudged &&
+          dispatch.sent === 0 &&
+          resolved.length === 1 &&
+          pendingUnwrappedOutputText &&
+          stillMissingVisibleReply
+        ) {
           log(
             JSON.stringify({
               severity: 'warn',
@@ -999,7 +1030,7 @@ async function processQuery(
         }
         // A successful result on this continuation resets the zombie backstop —
         // the session proved live.
-        if (queryContinuation) resetZombieCounter(providerName, queryContinuation);
+        if (queryContinuation) resetZombieCounter(providerName, queryContinuation, config?.provider.continuationScope);
         settleInitialBatch(resolved.includes(ledgerCtx.topLevelInputId));
       }
     }
@@ -1260,7 +1291,9 @@ function dispatchResultText(text: string, routing: RoutingContext): { sent: numb
 
   if (sent === 0 && text.trim()) {
     if (messageBlocks > 0) {
-      log(`WARNING: agent output had <message to="..."> blocks, but none resolved to a known destination — nothing was sent`);
+      log(
+        `WARNING: agent output had <message to="..."> blocks, but none resolved to a known destination — nothing was sent`,
+      );
     } else {
       log(`WARNING: agent output had no <message to="..."> blocks — nothing was sent`);
     }

@@ -5,23 +5,33 @@
  * Primary use: remember each provider's opaque continuation id so the
  * agent's conversation resumes across container restarts. Keyed per
  * provider because continuations are provider-private — a Claude
- * conversation id means nothing to Codex and vice versa. Switching
- * providers is therefore lossless: each provider's last thread stays
- * on file and resumes cleanly if the user flips back.
+ * conversation id means nothing to Codex and vice versa. Providers may
+ * add a runtime-config scope when their continuation ids are tied to
+ * model/provider settings; switching either providers or scoped runtime
+ * configs then starts fresh without deleting the old slot.
  */
 import { getOutboundDb } from './connection.js';
 import type { ProviderContinuationPolicy, ProviderSideEffect } from '../providers/types.js';
 
 const LEGACY_KEY = 'sdk_session_id';
 
-function continuationKey(providerName: string): string {
-  return `continuation:${providerName.toLowerCase()}`;
+function keyPart(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '_');
+}
+
+function continuationKey(providerName: string, continuationScope?: string): string {
+  const provider = keyPart(providerName);
+  const scope = continuationScope ? keyPart(continuationScope) : '';
+  return scope ? `continuation:${provider}:${scope}` : `continuation:${provider}`;
 }
 
 function getValue(key: string): string | undefined {
-  const row = getOutboundDb()
-    .prepare('SELECT value FROM session_state WHERE key = ?')
-    .get(key) as { value: string } | undefined;
+  const row = getOutboundDb().prepare('SELECT value FROM session_state WHERE key = ?').get(key) as
+    | { value: string }
+    | undefined;
   return row?.value;
 }
 
@@ -40,19 +50,21 @@ function deleteValue(key: string): void {
  *
  * Before this was keyed per provider, continuations lived under the
  * single key `sdk_session_id`. On container start, if that legacy row
- * exists and the current provider has no continuation of its own, adopt
- * the legacy value into the current provider's slot (best-guess — the
- * legacy row was written by whatever provider ran last). The legacy row
- * is always deleted so future provider flips never re-read a stale id
- * through the wrong lens.
+ * exists and the current provider has no unscoped continuation of its own,
+ * adopt the legacy value into the current provider's slot (best-guess — the
+ * legacy row was written by whatever provider ran last). Scoped continuations
+ * deliberately do NOT adopt the legacy value because the prior runtime config
+ * is unknowable; using it would reintroduce stale model/provider resumes. The
+ * legacy row is always deleted so future provider flips never re-read a stale
+ * id through the wrong lens.
  *
  * Returns the continuation the caller should use at startup (either the
  * current provider's existing value, the adopted legacy value, or
  * undefined).
  */
-export function migrateLegacyContinuation(providerName: string): string | undefined {
+export function migrateLegacyContinuation(providerName: string, continuationScope?: string): string | undefined {
   const legacy = getValue(LEGACY_KEY);
-  const currentKey = continuationKey(providerName);
+  const currentKey = continuationKey(providerName, continuationScope);
   const current = getValue(currentKey);
 
   if (legacy === undefined) return current;
@@ -63,20 +75,22 @@ export function migrateLegacyContinuation(providerName: string): string | undefi
   // Prefer the current provider's own slot if one already exists.
   if (current !== undefined) return current;
 
+  if (continuationScope) return undefined;
+
   setValue(currentKey, legacy);
   return legacy;
 }
 
-export function getContinuation(providerName: string): string | undefined {
-  return getValue(continuationKey(providerName));
+export function getContinuation(providerName: string, continuationScope?: string): string | undefined {
+  return getValue(continuationKey(providerName, continuationScope));
 }
 
-export function setContinuation(providerName: string, id: string): void {
-  setValue(continuationKey(providerName), id);
+export function setContinuation(providerName: string, id: string, continuationScope?: string): void {
+  setValue(continuationKey(providerName, continuationScope), id);
 }
 
-export function clearContinuation(providerName: string): void {
-  deleteValue(continuationKey(providerName));
+export function clearContinuation(providerName: string, continuationScope?: string): void {
+  deleteValue(continuationKey(providerName, continuationScope));
 }
 
 // ── Continuation-clear helper requiring attempted-continuation metadata ──────
@@ -91,11 +105,12 @@ export function clearContinuation(providerName: string): void {
 export function clearContinuationWithProof(
   providerName: string,
   meta: { attemptedContinuation: string; reason: string },
+  continuationScope?: string,
 ): void {
   if (!meta.attemptedContinuation) {
     throw new Error('clearContinuationWithProof requires attemptedContinuation metadata');
   }
-  clearContinuation(providerName);
+  clearContinuation(providerName, continuationScope);
 }
 
 // ── Route-scoped provider recovery (Task 1 Step 8) ───────────────────────────
@@ -246,7 +261,9 @@ export function appendRecoveryEntryAndOwnRows(
   const key = recoveryKey(scope);
   const now = new Date().toISOString();
   const nextPayload = JSON.stringify([...existing, entry]);
-  const setStateStmt = db.prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES ($key, $value, $updated_at)');
+  const setStateStmt = db.prepare(
+    'INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES ($key, $value, $updated_at)',
+  );
   const ownStmt = db.prepare(
     "INSERT OR REPLACE INTO processing_ack (message_id, status, status_changed) VALUES ($id, 'recovery', datetime('now'))",
   );
@@ -398,8 +415,7 @@ export function recoverMalformedRecovery(scope: ProviderRecoveryScope): Malforme
       status: 'pending',
       classification: 'malformed_recovery_reconstructed',
       agentMessage: 'Recovering interrupted work after a corrupted recovery record.',
-      fallbackUserMessage:
-        'I hit a problem restoring my place. If your last request is unfinished, please resend it.',
+      fallbackUserMessage: 'I hit a problem restoring my place. If your last request is unfinished, please resend it.',
       originalTasks: salvagedIds.map((id) => ({ messageId: id, text: '(reconstructed)', timestamp: now })),
       acceptedUnresolvedInputs: [],
       pendingFollowups: [],

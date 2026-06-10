@@ -52,7 +52,10 @@ function dmScope(overrides: Partial<ProviderRecoveryScope> = {}): ProviderRecove
 }
 
 let recoverySeq = 0;
-function newRecoveryEntry(scope: ProviderRecoveryScope, overrides: Partial<ProviderRecoveryEntry> = {}): ProviderRecoveryEntry {
+function newRecoveryEntry(
+  scope: ProviderRecoveryScope,
+  overrides: Partial<ProviderRecoveryEntry> = {},
+): ProviderRecoveryEntry {
   const now = new Date().toISOString();
   recoverySeq += 1;
   return {
@@ -96,6 +99,16 @@ describe('session-state — per-provider continuations', () => {
     expect(getContinuation('codex')).toBe('codex-thread-xyz');
   });
 
+  test('runtime scopes are isolated within one provider', () => {
+    setContinuation('opencode', 'old-default');
+    setContinuation('opencode', 'openai-session', 'openai-gpt-5.5-xhigh');
+    setContinuation('opencode', 'deepseek-session', 'opencode-go-deepseek-v4-pro');
+
+    expect(getContinuation('opencode')).toBe('old-default');
+    expect(getContinuation('opencode', 'openai-gpt-5.5-xhigh')).toBe('openai-session');
+    expect(getContinuation('opencode', 'opencode-go-deepseek-v4-pro')).toBe('deepseek-session');
+  });
+
   test('clearContinuation only affects the specified provider', () => {
     setContinuation('claude', 'keep-me');
     setContinuation('codex', 'drop-me');
@@ -104,6 +117,18 @@ describe('session-state — per-provider continuations', () => {
 
     expect(getContinuation('claude')).toBe('keep-me');
     expect(getContinuation('codex')).toBeUndefined();
+  });
+
+  test('clearContinuation only affects the specified runtime scope', () => {
+    setContinuation('opencode', 'keep-unscoped');
+    setContinuation('opencode', 'drop-scoped', 'scope-a');
+    setContinuation('opencode', 'keep-scoped', 'scope-b');
+
+    clearContinuation('opencode', 'scope-a');
+
+    expect(getContinuation('opencode')).toBe('keep-unscoped');
+    expect(getContinuation('opencode', 'scope-a')).toBeUndefined();
+    expect(getContinuation('opencode', 'scope-b')).toBe('keep-scoped');
   });
 
   test('unknown provider returns undefined', () => {
@@ -119,6 +144,16 @@ describe('session-state — legacy migration', () => {
 
     expect(adopted).toBe('old-session-id');
     expect(getContinuation('claude')).toBe('old-session-id');
+  });
+
+  test('does not adopt legacy continuation into scoped runtime config', () => {
+    seedLegacy('old-session-id');
+
+    const adopted = migrateLegacyContinuation('opencode', 'openai-gpt-5.5-xhigh');
+
+    expect(adopted).toBeUndefined();
+    expect(getContinuation('opencode', 'openai-gpt-5.5-xhigh')).toBeUndefined();
+    expect(migrateLegacyContinuation('claude')).toBeUndefined();
   });
 
   test('always deletes legacy row regardless of migration outcome', () => {
@@ -207,7 +242,9 @@ describe('side_effect_ledger import', () => {
     const r = importSideEffectLedger({ jsonl });
     expect(r.imported).toBe(1);
 
-    const row = getOutboundDb().prepare('SELECT kind, evidence_json FROM side_effect_ledger WHERE id = ?').get('tc-1') as {
+    const row = getOutboundDb()
+      .prepare('SELECT kind, evidence_json FROM side_effect_ledger WHERE id = ?')
+      .get('tc-1') as {
       kind: string;
       evidence_json: string;
     };
@@ -364,7 +401,11 @@ describe('side_effect_ledger import', () => {
     const mismatch = getAuthoritativeSideEffects({ inputId: 'in-ACTIVE', routeKey: 'opencode|discord|chan-9|dm:mg-9' });
     expect(mismatch.map((s) => s.id)).toEqual([]);
     // No filter still returns both (back-compat).
-    expect(getAuthoritativeSideEffects().map((s) => s.id).sort()).toEqual(['active-turn', 'other-turn']);
+    expect(
+      getAuthoritativeSideEffects()
+        .map((s) => s.id)
+        .sort(),
+    ).toEqual(['active-turn', 'other-turn']);
   });
 });
 
@@ -562,13 +603,19 @@ describe('provider recovery entries', () => {
     expect(second).toHaveLength(1); // non-destructive read
 
     // A different route does not see this entry.
-    const otherScope = dmScope({ routeKey: 'opencode|discord|chan-2|dm:mg-2', messagingGroupId: 'mg-2', platformId: 'chan-2' });
+    const otherScope = dmScope({
+      routeKey: 'opencode|discord|chan-2|dm:mg-2',
+      messagingGroupId: 'mg-2',
+      platformId: 'chan-2',
+    });
     expect(listRecoveryEntries(otherScope)).toHaveLength(0);
   });
 
   test('pending -> in_flight -> resolved deletes only after successful resolution', () => {
     const scope = dmScope();
-    const entry = newRecoveryEntry(scope, { acceptedUnresolvedInputs: [{ inputId: 'in-1', messageIds: ['m1'], prompt: 'do it' }] });
+    const entry = newRecoveryEntry(scope, {
+      acceptedUnresolvedInputs: [{ inputId: 'in-1', messageIds: ['m1'], prompt: 'do it' }],
+    });
     appendRecoveryEntry(scope, entry);
 
     markRecoveryInFlight(scope, entry.id, 'in-1');
@@ -585,7 +632,9 @@ describe('provider recovery entries', () => {
 
   test('an in_flight entry that gets another terminal interruption is retained and enriched, not deleted', () => {
     const scope = dmScope();
-    const entry = newRecoveryEntry(scope, { acceptedUnresolvedInputs: [{ inputId: 'in-1', messageIds: ['m1'], prompt: 'do it' }] });
+    const entry = newRecoveryEntry(scope, {
+      acceptedUnresolvedInputs: [{ inputId: 'in-1', messageIds: ['m1'], prompt: 'do it' }],
+    });
     appendRecoveryEntry(scope, entry);
     markRecoveryInFlight(scope, entry.id, 'in-1');
 
@@ -636,12 +685,15 @@ describe('provider recovery entries', () => {
   test('malformed recovery JSON is not destructively deleted until owned rows are reconstructed', () => {
     const scope = dmScope();
     // Plant a malformed payload directly under the route's storage key.
-    appendRecoveryEntry(scope, newRecoveryEntry(scope, { originalTasks: [{ messageId: 'm-keep', text: 'keep me', timestamp: new Date().toISOString() }] }));
+    appendRecoveryEntry(
+      scope,
+      newRecoveryEntry(scope, {
+        originalTasks: [{ messageId: 'm-keep', text: 'keep me', timestamp: new Date().toISOString() }],
+      }),
+    );
     // Corrupt the stored JSON.
     const key = `recovery:${scope.providerName}:${scope.routeKey}`;
-    getOutboundDb()
-      .prepare('UPDATE session_state SET value = ? WHERE key = ?')
-      .run('{not valid json', key);
+    getOutboundDb().prepare('UPDATE session_state SET value = ? WHERE key = ?').run('{not valid json', key);
 
     const outcome = recoverMalformedRecovery(scope);
     // Either reconstructed into a replacement entry or returned a fallback — never silently dropped.
@@ -663,10 +715,14 @@ describe('provider recovery entries', () => {
     // Rows are currently claimed (processing) — terminal interruption is moving
     // them to recovery ownership.
     getOutboundDb()
-      .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m1', 'processing', datetime('now'))")
+      .prepare(
+        "INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m1', 'processing', datetime('now'))",
+      )
       .run();
     getOutboundDb()
-      .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m2', 'processing', datetime('now'))")
+      .prepare(
+        "INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m2', 'processing', datetime('now'))",
+      )
       .run();
 
     const entry = newRecoveryEntry(scope, {
@@ -685,7 +741,9 @@ describe('provider recovery entries', () => {
   test('a mid-transaction failure rolls back BOTH the ownership move and the payload append (no partial state)', () => {
     const scope = dmScope();
     getOutboundDb()
-      .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m1', 'processing', datetime('now'))")
+      .prepare(
+        "INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m1', 'processing', datetime('now'))",
+      )
       .run();
 
     const entry = newRecoveryEntry(scope, {

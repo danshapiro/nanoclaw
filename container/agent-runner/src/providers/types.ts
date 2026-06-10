@@ -6,6 +6,14 @@ export interface AgentProvider {
    */
   readonly supportsNativeSlashCommands: boolean;
 
+  /**
+   * Optional provider-owned scope for stored continuation ids. Providers whose
+   * session ids are tied to runtime config should return a stable value derived
+   * from that config so model/provider flips start fresh instead of resuming an
+   * incompatible prior session.
+   */
+  readonly continuationScope?: string;
+
   /** Start a new query. Returns a handle for streaming input and output. */
   query(input: QueryInput): AgentQuery;
 
@@ -59,7 +67,6 @@ export interface QueryTurnInput {
 }
 
 export interface QueryInput extends QueryTurnInput {
-
   /**
    * Opaque continuation token from a previous query. The provider decides
    * what this means (session ID, thread ID, nothing at all).
@@ -124,7 +131,12 @@ export interface ProviderInterruption {
 export interface ProviderSideEffect {
   id: string;
   inputId: string;
-  kind: 'gmail_draft_created' | 'summarize_dnd_recording_cached' | 'summarize_dnd_summary_artifact' | 'tool_completed' | 'other';
+  kind:
+    | 'gmail_draft_created'
+    | 'summarize_dnd_recording_cached'
+    | 'summarize_dnd_summary_artifact'
+    | 'tool_completed'
+    | 'other';
   label: string;
   evidence: Record<string, string | number | boolean | null>;
   occurredAt: string;
