@@ -24,7 +24,7 @@ export const applyManagedRepos: McpToolDefinition = {
   tool: {
     name: 'apply_managed_repos',
     description:
-      'Ask the host to reconcile /workspace/local-skills/repos/manifest.json into /workspace/repos and applied group context. Main agent only; fire-and-forget.',
+      'Ask the host to reconcile host-declared managed repos into /workspace/repos, refresh /workspace/local-skills, and apply group context. Main agent only; fire-and-forget.',
     inputSchema: {
       type: 'object' as const,
       properties: {},
@@ -54,7 +54,11 @@ export const pushManagedRepo: McpToolDefinition = {
     inputSchema: {
       type: 'object' as const,
       properties: {
-        repoId: { type: 'string', description: 'Managed repo id from /workspace/repos/.managed/status.json' },
+        repoId: {
+          type: 'string',
+          description:
+            'Managed repo id from /workspace/repos/.managed/status.json, such as yente-context or local-skills.',
+        },
       },
       required: ['repoId'],
     },
