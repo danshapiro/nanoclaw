@@ -240,6 +240,7 @@ export function buildOpenCodeConfig(
   // by OpenCode, so point at the concrete files, not at composed CLAUDE.md.
   const instructions = [
     '/app/CLAUDE.md',
+    '/workspace/global/CLAUDE.local.md',
     '/workspace/agent/.claude-fragments/*.md',
     '/workspace/agent/CLAUDE.local.md',
   ];

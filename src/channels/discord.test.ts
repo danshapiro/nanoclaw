@@ -131,10 +131,32 @@ describe('Discord outbound Markdown normalization', () => {
     );
   });
 
+  it('rewrites bare Google Docs URLs before Discord autolink rendering', () => {
+    const url = 'https://docs.google.com/document/d/1haogfNkDIsknGWbWcBoKtDL_afj2rDBKKJhamyG2zcU';
+
+    expect(
+      normalizeDiscordOutboundMarkdown(
+        `Fable 5 rerun is complete. The new doc is at ${url} — both summaries are in there.`,
+      ),
+    ).toBe(`Fable 5 rerun is complete. The new doc is at [Google Doc](${url}) — both summaries are in there.`);
+  });
+
   it('rewrites generic URL-labeled links without changing the target', () => {
     const url = 'https://example.com/report?run=1';
 
     expect(normalizeDiscordOutboundMarkdown(`[${url}](${url})`)).toBe(`[link](${url})`);
+  });
+
+  it('rewrites bare generic URLs and preserves trailing sentence punctuation', () => {
+    const url = 'https://example.com/report?run=1';
+
+    expect(normalizeDiscordOutboundMarkdown(`See ${url}.`)).toBe(`See [link](${url}).`);
+  });
+
+  it('rewrites angle-bracket autolinks as masked links', () => {
+    const url = 'https://docs.google.com/spreadsheets/d/abc123/edit';
+
+    expect(normalizeDiscordOutboundMarkdown(`Sheet: <${url}>`)).toBe(`Sheet: [Google Sheet](${url})`);
   });
 
   it('leaves already descriptive masked links unchanged', () => {
@@ -150,6 +172,7 @@ describe('Discord outbound Markdown normalization', () => {
       '```md',
       `[${url}](${url})`,
       '```',
+      `Inline raw \`${url}\` stays literal.`,
       `Outside [${url}](${url}) changes.`,
     ].join('\n');
 
@@ -159,6 +182,7 @@ describe('Discord outbound Markdown normalization', () => {
         '```md',
         `[${url}](${url})`,
         '```',
+        `Inline raw \`${url}\` stays literal.`,
         `Outside [Google Doc](${url}) changes.`,
       ].join('\n'),
     );

@@ -13,8 +13,10 @@ import { syncYenteDiscordApplicationCommands } from './discord-commands.js';
 
 const DISCORD_API_BASE = 'https://discord.com/api/v10';
 const DISCORD_MESSAGE_TEXT_LIMIT = 2000;
-const URL_LABELED_MARKDOWN_LINK = /\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g;
+const MARKDOWN_LINK = /\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g;
+const BARE_HTTP_URL = /<?https?:\/\/[^\s<>()\]]+>?/g;
 type DiscordAdapterInstance = ReturnType<typeof createDiscordAdapter>;
+type NormalizeStats = { urlLabeledLinks: number; bareUrls: number };
 type TextSegment = { content: string; isProtected: boolean };
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -56,23 +58,68 @@ registerChannelAdapter('discord', {
 });
 
 export function normalizeDiscordOutboundMarkdown(text: string): string {
-  let rewriteCount = 0;
+  const stats: NormalizeStats = { urlLabeledLinks: 0, bareUrls: 0 };
   const normalized = splitMarkdownProtectedRegions(text)
     .map(({ content, isProtected }) => {
       if (isProtected) return content;
-      return content.replace(URL_LABELED_MARKDOWN_LINK, (match, rawLabel: string, targetUrl: string) => {
-        if (!isHttpUrlLabel(rawLabel)) return match;
-        rewriteCount++;
-        return `[${labelForUrl(targetUrl)}](${targetUrl})`;
-      });
+      return normalizeDiscordTextSegment(content, stats);
     })
     .join('')
     .replace(/^(\d+)\.$/gm, '$1\\.');
 
-  if (rewriteCount > 0) {
-    log.info('Discord outbound URL-labeled links normalized', { count: rewriteCount });
+  if (stats.urlLabeledLinks > 0 || stats.bareUrls > 0) {
+    log.info('Discord outbound links normalized', stats);
   }
   return normalized;
+}
+
+function normalizeDiscordTextSegment(content: string, stats: NormalizeStats): string {
+  let normalized = '';
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+
+  MARKDOWN_LINK.lastIndex = 0;
+  while ((match = MARKDOWN_LINK.exec(content)) !== null) {
+    normalized += normalizeBareUrls(content.slice(lastIndex, match.index), stats);
+
+    const rawMatch = match[0];
+    const rawLabel = match[1] ?? '';
+    const targetUrl = match[2] ?? '';
+    if (isHttpUrlLabel(rawLabel)) {
+      stats.urlLabeledLinks++;
+      normalized += `[${labelForUrl(targetUrl)}](${targetUrl})`;
+    } else {
+      normalized += rawMatch;
+    }
+    lastIndex = match.index + rawMatch.length;
+  }
+
+  normalized += normalizeBareUrls(content.slice(lastIndex), stats);
+  return normalized;
+}
+
+function normalizeBareUrls(content: string, stats: NormalizeStats): string {
+  return content.replace(BARE_HTTP_URL, (match: string) => {
+    const split = splitBareUrlMatch(match);
+    if (!split || !parseHttpUrl(split.url)) return match;
+
+    stats.bareUrls++;
+    return `[${labelForUrl(split.url)}](${split.url})${split.suffix}`;
+  });
+}
+
+function splitBareUrlMatch(match: string): { url: string; suffix: string } | null {
+  if (match.startsWith('<')) {
+    if (!match.endsWith('>')) return null;
+    return { url: match.slice(1, -1), suffix: '' };
+  }
+
+  const url = stripTrailingUrlPunctuation(match);
+  return { url, suffix: match.slice(url.length) };
+}
+
+function stripTrailingUrlPunctuation(value: string): string {
+  return value.replace(/[.,;:!?]+$/g, '');
 }
 
 function splitMarkdownProtectedRegions(text: string): TextSegment[] {

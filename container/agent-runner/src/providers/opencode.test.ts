@@ -118,6 +118,17 @@ describe('OpenCode config', () => {
     expect(provider).not.toHaveProperty('options');
   });
 
+  it('loads global prompt instructions through a concrete OpenCode path', () => {
+    const config = buildOpenCodeConfig({ mcpServers: undefined });
+
+    expect(config.instructions).toEqual([
+      '/app/CLAUDE.md',
+      '/workspace/global/CLAUDE.local.md',
+      '/workspace/agent/.claude-fragments/*.md',
+      '/workspace/agent/CLAUDE.local.md',
+    ]);
+  });
+
   it('allows OpenAI through OpenCode and passes reasoning effort as a model option', () => {
     const config = withEnv(
       {
