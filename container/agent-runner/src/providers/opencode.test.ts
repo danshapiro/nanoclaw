@@ -777,8 +777,9 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     expect(interruption.classification).toBe('opencode_session_error');
     expect(interruption.continuationPolicy).toBe('preserve');
     expect(interruption.terminal).toBe(true);
-    // Sanitized: no raw provider text in the user-facing fallback.
-    expect(interruption.fallbackUserMessage).not.toContain('boom');
+    // Trusted-operator policy: the provider's error text is surfaced verbatim in
+    // the user-facing fallback (so an actionable cause is not hidden).
+    expect(interruption.fallbackUserMessage).toContain('boom');
   });
 
   it('captures a completed tool as a side-effect reference event before result', async () => {

@@ -970,15 +970,16 @@ async function processQuery(
         }
         // A terminal interruption ends this turn before any user-visible result.
         // Every terminal path must leave the user with a visible next step (the
-        // Inactivity/terminal contract): write ONE sanitized direct fallback
+        // Inactivity/terminal contract): write ONE direct fallback
         // (route-stamped) so the user is never silently stranded — e.g. a denied
         // native question whose recovery is the blocked question text. We write
         // this fallback even if an earlier input in the same wake already produced
         // result text, because the interrupted (usually follow-up) work needs its
         // own visible recovery path. Guarded by `directFallbackSent` so a
-        // relay/inactivity fallback already sent this turn is not duplicated. The
-        // raw provider error text never leaks (the provider already sanitized
-        // fallbackUserMessage).
+        // relay/inactivity fallback already sent this turn is not duplicated. When
+        // the provider supplied a display-oriented error message, it is included
+        // verbatim in fallbackUserMessage (trusted-operator policy — see
+        // buildInterruption in opencode.ts).
         if (event.terminal && !directFallbackSent) {
           directFallbackSent = true;
           writeRoutedMessage(routing, event.fallbackUserMessage);

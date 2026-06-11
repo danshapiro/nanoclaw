@@ -979,12 +979,13 @@ describe('Task 6 Steps 3-4 — Dvora 5/19 recording → summary replay', () => {
       await loop.catch(() => {});
     }
 
-    // No outbound text contains raw provider timeout/error tokens.
+    // Internal timeout cause tokens never leak; the provider's own error message
+    // IS surfaced verbatim on the terminal interruption (trusted-operator policy).
     for (const t of outboundTexts()) {
       expect(t).not.toContain('OpenCode event timeout');
       expect(t).not.toContain('event timeout');
-      expect(t).not.toContain('opencode internal boom');
     }
+    expect(outboundTexts().some((t) => t.includes('opencode internal boom'))).toBe(true);
 
     // Recovery includes the EXACT progress line harvested from messages_out + the
     // original task (Dvora contract line 49/1459).
@@ -1475,7 +1476,9 @@ describe('Task 6 Step 8 — terminal after side effect: no duplication, recovery
         .filter((e) => e.status !== 'resolved')
         .at(-1)!;
       expect(rec.sideEffects.some((s) => s.kind === 'gmail_draft_created')).toBe(true);
-      for (const t of outboundTexts()) expect(t).not.toContain('stream died after draft');
+      // The provider's error message is surfaced verbatim in the user-facing
+      // fallback (trusted-operator policy); recovery evidence above is unaffected.
+      expect(outboundTexts().some((t) => t.includes('stream died after draft'))).toBe(true);
 
       // ── Wake B (the resume): the resumed prompt tells Yente the draft already
       // happened (recovery context includes the completed side effect). The agent
@@ -1591,7 +1594,9 @@ describe('Task 6 Step 8 — terminal after side effect: no duplication, recovery
       .at(-1)!;
     expect(rec.sideEffects.some((s) => s.kind === 'summarize_dnd_summary_artifact')).toBe(true);
     expect(rec.sideEffects.some((s) => s.kind === 'gmail_draft_created')).toBe(false);
-    for (const t of outboundTexts()) expect(t).not.toContain('died after summary');
+    // The provider's error message is surfaced verbatim in the user-facing
+    // fallback (trusted-operator policy); recovery evidence above is unaffected.
+    expect(outboundTexts().some((t) => t.includes('died after summary'))).toBe(true);
 
     // The summary is NOT redone on retry: re-importing the same JSONL is idempotent.
     const before = ledgerRows().filter((r) => r.kind === 'summarize_dnd_summary_artifact').length;
@@ -1620,6 +1625,12 @@ describe('Task 6 Step 9 — direct transport/terminal taxonomy', () => {
     expectContinuation: 'preserve' | 'clear';
     /** Whether the session-existence check should report the session GONE. */
     sessionGone?: boolean;
+    /**
+     * When the provider hands us a display-oriented error message, the exact
+     * text that must be surfaced VERBATIM in user-visible output. Absent for
+     * internal transport/liveness conditions that carry no provider message.
+     */
+    expectVisibleProviderText?: string;
   };
 
   const cases: Tax[] = [
@@ -1674,6 +1685,7 @@ describe('Task 6 Step 9 — direct transport/terminal taxonomy', () => {
       },
       expectClassification: 'opencode_session_error',
       expectContinuation: 'preserve',
+      expectVisibleProviderText: 'model error',
     },
     {
       name: 'retry exhaustion / session_retry_limit (preserve)',
@@ -1685,6 +1697,7 @@ describe('Task 6 Step 9 — direct transport/terminal taxonomy', () => {
       },
       expectClassification: 'opencode_session_retry_limit',
       expectContinuation: 'preserve',
+      expectVisibleProviderText: 'retry limit reached',
     },
   ];
 
@@ -1765,14 +1778,23 @@ describe('Task 6 Step 9 — direct transport/terminal taxonomy', () => {
       } else {
         expect(getContinuation('opencode')).toBe('ses_tax');
       }
-      // No raw provider error text in any user-visible output.
+      // Internal transport cause tokens and classification identifiers never
+      // leak into user-visible output.
       for (const t of outboundTexts()) {
         expect(t).not.toContain('OpenCode event timeout');
         expect(t).not.toContain('event timeout');
         expect(t).not.toContain('ECONNRESET');
-        expect(t).not.toContain('model error');
-        expect(t).not.toContain('retry limit reached');
         expect(t).not.toContain(tc.expectClassification);
+      }
+      // A provider-supplied display message IS surfaced verbatim (trusted-operator
+      // policy); internal-condition cases carry no such message.
+      if (tc.expectVisibleProviderText) {
+        expect(outboundTexts().some((t) => t.includes(tc.expectVisibleProviderText!))).toBe(true);
+      } else {
+        for (const t of outboundTexts()) {
+          expect(t).not.toContain('model error');
+          expect(t).not.toContain('retry limit reached');
+        }
       }
       // A user-visible fallback exists (terminal path never strands the user).
       expect(outboundTexts().some((t) => t.trim().length > 0)).toBe(true);

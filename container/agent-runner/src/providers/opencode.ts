@@ -931,6 +931,14 @@ export class OpenCodeProvider implements AgentProvider {
            * log-only). Preserves continuation by default; carries liveness,
            * input correlation, and any collected side-effect evidence as the
            * recovery seed.
+           *
+           * When the provider hands us a display-oriented error message (a
+           * session.error `data.message` or a retry-limit status message), pass it
+           * as `providerDetail`: it is appended VERBATIM to both the agent-facing
+           * and user-facing messages so the real cause — e.g. "Insufficient
+           * balance…" — is surfaced instead of hidden behind a generic banner.
+           * Trusted-operator policy: provider error text is shown, not sanitized
+           * away.
            */
           const buildInterruption = (
             classification: string,
@@ -938,24 +946,29 @@ export class OpenCodeProvider implements AgentProvider {
             fallbackUserMessage: string,
             liveness: OpenCodeLivenessSnapshot,
             continuationPolicy: ProviderContinuationPolicy,
-          ): Extract<ProviderEvent, { type: 'interruption' }> => ({
-            type: 'interruption',
-            inputId: turnInputId,
-            classification,
-            severity: 'warn',
-            terminal: true,
-            agentMessage,
-            fallbackUserMessage,
-            continuationPolicy,
-            attemptedContinuation: input.continuation,
-            liveness: {
-              configuredTimeoutMs: liveness.configuredTimeoutMs,
-              elapsedMs: liveness.elapsedMs,
-              lastEventType: liveness.lastEventType ?? undefined,
-              lastMeaningfulEventAt: liveness.lastMeaningfulEventAt,
-            },
-            recoverySeed: collectedSideEffects.length > 0 ? { sideEffects: [...collectedSideEffects] } : undefined,
-          });
+            providerDetail?: string,
+          ): Extract<ProviderEvent, { type: 'interruption' }> => {
+            const detail = providerDetail?.trim();
+            const withDetail = (msg: string): string => (detail ? `${msg}\n\nProvider error: ${detail}` : msg);
+            return {
+              type: 'interruption',
+              inputId: turnInputId,
+              classification,
+              severity: 'warn',
+              terminal: true,
+              agentMessage: withDetail(agentMessage),
+              fallbackUserMessage: withDetail(fallbackUserMessage),
+              continuationPolicy,
+              attemptedContinuation: input.continuation,
+              liveness: {
+                configuredTimeoutMs: liveness.configuredTimeoutMs,
+                elapsedMs: liveness.elapsedMs,
+                lastEventType: liveness.lastEventType ?? undefined,
+                lastMeaningfulEventAt: liveness.lastMeaningfulEventAt,
+              },
+              recoverySeed: collectedSideEffects.length > 0 ? { sideEffects: [...collectedSideEffects] } : undefined,
+            };
+          };
 
           let terminalInterruption: Extract<ProviderEvent, { type: 'interruption' }> | null = null;
 
@@ -1241,7 +1254,9 @@ export class OpenCodeProvider implements AgentProvider {
                     // Invariant 159: convert the retry-limit path into a typed,
                     // input-correlated terminal interruption (NOT a raw throw,
                     // NOT a direct activeSessionId clear). Continuation is
-                    // preserved — a retry-limit is not stale-session proof.
+                    // preserved — a retry-limit is not stale-session proof. The
+                    // provider's retry status message is surfaced verbatim so the
+                    // user sees why the turn stopped.
                     clearActiveTools();
                     terminalInterruption = buildInterruption(
                       'opencode_session_retry_limit',
@@ -1249,6 +1264,7 @@ export class OpenCodeProvider implements AgentProvider {
                       'The model had trouble finishing this turn. Your request is preserved — ask me to continue.',
                       pump.liveness(),
                       'preserve',
+                      st.message,
                     );
                     pump.dispose();
                     teardownRuntime('session_retry_limit');
@@ -1259,15 +1275,18 @@ export class OpenCodeProvider implements AgentProvider {
                 case 'session.error': {
                   const props = ev.properties as { sessionID?: string; error?: unknown };
                   if (props.sessionID === sessionId || props.sessionID === undefined) {
-                    // Invariant 159: typed terminal interruption, input-
-                    // correlated, sanitized (no raw provider error text in the
-                    // user-facing fallback). Continuation preserved.
+                    // Typed terminal interruption, input-correlated, continuation
+                    // preserved. The provider's own error message is surfaced
+                    // VERBATIM to the user (trusted-operator policy) so an
+                    // actionable cause — e.g. "Insufficient balance…" — is not
+                    // hidden behind a generic banner.
+                    const providerMessage = sessionErrorMessage(props);
                     log(
                       JSON.stringify({
                         severity: 'warn',
                         event: 'opencode_session_error',
                         session_id: sessionId,
-                        message: sessionErrorMessage(props),
+                        message: providerMessage,
                       }),
                     );
                     clearActiveTools();
@@ -1277,6 +1296,7 @@ export class OpenCodeProvider implements AgentProvider {
                       'Something went wrong on this turn. Your request is preserved — ask me to continue.',
                       pump.liveness(),
                       'preserve',
+                      providerMessage,
                     );
                     pump.dispose();
                     teardownRuntime('session_error');

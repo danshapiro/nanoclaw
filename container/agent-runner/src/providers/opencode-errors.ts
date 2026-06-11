@@ -14,8 +14,14 @@
  *     `clear-continuation`, (b) a positive existence check proving the session
  *     is gone (`classifyContinuation` with `sessionExists`), or (c) the bounded
  *     zombie path (`zombieDecision`).
- *   - Sanitization: user-facing/fallback messages NEVER embed raw provider error
- *     text, stack traces, secrets, or paths.
+ *   - Provider error surfacing (trusted-operator policy): when the provider
+ *     hands us a display-oriented error message — a session.error `data.message`
+ *     or a retry-limit status message — it is surfaced VERBATIM to the user so
+ *     actionable causes (e.g. "Insufficient balance…") are not hidden behind a
+ *     generic banner. The typed interruptions below describe internal
+ *     transport/liveness conditions for which the provider gives NO display
+ *     message, so they carry only their own wording (we still do not fabricate
+ *     raw transport cause strings, stack traces, or paths into them).
  */
 
 import type { ProviderContinuationPolicy } from './types.js';
@@ -103,7 +109,8 @@ export class OpenCodeStreamReadError extends OpenCodeInterruptionError {
   constructor(liveness: OpenCodeLivenessSnapshot) {
     super({
       classification: 'stream-read-error',
-      // Deliberately does NOT embed the raw cause text — sanitized.
+      // A transport read failure has no provider display message; the typed
+      // wording describes the condition (we do not fabricate the raw cause).
       message: 'OpenCode event stream read error',
       liveness,
       fallbackUserMessage: FALLBACK_READ,
