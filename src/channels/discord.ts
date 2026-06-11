@@ -6,13 +6,16 @@ import { createDiscordAdapter } from '@chat-adapter/discord';
 
 import { getDb, hasTable, isDbInitialized } from '../db/connection.js';
 import { readEnvFile } from '../env.js';
+import { log } from '../log.js';
 import { createChatSdkBridge, type ReplyContext } from './chat-sdk-bridge.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import { syncYenteDiscordApplicationCommands } from './discord-commands.js';
 
 const DISCORD_API_BASE = 'https://discord.com/api/v10';
 const DISCORD_MESSAGE_TEXT_LIMIT = 2000;
+const URL_LABELED_MARKDOWN_LINK = /\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g;
 type DiscordAdapterInstance = ReturnType<typeof createDiscordAdapter>;
+type TextSegment = { content: string; isProtected: boolean };
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function extractReplyContext(raw: Record<string, any>): ReplyContext | null {
@@ -47,10 +50,110 @@ registerChannelAdapter('discord', {
       extractReplyContext,
       supportsThreads: true,
       maxTextLength: DISCORD_MESSAGE_TEXT_LIMIT,
-      transformOutboundText: (t) => t.replace(/^(\d+)\.$/gm, '$1\\.'),
+      transformOutboundText: normalizeDiscordOutboundMarkdown,
     });
   },
 });
+
+export function normalizeDiscordOutboundMarkdown(text: string): string {
+  let rewriteCount = 0;
+  const normalized = splitMarkdownProtectedRegions(text)
+    .map(({ content, isProtected }) => {
+      if (isProtected) return content;
+      return content.replace(URL_LABELED_MARKDOWN_LINK, (match, rawLabel: string, targetUrl: string) => {
+        if (!isHttpUrlLabel(rawLabel)) return match;
+        rewriteCount++;
+        return `[${labelForUrl(targetUrl)}](${targetUrl})`;
+      });
+    })
+    .join('')
+    .replace(/^(\d+)\.$/gm, '$1\\.');
+
+  if (rewriteCount > 0) {
+    log.info('Discord outbound URL-labeled links normalized', { count: rewriteCount });
+  }
+  return normalized;
+}
+
+function splitMarkdownProtectedRegions(text: string): TextSegment[] {
+  const segments: TextSegment[] = [];
+  const protectedRegion = /```[\s\S]*?```|`[^`\n]+`/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = protectedRegion.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      segments.push({ content: text.slice(lastIndex, match.index), isProtected: false });
+    }
+    segments.push({ content: match[0], isProtected: true });
+    lastIndex = match.index + match[0].length;
+  }
+
+  if (lastIndex < text.length) {
+    segments.push({ content: text.slice(lastIndex), isProtected: false });
+  }
+  return segments;
+}
+
+function isHttpUrlLabel(label: string): boolean {
+  return parseHttpUrl(stripAutolinkBrackets(label)) !== null;
+}
+
+function stripAutolinkBrackets(label: string): string {
+  const trimmed = label.trim();
+  if (trimmed.startsWith('<') && trimmed.endsWith('>')) {
+    return trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+}
+
+function parseHttpUrl(value: string): URL | null {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+    return url;
+  } catch (err) {
+    if (err instanceof TypeError) return null;
+    throw err;
+  }
+}
+
+function labelForUrl(value: string): string {
+  const parsed = parseHttpUrl(value);
+  if (!parsed) return 'link';
+
+  const host = parsed.hostname.toLowerCase().replace(/^www\./, '');
+  const path = parsed.pathname;
+
+  if (host === 'docs.google.com') {
+    if (path.startsWith('/document/')) return 'Google Doc';
+    if (path.startsWith('/spreadsheets/')) return 'Google Sheet';
+    if (path.startsWith('/presentation/')) return 'Google Slides';
+    if (path.startsWith('/forms/')) return 'Google Form';
+    return 'Google document';
+  }
+  if (host === 'drive.google.com') return 'Google Drive file';
+  if (host === 'calendar.google.com') return 'Google Calendar';
+  if (
+    (host === 'maps.google.com' || host === 'google.com' || host.endsWith('.google.com')) &&
+    path.startsWith('/maps')
+  ) {
+    return 'map';
+  }
+  if (host === 'photos.app.goo.gl' || host === 'photos.google.com') return 'photo album';
+  if (host === 'gist.github.com') return 'gist';
+  if (host === 'github.com') {
+    if (/\/pull\/\d+(?:\/|$)/.test(path)) return 'GitHub PR';
+    if (/\/issues\/\d+(?:\/|$)/.test(path)) return 'GitHub issue';
+    if (/\/commit\/[0-9a-f]+(?:\/|$)/i.test(path)) return 'GitHub commit';
+    return 'GitHub link';
+  }
+  if (host === 'youtu.be' || host === 'youtube.com' || host.endsWith('.youtube.com')) return 'YouTube video';
+  if (host === 'zoom.us' || host.endsWith('.zoom.us')) return 'Zoom link';
+  if (host.endsWith('home.danshapiro.com') && path.startsWith('/p/')) return 'shared page';
+
+  return 'link';
+}
 
 function getRegisteredDiscordChannelIds(): string[] {
   if (!isDbInitialized()) return [];

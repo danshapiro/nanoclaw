@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../db/index.js';
 import { inboundDbPath, resolveSession, writeSessionMessage } from '../session-manager.js';
-import { toDiscordThreadId, yenteDiscordPlatformIdFromThreadId } from './discord.js';
+import { normalizeDiscordOutboundMarkdown, toDiscordThreadId, yenteDiscordPlatformIdFromThreadId } from './discord.js';
 
 vi.mock('../config.js', async () => {
   const actual = await vi.importActual('../config.js');
@@ -119,5 +119,52 @@ describe('Discord v1 channel-id compatibility', () => {
       headers: { Authorization: 'Bot bot-token' },
     });
     globalThis.fetch = originalFetch;
+  });
+});
+
+describe('Discord outbound Markdown normalization', () => {
+  it('rewrites URL-labeled Google Docs links with a plaintext label', () => {
+    const url = 'https://docs.google.com/document/d/abc123/edit';
+
+    expect(normalizeDiscordOutboundMarkdown(`The doc is at [${url}](${url}).`)).toBe(
+      `The doc is at [Google Doc](${url}).`,
+    );
+  });
+
+  it('rewrites generic URL-labeled links without changing the target', () => {
+    const url = 'https://example.com/report?run=1';
+
+    expect(normalizeDiscordOutboundMarkdown(`[${url}](${url})`)).toBe(`[link](${url})`);
+  });
+
+  it('leaves already descriptive masked links unchanged', () => {
+    const url = 'https://docs.google.com/document/d/abc123/edit';
+
+    expect(normalizeDiscordOutboundMarkdown(`[summary doc](${url})`)).toBe(`[summary doc](${url})`);
+  });
+
+  it('does not rewrite markdown examples inside code spans or fenced code blocks', () => {
+    const url = 'https://docs.google.com/document/d/abc123/edit';
+    const text = [
+      `Inline \`[${url}](${url})\` stays literal.`,
+      '```md',
+      `[${url}](${url})`,
+      '```',
+      `Outside [${url}](${url}) changes.`,
+    ].join('\n');
+
+    expect(normalizeDiscordOutboundMarkdown(text)).toBe(
+      [
+        `Inline \`[${url}](${url})\` stays literal.`,
+        '```md',
+        `[${url}](${url})`,
+        '```',
+        `Outside [Google Doc](${url}) changes.`,
+      ].join('\n'),
+    );
+  });
+
+  it('still escapes numbered-list lines that Discord would autoformat', () => {
+    expect(normalizeDiscordOutboundMarkdown('1.\n2.')).toBe('1\\.\n2\\.');
   });
 });
