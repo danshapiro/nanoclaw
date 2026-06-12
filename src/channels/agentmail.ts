@@ -45,14 +45,15 @@ export function createAgentMailAdapter(deps: AgentMailAdapterDeps = {}): Channel
   if (env.AGENTMAIL_ENABLED !== '1') return null;
 
   const apiKey = env.AGENTMAIL_API_KEY?.trim();
-  if (!deps.api && !apiKey) throw new Error('AGENTMAIL_API_KEY is required when AGENTMAIL_ENABLED=1');
+  if (apiKey) throw new Error('AGENTMAIL_API_KEY must live in OneCLI, not NanoClaw env');
+  if (!deps.api) requireAgentMailOneCliProxyEnv(env);
 
   const routePath = env.AGENTMAIL_ROUTES_PATH || `${env.NANOCLAW_ROOT || NANOCLAW_ROOT}/agentmail-routes.json`;
   const routeFile =
     deps.api && !env.AGENTMAIL_ROUTES_PATH ? defaultAgentMailRouteFile() : readAgentMailRouteFile(routePath);
   const routes = resolveAgentMailRoutes(routeFile, env);
   const routesByInbox = new Map(routes.map((route) => [route.inboxId, route]));
-  const api = deps.api ?? createAgentMailApi(apiKey!);
+  const api = deps.api ?? createAgentMailApi({ mode: 'onecli' });
   const now = deps.now ?? (() => new Date().toISOString());
   const catchupPageLimit = catchupPageLimitFromEnv(env);
   const catchupMaxPages = catchupMaxPagesFromEnv(env);
@@ -387,3 +388,16 @@ export function createAgentMailAdapter(deps: AgentMailAdapterDeps = {}): Channel
 }
 
 registerChannelAdapter('agentmail', { factory: () => createAgentMailAdapter() });
+
+function requireAgentMailOneCliProxyEnv(env: NodeJS.ProcessEnv): void {
+  const proxy = env.HTTPS_PROXY?.trim() || env.https_proxy?.trim() || env.HTTP_PROXY?.trim() || env.http_proxy?.trim();
+  if (!proxy) {
+    throw new Error('AgentMail requires OneCLI proxy env when AGENTMAIL_ENABLED=1');
+  }
+  if (env.NODE_USE_ENV_PROXY !== '1') {
+    throw new Error('AgentMail requires NODE_USE_ENV_PROXY=1 when AGENTMAIL_ENABLED=1');
+  }
+  if (!env.NODE_EXTRA_CA_CERTS?.trim()) {
+    throw new Error('AgentMail requires NODE_EXTRA_CA_CERTS from OneCLI when AGENTMAIL_ENABLED=1');
+  }
+}

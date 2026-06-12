@@ -2,6 +2,8 @@ import { AgentMailClient, type AgentMail } from 'agentmail';
 
 import type { AgentMailMessageLike } from './agentmail-config.js';
 
+export const AGENTMAIL_ONECLI_PLACEHOLDER = 'onecli-managed';
+
 export type AgentMailSocketLike = {
   on(event: 'open', handler: () => void): void;
   on(event: 'message', handler: (event: unknown) => void | Promise<void>): void;
@@ -57,8 +59,23 @@ export type AgentMailDownloadedAttachment = {
   data: Buffer;
 };
 
-export function createAgentMailApi(apiKey: string): AgentMailApi {
-  const client = new AgentMailClient({ apiKey });
+export type AgentMailApiAuthOptions = { mode: 'onecli' } | { mode: 'api-key'; apiKey: string };
+
+export function agentMailClientOptions(options: AgentMailApiAuthOptions): AgentMailClient.Options {
+  if (options.mode === 'api-key') {
+    return { apiKey: options.apiKey };
+  }
+  return {
+    authProvider: {
+      async getAuthRequest() {
+        return { headers: { Authorization: `Bearer ${AGENTMAIL_ONECLI_PLACEHOLDER}` } };
+      },
+    },
+  } as AgentMailClient.Options;
+}
+
+export function createAgentMailApi(options: AgentMailApiAuthOptions): AgentMailApi {
+  const client = new AgentMailClient(agentMailClientOptions(options));
 
   return {
     connectWebSocket: () => client.websockets.connect(),

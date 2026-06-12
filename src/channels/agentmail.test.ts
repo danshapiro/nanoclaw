@@ -6,6 +6,7 @@ import { createAgentGroup } from '../db/agent-groups.js';
 import { closeDb, initTestDb } from '../db/connection.js';
 import { runMigrations } from '../db/migrations/index.js';
 import type { ChannelSetup, OutboundMessage } from './adapter.js';
+import { agentMailClientOptions } from './agentmail-api.js';
 import type { AgentMailApi, AgentMailSocketLike } from './agentmail-api.js';
 import { createAgentMailAdapter } from './agentmail.js';
 
@@ -94,6 +95,41 @@ describe('AgentMail adapter', () => {
   });
 
   afterEach(() => closeDb());
+
+  it('refuses raw AgentMail API keys in NanoClaw env', () => {
+    expect(() =>
+      createAgentMailAdapter({
+        env: {
+          AGENTMAIL_ENABLED: '1',
+          AGENTMAIL_DOMAIN: 'agentmail.to',
+          AGENTMAIL_API_KEY: 'am_secret',
+        },
+      }),
+    ).toThrow('AGENTMAIL_API_KEY must live in OneCLI');
+  });
+
+  it('requires OneCLI proxy env when constructing the real AgentMail client', () => {
+    expect(() =>
+      createAgentMailAdapter({
+        env: {
+          AGENTMAIL_ENABLED: '1',
+          AGENTMAIL_DOMAIN: 'agentmail.to',
+        },
+      }),
+    ).toThrow('AgentMail requires OneCLI proxy env');
+  });
+
+  it('uses OneCLI placeholder auth instead of an SDK API key', async () => {
+    const options = agentMailClientOptions({ mode: 'onecli' }) as {
+      apiKey?: string;
+      authProvider?: { getAuthRequest(): Promise<{ headers: Record<string, string> }> };
+    };
+
+    expect(options.apiKey).toBeUndefined();
+    await expect(options.authProvider?.getAuthRequest()).resolves.toEqual({
+      headers: { Authorization: 'Bearer onecli-managed' },
+    });
+  });
 
   it('subscribes one socket to the three configured inboxes', async () => {
     const socket = new FakeSocket();
