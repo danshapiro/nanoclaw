@@ -149,6 +149,24 @@ describe('yente inventory', () => {
     }
   });
 
+  it('skips unreadable secret directories during inventory and hashing', () => {
+    const authDir = path.join(stateRoot, 'codex', 'auth');
+    fs.mkdirSync(authDir, { recursive: true });
+    fs.writeFileSync(path.join(authDir, 'auth.json'), '{"refresh_token":"secret"}');
+    fs.chmodSync(authDir, 0o000);
+
+    try {
+      const inventory = buildYenteInventory({ stateRoot, configRoot, checkedAt: '2026-04-26T00:00:00.000Z' });
+
+      expect(hashSourceState(stateRoot)).toMatch(/^[a-f0-9]{64}$/);
+      expect(inventory.source.files).not.toContain('codex/auth/auth.json');
+      expect(JSON.stringify(inventory)).not.toContain('refresh_token');
+      expect(JSON.stringify(inventory)).not.toContain('codex/auth/auth.json');
+    } finally {
+      fs.chmodSync(authDir, 0o700);
+    }
+  });
+
   it('excludes host backup directories from the source state hash', () => {
     const before = hashSourceState(stateRoot);
     const backupDir = path.join(stateRoot, 'backups', 'predeploy-archive');

@@ -580,7 +580,15 @@ function listFiles(root: string): string[] {
   const files: string[] = [];
 
   function walk(dir: string): void {
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (err) {
+      if (isPermissionDenied(err)) return;
+      throw err;
+    }
+
+    for (const entry of entries) {
       const full = path.join(dir, entry.name);
       const rel = path.relative(root, full).split(path.sep).join('/');
       if (entry.isDirectory() && isSourceHashPrunedDirectory(rel)) continue;
