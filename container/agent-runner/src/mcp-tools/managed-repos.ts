@@ -19,6 +19,7 @@ function err(text: string) {
 }
 
 const REPO_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const LOCAL_SKILL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
 export const applyManagedRepos: McpToolDefinition = {
   tool: {
@@ -83,4 +84,49 @@ export const pushManagedRepo: McpToolDefinition = {
   },
 };
 
-registerTools([applyManagedRepos, pushManagedRepo]);
+export const publishLocalSkill: McpToolDefinition = {
+  tool: {
+    name: 'publish_local_skill',
+    description:
+      'Ask the host to commit and publish uncommitted changes for one local skill under /workspace/local-skills/skills/<skillName>, then reconcile managed repos. Fire-and-forget.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        skillName: {
+          type: 'string',
+          description:
+            'Local skill directory name under /workspace/local-skills/skills, such as summarize-dnd or researching-a-contact.',
+        },
+        commitMessage: {
+          type: 'string',
+          description: 'Git commit message for the isolated local skill edit.',
+        },
+      },
+      required: ['skillName', 'commitMessage'],
+    },
+  },
+  async handler(args) {
+    const skillName = args.skillName as string;
+    const commitMessage = args.commitMessage as string;
+    if (!skillName || !LOCAL_SKILL_NAME_RE.test(skillName))
+      return err('skillName must be a local skill directory name');
+    if (!commitMessage || !commitMessage.trim()) return err('commitMessage must be non-empty');
+
+    const requestId = generateId();
+    writeMessageOut({
+      id: requestId,
+      kind: 'system',
+      content: JSON.stringify({
+        action: 'publish_local_skill',
+        requestId,
+        skillName,
+        commitMessage: commitMessage.trim(),
+      }),
+    });
+
+    log(`publish_local_skill: ${requestId} → ${skillName}`);
+    return ok(`Local skill publish requested for ${skillName}. You will receive a system message when it completes.`);
+  },
+};
+
+registerTools([applyManagedRepos, pushManagedRepo, publishLocalSkill]);

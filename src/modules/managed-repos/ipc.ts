@@ -17,6 +17,12 @@ type ManagedReposIpcTask =
       type: 'push_managed_repo';
       requestId?: string;
       repoId?: string;
+    }
+  | {
+      type: 'publish_local_skill';
+      requestId?: string;
+      skillName?: string;
+      commitMessage?: string;
     };
 
 interface ManagedReposIpcResponse {
@@ -24,6 +30,7 @@ interface ManagedReposIpcResponse {
   requestId: string;
   type: ManagedReposIpcTask['type'];
   repoId?: string;
+  skillName?: string;
   stdout: string;
   stderr: string;
 }
@@ -56,11 +63,14 @@ function commandError(error: unknown): ManagedRepoCommandResult {
 }
 
 async function processManagedReposIpcTask(data: ManagedReposIpcTask, sourceGroup: string): Promise<boolean> {
-  if (data.type !== 'apply_managed_repos' && data.type !== 'push_managed_repo') return false;
+  if (data.type !== 'apply_managed_repos' && data.type !== 'push_managed_repo' && data.type !== 'publish_local_skill') {
+    return false;
+  }
   if (!data.requestId) {
     throw new Error(`${data.type} IPC tasks require requestId`);
   }
   const repoId = 'repoId' in data ? data.repoId : undefined;
+  const skillName = 'skillName' in data ? data.skillName : undefined;
 
   if (data.type === 'push_managed_repo' && !data.repoId) {
     writeResponse(sourceGroup, {
@@ -72,17 +82,33 @@ async function processManagedReposIpcTask(data: ManagedReposIpcTask, sourceGroup
     });
     return true;
   }
+  if (data.type === 'publish_local_skill' && (!data.skillName || !data.commitMessage)) {
+    writeResponse(sourceGroup, {
+      ok: false,
+      requestId: data.requestId,
+      type: data.type,
+      skillName,
+      stdout: '',
+      stderr: 'publish_local_skill requires skillName and commitMessage',
+    });
+    return true;
+  }
 
   try {
-    const result =
-      data.type === 'apply_managed_repos'
-        ? await runManagedRepoCommand('apply-managed-repos.sh')
-        : await runManagedRepoCommand('push-managed-repo.sh', [data.repoId!]);
+    let result: ManagedRepoCommandResult;
+    if (data.type === 'apply_managed_repos') {
+      result = await runManagedRepoCommand('apply-managed-repos.sh');
+    } else if (data.type === 'push_managed_repo') {
+      result = await runManagedRepoCommand('push-managed-repo.sh', [data.repoId!]);
+    } else {
+      result = await runManagedRepoCommand('publish-local-skill.sh', [data.skillName!, data.commitMessage!]);
+    }
     writeResponse(sourceGroup, {
       ok: true,
       requestId: data.requestId,
       type: data.type,
       repoId,
+      skillName,
       stdout: result.stdout,
       stderr: result.stderr,
     });
@@ -93,6 +119,7 @@ async function processManagedReposIpcTask(data: ManagedReposIpcTask, sourceGroup
       requestId: data.requestId,
       type: data.type,
       repoId,
+      skillName,
       stdout: result.stdout,
       stderr: result.stderr,
     });

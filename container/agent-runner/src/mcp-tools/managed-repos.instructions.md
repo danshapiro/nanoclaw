@@ -10,13 +10,24 @@ When you need the host to refresh managed repo checkouts or reapply committed pr
 mcp__nanoclaw__apply_managed_repos({})
 ```
 
-When a managed repo has committed local changes that should be published, call:
+When a managed repo other than local-skills has committed local changes that should be published, call:
 
 ```js
 mcp__nanoclaw__push_managed_repo({ repoId: "yente-context" })
 ```
 
-Use repo id `local-skills` when publishing committed changes from `/workspace/local-skills`:
+For local skill edits, prefer the publish tool. Edit only the intended skill under `/workspace/local-skills/skills/<skill-name>`, then call:
+
+```js
+mcp__nanoclaw__publish_local_skill({
+  skillName: "<skill-name>",
+  commitMessage: "Update <skill-name> instructions"
+})
+```
+
+The host stages only that skill path, commits it, pushes with host credentials, and reconciles managed repos. If unrelated files in `/workspace/local-skills` are dirty, the publish will fail so another agent's work is not swept into your commit.
+
+Use repo id `local-skills` with `push_managed_repo` only when you intentionally created the commit yourself:
 
 ```js
 mcp__nanoclaw__push_managed_repo({ repoId: "local-skills" })

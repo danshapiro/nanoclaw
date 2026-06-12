@@ -10,26 +10,36 @@
  * stable for the numeric parts we assert on (hour, minute, year).
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { execFileSync } from 'child_process';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb } from './db/connection.js';
 import { getPendingMessages } from './db/messages-in.js';
 import { formatMessages, stripInternalTags } from './formatter.js';
 import { TIMEZONE } from './timezone.js';
 
+let originalLocalSkillsWorkspace: string | undefined;
+let originalLocalSkillsWarning: string | undefined;
+
 beforeEach(() => {
   initTestSessionDb();
+  originalLocalSkillsWorkspace = process.env.NANOCLAW_LOCAL_SKILLS_WORKSPACE;
+  originalLocalSkillsWarning = process.env.NANOCLAW_LOCAL_SKILLS_DIRTY_WARNING;
+  process.env.NANOCLAW_LOCAL_SKILLS_WORKSPACE = path.join(os.tmpdir(), `nanoclaw-missing-local-skills-${process.pid}`);
+  delete process.env.NANOCLAW_LOCAL_SKILLS_DIRTY_WARNING;
 });
 
 afterEach(() => {
   closeSessionDb();
+  if (originalLocalSkillsWorkspace === undefined) delete process.env.NANOCLAW_LOCAL_SKILLS_WORKSPACE;
+  else process.env.NANOCLAW_LOCAL_SKILLS_WORKSPACE = originalLocalSkillsWorkspace;
+  if (originalLocalSkillsWarning === undefined) delete process.env.NANOCLAW_LOCAL_SKILLS_DIRTY_WARNING;
+  else process.env.NANOCLAW_LOCAL_SKILLS_DIRTY_WARNING = originalLocalSkillsWarning;
 });
 
-function insertMessage(
-  id: string,
-  kind: string,
-  content: object,
-  opts?: { timestamp?: string },
-) {
+function insertMessage(id: string, kind: string, content: object, opts?: { timestamp?: string }) {
   const timestamp = opts?.timestamp ?? new Date().toISOString();
   getInboundDb()
     .prepare(
@@ -59,6 +69,33 @@ describe('context timezone header', () => {
     const msgsIdx = result.indexOf('<messages>');
     expect(ctxIdx).toBeGreaterThanOrEqual(0);
     expect(msgsIdx).toBeGreaterThan(ctxIdx);
+  });
+});
+
+describe('local-skills dirty warning', () => {
+  it('prepends a turn warning when the local-skills repo has uncommitted changes', () => {
+    const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-local-skills-warning-'));
+    try {
+      fs.mkdirSync(path.join(repo, 'skills', 'demo'), { recursive: true });
+      execFileSync('git', ['-C', repo, 'init', '-b', 'main']);
+      execFileSync('git', ['-C', repo, 'config', 'user.name', 'tester']);
+      execFileSync('git', ['-C', repo, 'config', 'user.email', 'tester@example.test']);
+      fs.writeFileSync(path.join(repo, 'skills', 'demo', 'SKILL.md'), '# Demo\n');
+      execFileSync('git', ['-C', repo, 'add', 'skills/demo/SKILL.md']);
+      execFileSync('git', ['-C', repo, 'commit', '-m', 'seed demo skill']);
+      fs.appendFileSync(path.join(repo, 'skills', 'demo', 'SKILL.md'), '\nDirty edit\n');
+      process.env.NANOCLAW_LOCAL_SKILLS_WORKSPACE = repo;
+
+      insertMessage('m1', 'chat', { sender: 'Alice', text: 'hello' });
+      const result = formatMessages(getPendingMessages());
+
+      expect(result).toContain('<local_skills_warning');
+      expect(result).toContain('mcp__nanoclaw__publish_local_skill');
+      expect(result).toContain('skills/demo/SKILL.md');
+      expect(result.indexOf('<local_skills_warning')).toBeLessThan(result.indexOf('<message'));
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
   });
 });
 
@@ -142,9 +179,7 @@ describe('stripInternalTags', () => {
   });
 
   it('strips multi-line internal tags', () => {
-    expect(stripInternalTags('hello <internal>\nsecret\nstuff\n</internal> world')).toBe(
-      'hello  world',
-    );
+    expect(stripInternalTags('hello <internal>\nsecret\nstuff\n</internal> world')).toBe('hello  world');
   });
 
   it('strips multiple internal tag blocks', () => {
@@ -160,8 +195,6 @@ describe('stripInternalTags', () => {
   });
 
   it('preserves content that surrounds internal tags', () => {
-    expect(stripInternalTags('<internal>thinking</internal>The answer is 42')).toBe(
-      'The answer is 42',
-    );
+    expect(stripInternalTags('<internal>thinking</internal>The answer is 42')).toBe('The answer is 42');
   });
 });

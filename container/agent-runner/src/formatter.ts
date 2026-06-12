@@ -1,5 +1,6 @@
 import { findByRouting } from './destinations.js';
 import type { MessageInRow } from './db/messages-in.js';
+import { readLocalSkillsDirtyStatus } from './local-skills-status.js';
 import { TIMEZONE, formatLocalTime } from './timezone.js';
 
 /**
@@ -119,7 +120,7 @@ export function extractRouting(messages: MessageInRow[]): RoutingContext {
  * Strips routing fields — the agent never sees platform_id, channel_type, thread_id.
  */
 export function formatMessages(messages: MessageInRow[]): string {
-  const header = `<context timezone="${escapeXml(TIMEZONE)}" />\n`;
+  const header = formatTurnHeader();
   if (messages.length === 0) return header;
 
   // Group by kind
@@ -144,6 +145,27 @@ export function formatMessages(messages: MessageInRow[]): string {
   }
 
   return header + parts.join('\n\n');
+}
+
+function formatTurnHeader(): string {
+  const lines = [`<context timezone="${escapeXml(TIMEZONE)}" />`];
+  const localSkillsStatus = readLocalSkillsDirtyStatus();
+  if (localSkillsStatus) {
+    const dirtyLines = localSkillsStatus.lines.map((line) => `  ${escapeXml(line)}`);
+    if (localSkillsStatus.truncated) {
+      dirtyLines.push('  ...');
+    }
+    lines.push(
+      [
+        `<local_skills_warning repo="${escapeXml(localSkillsStatus.repoPath)}">`,
+        'The local-skills repo has uncommitted changes. If this turn changes a local skill, keep editing the source under /workspace/local-skills, then publish exactly one intended skill with mcp__nanoclaw__publish_local_skill({ skillName, commitMessage }). Do not edit /app/skills; it is the installed read-only view.',
+        'Dirty paths:',
+        ...dirtyLines,
+        '</local_skills_warning>',
+      ].join('\n'),
+    );
+  }
+  return `${lines.join('\n')}\n`;
 }
 
 function formatChatMessages(messages: MessageInRow[]): string {
@@ -306,14 +328,19 @@ export function formatRecoveryContext(entries: RecoveryContextInput[]): string {
     '  <note>You were interrupted on a previous turn for this conversation. Resume the work below; do NOT repeat any completed side effects.</note>',
   );
   for (const e of entries) {
-    lines.push(`  <interrupted classification="${escapeXml(e.classification)}" continuation_policy="${escapeXml(e.continuationPolicy)}">`);
+    lines.push(
+      `  <interrupted classification="${escapeXml(e.classification)}" continuation_policy="${escapeXml(e.continuationPolicy)}">`,
+    );
     if (e.agentMessage) lines.push(`    <status>${escapeXml(e.agentMessage)}</status>`);
     for (const t of e.originalTasks) lines.push(`    <original_task>${escapeXml(t.text)}</original_task>`);
-    for (const a of e.acceptedUnresolvedInputs) lines.push(`    <unresolved_input>${escapeXml(a.prompt)}</unresolved_input>`);
+    for (const a of e.acceptedUnresolvedInputs)
+      lines.push(`    <unresolved_input>${escapeXml(a.prompt)}</unresolved_input>`);
     for (const p of e.priorProgress) lines.push(`    <prior_progress>${escapeXml(p.text)}</prior_progress>`);
     for (const o of e.observations) lines.push(`    <observation>${escapeXml(o)}</observation>`);
     for (const s of e.sideEffects)
-      lines.push(`    <completed_side_effect kind="${escapeXml(s.kind)}">${escapeXml(s.label)}</completed_side_effect>`);
+      lines.push(
+        `    <completed_side_effect kind="${escapeXml(s.kind)}">${escapeXml(s.label)}</completed_side_effect>`,
+      );
     lines.push('  </interrupted>');
   }
   lines.push('</recovery>');

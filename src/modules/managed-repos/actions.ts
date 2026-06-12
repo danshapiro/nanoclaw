@@ -15,6 +15,7 @@ import type { Session } from '../../types.js';
 const execFileAsync = promisify(execFile);
 const MAX_COMMAND_OUTPUT = 10 * 1024 * 1024;
 const REPO_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const LOCAL_SKILL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
 export interface ManagedRepoCommandResult {
   stdout: string;
@@ -105,6 +106,27 @@ async function pushManagedRepo(content: Record<string, unknown>, session: Sessio
   }
 }
 
+async function publishLocalSkill(content: Record<string, unknown>, session: Session): Promise<void> {
+  if (!requireKnownGroup(session)) return;
+  const skillName = content.skillName;
+  const commitMessage = content.commitMessage;
+  if (typeof skillName !== 'string' || !LOCAL_SKILL_NAME_RE.test(skillName)) {
+    notifyAgent(session, 'publish_local_skill failed: skillName must be a local skill directory name.');
+    return;
+  }
+  if (typeof commitMessage !== 'string' || commitMessage.trim() === '') {
+    notifyAgent(session, 'publish_local_skill failed: commitMessage must be a non-empty string.');
+    return;
+  }
+  try {
+    const result = await runManagedRepoCommand('publish-local-skill.sh', [skillName, commitMessage.trim()]);
+    notifyAgent(session, formatCommandResult('publish_local_skill', result));
+  } catch (error) {
+    log.error('publish_local_skill failed', { skillName, err: error });
+    notifyAgent(session, `publish_local_skill failed for ${skillName}:\n${errorMessage(error)}`);
+  }
+}
+
 export async function handleApplyManagedRepos(
   _content: Record<string, unknown>,
   session: Session,
@@ -119,4 +141,12 @@ export async function handlePushManagedRepo(
   _inDb: Database.Database,
 ): Promise<void> {
   await pushManagedRepo(content, session);
+}
+
+export async function handlePublishLocalSkill(
+  content: Record<string, unknown>,
+  session: Session,
+  _inDb: Database.Database,
+): Promise<void> {
+  await publishLocalSkill(content, session);
 }

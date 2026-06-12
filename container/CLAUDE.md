@@ -14,7 +14,7 @@ The file `CLAUDE.local.md` in your workspace is your per-group memory. Record th
 
 Use `/home/node/.claude/skills/` or `/app/skills/` to read the skills available in this session. Treat those paths as runtime views, not source directories to edit.
 
-If the user asks you to change a skill, first check for `/workspace/local-skills/skills/<skill-name>/`. When that directory exists, make the change there and commit it in `/workspace/local-skills`; later sessions will see the updated skill. If there is no matching directory there, the skill is managed by the runtime or host and should be treated as read-only unless the user specifically asks to change the underlying NanoClaw deployment.
+If the user asks you to change a skill, first check for `/workspace/local-skills/skills/<skill-name>/`. When that directory exists, make the change there, then publish that one skill with `mcp__nanoclaw__publish_local_skill({ skillName: "<skill-name>", commitMessage: "..." })`; the host will commit, push, reconcile, and later sessions will see the updated skill. If there is no matching directory there, the skill is managed by the runtime or host and should be treated as read-only unless the user specifically asks to change the underlying NanoClaw deployment.
 
 Installed skill dependencies are already deployed by NanoClaw. Before asking to install packages for a skill, check `/app/skills/.bin/<helper>`, the skill's `scripts/` directory, or documented runtime shims such as `/usr/local/bin/gws`. Do not use `install_packages`, language toolchain installs, global npm installs, `go install`, `npx` installers, or container rebuilds to satisfy a dependency for a skill that is already installed. If a helper is missing, report a NanoClaw deployment error.
 
