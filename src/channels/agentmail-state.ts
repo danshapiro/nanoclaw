@@ -39,7 +39,7 @@ export function claimAgentMailMessage(
   now: string,
   leaseExpiresAt: string,
 ): AgentMailClaimResult {
-  return getDb().transaction(() => {
+  const claim = getDb().transaction((): AgentMailClaimResult => {
     const existing = getDb()
       .prepare(
         `SELECT status, lease_expires_at
@@ -68,7 +68,8 @@ export function claimAgentMailMessage(
       .run(inboxId, messageId, now, now, leaseExpiresAt);
 
     return { claimed: true, status: 'processing' };
-  })();
+  }) as () => AgentMailClaimResult;
+  return claim();
 }
 
 export function recordAgentMailMessageRoute(input: AgentMailMessageRouteInput): void {
