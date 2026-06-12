@@ -230,6 +230,8 @@ async function loadContainerRunnerHarness(
     session,
     sessions,
     execFileMock,
+    execSyncMock,
+    dataDir,
     groupsDir,
     loadAgentMcpConfigForGroupMock,
     root,
@@ -393,6 +395,46 @@ describe('resolveAgentImageForRun', () => {
     ).rejects.toThrow(
       "Per-agent image for main was rebuilt as 'nanoclaw-agent-v2-oldbase:ag-main', expected 'nanoclaw-agent-v2-newbase:ag-main'",
     );
+  });
+});
+
+describe('buildAgentGroupImage', () => {
+  it('uses a unique temporary Dockerfile path for each build', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      const { writeContainerConfig } = await import('./container-config.js');
+      writeContainerConfig('agent', {
+        mcpServers: {},
+        packages: { apt: ['jq'], npm: [] },
+        additionalMounts: [],
+        skills: 'all',
+      });
+
+      harness.execSyncMock.mockImplementation((command: string) => {
+        const match = command.match(/ -f '([^']+)' /);
+        expect(match?.[1]).toBeTruthy();
+        expect(fs.existsSync(match![1])).toBe(true);
+      });
+
+      await harness.containerRunner.buildAgentGroupImage('ag-1');
+      await harness.containerRunner.buildAgentGroupImage('ag-1');
+
+      const dockerfilePaths = harness.execSyncMock.mock.calls.map((call) => {
+        const command = String(call[0]);
+        const match = command.match(/ -f '([^']+)' /);
+        expect(match?.[1]).toBeTruthy();
+        return match![1];
+      });
+
+      expect(dockerfilePaths).toHaveLength(2);
+      expect(new Set(dockerfilePaths).size).toBe(2);
+      for (const dockerfilePath of dockerfilePaths) {
+        expect(dockerfilePath.startsWith(path.join(harness.dataDir, '.nanoclaw-image-build-ag-1-'))).toBe(true);
+        expect(fs.existsSync(path.dirname(dockerfilePath))).toBe(false);
+      }
+    } finally {
+      harness.close();
+    }
   });
 });
 

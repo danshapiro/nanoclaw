@@ -1168,17 +1168,19 @@ export async function buildAgentGroupImage(agentGroupId: string): Promise<void> 
 
   log.info('Building per-agent-group image', { agentGroupId, imageTag, apt: aptPackages, npm: npmPackages });
 
-  // Write Dockerfile to temp file and build
-  const tmpDockerfile = path.join(DATA_DIR, `Dockerfile.${agentGroupId}`);
+  // Use a per-build temp directory so concurrent rebuilds for the same agent
+  // group do not share and delete the same Dockerfile path.
+  const tmpBuildDir = fs.mkdtempSync(path.join(DATA_DIR, `.nanoclaw-image-build-${agentGroupId}-`));
+  const tmpDockerfile = path.join(tmpBuildDir, 'Dockerfile');
   fs.writeFileSync(tmpDockerfile, dockerfile);
   try {
-    execSync(`${CONTAINER_RUNTIME_BIN} build -t ${imageTag} -f ${tmpDockerfile} .`, {
+    execSync(`${CONTAINER_RUNTIME_BIN} build -t ${shellSingleQuote(imageTag)} -f ${shellSingleQuote(tmpDockerfile)} .`, {
       cwd: DATA_DIR,
       stdio: 'pipe',
       timeout: 300_000,
     });
   } finally {
-    fs.unlinkSync(tmpDockerfile);
+    fs.rmSync(tmpBuildDir, { recursive: true, force: true });
   }
 
   // Store the image tag in groups/<folder>/container.json
