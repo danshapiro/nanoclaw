@@ -1260,6 +1260,24 @@ describe('side-effect ledger container env', () => {
     }
   });
 
+  it('does not pass AGENTMAIL_API_KEY into agent containers', async () => {
+    const harness = await loadContainerRunnerHarness();
+    const saved = process.env.AGENTMAIL_API_KEY;
+    try {
+      process.env.AGENTMAIL_API_KEY = 'test-agentmail-secret';
+      const args = await buildArgs(harness);
+      expect(args.join('\n')).not.toContain('AGENTMAIL_API_KEY');
+      expect(args.join('\n')).not.toContain('test-agentmail-secret');
+    } finally {
+      if (saved === undefined) {
+        delete process.env.AGENTMAIL_API_KEY;
+      } else {
+        process.env.AGENTMAIL_API_KEY = saved;
+      }
+      harness.close();
+    }
+  });
+
   it('does not pass per-input correlation as process env (it is the .active-input.json file)', async () => {
     const harness = await loadContainerRunnerHarness();
     try {

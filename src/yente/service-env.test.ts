@@ -58,6 +58,7 @@ describe('Yente service env contract', () => {
       MSGVAULT_API_KEY: 'raw-msgvault-api-key',
       YENTE_BROWSER_HANDOFF_BROKER_SECRET: 'raw-broker-secret',
       YENTE_BROWSER_HANDOFF_VNC_PASSWORD: 'raw-vnc-password',
+      AGENTMAIL_API_KEY: 'raw-agentmail-key',
     });
 
     expect(result.onecliUrl).toBe('https://onecli.local');
@@ -81,6 +82,7 @@ describe('Yente service env contract', () => {
     expect(result.containerEnv).not.toHaveProperty('MSGVAULT_API_KEY');
     expect(result.containerEnv).not.toHaveProperty('YENTE_BROWSER_HANDOFF_BROKER_SECRET');
     expect(result.containerEnv).not.toHaveProperty('YENTE_BROWSER_HANDOFF_VNC_PASSWORD');
+    expect(result.containerEnv).not.toHaveProperty('AGENTMAIL_API_KEY');
   });
 
   it('does not bypass OneCLI for mediated local service hosts', () => {
