@@ -232,6 +232,89 @@ describe('AgentMail adapter', () => {
     expect(inbound).toHaveLength(0);
   });
 
+  it('suppresses provider sent messages during catch-up', async () => {
+    const socket = new FakeSocket();
+    fake = fakeApi(socket);
+    vi.mocked(fake.listMessages).mockImplementation(async (inboxId: string) => ({
+      messages:
+        inboxId === 'yente-threads@agentmail.to'
+          ? [
+              {
+                inboxId,
+                messageId: 'sent-1',
+                threadId: 'thread-sent',
+                from_: 'yente-aidy@agentmail.to',
+                subject: 'sent probe',
+                text: 'already sent',
+                labels: ['sent'],
+              },
+            ]
+          : [],
+    }));
+    vi.mocked(fake.getMessage).mockImplementation(async (inboxId: string, messageId: string) => ({
+      inboxId,
+      messageId,
+      threadId: 'thread-sent',
+      from_: 'yente-aidy@agentmail.to',
+      subject: 'sent probe',
+      text: 'already sent',
+      labels: ['sent'],
+    }));
+    const inbound: Parameters<ChannelSetup['onInbound']>[] = [];
+    const adapter = createAgentMailAdapter({
+      api: fake,
+      env: { AGENTMAIL_ENABLED: '1', AGENTMAIL_DOMAIN: 'agentmail.to' },
+      now: () => '2026-06-12T00:00:00.000Z',
+    })!;
+
+    await adapter.setup(setupCollector(inbound));
+    socket.emit('message', {
+      type: 'subscribed',
+      inboxIds: ['yente@agentmail.to', 'yente-threads@agentmail.to', 'yente-aidy@agentmail.to'],
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(inbound).toHaveLength(0);
+    expect(fake.updateLabels).not.toHaveBeenCalled();
+  });
+
+  it('marks strict routing failures failed so a later event can retry', async () => {
+    const socket = new FakeSocket();
+    fake = fakeApi(socket);
+    const setup = setupCollector();
+    setup.onInboundStrict = vi.fn().mockRejectedValueOnce(new Error('route failed')).mockResolvedValueOnce(undefined);
+    const adapter = createAgentMailAdapter({
+      api: fake,
+      env: { AGENTMAIL_ENABLED: '1', AGENTMAIL_DOMAIN: 'agentmail.to' },
+      now: () => '2026-06-12T00:00:00.000Z',
+    })!;
+    const event = {
+      type: 'event',
+      eventType: 'message.received',
+      eventId: 'evt-retry',
+      message: {
+        inboxId: 'yente-threads@agentmail.to',
+        messageId: 'm-retry',
+        threadId: 'thread-retry',
+        from_: 'ci@example.com',
+        subject: 'QA retry',
+        text: 'retry me',
+      },
+    };
+
+    await adapter.setup(setup);
+    socket.emit('message', event);
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    socket.emit('message', event);
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(setup.onInboundStrict).toHaveBeenCalledTimes(2);
+    expect(fake.updateLabels).toHaveBeenCalledTimes(1);
+  });
+
   it('serializes first messages for the same AgentMail thread', async () => {
     const socket = new FakeSocket();
     fake = fakeApi(socket);

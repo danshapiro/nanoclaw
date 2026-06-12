@@ -233,6 +233,7 @@ export function createAgentMailAdapter(deps: AgentMailAdapterDeps = {}): Channel
   function shouldSuppressAgentMailMessage(message: AgentMailMessageLike): boolean {
     const labels = new Set((message.labels ?? []).map((label) => label.toLowerCase()));
     if (labels.has('nanoclaw:outbound')) return true;
+    if (labels.has('sent')) return true;
 
     const headers = Object.fromEntries(
       Object.entries(message.headers ?? {}).map(([key, value]) => [
