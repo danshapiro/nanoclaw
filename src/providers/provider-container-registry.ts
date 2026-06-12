@@ -15,6 +15,7 @@
  * with a top-level `registerProviderContainerConfig(...)` call, then appending
  * `import './<name>.js';` to `src/providers/index.ts` (the barrel).
  */
+import type { ContainerConfig } from '../container-config.js';
 
 export interface VolumeMount {
   hostPath: string;
@@ -27,6 +28,10 @@ export interface ProviderContainerContext {
   sessionDir: string;
   /** Agent group ID, for any per-group logic. */
   agentGroupId: string;
+  /** Agent group folder name, for per-group filesystem layout. */
+  agentGroupFolder?: string;
+  /** Parsed group container.json read once by the container runner. */
+  containerConfig?: ContainerConfig;
   /** `process.env` at spawn time — pull passthrough values from here. */
   hostEnv: NodeJS.ProcessEnv;
   /** Per-group model override from container.json. When set, takes precedence over hostEnv.OPENCODE_MODEL. */

@@ -1,6 +1,14 @@
 import { describe, it, expect } from 'bun:test';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 
-import { STALE_THREAD_RE, tomlBasicString } from './codex-app-server.js';
+import {
+  createCodexConfigOverrides,
+  STALE_THREAD_RE,
+  tomlBasicString,
+  writeCodexMcpConfigToml,
+} from './codex-app-server.js';
 
 describe('tomlBasicString', () => {
   it('leaves safe strings unchanged inside quotes', () => {
@@ -43,5 +51,34 @@ describe('STALE_THREAD_RE', () => {
     expect(STALE_THREAD_RE.test('authentication failed')).toBe(false);
     expect(STALE_THREAD_RE.test('connection reset by peer')).toBe(false);
     expect(STALE_THREAD_RE.test('internal server error')).toBe(false);
+  });
+});
+
+describe('Codex strict config compatibility', () => {
+  it('does not emit unsupported mcp server type under strict config', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-home-'));
+    const oldHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      writeCodexMcpConfigToml({
+        local: { command: 'node', args: ['server.mjs'], env: { SAFE_VALUE: 'ok' } },
+      });
+      const toml = fs.readFileSync(path.join(home, '.codex', 'config.toml'), 'utf8');
+      expect(toml).toContain('[mcp_servers.local]');
+      expect(toml).toContain('command = "node"');
+      expect(toml).not.toContain('type = "stdio"');
+    } finally {
+      process.env.HOME = oldHome;
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('passes model_reasoning_effort as a strict config override', () => {
+    process.env.CODEX_REASONING_EFFORT = 'xhigh';
+    try {
+      expect(createCodexConfigOverrides()).toContain('model_reasoning_effort=xhigh');
+    } finally {
+      delete process.env.CODEX_REASONING_EFFORT;
+    }
   });
 });

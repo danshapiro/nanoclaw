@@ -21,6 +21,7 @@ ARG INSTALL_CJK_FONTS=false
 # across all users.
 ARG CLAUDE_CODE_VERSION=2.1.116
 ARG OPENCODE_VERSION=1.15.10
+ARG CODEX_VERSION=0.139.0
 ARG AGENT_BROWSER_VERSION=latest
 ARG VERCEL_VERSION=latest
 ARG BUN_VERSION=1.3.12
@@ -133,6 +134,13 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
     cd "$opencode_pkg" && \
     node postinstall.mjs && \
     opencode --version
+
+RUN --mount=type=cache,target=/root/.cache/pnpm \
+    export PATH="/pnpm/bin:/pnpm:$PATH" && \
+    pnpm install -g "@openai/codex@${CODEX_VERSION}" && \
+    codex --version && \
+    codex app-server --help | grep -F -- '--strict-config' && \
+    codex app-server --help | grep -F -- '--listen'
 
 # ---- GWS policy proxy shim ---------------------------------------------------
 # Agent containers must not include the real Google Workspace CLI or OAuth

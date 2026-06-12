@@ -101,7 +101,11 @@ export interface AppServer {
 }
 
 export function spawnCodexAppServer(configOverrides: string[] = []): AppServer {
-  const args = ['app-server', '--listen', 'stdio://'];
+  // --strict-config makes a typo'd `-c` override fail-fast at spawn instead of
+  // being silently ignored (which would downgrade reasoning with no warning).
+  // Verified by the image build smoke: both overrides we send pass strict-config; a
+  // misspelled key exits 1 with "unknown configuration field".
+  const args = ['app-server', '--strict-config', '--listen', 'stdio://'];
   for (const override of configOverrides) args.push('-c', override);
 
   log(`Spawning: codex ${args.join(' ')}`);
@@ -221,27 +225,43 @@ export function killCodexAppServer(server: AppServer): void {
 // ── Auto-approval ───────────────────────────────────────────────────────────
 // The container sandbox is already the security boundary; inside it, Codex's
 // own approval prompts would just block every tool call on a user that isn't
-// watching. Accept everything and let sandbox limits do the enforcement.
+// watching. For a NORMAL turn we accept everything and let sandbox limits do
+// the enforcement.
+//
+// RELAY turns are different. A relay/recovery turn narrates status only and
+// runs under a `read-only` sandbox (codexThreadSandbox(true)); auto-approving
+// writes/exec/network for a relay would let it bypass the read-only boundary
+// the moment the model attempts a side effect, so in relay mode we REFUSE every
+// side-effecting approval. The Codex app-server's `ReviewDecision` enum (verified
+// against the bundled codex-cli 0.139.0 native binary's embedded protocol types
+// — `ReviewDecision.ts`: `approved`, `approved_for_session`, `denied`, `abort`)
+// accepts `denied` as the explicit refusal, and the `item/*/requestApproval`
+// family accepts `reject`. We use those real values — never an invented one.
 
-export function attachCodexAutoApproval(server: AppServer): void {
+export function attachCodexAutoApproval(server: AppServer, { relay }: { relay: boolean } = { relay: false }): void {
   server.serverRequestHandlers.push((req) => {
     const method = req.method;
-    log(`[approval] ${method}`);
+    log(`[approval] ${method}${relay ? ' (relay)' : ''}`);
 
     switch (method) {
       case 'item/commandExecution/requestApproval':
       case 'item/fileChange/requestApproval':
-        sendCodexResponse(server, req.id, { decision: 'accept' });
+        // Relay: refuse the side effect (read-only narration only).
+        sendCodexResponse(server, req.id, { decision: relay ? 'reject' : 'accept' });
         break;
       case 'item/permissions/requestApproval':
+        // Relay: grant READ-ONLY filesystem and NO network — never write.
         sendCodexResponse(server, req.id, {
-          permissions: { fileSystem: { read: ['/'], write: ['/'] }, network: { enabled: true } },
+          permissions: relay
+            ? { fileSystem: { read: ['/'], write: [] }, network: { enabled: false } }
+            : { fileSystem: { read: ['/'], write: ['/'] }, network: { enabled: true } },
           scope: 'session',
         });
         break;
       case 'applyPatchApproval':
       case 'execCommandApproval':
-        sendCodexResponse(server, req.id, { decision: 'approved' });
+        // Relay: deny the patch/command outright (read-only boundary).
+        sendCodexResponse(server, req.id, { decision: relay ? 'denied' : 'approved' });
         break;
       case 'item/tool/call': {
         const toolName = (req.params as { tool?: string }).tool || 'unknown';
@@ -369,7 +389,11 @@ export function writeCodexMcpConfigToml(servers: Record<string, CodexMcpServer>)
   const lines: string[] = [];
   for (const [name, config] of Object.entries(servers)) {
     lines.push(`[mcp_servers.${name}]`);
-    lines.push('type = "stdio"');
+    // NO `type = "stdio"` line: the pinned codex-cli rejects an unknown
+    // `mcp_servers.<n>.type` field under `--strict-config` and
+    // the app-server aborts with exit code=1 at startup. stdio is inferred from
+    // the presence of `command`; the command-only form is accepted across codex
+    // versions (the explicit `type` key was a later 0.139.x addition).
     lines.push(`command = ${tomlBasicString(config.command)}`);
     if (config.args && config.args.length > 0) {
       const argsStr = config.args.map(tomlBasicString).join(', ');
@@ -389,5 +413,11 @@ export function writeCodexMcpConfigToml(servers: Record<string, CodexMcpServer>)
 }
 
 export function createCodexConfigOverrides(): string[] {
-  return ['features.use_linux_sandbox_bwrap=false'];
+  const overrides = ['features.use_linux_sandbox_bwrap=false'];
+  // Yente runs high reasoning by default; per-group override via
+  // CODEX_REASONING_EFFORT forwarded by the host-side provider config.
+  // `model_reasoning_effort` is the strict-config key codex app-server accepts.
+  const effort = process.env.CODEX_REASONING_EFFORT?.trim() || 'high';
+  overrides.push(`model_reasoning_effort=${effort}`);
+  return overrides;
 }

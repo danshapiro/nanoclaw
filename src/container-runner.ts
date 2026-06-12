@@ -543,6 +543,8 @@ function resolveProviderContribution(
     ? fn({
         sessionDir: sessionDir(agentGroup.id, session.id),
         agentGroupId: agentGroup.id,
+        agentGroupFolder: agentGroup.folder,
+        containerConfig,
         hostEnv: process.env,
         groupModel: containerConfig.model,
         groupReasoningEffort: containerConfig.reasoningEffort,

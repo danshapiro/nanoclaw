@@ -6,3 +6,4 @@
 // Skills add a new provider by appending one import line below.
 import './yente-claude.js';
 import './opencode.js';
+import './codex.js';

@@ -17,15 +17,16 @@ import fs from 'fs';
 import path from 'path';
 
 import { registerProvider } from './provider-registry.js';
-import {
-  normalizeQueryTurnInput,
-  type AgentProvider,
-  type AgentQuery,
-  type ProviderEvent,
-  type ProviderInputScope,
-  type ProviderOptions,
-  type QueryInput,
+import type {
+  AgentProvider,
+  AgentQuery,
+  ProviderEvent,
+  ProviderInputScope,
+  ProviderOptions,
+  QueryInput,
+  QueryTurnInput,
 } from './types.js';
+import { normalizeQueryTurnInput } from './types.js';
 import {
   type AppServer,
   type JsonRpcNotification,
@@ -40,8 +41,11 @@ import {
   writeCodexMcpConfigToml,
 } from './codex-app-server.js';
 
-/** Hard ceiling for a single turn. Guards against app-server wedging. */
-const TURN_TIMEOUT_MS = 5 * 60 * 1000;
+import { CodexTurnTimers, codexTimingConfigFromEnv, type CodexTimingClock } from './codex-turn-timing.js';
+import { buildInactivityNotice, dedupeCodexSideEffect, codexCapabilities, codexThreadSandbox } from './codex-parity.js';
+
+/** Real wall clock; tests inject a fake one via runOneTurn's deps. */
+const REAL_CLOCK: CodexTimingClock = { now: () => Date.now() };
 
 // ── System-prompt assembly ──────────────────────────────────────────────────
 // Codex's app-server doesn't expand Claude Code's `@-import` syntax in
@@ -104,33 +108,37 @@ function composeBaseInstructions(promptAddendum: string | undefined): string | u
   return pieces.length > 0 ? pieces.join('\n\n---\n\n') : undefined;
 }
 
-function log(msg: string): void {
-  console.error(`[codex-provider] ${msg}`);
-}
-
 // ── Provider ────────────────────────────────────────────────────────────────
 
 export class CodexProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = false;
+
+  get capabilities() {
+    return codexCapabilities();
+  }
 
   private readonly mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }>;
   private readonly model: string;
 
   constructor(options: ProviderOptions = {}) {
     this.mcpServers = options.mcpServers ?? {};
-    this.model = (options.env?.CODEX_MODEL as string | undefined) ?? 'gpt-5.4-mini';
+    // Yente default. Per-group override via CODEX_MODEL in the runtime env
+    // supplied by the host-side provider config.
+    this.model = (options.env?.CODEX_MODEL as string | undefined) ?? 'gpt-5.5';
   }
 
-  isSessionInvalid(err: unknown, opts: { attemptedContinuation?: string } = {}): boolean {
-    // Diagnostic/trigger predicate only; never authoritative on its own. A
-    // stale-thread error without an attempted continuation is not proof.
-    if (!opts.attemptedContinuation) return false;
+  isSessionInvalid(err: unknown): boolean {
     const msg = err instanceof Error ? err.message : String(err);
     return STALE_THREAD_RE.test(msg);
   }
 
   query(input: QueryInput): AgentQuery {
-    const pending: Array<{ inputId?: string; prompt: string; scope: ProviderInputScope }> = [];
+    // Mirrors OpenCode (opencode-container.ts): `pending` holds turn INPUTS, not
+    // bare prompt strings, so each turn carries its `inputId` for the poll-loop's
+    // input-correlation contract (input-accepted / result.resolvedInputIds). A
+    // follow-up `push({ prompt, inputId })` therefore queues the object intact
+    // instead of being coerced to `[object Object]`.
+    const pending: QueryTurnInput[] = [];
     let waiting: (() => void) | null = null;
     let ended = false;
     let aborted = false;
@@ -138,7 +146,7 @@ export class CodexProvider implements AgentProvider {
       waiting?.();
     };
 
-    pending.push({ inputId: input.inputId, prompt: input.prompt, scope: 'initial' });
+    pending.push({ prompt: input.prompt, inputId: input.inputId });
 
     const self = this;
 
@@ -148,10 +156,15 @@ export class CodexProvider implements AgentProvider {
       // spawn-per-query matches that cadence naturally.
       writeCodexMcpConfigToml(self.mcpServers);
       const server = spawnCodexAppServer(createCodexConfigOverrides());
-      attachCodexAutoApproval(server);
+      // Relay turns run read-only (codexThreadSandbox(relay)); auto-approval is
+      // made relay-aware so a relay can't bypass that boundary by side-effecting
+      // through an approval prompt.
+      const relay = input.relayMode === true;
+      attachCodexAutoApproval(server, { relay });
 
       let threadId: string | undefined = input.continuation;
       let initYielded = false;
+      let turnIndex = 0;
 
       try {
         await initializeCodexAppServer(server);
@@ -159,7 +172,9 @@ export class CodexProvider implements AgentProvider {
         const threadParams = {
           model: self.model,
           cwd: input.cwd,
-          sandbox: 'danger-full-access',
+          // Relay turns narrate status only — pin the sandbox read-only so a
+          // relay can never mutate the workspace even if the model tries.
+          sandbox: codexThreadSandbox(relay),
           approvalPolicy: 'never',
           personality: 'friendly',
           baseInstructions: composeBaseInstructions(input.systemContext?.instructions),
@@ -177,25 +192,43 @@ export class CodexProvider implements AgentProvider {
           if (aborted) return;
           if (pending.length === 0 && ended) return;
 
-          const next = pending.shift()!;
+          const turn = pending.shift()!;
+          const text = turn.prompt;
+          const turnInputId = turn.inputId;
+
+          // The turn is now committed — emit input-accepted so the poll-loop can
+          // correlate this input (mirrors opencode-container.ts:877-881). Scope
+          // mirrors OpenCode: relay turns are 'relay'; the first normal turn is
+          // 'initial'; subsequent normal turns are 'followup'.
+          const scope: ProviderInputScope = relay ? 'relay' : turnIndex === 0 ? 'initial' : 'followup';
+          turnIndex += 1;
+          if (turnInputId) {
+            yield { type: 'input-accepted', inputId: turnInputId, scope };
+          }
 
           // One turn = one channel of streaming events. Each notification
           // from the app-server yields an `activity` first (so the
           // poll-loop's idle timer stays honest) and then, where relevant,
           // an init / result / progress event.
-          yield* runOneTurn(
+          const terminal = yield* runOneTurn(
             server,
             threadId!,
-            next.prompt,
+            text,
             self.model,
             input.cwd,
+            turnInputId,
             () => initYielded,
             () => {
               initYielded = true;
             },
-            next.inputId,
-            next.scope,
           );
+          // A terminal interruption (timeout / turn failure) ENDS the whole
+          // query stream — mirrors opencode-container.ts:1238-1240. Without this
+          // the outer loop would block waiting for more input, `query.events`
+          // would never close, and the poll-loop could never finalize recovery
+          // (codex would hang after a timeout). A normal turn returns false and
+          // the loop continues to drain the next pending input.
+          if (terminal) return;
         }
       } finally {
         killCodexAppServer(server);
@@ -203,19 +236,11 @@ export class CodexProvider implements AgentProvider {
     }
 
     return {
-      push: (message) => {
-        const turn = normalizeQueryTurnInput(message);
-        if (turn.attachments?.length) {
-          log(
-            JSON.stringify({
-              severity: 'info',
-              event: 'provider_attachments_ignored',
-              provider: 'codex',
-              attachment_count: turn.attachments.length,
-            }),
-          );
-        }
-        pending.push({ inputId: turn.inputId, prompt: turn.prompt, scope: 'followup' });
+      push: (message: string | QueryTurnInput) => {
+        // Mirror OpenCode (opencode-container.ts:1265): normalize so a
+        // `{ prompt, inputId }` object is queued intact (preserving its
+        // inputId) instead of being coerced to a string.
+        pending.push(normalizeQueryTurnInput(message));
         kick();
       },
       end: () => {
@@ -236,17 +261,21 @@ export class CodexProvider implements AgentProvider {
 // and because it's a natural seam for future unit tests that drive it with
 // a fake notification stream.
 
-async function* runOneTurn(
+export async function* runOneTurn(
   server: AppServer,
   threadId: string,
   inputText: string,
   model: string,
   cwd: string,
+  turnInputId: string | undefined,
   hasInit: () => boolean,
   markInit: () => void,
-  inputId?: string,
-  scope: ProviderInputScope = 'initial',
-): AsyncGenerator<ProviderEvent> {
+  deps: {
+    clock: CodexTimingClock;
+    setTimer: (ms: number, cb: () => void) => ReturnType<typeof setTimeout>;
+    startTurn: typeof startCodexTurn;
+  } = { clock: REAL_CLOCK, setTimer: (ms, cb) => setTimeout(cb, ms), startTurn: startCodexTurn },
+): AsyncGenerator<ProviderEvent, boolean> {
   // Mutable refs via object properties — TS can't track closure assignments
   // for narrowing, but property access keeps the declared type visible.
   const turnState: { error: Error | null } = { error: null };
@@ -263,6 +292,46 @@ async function* runOneTurn(
     waker = null;
   };
 
+  const timers = new CodexTurnTimers(deps.clock, codexTimingConfigFromEnv());
+  let terminalTimeout: 'transport' | 'absolute' | null = null;
+  let liveness: import('./codex-turn-timing.js').CodexLiveness | null = null;
+  let wakeHandle: ReturnType<typeof setTimeout> | null = null;
+  // Side-effect collection lives here (B3) so the terminal interruption's
+  // recoverySeed spread below typechecks standalone; Task B4 wires the emission
+  // that fills it. Declared once — B4 must NOT re-declare.
+  const collectedSideEffects: import('./types.js').ProviderSideEffect[] = [];
+  const emittedSideEffectIds = new Set<string>();
+  // The per-turn inputId from the poll-loop, used by buildInactivityNotice / the
+  // terminal interruption / dedupeCodexSideEffect so those carry the REAL input
+  // correlation id (F1). Undefined only when the caller has no inputId; ?? '' is
+  // safe for the message builders.
+  const inputId: string | undefined = turnInputId;
+  const armWake = (): void => {
+    // Never (re-)arm once the turn is terminal: a wedged app-server would keep
+    // re-polling transport-timeout and re-arming forever (an infinite timeout
+    // loop). After a terminal decision the turn is done and drains via kick().
+    if (terminalTimeout || turnDone) return;
+    if (wakeHandle) clearTimeout(wakeHandle);
+    wakeHandle = deps.setTimer(timers.nextWakeMs(), onWake);
+  };
+  function onWake(): void {
+    const d = timers.poll();
+    if (d.kind === 'transport-timeout' || d.kind === 'absolute-timeout') {
+      terminalTimeout = d.kind === 'transport-timeout' ? 'transport' : 'absolute';
+      liveness = d.liveness;
+      turnState.error = new Error(`Turn ${terminalTimeout}-timeout after ${d.liveness.elapsedMs}ms`);
+      turnDone = true;
+      kick();
+      return;   // terminal: do NOT re-arm (armWake would no-op anyway, but be explicit)
+    }
+    if (d.kind === 'inactivity-notice') {
+      buffer.push(buildInactivityNotice(inputId ?? '', d.liveness));   // Behavior 1 (Task B4 enables consumption)
+    }
+    armWake();
+    kick();
+  }
+  armWake();
+
   const handler = (n: JsonRpcNotification): void => {
     const method = n.method;
     const params = n.params;
@@ -271,6 +340,9 @@ async function* runOneTurn(
     // idle timer — yield before any event-specific translation so even
     // long tool executions keep the loop awake.
     buffer.push({ type: 'activity' });
+    const meaningful = method === 'item/agentMessage/delta' || method === 'item/completed' || method === 'turn/completed';
+    timers.onActivity(method ?? 'activity', meaningful);
+    armWake();
 
     switch (method) {
       case 'thread/started': {
@@ -289,6 +361,11 @@ async function* runOneTurn(
       case 'item/completed': {
         const item = params.item as { type?: string; text?: string } | undefined;
         if (item?.type === 'agentMessage' && item.text) resultText = item.text;
+        const se = dedupeCodexSideEffect(item as { id?: string; type?: string }, inputId ?? '', Date.now(), emittedSideEffectIds);
+        if (se) {
+          collectedSideEffects.push(se);
+          buffer.push({ type: 'side-effect', sideEffect: se });   // emitted to the poll loop
+        }
         break;
       }
       case 'turn/completed':
@@ -316,12 +393,6 @@ async function* runOneTurn(
 
   server.notificationHandlers.push(handler);
 
-  const timer = setTimeout(() => {
-    turnState.error = new Error(`Turn timed out after ${TURN_TIMEOUT_MS}ms`);
-    turnDone = true;
-    kick();
-  }, TURN_TIMEOUT_MS);
-
   try {
     // If we yield init before turn/start, the poll-loop stores
     // continuation early and survives a mid-turn crash.
@@ -330,12 +401,7 @@ async function* runOneTurn(
       buffer.push({ type: 'init', continuation: threadId });
     }
 
-    await startCodexTurn(server, { threadId, inputText, model, cwd });
-
-    // turn/start accepted the input — emit input-accepted for the matching id.
-    if (inputId) {
-      yield { type: 'input-accepted', inputId, scope };
-    }
+    await deps.startTurn(server, { threadId, inputText, model, cwd });
 
     while (true) {
       while (buffer.length > 0) {
@@ -352,30 +418,43 @@ async function* runOneTurn(
     while (buffer.length > 0) yield buffer.shift()!;
 
     if (turnState.error) {
-      // A real turn error is terminal-recoverable: emit a typed interruption
-      // with input correlation, recovery metadata, and continuation policy so
-      // the poll loop can preserve recovery rather than dropping the turn.
+      const classification = terminalTimeout === 'transport' ? 'codex_transport_timeout'
+        : terminalTimeout === 'absolute' ? 'codex_absolute_timeout'
+        : 'codex_turn_failed';
       yield {
         type: 'interruption',
         inputId: inputId ?? '',
-        classification: 'codex_turn_failed',
+        classification,
         severity: 'error',
         terminal: true,
-        agentMessage: 'The Codex turn failed before completing.',
-        fallbackUserMessage: `The previous request failed (${turnState.error.message}). Please try again.`,
+        agentMessage: terminalTimeout
+          ? "I ran out of time on this turn before finishing."
+          : 'The Codex turn failed before completing.',
+        fallbackUserMessage: terminalTimeout
+          ? "That took longer than I'm allowed for one turn. Please ask me to continue."
+          : `The previous request failed (${turnState.error.message}). Please try again.`,
         continuationPolicy: 'preserve',
+        ...(liveness ? { liveness } : {}),
+        ...(collectedSideEffects.length > 0 ? { recoverySeed: { sideEffects: [...collectedSideEffects] } } : {}),
       };
-      return;
+      // Terminal: signal the caller to END the whole query stream (F2,
+      // mirrors opencode-container.ts:1238-1240).
+      return true;
     }
 
+    // A successful turn resolves its input — carry inputId/resolvedInputIds so
+    // the recovery system (patch 044) can mark it resolved (F1, mirrors
+    // opencode-container.ts:1251-1256).
     yield {
       type: 'result',
       text: resultText || null,
-      inputId,
-      resolvedInputIds: inputId ? [inputId] : [],
+      inputId: turnInputId,
+      resolvedInputIds: turnInputId ? [turnInputId] : [],
     };
+    // Non-terminal: the outer loop continues to drain the next pending input.
+    return false;
   } finally {
-    clearTimeout(timer);
+    if (wakeHandle) clearTimeout(wakeHandle);
     const idx = server.notificationHandlers.indexOf(handler);
     if (idx >= 0) server.notificationHandlers.splice(idx, 1);
   }

@@ -32,6 +32,14 @@ export interface AdditionalMountConfig {
 
 export type SkillSelection = string[] | 'all';
 
+export interface CodexContainerConfig {
+  onecliConfigPath?: string;
+  brokerTarget?: string;
+  brokerSocket?: string;
+  authGateHost?: string;
+  authGatePort?: number;
+}
+
 export interface ContainerConfig {
   mcpServers: Record<string, McpServerConfig>;
   /** Host-managed MCP bridge server names. Removed/replaced at spawn time. */
@@ -66,6 +74,8 @@ export interface ContainerConfig {
   model?: string;
   /** Per-group OpenCode reasoning effort override, passed through to the build agent when set. */
   reasoningEffort?: string;
+  /** Per-group Codex credential and egress paths, managed by host tooling. */
+  codex?: CodexContainerConfig;
 }
 
 function emptyConfig(): ContainerConfig {
@@ -111,6 +121,7 @@ export function readContainerConfig(folder: string): ContainerConfig {
       assistantName: raw.assistantName,
       agentGroupId: raw.agentGroupId,
       maxMessagesPerPrompt: raw.maxMessagesPerPrompt,
+      codex: raw.codex,
     };
   } catch (err) {
     console.error(`[container-config] failed to parse ${p}: ${String(err)}`);
