@@ -11,6 +11,16 @@ export interface ChannelSetup {
   onInbound(platformId: string, threadId: string | null, message: InboundMessage): void | Promise<void>;
 
   /**
+   * Same route as onInbound, but rejects when the host router fails.
+   *
+   * Existing adapters call onInbound fire-and-forget and rely on the host to
+   * swallow/log failures. Adapters with durable provider state can use this
+   * strict variant to mark provider messages routed only after NanoClaw accepts
+   * the inbound write path.
+   */
+  onInboundStrict?(platformId: string, threadId: string | null, message: InboundMessage): Promise<void>;
+
+  /**
    * Called by admin-transport adapters (CLI) that want to route a message to
    * an arbitrary channel/platform and optionally redirect replies elsewhere.
    * Regular chat adapters should use `onInbound`; `onInboundEvent` skips the

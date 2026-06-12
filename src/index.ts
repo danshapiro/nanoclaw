@@ -73,23 +73,37 @@ async function main(): Promise<void> {
 
   // 3. Channel adapters
   await initChannelAdapters((adapter: ChannelAdapter): ChannelSetup => {
+    function routeInboundForAdapter(
+      platformId: string,
+      threadId: string | null,
+      message: Parameters<ChannelSetup['onInbound']>[2],
+      strict: boolean,
+    ): Promise<void> | void {
+      const route = routeInbound({
+        channelType: adapter.channelType,
+        platformId,
+        threadId,
+        message: {
+          id: message.id,
+          kind: message.kind,
+          content: JSON.stringify(message.content),
+          timestamp: message.timestamp,
+          isMention: message.isMention,
+          isGroup: message.isGroup,
+        },
+      }).catch((err) => {
+        log.error('Failed to route inbound message', { channelType: adapter.channelType, err });
+        if (strict) throw err;
+      });
+      if (strict) return route;
+    }
+
     return {
       onInbound(platformId, threadId, message) {
-        routeInbound({
-          channelType: adapter.channelType,
-          platformId,
-          threadId,
-          message: {
-            id: message.id,
-            kind: message.kind,
-            content: JSON.stringify(message.content),
-            timestamp: message.timestamp,
-            isMention: message.isMention,
-            isGroup: message.isGroup,
-          },
-        }).catch((err) => {
-          log.error('Failed to route inbound message', { channelType: adapter.channelType, err });
-        });
+        routeInboundForAdapter(platformId, threadId, message, false);
+      },
+      onInboundStrict(platformId, threadId, message) {
+        return routeInboundForAdapter(platformId, threadId, message, true) as Promise<void>;
       },
       onInboundEvent(event) {
         routeInbound(event).catch((err) => {

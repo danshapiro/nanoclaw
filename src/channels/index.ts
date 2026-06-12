@@ -9,3 +9,4 @@
 import './cli.js';
 import './discord.js';
 import './whatsapp.js';
+import './agentmail.js';
