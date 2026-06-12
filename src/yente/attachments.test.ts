@@ -92,6 +92,42 @@ describe('Yente attachment materialization', () => {
     expect(fs.readFileSync(result.hostPath, 'utf8')).toBe('pdf');
   });
 
+  it('materializes AgentMail attachments under the mounted group workspace', () => {
+    const groupsDir = makeTmpRoot();
+    expect(
+      materializedAttachmentDir({
+        groupsDir,
+        groupFolder: 'main',
+        channel: 'agentmail',
+        messageId: 'agentmail:yente-threads@agentmail.to:m1',
+      }),
+    ).toBe(path.join(groupsDir, 'main', 'attachments', 'agentmail', 'agentmail-yente-threads-agentmail.to-m1'));
+
+    const result = materializeAttachmentData({
+      groupsDir,
+      groupFolder: 'main',
+      channel: 'agentmail',
+      messageId: 'agentmail:yente-threads@agentmail.to:m1',
+      attachmentId: 'a1',
+      originalName: 'report.txt',
+      contentType: 'text/plain',
+      data: Buffer.from('report'),
+    });
+    expect(result.hostPath).toBe(
+      path.join(
+        groupsDir,
+        'main',
+        'attachments',
+        'agentmail',
+        'agentmail-yente-threads-agentmail.to-m1',
+        'a1-report.txt',
+      ),
+    );
+    expect(result.workspacePath).toBe(
+      '/workspace/agent/attachments/agentmail/agentmail-yente-threads-agentmail.to-m1/a1-report.txt',
+    );
+  });
+
   it('formats prompt metadata without leaking host paths', () => {
     expect(
       formatAttachmentPromptMetadata({

@@ -224,6 +224,48 @@ describe('session manager', () => {
     expect(parsed.attachments[0]).not.toHaveProperty('data');
   });
 
+  it('AgentMail attachments are materialized into the routed prompt', () => {
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+
+    writeSessionMessage('ag-1', session.id, {
+      id: 'agentmail:yente-threads@agentmail.to:m1',
+      kind: 'chat',
+      timestamp: now(),
+      platformId: 'yente-threads@agentmail.to',
+      channelType: 'agentmail',
+      threadId: 'agentmail:yente-threads:t1',
+      content: JSON.stringify({
+        sender: 'ci@example.com',
+        text: 'See attached.',
+        attachments: [
+          {
+            id: 'a1',
+            filename: 'report.txt',
+            data: 'cmVwb3J0',
+            contentType: 'text/plain',
+          },
+        ],
+      }),
+    });
+
+    const db = new Database(inboundDbPath('ag-1', session.id));
+    const row = db
+      .prepare('SELECT content FROM messages_in WHERE id = ?')
+      .get('agentmail:yente-threads@agentmail.to:m1') as {
+      content: string;
+    };
+    db.close();
+
+    const parsed = JSON.parse(row.content) as { text: string; attachments: Array<{ workspacePath: string }> };
+    expect(parsed.text).toContain(
+      '/workspace/agent/attachments/agentmail/agentmail-yente-threads-agentmail.to-m1/a1-report.txt',
+    );
+    expect(parsed.attachments[0].workspacePath).toBe(
+      '/workspace/agent/attachments/agentmail/agentmail-yente-threads-agentmail.to-m1/a1-report.txt',
+    );
+    expect(parsed.attachments[0]).not.toHaveProperty('data');
+  });
+
   it('should update last_active on message write', () => {
     const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
     expect(getSession(session.id)!.last_active).toBeNull();

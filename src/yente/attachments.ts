@@ -33,7 +33,7 @@ export function safeAttachmentName(input: string): string {
 export function materializedAttachmentDir(args: {
   groupsDir: string;
   groupFolder: string;
-  channel: 'discord' | 'whatsapp';
+  channel: 'discord' | 'whatsapp' | 'agentmail';
   messageId: string;
 }): string {
   const groupsRoot = path.resolve(args.groupsDir);
@@ -49,7 +49,7 @@ export function materializedAttachmentDir(args: {
 export function materializeAttachmentData(args: {
   groupsDir: string;
   groupFolder: string;
-  channel: 'discord' | 'whatsapp';
+  channel: 'discord' | 'whatsapp' | 'agentmail';
   messageId: string;
   attachmentId: string;
   originalName: string;

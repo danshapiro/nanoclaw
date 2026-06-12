@@ -366,7 +366,8 @@ function extractAttachmentFiles(
   const attachments = parsed.attachments as Array<Record<string, unknown>> | undefined;
   if (!Array.isArray(attachments)) return contentStr;
 
-  const channel = channelType === 'discord' || channelType === 'whatsapp' ? channelType : null;
+  const channel =
+    channelType === 'discord' || channelType === 'whatsapp' || channelType === 'agentmail' ? channelType : null;
   const agentGroup = getAgentGroup(agentGroupId);
   if (!agentGroup) {
     throw new Error(`Cannot materialize attachments: unknown agent group ${agentGroupId}`);
