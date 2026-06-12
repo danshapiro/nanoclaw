@@ -6,7 +6,9 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import {
   clearManagedSkillRootCache,
+  cleanupStaleTempRoots,
   computeManagedSkillGeneration,
+  createManagedSkillTempRoot,
   currentManagedSkillGeneration,
   managedSkillRootsFromEnv,
   resolveManagedSkillRoot,
@@ -313,6 +315,39 @@ describe('resolveManagedSkillRoot', () => {
         env: { NANOCLAW_MANAGED_SKILLS_DIRS: missingRoot },
       }),
     ).toThrow(`Configured managed skills root does not exist: ${missingRoot}`);
+  });
+});
+
+describe('managed skill temp root cleanup', () => {
+  it('does not remove roots owned by the current process', () => {
+    const dataDir = makeTempDir();
+    const root = createManagedSkillTempRoot(dataDir);
+    const old = new Date(Date.now() - 48 * 60 * 60 * 1000);
+    fs.utimesSync(root, old, old);
+
+    cleanupStaleTempRoots(dataDir);
+
+    expect(fs.existsSync(root)).toBe(true);
+  });
+
+  it('does not remove recent roots without an owner marker', () => {
+    const dataDir = makeTempDir();
+    const root = fs.mkdtempSync(path.join(dataDir, '.nanoclaw-skills-'));
+
+    cleanupStaleTempRoots(dataDir);
+
+    expect(fs.existsSync(root)).toBe(true);
+  });
+
+  it('removes old roots without a live owner marker', () => {
+    const dataDir = makeTempDir();
+    const root = fs.mkdtempSync(path.join(dataDir, '.nanoclaw-skills-'));
+    const old = new Date(Date.now() - 48 * 60 * 60 * 1000);
+    fs.utimesSync(root, old, old);
+
+    cleanupStaleTempRoots(dataDir);
+
+    expect(fs.existsSync(root)).toBe(false);
   });
 });
 

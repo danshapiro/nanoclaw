@@ -47,29 +47,41 @@ const RUNTIME_SHIM_BINS = new Set(['gws']);
 const BASE_RUNTIME_COMMANDS = new Set(['bash', 'sh', 'node', 'python3', 'agent-browser']);
 const SKILL_RUNTIME_MANIFEST = 'skill-runtime-manifest.json';
 export const SKILL_GENERATION_FILE = '.skill-generation';
+const TEMP_ROOT_PREFIX = '.nanoclaw-skills-';
+const TEMP_ROOT_OWNER_FILE = '.nanoclaw-owner-pid';
+const TEMP_ROOT_MIN_AGE_MS = 24 * 60 * 60 * 1000;
 
 let _cleanupRan = false;
 
 export function cleanupStaleTempRoots(dataDir: string): void {
   // Run once per process lifetime. Called from buildMounts before any
-  // temp roots are created, so it only removes dirs from a prior process.
+  // temp roots are created by the long-lived service. Smoke helpers are
+  // short-lived separate processes, so cleanup must not delete temp roots
+  // currently owned by another live process.
   if (_cleanupRan) return;
   _cleanupRan = true;
 
   try {
     for (const entry of fs.readdirSync(dataDir)) {
-      if (entry.startsWith('.nanoclaw-skills-')) {
-        const dir = path.join(dataDir, entry);
-        try {
-          fs.rmSync(dir, { recursive: true, force: true });
-        } catch {
-          // Mount still active or permissions — skip, not fatal.
-        }
+      if (!entry.startsWith(TEMP_ROOT_PREFIX)) continue;
+      const dir = path.join(dataDir, entry);
+      if (!shouldRemoveTempRoot(dir)) continue;
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+      } catch {
+        // Mount still active or permissions — skip, not fatal.
       }
     }
   } catch {
     // dataDir may not exist yet on first-ever run.
   }
+}
+
+export function createManagedSkillTempRoot(dataDir: string): string {
+  fs.mkdirSync(dataDir, { recursive: true });
+  const root = fs.mkdtempSync(path.join(dataDir, TEMP_ROOT_PREFIX));
+  fs.writeFileSync(path.join(root, TEMP_ROOT_OWNER_FILE), `${process.pid}\n`, { mode: 0o600 });
+  return root;
 }
 
 export function resolveManagedSkillRoot(args: {
@@ -118,7 +130,7 @@ export function resolveManagedSkillRoot(args: {
   // Each spawn gets a fresh, isolated merged root. If the caller provides
   // a root path (created externally with its own lifecycle), use it.
   // Otherwise create one under the data directory.
-  const root = args.root ?? fs.mkdtempSync(path.join(args.dataDir, '.nanoclaw-skills-'));
+  const root = args.root ?? createManagedSkillTempRoot(args.dataDir);
   for (const skill of skills) {
     skill.mergedPath = path.join(root, skill.name);
     fs.cpSync(skill.sourcePath, skill.mergedPath, { recursive: true, dereference: true });
@@ -411,6 +423,40 @@ function pathExistsNoFollow(entryPath: string): boolean {
       return false;
     }
     throw err;
+  }
+}
+
+function shouldRemoveTempRoot(root: string): boolean {
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(root);
+  } catch {
+    return false;
+  }
+  if (!stat.isDirectory()) return false;
+  if (tempRootOwnerIsRunning(root)) return false;
+  return Date.now() - stat.mtimeMs >= TEMP_ROOT_MIN_AGE_MS;
+}
+
+function tempRootOwnerIsRunning(root: string): boolean {
+  const pidPath = path.join(root, TEMP_ROOT_OWNER_FILE);
+  let raw: string;
+  try {
+    raw = fs.readFileSync(pidPath, 'utf8').trim();
+  } catch {
+    return false;
+  }
+  if (!/^[1-9][0-9]*$/.test(raw)) return false;
+  const pid = Number(raw);
+  if (!Number.isSafeInteger(pid)) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    if (err && typeof err === 'object' && 'code' in err && err.code === 'EPERM') {
+      return true;
+    }
+    return false;
   }
 }
 

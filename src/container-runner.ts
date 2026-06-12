@@ -41,7 +41,12 @@ import { resolveGroupIpcPath } from './group-folder.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
-import { cleanupStaleTempRoots, resolveManagedSkillRoot, syncManagedSkillSymlinks } from './yente/managed-skills.js';
+import {
+  cleanupStaleTempRoots,
+  createManagedSkillTempRoot,
+  resolveManagedSkillRoot,
+  syncManagedSkillSymlinks,
+} from './yente/managed-skills.js';
 import {
   assertOneCliApplied,
   ensureOneCliAgentSecretAccess,
@@ -757,7 +762,7 @@ function buildMounts(
 
   // Create temp root here so we own its lifecycle. If any step below throws,
   // the catch block ensures the temp dir is cleaned up.
-  const tempRoot = fs.mkdtempSync(path.join(DATA_DIR, '.nanoclaw-skills-'));
+  const tempRoot = createManagedSkillTempRoot(DATA_DIR);
   try {
     const managedSkills = resolveManagedSkillRoot({ projectRoot, dataDir: DATA_DIR, env: process.env, root: tempRoot });
 
