@@ -5,7 +5,12 @@ import path from 'path';
 import { describe, it, expect } from 'bun:test';
 
 import { createProvider } from './factory.js';
-import { CodexProvider, resolveClaudeImports } from './codex.js';
+import {
+  buildNanoclawSkillInventoryInstructions,
+  CodexProvider,
+  resolveClaudeImports,
+  syncCodexManagedSkillLinks,
+} from './codex.js';
 
 describe('createProvider (codex)', () => {
   it('returns CodexProvider for codex', () => {
@@ -78,5 +83,44 @@ describe('resolveClaudeImports', () => {
     const dir = scratchDir();
     const resolved = resolveClaudeImports('email @someone for details', dir);
     expect(resolved).toBe('email @someone for details');
+  });
+});
+
+describe('Codex NanoClaw skill bridge', () => {
+  function writeSkill(root: string, name: string): void {
+    const dir = path.join(root, name);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'SKILL.md'), `---\nname: ${name}\ndescription: ${name}\n---\n`);
+  }
+
+  it('links deployed NanoClaw skills into the Codex skill root and prunes stale managed links', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-skills-root-'));
+    const dest = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-skills-dest-'));
+    writeSkill(root, 'gws-calendar');
+    writeSkill(root, 'using-familiar');
+    fs.mkdirSync(path.join(root, '.bin'));
+    fs.mkdirSync(path.join(root, 'not-a-skill'));
+    fs.symlinkSync(path.join(root, 'removed-skill'), path.join(dest, 'removed-skill'), 'dir');
+    fs.mkdirSync(path.join(dest, 'imagegen'), { recursive: true });
+
+    const linked = syncCodexManagedSkillLinks(root, dest);
+
+    expect(linked).toEqual(['gws-calendar', 'using-familiar']);
+    expect(fs.readlinkSync(path.join(dest, 'gws-calendar'))).toBe(path.join(root, 'gws-calendar'));
+    expect(fs.readlinkSync(path.join(dest, 'using-familiar'))).toBe(path.join(root, 'using-familiar'));
+    expect(fs.existsSync(path.join(dest, 'removed-skill'))).toBe(false);
+    expect(fs.lstatSync(path.join(dest, 'imagegen')).isDirectory()).toBe(true);
+    expect(fs.existsSync(path.join(dest, '.bin'))).toBe(false);
+    expect(fs.existsSync(path.join(dest, 'not-a-skill'))).toBe(false);
+  });
+
+  it('builds a compact deployed-skill inventory for Codex base instructions', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-skill-inventory-'));
+    writeSkill(root, 'using-msgvault');
+    writeSkill(root, 'agent-browser');
+
+    const text = buildNanoclawSkillInventoryInstructions(root);
+
+    expect(text).toContain('Available NanoClaw skills: agent-browser, using-msgvault');
   });
 });

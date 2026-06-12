@@ -46,6 +46,15 @@ import { buildInactivityNotice, dedupeCodexSideEffect, codexCapabilities, codexT
 
 /** Real wall clock; tests inject a fake one via runOneTurn's deps. */
 const REAL_CLOCK: CodexTimingClock = { now: () => Date.now() };
+const NANOCLAW_SKILLS_ROOT = '/app/skills';
+
+const CODEX_NANOCLAW_BRIDGE_INSTRUCTIONS = [
+  '## NanoClaw Codex bridge',
+  '',
+  'NanoClaw-managed skills are deployed under `/app/skills` and linked into your Codex skill root before each turn. Treat those as first-class available skills. If asked to list available skills, include the NanoClaw skill names.',
+  '',
+  'Trailing run identifiers such as `Smoke run id: ...` are diagnostic metadata from test harnesses. Do not treat them as remembered conversation facts, passwords, or requested answer values unless the message explicitly says that exact run id is the value to use.',
+].join('\n');
 
 // ── System-prompt assembly ──────────────────────────────────────────────────
 // Codex's app-server doesn't expand Claude Code's `@-import` syntax in
@@ -102,9 +111,133 @@ function readAgentAndGlobalClaudeMd(): string | undefined {
   return parts.length > 0 ? parts.join('\n\n---\n\n') : undefined;
 }
 
+function codexSkillsDir(): string {
+  return path.join(process.env.HOME || '/home/node', '.codex', 'skills');
+}
+
+function logStructured(event: string, fields: Record<string, unknown> = {}): void {
+  console.error(JSON.stringify({ severity: 'info', event, ...fields }));
+}
+
+function warnStructured(event: string, fields: Record<string, unknown> = {}): void {
+  console.error(JSON.stringify({ severity: 'warn', event, ...fields }));
+}
+
+function isManagedSkillTarget(target: string, skillsRoot: string): boolean {
+  return target === skillsRoot || target.startsWith(`${skillsRoot}/`);
+}
+
+function listNanoclawSkillNames(skillsRoot = NANOCLAW_SKILLS_ROOT): string[] {
+  try {
+    if (!fs.existsSync(skillsRoot)) return [];
+    return fs
+      .readdirSync(skillsRoot, { withFileTypes: true })
+      .filter((entry) => {
+        if (entry.name.startsWith('.') || entry.name === '.bin' || entry.name === 'skill-runtime-manifest.json') {
+          return false;
+        }
+        if (!entry.isDirectory() && !entry.isSymbolicLink()) return false;
+        return fs.existsSync(path.join(skillsRoot, entry.name, 'SKILL.md'));
+      })
+      .map((entry) => entry.name)
+      .sort((a, b) => a.localeCompare(b));
+  } catch (err) {
+    warnStructured('codex_nanoclaw_skill_list_failed', { error: err instanceof Error ? err.message : String(err) });
+    return [];
+  }
+}
+
+export function syncCodexManagedSkillLinks(
+  skillsRoot = NANOCLAW_SKILLS_ROOT,
+  destinationDir = codexSkillsDir(),
+): string[] {
+  const names = listNanoclawSkillNames(skillsRoot);
+  if (names.length === 0) return [];
+
+  fs.mkdirSync(destinationDir, { recursive: true });
+  const desired = new Map(names.map((name) => [name, path.join(skillsRoot, name)]));
+  const linked: string[] = [];
+
+  for (const entry of fs.readdirSync(destinationDir, { withFileTypes: true })) {
+    const dest = path.join(destinationDir, entry.name);
+    let linkTarget: string | undefined;
+    try {
+      if (entry.isSymbolicLink()) linkTarget = fs.readlinkSync(dest);
+    } catch (err) {
+      warnStructured('codex_nanoclaw_skill_link_read_failed', {
+        skill: entry.name,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      continue;
+    }
+    if (linkTarget && isManagedSkillTarget(linkTarget, skillsRoot) && desired.get(entry.name) !== linkTarget) {
+      fs.unlinkSync(dest);
+    }
+  }
+
+  for (const [name, target] of desired) {
+    const dest = path.join(destinationDir, name);
+    try {
+      const existing = fs.lstatSync(dest);
+      if (existing.isSymbolicLink()) {
+        const current = fs.readlinkSync(dest);
+        if (current === target) {
+          linked.push(name);
+          continue;
+        }
+        if (isManagedSkillTarget(current, skillsRoot)) {
+          fs.unlinkSync(dest);
+        } else {
+          warnStructured('codex_nanoclaw_skill_link_conflict', { skill: name, existingTarget: current });
+          continue;
+        }
+      } else {
+        warnStructured('codex_nanoclaw_skill_link_conflict', { skill: name, existingType: 'non_symlink' });
+        continue;
+      }
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT') {
+        warnStructured('codex_nanoclaw_skill_link_stat_failed', {
+          skill: name,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        continue;
+      }
+    }
+    try {
+      fs.symlinkSync(target, dest, 'dir');
+      linked.push(name);
+    } catch (err) {
+      warnStructured('codex_nanoclaw_skill_link_create_failed', {
+        skill: name,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  logStructured('codex_nanoclaw_skill_links_synced', { count: linked.length });
+  return linked;
+}
+
+export function buildNanoclawSkillInventoryInstructions(skillsRoot = NANOCLAW_SKILLS_ROOT): string | undefined {
+  const names = listNanoclawSkillNames(skillsRoot);
+  if (names.length === 0) return undefined;
+  return [
+    '## NanoClaw deployed skill inventory',
+    '',
+    `Available NanoClaw skills: ${names.join(', ')}`,
+  ].join('\n');
+}
+
 function composeBaseInstructions(promptAddendum: string | undefined): string | undefined {
   const claudeMd = readAgentAndGlobalClaudeMd();
-  const pieces = [claudeMd, promptAddendum].filter((s): s is string => Boolean(s));
+  const pieces = [
+    claudeMd,
+    CODEX_NANOCLAW_BRIDGE_INSTRUCTIONS,
+    buildNanoclawSkillInventoryInstructions(),
+    promptAddendum,
+  ].filter((s): s is string => Boolean(s));
   return pieces.length > 0 ? pieces.join('\n\n---\n\n') : undefined;
 }
 
@@ -154,6 +287,7 @@ export class CodexProvider implements AgentProvider {
       // One app-server per query invocation. The poll-loop keeps a single
       // query active per batch of pending messages and ends it on idle, so
       // spawn-per-query matches that cadence naturally.
+      syncCodexManagedSkillLinks();
       writeCodexMcpConfigToml(self.mcpServers);
       const server = spawnCodexAppServer(createCodexConfigOverrides());
       // Relay turns run read-only (codexThreadSandbox(relay)); auto-approval is
