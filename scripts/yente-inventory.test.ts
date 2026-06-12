@@ -180,6 +180,18 @@ describe('yente inventory', () => {
       fs.chmodSync(backupDir, 0o700);
     }
   });
+
+  it('skips transient managed skill temp roots during inventory and hashing', () => {
+    const before = hashSourceState(stateRoot);
+    const tempSkillDir = path.join(stateRoot, 'data', '.nanoclaw-skills-race', 'FullQAPass');
+    fs.mkdirSync(tempSkillDir, { recursive: true });
+    fs.writeFileSync(path.join(tempSkillDir, 'SKILL.md'), '# transient skill copy\n');
+
+    const inventory = buildYenteInventory({ stateRoot, configRoot, checkedAt: '2026-04-26T00:00:00.000Z' });
+
+    expect(hashSourceState(stateRoot)).toBe(before);
+    expect(inventory.source.files.some((file) => file.includes('.nanoclaw-skills-'))).toBe(false);
+  });
 });
 
 function createInventoryFixture(root: string, config: string): void {

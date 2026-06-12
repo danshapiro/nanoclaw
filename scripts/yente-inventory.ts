@@ -204,6 +204,7 @@ function updateHashFromFile(hash: crypto.Hash, file: string): void {
   try {
     fd = fs.openSync(file, 'r');
   } catch (err) {
+    if (isMissingPath(err)) return;
     if (isPermissionDenied(err)) {
       const stat = fs.statSync(file);
       hash.update('<unreadable>');
@@ -537,9 +538,19 @@ function readTextIfReadable(file: string): string | null {
   try {
     return fs.readFileSync(file, 'utf8');
   } catch (err) {
+    if (isMissingPath(err)) return null;
     if (isPermissionDenied(err)) return null;
     throw err;
   }
+}
+
+function isMissingPath(err: unknown): boolean {
+  return (
+    err instanceof Error &&
+    'code' in err &&
+    (err as NodeJS.ErrnoException).code !== undefined &&
+    ['ENOENT', 'ENOTDIR'].includes((err as NodeJS.ErrnoException).code ?? '')
+  );
 }
 
 function isPermissionDenied(err: unknown): boolean {
@@ -584,6 +595,7 @@ function listFiles(root: string): string[] {
     try {
       entries = fs.readdirSync(dir, { withFileTypes: true });
     } catch (err) {
+      if (isMissingPath(err)) return;
       if (isPermissionDenied(err)) return;
       throw err;
     }
@@ -605,7 +617,11 @@ function listFiles(root: string): string[] {
 }
 
 function isSourceHashPrunedDirectory(rel: string): boolean {
-  return rel === 'backups' || rel.startsWith('backups/');
+  return (
+    rel === 'backups' ||
+    rel.startsWith('backups/') ||
+    rel.split('/').some((part) => part.startsWith('.nanoclaw-skills-'))
+  );
 }
 
 function parseJsonObject(raw: string | null): Record<string, unknown> | null {
