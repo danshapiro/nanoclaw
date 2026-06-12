@@ -72,8 +72,6 @@ function writeNativeConfig(root: string, agentGroupId = 'ag-main') {
   const token = 'aoc_test_agent_token';
   const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
   fs.writeFileSync(tokenFile, token);
-  const caFile = path.join(root, 'ca.pem');
-  fs.writeFileSync(caFile, '-----BEGIN CERTIFICATE-----\nMIIBtest\n-----END CERTIFICATE-----\n');
   const configPath = path.join(root, 'onecli-codex-container-config.json');
   fs.writeFileSync(
     configPath,
@@ -95,10 +93,10 @@ function writeNativeConfig(root: string, agentGroupId = 'ag-main') {
         HTTPS_PROXY: 'http://codex-yente-main@yente-onecli-auth-gate.local:18055',
         HTTP_PROXY: 'http://codex-yente-main@yente-onecli-auth-gate.local:18055',
       },
-      mounts: [{ hostPath: caFile, containerPath: '/tmp/onecli-gateway-ca.pem', readonly: true }],
+      mounts: [],
     }),
   );
-  return { caFile, configPath, tokenFile };
+  return { configPath, tokenFile };
 }
 
 function tempDir(prefix: string) {
@@ -118,7 +116,7 @@ describe('codex host provider container config', () => {
     const root = tempDir('yente-codex-provider-');
     const sessionDir = path.join(root, 'session');
     fs.mkdirSync(sessionDir, { recursive: true });
-    const { caFile, configPath } = writeNativeConfig(root);
+    const { configPath } = writeNativeConfig(root);
     const broker = await startFakeBroker({
       auth_mode: 'chatgpt',
       tokens: {
@@ -178,11 +176,7 @@ describe('codex host provider container config', () => {
         containerPath: '/home/node/.codex',
         readonly: false,
       });
-      expect(contribution.mounts).toContainEqual({
-        hostPath: caFile,
-        containerPath: '/tmp/onecli-gateway-ca.pem',
-        readonly: true,
-      });
+      expect(contribution.mounts?.some((mount) => mount.containerPath === '/tmp/onecli-gateway-ca.pem')).toBe(false);
       expect(contribution.env?.OPENAI_API_KEY).toBeUndefined();
       expect(contribution.env?.CODEX_MODEL).toBe('gpt-5.5');
       expect(contribution.env?.CODEX_REASONING_EFFORT).toBe('xhigh');

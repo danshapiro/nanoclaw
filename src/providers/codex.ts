@@ -245,17 +245,14 @@ function assertNativeCodexOneCliConfig(
   if (!hasPlaceholder) {
     throw new Error('Native OneCLI codex config must include a provider placeholder credential');
   }
-  // The container MUST trust the auth-gate CA. Codex (Rust) honors
-  // CODEX_CA_CERTIFICATE + SSL_CERT_FILE; require BOTH, each pointing at a
-  // read-only CA mount. NODE_EXTRA_CA_CERTS (Node wrapper) is also required.
+  // The container MUST trust the auth-gate CA. The standard OneCLI gateway
+  // integration owns the CA bind mount; Codex only contributes the env keys
+  // pointing at that shared in-container path. Requiring a second Codex-owned
+  // mount here creates a duplicate Docker mount point.
   for (const caKey of ONECLI_CA_ENV) {
     const caPath = config.env[caKey];
     if (!caPath || !path.posix.isAbsolute(caPath)) {
       throw new Error(`Native OneCLI codex config must include absolute ${caKey}`);
-    }
-    const caMount = config.mounts.find((mount) => mount.containerPath === caPath);
-    if (!caMount?.readonly) {
-      throw new Error(`Native OneCLI codex CA must be mounted read-only at ${caKey}`);
     }
   }
   for (const mount of config.mounts) {
