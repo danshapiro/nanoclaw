@@ -12,6 +12,7 @@ import { migration012 } from './012-channel-registration.js';
 import { migration013 } from './013-approval-render-metadata.js';
 import { migration014 } from './014-scheduler-ledger.js';
 import { migration015 } from './015-scheduler-supersession-response-address.js';
+import { migration016 } from './016-agentmail-message-routes.js';
 import { moduleApprovalsPendingApprovals } from './module-approvals-pending-approvals.js';
 import { moduleApprovalsTitleOptions } from './module-approvals-title-options.js';
 
@@ -35,6 +36,7 @@ const migrations: Migration[] = [
   migration013,
   migration014,
   migration015,
+  migration016,
 ];
 
 export function runMigrations(db: Database.Database): void {
