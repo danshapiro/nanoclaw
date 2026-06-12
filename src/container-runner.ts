@@ -1174,11 +1174,14 @@ export async function buildAgentGroupImage(agentGroupId: string): Promise<void> 
   const tmpDockerfile = path.join(tmpBuildDir, 'Dockerfile');
   fs.writeFileSync(tmpDockerfile, dockerfile);
   try {
-    execSync(`${CONTAINER_RUNTIME_BIN} build -t ${shellSingleQuote(imageTag)} -f ${shellSingleQuote(tmpDockerfile)} .`, {
-      cwd: DATA_DIR,
-      stdio: 'pipe',
-      timeout: 300_000,
-    });
+    execSync(
+      `${CONTAINER_RUNTIME_BIN} build -t ${shellSingleQuote(imageTag)} -f ${shellSingleQuote(tmpDockerfile)} .`,
+      {
+        cwd: DATA_DIR,
+        stdio: 'pipe',
+        timeout: 300_000,
+      },
+    );
   } finally {
     fs.rmSync(tmpBuildDir, { recursive: true, force: true });
   }
