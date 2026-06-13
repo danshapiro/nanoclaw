@@ -517,6 +517,28 @@ describe('gws proxy shim', () => {
     expect(fs.existsSync(outputPath)).toBe(false);
   });
 
+  it('preserves output-mode proxy CLI failure bodies', async () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-shim-workspace-'));
+    const shim = shimWithOutputRootsForTest([workspace]);
+    const outputPath = path.join(workspace, 'out.txt');
+    const proxy = await withProxy((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/plain', 'X-Exit-Code': '3' });
+      res.end('Request had insufficient authentication scopes.\n');
+    });
+
+    const result = await runShim(
+      ['drive', 'files', 'export', '--params', '{"fileId":"doc-1"}', '-o', outputPath],
+      { GWS_PROXY_URL: proxy.url },
+      workspace,
+      shim,
+    );
+
+    expect(result.status).toBe(3);
+    expect(result.stdout).toContain('insufficient authentication scopes');
+    expect(result.stderr).toBe('');
+    expect(fs.existsSync(outputPath)).toBe(false);
+  });
+
   it('rejects an existing output target before contacting the proxy', async () => {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-shim-workspace-'));
     const shim = shimWithOutputRootsForTest([workspace]);

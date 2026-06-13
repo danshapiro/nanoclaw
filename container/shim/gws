@@ -227,14 +227,6 @@ output_parent="$(
     process.stdout.write(plan.output ? plan.output.parent : "");
   ' "$tmp_arg_plan"
 )"
-output_basename="$(
-  NODE_NO_WARNINGS=1 node -e '
-    const fs = require("fs");
-    const plan = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-    process.stdout.write(plan.output ? plan.output.basename : "");
-  ' "$tmp_arg_plan"
-)"
-
 curl_body_target="$tmp_body"
 if [ -n "$output_resolved_path" ]; then
   tmp_output_body="$(mktemp "$output_parent/.gws-output.XXXXXX")"
@@ -390,13 +382,15 @@ case "$http_code" in
         print_output_success_json
         exit 0
       fi
-      rm -f "$tmp_output_body"
-      tmp_output_body=""
       if [ "$exit_code" = "0" ]; then
+        rm -f "$tmp_output_body"
+        tmp_output_body=""
         printf 'Error: GWS proxy did not return output bytes for -o/--output request.\n' >&2
         exit 1
       fi
-      body="$(cat "$curl_body_target" 2>/dev/null || true)"
+      body="$(cat "$tmp_output_body" 2>/dev/null || true)"
+      rm -f "$tmp_output_body"
+      tmp_output_body=""
     fi
     api_effect="$(header_value 'X-GWS-Api-Effect')"
     op_succeeded="$(header_value 'X-GWS-Operation-Succeeded')"
