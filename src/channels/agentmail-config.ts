@@ -66,7 +66,6 @@ export type AgentMailInboundContent = {
   text: string;
   html?: string;
   extractedText?: string;
-  headers: Record<string, string | string[]>;
   sender: string;
   senderId: string;
   senderName: string;
@@ -332,7 +331,6 @@ export function buildAgentMailInboundContent(
     ...(message.extractedText || message.extracted_text
       ? { extractedText: (message.extractedText ?? message.extracted_text)!.trim() }
       : {}),
-    headers,
     sender,
     senderId: `agentmail:${sender.toLowerCase()}`,
     senderName: sender,

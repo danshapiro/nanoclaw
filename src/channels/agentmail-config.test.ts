@@ -90,7 +90,22 @@ describe('AgentMail route config', () => {
       },
     );
 
-    expect(content.headers).toEqual({
+    expect(
+      normalizedAgentMailHeaders({
+        inboxId: 'yente-threads@agentmail.to',
+        messageId: 'm-headers',
+        threadId: 't-headers',
+        from_: 'CI Bot <ci@example.com>',
+        to: ['Yente Threads <yente-threads@agentmail.to>'],
+        cc: ['Observer <observer@example.com>'],
+        subject: 'QA header visibility',
+        text: 'please inspect the headers',
+        headers: {
+          Received: ['from mx1.example.test', 'by inbound.agentmail.test'],
+          'X-Custom-Trace': 'abc123',
+        },
+      }),
+    ).toEqual({
       From: 'CI Bot <ci@example.com>',
       To: 'Yente Threads <yente-threads@agentmail.to>',
       Cc: 'Observer <observer@example.com>',
@@ -98,6 +113,7 @@ describe('AgentMail route config', () => {
       Received: ['from mx1.example.test', 'by inbound.agentmail.test'],
       'X-Custom-Trace': 'abc123',
     });
+    expect((content as Record<string, unknown>).headers).toBeUndefined();
     expect(content.text).toContain('Email headers:\n');
     expect(content.text).toContain('Subject: QA header visibility');
     expect(content.text).toContain('Received: from mx1.example.test\nReceived: by inbound.agentmail.test');
