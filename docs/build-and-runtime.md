@@ -93,7 +93,7 @@ Any failure fails the PR.
 - **Agent-runner tests run under `bun:test`, not vitest.** `vitest.config.ts` excludes the `container/agent-runner/` tree because vitest runs on Node and can't load `bun:sqlite`.
 - **No tsc build step in the container image.** Re-adding one would reintroduce the ~200-500ms per-session-wake cost we removed.
 - **Global container CLIs stay on pnpm, not Bun.** `agent-browser`, `@anthropic-ai/claude-code`, `vercel` and any future Node CLIs the agent invokes should be pinned versions under the Dockerfile's pnpm global-install block. `bun install -g` would bypass the pnpm supply-chain policy.
-- **GWS stays mediated.** The agent image must expose `/usr/local/bin/gws` as the policy-proxy shim, must not install the real Google Workspace CLI, and must not create or receive a Google OAuth config path. The trusted `gws-proxy` service owns the real CLI and OAuth state.
+- **GWS stays mediated.** The agent image must expose `/usr/local/bin/gws` as the policy-proxy shim, must not install the real Google Workspace CLI, and must not create or receive a Google OAuth config path. The trusted `gws-proxy` service owns the real CLI and OAuth state. For `-o/--output`, the shim writes caller-visible Drive export/download files locally from bytes streamed by the proxy, verifies byte count and SHA-256 metadata, and refuses to overwrite existing targets; the proxy uses only private temp output paths and never receives caller paths.
 - **Browser handoff stays mediated.** Agents receive only `YENTE_BROWSER_HANDOFF_URL` and the skill helper. OneCLI owns broker authorization, and the browser handoff service owns the VNC password, profile, and CDP socket.
 
 ## Migration history
