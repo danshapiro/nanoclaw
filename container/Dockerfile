@@ -106,7 +106,7 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
 #     global install leaves the placeholder shim in place unless we run it
 #     explicitly in the OpenCode layer below.
 ENV PNPM_HOME="/pnpm"
-ENV PATH="${PNPM_HOME}/bin:${PNPM_HOME}:$PATH"
+ENV PATH="/app/skills/.bin:${PNPM_HOME}/bin:${PNPM_HOME}:$PATH"
 RUN corepack enable
 
 RUN --mount=type=cache,target=/root/.cache/pnpm \
@@ -114,7 +114,20 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
     echo "only-built-dependencies[]=esbuild" >> /root/.npmrc && \
     echo "only-built-dependencies[]=@anthropic-ai/claude-code" >> /root/.npmrc && \
     echo "only-built-dependencies[]=opencode-ai" >> /root/.npmrc && \
-    printf 'export PNPM_HOME=/pnpm\nexport PATH=/pnpm/bin:/pnpm:$PATH\n' > /etc/profile.d/pnpm-home.sh && \
+    printf '%s\n' \
+      'export PNPM_HOME=/pnpm' \
+      'case ":$PATH:" in' \
+      '  *:/pnpm:*) ;;' \
+      '  *) export PATH="/pnpm:$PATH" ;;' \
+      'esac' \
+      'case ":$PATH:" in' \
+      '  *:/pnpm/bin:*) ;;' \
+      '  *) export PATH="/pnpm/bin:$PATH" ;;' \
+      'esac' \
+      'case ":$PATH:" in' \
+      '  *:/app/skills/.bin:*) ;;' \
+      '  *) export PATH="/app/skills/.bin:$PATH" ;;' \
+      'esac' > /etc/profile.d/pnpm-home.sh && \
     export PATH="/pnpm/bin:/pnpm:$PATH" && \
     pnpm install -g "vercel@${VERCEL_VERSION}"
 

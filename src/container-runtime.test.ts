@@ -97,6 +97,14 @@ describe('agent container Dockerfile', () => {
     }
   });
 
+  it('keeps skill-local helpers on PATH for login shells', () => {
+    const dockerfile = fs.readFileSync(path.join(process.cwd(), 'container', 'Dockerfile'), 'utf8');
+
+    expect(dockerfile).toContain('ENV PATH="/app/skills/.bin:${PNPM_HOME}/bin:${PNPM_HOME}:$PATH"');
+    expect(dockerfile).toContain('/etc/profile.d/pnpm-home.sh');
+    expect(dockerfile).toContain('*) export PATH="/app/skills/.bin:$PATH" ;;');
+  });
+
   it('runs and verifies the OpenCode postinstall artifact after the pnpm global install', () => {
     const dockerfile = fs.readFileSync(path.join(process.cwd(), 'container', 'Dockerfile'), 'utf8');
 
