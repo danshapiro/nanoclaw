@@ -66,6 +66,7 @@ export type AgentMailInboundContent = {
   text: string;
   html?: string;
   extractedText?: string;
+  headers: Record<string, string | string[]>;
   sender: string;
   senderId: string;
   senderName: string;
@@ -216,22 +217,122 @@ function firstText(...values: Array<string | null | undefined>): string | undefi
   return values.find((value) => typeof value === 'string' && value.trim().length > 0)?.trim();
 }
 
+function headerValue(value: unknown): string | undefined {
+  if (value === null || value === undefined) return undefined;
+  if (typeof value === 'string') return value.trim();
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (Array.isArray(value)) {
+    const values = value
+      .map((item) => headerValue(item))
+      .filter((item): item is string => item !== undefined && item.length > 0);
+    return values.length > 0 ? values.join(', ') : undefined;
+  }
+  try {
+    return JSON.stringify(value);
+    // eslint-disable-next-line no-catch-all/no-catch-all -- Header-like SDK fields can contain non-JSON values; fall back to a visible string.
+  } catch {
+    return String(value);
+  }
+}
+
+function normalizeHeaderLineValue(value: string): string {
+  return value
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/\n[ \t]*/g, '\n  ');
+}
+
+function appendHeader(
+  headers: Map<string, { name: string; values: string[] }>,
+  name: string,
+  values: string | string[] | undefined,
+): void {
+  const trimmedName = name.trim();
+  if (!trimmedName) return;
+  const normalizedValues = (Array.isArray(values) ? values : [values])
+    .filter((value): value is string => typeof value === 'string')
+    .map((value) => normalizeHeaderLineValue(value.trim()));
+  if (normalizedValues.length === 0) return;
+
+  const key = trimmedName.toLowerCase();
+  const existing = headers.get(key);
+  if (existing) {
+    existing.values.push(...normalizedValues);
+  } else {
+    headers.set(key, { name: trimmedName, values: normalizedValues });
+  }
+}
+
+export function normalizedAgentMailHeaders(message: AgentMailMessageLike): Record<string, string | string[]> {
+  const headers = new Map<string, { name: string; values: string[] }>();
+  for (const [name, value] of Object.entries(message.headers ?? {})) {
+    appendHeader(headers, name, value);
+  }
+
+  const standardHeaders: Array<[string, unknown]> = [
+    ['From', message.from ?? message.from_],
+    ['To', message.to],
+    ['Cc', message.cc],
+    ['Bcc', message.bcc],
+    ['Subject', message.subject],
+  ];
+  for (const [name, value] of standardHeaders) {
+    const header = headerValue(value);
+    if (header !== undefined && !headers.has(name.toLowerCase())) appendHeader(headers, name, header);
+  }
+
+  const ordered: Array<{ name: string; values: string[] }> = [];
+  const added = new Set<string>();
+  for (const name of standardHeaders.map(([headerName]) => headerName)) {
+    const key = name.toLowerCase();
+    const existing = headers.get(key);
+    if (existing) {
+      ordered.push(existing);
+      added.add(key);
+    }
+  }
+  for (const [key, value] of headers) {
+    if (!added.has(key)) ordered.push(value);
+  }
+
+  return Object.fromEntries(
+    ordered.map((header) => [header.name, header.values.length === 1 ? header.values[0]! : header.values]),
+  );
+}
+
+function formatAgentMailHeaders(headers: Record<string, string | string[]>): string {
+  return Object.entries(headers)
+    .flatMap(([name, values]) => {
+      const lines = Array.isArray(values) ? values : [values];
+      return lines.map((value) => `${name}: ${value}`);
+    })
+    .join('\n');
+}
+
+function visibleAgentMailText(body: string, headers: Record<string, string | string[]>): string {
+  const formattedHeaders = formatAgentMailHeaders(headers);
+  if (!formattedHeaders) return body;
+  return `Email headers:\n${formattedHeaders}\n\nEmail body:\n${body}`;
+}
+
 export function buildAgentMailInboundContent(
   route: Pick<AgentMailResolvedRoute, 'localPart' | 'inboxId' | 'purpose'>,
   message: AgentMailMessageLike,
 ): AgentMailInboundContent {
   const sender = senderEmailForAgentMailMessage(message);
   const html = firstText(message.extractedHtml, message.extracted_html, message.html);
-  const text =
+  const body =
     (firstText(message.extractedText, message.extracted_text, message.text) ?? (html ? htmlToPlainText(html) : '')) ||
     '(empty email body)';
+  const headers = normalizedAgentMailHeaders(message);
 
   return {
-    text,
+    text: visibleAgentMailText(body, headers),
     ...(html ? { html } : {}),
     ...(message.extractedText || message.extracted_text
       ? { extractedText: (message.extractedText ?? message.extracted_text)!.trim() }
       : {}),
+    headers,
     sender,
     senderId: `agentmail:${sender.toLowerCase()}`,
     senderName: sender,
