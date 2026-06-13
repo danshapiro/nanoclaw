@@ -158,7 +158,7 @@ function formatTurnHeader(): string {
     lines.push(
       [
         `<local_skills_warning repo="${escapeXml(localSkillsStatus.repoPath)}">`,
-        'The local-skills repo has uncommitted changes. If this turn changes a local skill, keep editing the source under /workspace/local-skills, then publish exactly one intended skill with mcp__nanoclaw__publish_local_skill({ skillName, commitMessage }). Do not edit /app/skills; it is the installed read-only view.',
+        'The local-skills repo has uncommitted changes. If this turn changes a local skill, keep editing the source under /workspace/local-skills, then publish exactly one intended skill with publish-local-skill <skill-name> "<commit message>". Do not edit /app/skills; it is the installed read-only view.',
         'Dirty paths:',
         ...dirtyLines,
         '</local_skills_warning>',

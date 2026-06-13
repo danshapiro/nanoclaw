@@ -90,7 +90,7 @@ describe('local-skills dirty warning', () => {
       const result = formatMessages(getPendingMessages());
 
       expect(result).toContain('<local_skills_warning');
-      expect(result).toContain('mcp__nanoclaw__publish_local_skill');
+      expect(result).toContain('publish-local-skill <skill-name>');
       expect(result).toContain('skills/demo/SKILL.md');
       expect(result.indexOf('<local_skills_warning')).toBeLessThan(result.indexOf('<message'));
     } finally {

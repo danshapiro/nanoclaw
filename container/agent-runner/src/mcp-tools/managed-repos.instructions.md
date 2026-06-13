@@ -16,13 +16,10 @@ When a managed repo other than local-skills has committed local changes that sho
 mcp__nanoclaw__push_managed_repo({ repoId: "yente-context" })
 ```
 
-For local skill edits, prefer the publish tool. Edit only the intended skill under `/workspace/local-skills/skills/<skill-name>`, then call:
+For local skill edits, use the bundled `local-skills` skill and CLI. Edit only the intended skill under `/workspace/local-skills/skills/<skill-name>`, then run:
 
-```js
-mcp__nanoclaw__publish_local_skill({
-  skillName: "<skill-name>",
-  commitMessage: "Update <skill-name> instructions"
-})
+```bash
+publish-local-skill <skill-name> "Update <skill-name> instructions"
 ```
 
 The host stages only that skill path, commits it, pushes with host credentials, and reconciles managed repos. If unrelated files in `/workspace/local-skills` are dirty, the publish will fail so another agent's work is not swept into your commit.

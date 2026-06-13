@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  echo "Usage: publish-local-skill SKILL_NAME COMMIT_MESSAGE" >&2
+}
+
+fail() {
+  echo "Error: $*" >&2
+  exit 1
+}
+
+skill_name="${1:-}"
+commit_message="${2:-}"
+if [[ -z "$skill_name" || -z "$commit_message" ]]; then
+  usage
+  exit 1
+fi
+shift 2 || true
+if [[ "$#" -ne 0 ]]; then
+  usage
+  exit 1
+fi
+
+[[ "$skill_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] \
+  || fail "skill name must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+[[ "$commit_message" =~ [^[:space:]] ]] || fail "commit message must not be blank"
+
+local_skills_dir="${NANOCLAW_LOCAL_SKILLS_WORKSPACE:-/workspace/local-skills}"
+task_dir="${NANOCLAW_IPC_TASKS_DIR:-/workspace/ipc/tasks}"
+response_dir="${NANOCLAW_IPC_RESPONSES_DIR:-/workspace/ipc/responses}"
+timeout_seconds="${PUBLISH_LOCAL_SKILL_TIMEOUT_SECONDS:-300}"
+ipc_root="$(dirname "$task_dir")"
+
+[[ "$timeout_seconds" =~ ^[0-9]+$ && "$timeout_seconds" -gt 0 ]] \
+  || fail "PUBLISH_LOCAL_SKILL_TIMEOUT_SECONDS must be a positive integer"
+[[ -d "$local_skills_dir/.git" ]] || fail "local skills git repo is not mounted at $local_skills_dir"
+[[ -f "$local_skills_dir/skills/$skill_name/SKILL.md" ]] \
+  || fail "local skill is missing $local_skills_dir/skills/$skill_name/SKILL.md"
+[[ -d "$ipc_root" ]] || fail "managed repo IPC mount is not available at $ipc_root"
+
+mkdir -p "$task_dir" "$response_dir"
+request_id="$(node -e 'const { randomUUID } = require("crypto"); console.log("publish-local-skill-" + Date.now() + "-" + randomUUID())')"
+task_file="$task_dir/$request_id.json"
+tmp_file="$task_dir/.$request_id.tmp"
+response_file="$response_dir/$request_id.json"
+
+node - "$tmp_file" "$request_id" "$skill_name" "$commit_message" <<'NODE'
+const fs = require('fs');
+
+const [target, requestId, skillName, commitMessage] = process.argv.slice(2);
+fs.writeFileSync(
+  target,
+  JSON.stringify(
+    {
+      type: 'publish_local_skill',
+      requestId,
+      skillName,
+      commitMessage,
+    },
+    null,
+    2,
+  ) + '\n',
+);
+NODE
+mv "$tmp_file" "$task_file"
+
+echo "Submitted local skill publish request $request_id for $skill_name" >&2
+
+deadline=$((SECONDS + timeout_seconds))
+while (( SECONDS < deadline )); do
+  if [[ -f "$response_file" ]]; then
+    node - "$response_file" <<'NODE'
+const fs = require('fs');
+
+const responsePath = process.argv[2];
+const response = JSON.parse(fs.readFileSync(responsePath, 'utf8'));
+if (response.stdout) process.stdout.write(response.stdout);
+if (response.stderr) process.stderr.write(response.stderr);
+process.exit(response.ok ? 0 : 1);
+NODE
+    exit "$?"
+  fi
+  sleep 0.5
+done
+
+fail "timed out waiting for host response at $response_file"

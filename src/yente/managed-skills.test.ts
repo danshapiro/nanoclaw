@@ -61,6 +61,20 @@ describe('resolveManagedSkillRoot', () => {
     expect(body).not.toContain('target_group_jid');
   });
 
+  it('ships the local-skill publish workflow as a skill-local CLI helper', () => {
+    const result = resolveManagedSkillRoot({
+      projectRoot: process.cwd(),
+      dataDir: makeTempDir(),
+      env: {},
+    });
+
+    expect(result.skills.map((skill) => skill.name)).toContain('local-skills');
+    expect(fs.lstatSync(path.join(result.root, '.bin', 'publish-local-skill')).isSymbolicLink()).toBe(true);
+    expect(fs.readlinkSync(path.join(result.root, '.bin', 'publish-local-skill'))).toBe(
+      '../local-skills/scripts/publish-local-skill',
+    );
+  });
+
   it('merges bundled, managed, and local skills into one root', () => {
     const projectRoot = makeTempDir();
     const dataDir = makeTempDir();
