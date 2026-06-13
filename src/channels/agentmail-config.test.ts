@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  agentMailSenderAuthPoliciesFromEnv,
   buildAgentMailInboundContent,
   defaultAgentMailRouteFile,
+  evaluateAgentMailSenderAuthPolicy,
   htmlToPlainText,
   nanoThreadIdForAgentMailMessage,
   normalizedAgentMailHeaders,
@@ -35,6 +37,99 @@ describe('AgentMail route config', () => {
         { AGENTMAIL_DOMAIN: 'agentmail.to' },
       ),
     ).toThrow(/exactly three AgentMail routes/);
+  });
+
+  it('parses sender auth policies from the AgentMail greenlist env', () => {
+    const policies = agentMailSenderAuthPoliciesFromEnv({
+      AGENTMAIL_SENDER_GREENLIST: JSON.stringify({
+        'Dan@DanShapiro.com': { spf: 'none', dkim: 'pass-aligned', dmarc: 'none' },
+      }),
+    });
+
+    expect(policies.get('dan@danshapiro.com')).toEqual({
+      spf: 'none',
+      dkim: 'pass-aligned',
+      dmarc: 'none',
+    });
+  });
+
+  it('requires every greenlisted sender to carry explicit SPF, DKIM, and DMARC policy', () => {
+    expect(() =>
+      agentMailSenderAuthPoliciesFromEnv({
+        AGENTMAIL_SENDER_GREENLIST: 'dan@danshapiro.com',
+      }),
+    ).toThrow(/must be a JSON object/);
+    expect(() =>
+      agentMailSenderAuthPoliciesFromEnv({
+        AGENTMAIL_SENDER_GREENLIST: JSON.stringify({
+          'dan@danshapiro.com': { spf: 'none', dkim: 'pass-aligned' },
+        }),
+      }),
+    ).toThrow(/dmarc must be a string/);
+  });
+
+  it('accepts Dan mail when SPF is none, DKIM is pass-aligned, and DMARC is none', () => {
+    expect(
+      evaluateAgentMailSenderAuthPolicy(
+        {
+          inboxId: 'yente@agentmail.to',
+          messageId: 'm1',
+          from_: 'Dan Shapiro <dan@danshapiro.com>',
+          headers: {
+            'Authentication-Results':
+              'amazonses.com; spf=none smtp.mailfrom=danshapiro.com; dkim=pass header.i=@danshapiro.com; dmarc=none header.from=danshapiro.com',
+          },
+        },
+        'dan@danshapiro.com',
+        { spf: 'none', dkim: 'pass-aligned', dmarc: 'none' },
+        new Set(['amazonses.com']),
+      ),
+    ).toEqual({ allowed: true, authservId: 'amazonses.com' });
+  });
+
+  it('rejects Dan mail when a DKIM pass is not aligned to the sender domain', () => {
+    const result = evaluateAgentMailSenderAuthPolicy(
+      {
+        inboxId: 'yente@agentmail.to',
+        messageId: 'm1',
+        from_: 'Dan Shapiro <dan@danshapiro.com>',
+        headers: {
+          'Authentication-Results':
+            'amazonses.com; spf=none smtp.mailfrom=danshapiro.com; dkim=pass header.i=@attacker.example; dmarc=none header.from=danshapiro.com',
+        },
+      },
+      'dan@danshapiro.com',
+      { spf: 'none', dkim: 'pass-aligned', dmarc: 'none' },
+      new Set(['amazonses.com']),
+    );
+
+    expect(result).toMatchObject({
+      allowed: false,
+      reason: 'sender_auth_failed:dan@danshapiro.com:dkim_pass-aligned_required',
+      authservId: 'amazonses.com',
+    });
+  });
+
+  it('ignores untrusted Authentication-Results headers', () => {
+    const result = evaluateAgentMailSenderAuthPolicy(
+      {
+        inboxId: 'yente@agentmail.to',
+        messageId: 'm1',
+        from_: 'Dan Shapiro <dan@danshapiro.com>',
+        headers: {
+          'Authentication-Results':
+            'attacker.example; spf=none smtp.mailfrom=danshapiro.com; dkim=pass header.i=@danshapiro.com; dmarc=none header.from=danshapiro.com',
+        },
+      },
+      'dan@danshapiro.com',
+      { spf: 'none', dkim: 'pass-aligned', dmarc: 'none' },
+      new Set(['amazonses.com']),
+    );
+
+    expect(result).toMatchObject({
+      allowed: false,
+      reason: 'sender_auth_failed:dan@danshapiro.com:authentication_results_missing',
+    });
   });
 
   it('derives stable NanoClaw thread ids without treating yente-threads as email-thread semantics', () => {

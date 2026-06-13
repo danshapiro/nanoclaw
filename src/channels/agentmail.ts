@@ -9,7 +9,8 @@ import {
   type AgentMailSocketLike,
 } from './agentmail-api.js';
 import {
-  agentMailSenderGreenlistFromEnv,
+  agentMailSenderAuthPoliciesFromEnv,
+  agentMailTrustedAuthServersFromEnv,
   agentMailEventTypesFromEnv,
   buildAgentMailInboundContent,
   catchupMaxPagesFromEnv,
@@ -18,6 +19,7 @@ import {
   DEFAULT_AGENTMAIL_CATCHUP_INTERVAL_MS,
   DEFAULT_AGENTMAIL_ROUTE_LEASE_MS,
   defaultAgentMailRouteFile,
+  evaluateAgentMailSenderAuthPolicy,
   nanoThreadIdForAgentMailMessage,
   readAgentMailRouteFile,
   resolveAgentMailRoutes,
@@ -61,7 +63,8 @@ export function createAgentMailAdapter(deps: AgentMailAdapterDeps = {}): Channel
   const catchupMaxPages = catchupMaxPagesFromEnv(env);
   const eventTypes = agentMailEventTypesFromEnv(env);
   const routeLeaseMs = positiveIntegerEnv(env, 'AGENTMAIL_ROUTE_LEASE_MS', DEFAULT_AGENTMAIL_ROUTE_LEASE_MS);
-  const senderGreenlist = agentMailSenderGreenlistFromEnv(env);
+  const senderAuthPolicies = agentMailSenderAuthPoliciesFromEnv(env);
+  const trustedAuthServers = agentMailTrustedAuthServersFromEnv(env);
   const catchupIntervalMs = positiveIntegerEnv(
     env,
     'AGENTMAIL_CATCHUP_INTERVAL_MS',
@@ -123,7 +126,8 @@ export function createAgentMailAdapter(deps: AgentMailAdapterDeps = {}): Channel
     }
 
     const senderEmail = senderEmailForAgentMailMessage(message);
-    if (!senderGreenlist.has(senderEmail)) {
+    const senderAuthPolicy = senderAuthPolicies.get(senderEmail);
+    if (!senderAuthPolicy) {
       const blockedAt = now();
       const nanoThreadId = nanoThreadIdForAgentMailMessage(route, message);
       const reason = `sender_not_greenlisted:${senderEmail}`;
@@ -153,6 +157,51 @@ export function createAgentMailAdapter(deps: AgentMailAdapterDeps = {}): Channel
         });
       } catch (err) {
         log.warn('AgentMail label update failed after sender-greenlist block', {
+          inboxId: message.inboxId,
+          messageId: message.messageId,
+          err,
+        });
+      }
+      return;
+    }
+
+    const authEvaluation = evaluateAgentMailSenderAuthPolicy(
+      message,
+      senderEmail,
+      senderAuthPolicy,
+      trustedAuthServers,
+    );
+    if (!authEvaluation.allowed) {
+      const blockedAt = now();
+      const nanoThreadId = nanoThreadIdForAgentMailMessage(route, message);
+      markAgentMailMessageBlocked({
+        inboxId: message.inboxId,
+        messageId: message.messageId,
+        eventId: message.eventId ?? null,
+        agentmailThreadId: message.threadId ?? null,
+        nanoThreadId,
+        messagingGroupId: route.messagingGroupId,
+        senderEmail,
+        subject: message.subject ?? '',
+        receivedAt: message.timestamp ?? message.receivedAt ?? message.createdAt ?? blockedAt,
+        blockedAt,
+        reason: authEvaluation.reason,
+      });
+      log.warn('AgentMail message blocked by sender authentication policy', {
+        inboxId: message.inboxId,
+        messageId: message.messageId,
+        senderEmail,
+        source,
+        authservId: authEvaluation.authservId,
+        detail: authEvaluation.detail,
+      });
+      try {
+        await api.updateLabels(message.inboxId, message.messageId, {
+          add: ['nanoclaw:blocked-auth'],
+          remove: ['unread'],
+        });
+      } catch (err) {
+        log.warn('AgentMail label update failed after sender-auth block', {
           inboxId: message.inboxId,
           messageId: message.messageId,
           err,

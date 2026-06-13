@@ -18,6 +18,39 @@ const ALLOWED_AGENTMAIL_EVENT_TYPES = new Set<AgentMailEventType>([
 ]);
 
 export const AGENTMAIL_SENDER_GREENLIST_ENV = 'AGENTMAIL_SENDER_GREENLIST';
+export const AGENTMAIL_AUTH_TRUSTED_SERVERS_ENV = 'AGENTMAIL_AUTH_TRUSTED_SERVERS';
+export const DEFAULT_AGENTMAIL_AUTH_TRUSTED_SERVERS = ['amazonses.com', 'agentmail.to'] as const;
+
+export type AgentMailAuthResultRequirement =
+  | 'any'
+  | 'pass'
+  | 'none'
+  | 'fail'
+  | 'softfail'
+  | 'neutral'
+  | 'policy'
+  | 'temperror'
+  | 'permerror';
+
+export type AgentMailDkimRequirement = AgentMailAuthResultRequirement | 'pass-aligned';
+
+export type AgentMailSenderAuthPolicy = {
+  spf: AgentMailAuthResultRequirement;
+  dkim: AgentMailDkimRequirement;
+  dmarc: AgentMailAuthResultRequirement;
+};
+
+export type AgentMailSenderAuthEvaluation =
+  | {
+      allowed: true;
+      authservId: string;
+    }
+  | {
+      allowed: false;
+      reason: string;
+      detail: string;
+      authservId?: string;
+    };
 
 export type AgentMailRouteFile = {
   version: 1;
@@ -189,20 +222,99 @@ export function agentMailEventTypesFromEnv(env: NodeJS.ProcessEnv): AgentMailEve
   });
 }
 
-export function agentMailSenderGreenlistFromEnv(env: NodeJS.ProcessEnv): Set<string> {
-  const raw = env[AGENTMAIL_SENDER_GREENLIST_ENV]?.trim() ?? '';
-  const senders = raw
-    .split(/[\s,]+/)
-    .map((value) => value.trim().toLowerCase())
-    .filter(Boolean);
+const AUTH_RESULT_REQUIREMENTS = new Set<AgentMailAuthResultRequirement>([
+  'any',
+  'pass',
+  'none',
+  'fail',
+  'softfail',
+  'neutral',
+  'policy',
+  'temperror',
+  'permerror',
+]);
+const DKIM_REQUIREMENTS = new Set<AgentMailDkimRequirement>([...AUTH_RESULT_REQUIREMENTS, 'pass-aligned']);
 
-  for (const sender of senders) {
-    if (!/^[^@\s<>]+@[^@\s<>]+$/.test(sender)) {
-      throw new Error(`${AGENTMAIL_SENDER_GREENLIST_ENV} contains an invalid email address: ${sender}`);
+export function agentMailTrustedAuthServersFromEnv(env: NodeJS.ProcessEnv): Set<string> {
+  const raw = env[AGENTMAIL_AUTH_TRUSTED_SERVERS_ENV]?.trim();
+  const values = raw
+    ? raw
+        .split(/[\s,]+/)
+        .map((value) => value.trim().toLowerCase())
+        .filter(Boolean)
+    : [...DEFAULT_AGENTMAIL_AUTH_TRUSTED_SERVERS];
+
+  for (const value of values) {
+    if (!/^[a-z0-9.-]+$/.test(value)) {
+      throw new Error(`${AGENTMAIL_AUTH_TRUSTED_SERVERS_ENV} contains an invalid auth service id: ${value}`);
     }
   }
 
-  return new Set(senders);
+  return new Set(values);
+}
+
+export function agentMailSenderAuthPoliciesFromEnv(env: NodeJS.ProcessEnv): Map<string, AgentMailSenderAuthPolicy> {
+  const raw = env[AGENTMAIL_SENDER_GREENLIST_ENV]?.trim() ?? '';
+  if (!raw) return new Map();
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    throw new Error(`${AGENTMAIL_SENDER_GREENLIST_ENV} must be a JSON object mapping sender emails to auth policies`, {
+      cause: err,
+    });
+  }
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(`${AGENTMAIL_SENDER_GREENLIST_ENV} must be a JSON object mapping sender emails to auth policies`);
+  }
+
+  const policies = new Map<string, AgentMailSenderAuthPolicy>();
+  for (const [email, policy] of Object.entries(parsed)) {
+    const sender = normalizePolicyEmail(email);
+    if (policies.has(sender)) throw new Error(`${AGENTMAIL_SENDER_GREENLIST_ENV} contains duplicate sender: ${sender}`);
+    policies.set(sender, normalizeSenderAuthPolicy(sender, policy));
+  }
+
+  return policies;
+}
+
+function normalizePolicyEmail(email: string): string {
+  const sender = email.trim().toLowerCase();
+  if (!/^[^@\s<>]+@[^@\s<>]+$/.test(sender)) {
+    throw new Error(`${AGENTMAIL_SENDER_GREENLIST_ENV} contains an invalid email address: ${sender || email}`);
+  }
+  return sender;
+}
+
+function normalizeSenderAuthPolicy(sender: string, policy: unknown): AgentMailSenderAuthPolicy {
+  if (!policy || typeof policy !== 'object' || Array.isArray(policy)) {
+    throw new Error(`${AGENTMAIL_SENDER_GREENLIST_ENV}.${sender} must be an object with spf, dkim, and dmarc`);
+  }
+  const record = policy as Record<string, unknown>;
+  const spf = normalizeAuthRequirement(`${AGENTMAIL_SENDER_GREENLIST_ENV}.${sender}.spf`, record.spf);
+  const dkim = normalizeDkimRequirement(`${AGENTMAIL_SENDER_GREENLIST_ENV}.${sender}.dkim`, record.dkim);
+  const dmarc = normalizeAuthRequirement(`${AGENTMAIL_SENDER_GREENLIST_ENV}.${sender}.dmarc`, record.dmarc);
+  return { spf, dkim, dmarc };
+}
+
+function normalizeAuthRequirement(key: string, value: unknown): AgentMailAuthResultRequirement {
+  if (typeof value !== 'string') throw new Error(`${key} must be a string`);
+  const normalized = value.trim().toLowerCase();
+  if (!AUTH_RESULT_REQUIREMENTS.has(normalized as AgentMailAuthResultRequirement)) {
+    throw new Error(`${key} must be one of ${[...AUTH_RESULT_REQUIREMENTS].join(', ')}`);
+  }
+  return normalized as AgentMailAuthResultRequirement;
+}
+
+function normalizeDkimRequirement(key: string, value: unknown): AgentMailDkimRequirement {
+  if (typeof value !== 'string') throw new Error(`${key} must be a string`);
+  const normalized = value.trim().toLowerCase();
+  if (!DKIM_REQUIREMENTS.has(normalized as AgentMailDkimRequirement)) {
+    throw new Error(`${key} must be one of ${[...DKIM_REQUIREMENTS].join(', ')}`);
+  }
+  return normalized as AgentMailDkimRequirement;
 }
 
 export function nanoThreadIdForAgentMailMessage(route: AgentMailResolvedRoute, message: AgentMailMessageLike): string {
@@ -214,6 +326,167 @@ export function senderEmailForAgentMailMessage(message: AgentMailMessageLike): s
   const raw = (message.from ?? message.from_ ?? 'unknown@agentmail.local').trim();
   const match = raw.match(/<([^<>@\s]+@[^<>\s]+)>/);
   return (match?.[1] ?? raw).trim().toLowerCase();
+}
+
+type ParsedAuthMethod = {
+  result: string;
+  params: Record<string, string>;
+};
+
+type ParsedAuthenticationResults = {
+  authservId: string;
+  methods: Map<string, ParsedAuthMethod[]>;
+};
+
+export function evaluateAgentMailSenderAuthPolicy(
+  message: AgentMailMessageLike,
+  senderEmail: string,
+  policy: AgentMailSenderAuthPolicy,
+  trustedAuthServers: Set<string>,
+): AgentMailSenderAuthEvaluation {
+  if (policy.spf === 'any' && policy.dkim === 'any' && policy.dmarc === 'any') {
+    return { allowed: true, authservId: 'not-required' };
+  }
+
+  const authResults = trustedAuthenticationResults(message, trustedAuthServers);
+  if (!authResults) {
+    return {
+      allowed: false,
+      reason: `sender_auth_failed:${senderEmail}:authentication_results_missing`,
+      detail: 'no trusted Authentication-Results header was present',
+    };
+  }
+
+  const spf = authRequirementMatches(authResults.methods.get('spf'), policy.spf);
+  if (!spf) {
+    return {
+      allowed: false,
+      reason: `sender_auth_failed:${senderEmail}:spf_${policy.spf}_required`,
+      detail: authFailureDetail('spf', policy.spf, authResults.methods.get('spf')),
+      authservId: authResults.authservId,
+    };
+  }
+
+  const dkim =
+    policy.dkim === 'pass-aligned'
+      ? dkimPassesWithAlignedDomain(authResults.methods.get('dkim'), senderEmail)
+      : authRequirementMatches(authResults.methods.get('dkim'), policy.dkim);
+  if (!dkim) {
+    return {
+      allowed: false,
+      reason: `sender_auth_failed:${senderEmail}:dkim_${policy.dkim}_required`,
+      detail:
+        policy.dkim === 'pass-aligned'
+          ? `dkim=pass with header.i/header.d aligned to ${senderDomain(senderEmail)} is required`
+          : authFailureDetail('dkim', policy.dkim, authResults.methods.get('dkim')),
+      authservId: authResults.authservId,
+    };
+  }
+
+  const dmarc = authRequirementMatches(authResults.methods.get('dmarc'), policy.dmarc);
+  if (!dmarc) {
+    return {
+      allowed: false,
+      reason: `sender_auth_failed:${senderEmail}:dmarc_${policy.dmarc}_required`,
+      detail: authFailureDetail('dmarc', policy.dmarc, authResults.methods.get('dmarc')),
+      authservId: authResults.authservId,
+    };
+  }
+
+  return { allowed: true, authservId: authResults.authservId };
+}
+
+function trustedAuthenticationResults(
+  message: AgentMailMessageLike,
+  trustedAuthServers: Set<string>,
+): ParsedAuthenticationResults | null {
+  for (const value of authenticationResultsHeaderValues(message)) {
+    const parsed = parseAuthenticationResultsHeader(value);
+    if (parsed && trustedAuthServers.has(parsed.authservId)) return parsed;
+  }
+  return null;
+}
+
+function authenticationResultsHeaderValues(message: AgentMailMessageLike): string[] {
+  const values: string[] = [];
+  for (const [name, value] of Object.entries(message.headers ?? {})) {
+    if (name.toLowerCase() !== 'authentication-results') continue;
+    const items = Array.isArray(value) ? value : [value];
+    for (const item of items) {
+      if (typeof item === 'string' && item.trim()) values.push(item.trim());
+    }
+  }
+  return values;
+}
+
+function parseAuthenticationResultsHeader(value: string): ParsedAuthenticationResults | null {
+  const segments = value
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .split(';')
+    .map((segment) => segment.replace(/\n[ \t]*/g, ' ').trim())
+    .filter(Boolean);
+  const authservId = segments[0]?.split(/\s+/)[0]?.toLowerCase();
+  if (!authservId) return null;
+
+  const methods = new Map<string, ParsedAuthMethod[]>();
+  for (const segment of segments.slice(1)) {
+    const methodMatch = segment.match(/^([a-z][a-z0-9_-]*)\s*=\s*([a-z0-9_.-]+)/i);
+    if (!methodMatch) continue;
+    const method = methodMatch[1]!.toLowerCase();
+    const result = methodMatch[2]!.toLowerCase();
+    const rest = segment.slice(methodMatch[0].length);
+    const params: Record<string, string> = {};
+    for (const paramMatch of rest.matchAll(/([a-z][a-z0-9_.-]*)=("[^"]*"|[^\s;]+)/gi)) {
+      params[paramMatch[1]!.toLowerCase()] = paramMatch[2]!.replace(/^"|"$/g, '').toLowerCase();
+    }
+    const entries = methods.get(method) ?? [];
+    entries.push({ result, params });
+    methods.set(method, entries);
+  }
+
+  return { authservId, methods };
+}
+
+function authRequirementMatches(
+  methods: ParsedAuthMethod[] | undefined,
+  requirement: AgentMailAuthResultRequirement,
+): boolean {
+  if (requirement === 'any') return true;
+  return Boolean(methods?.some((method) => method.result === requirement));
+}
+
+function dkimPassesWithAlignedDomain(methods: ParsedAuthMethod[] | undefined, senderEmail: string): boolean {
+  const expectedDomain = senderDomain(senderEmail);
+  return Boolean(
+    methods?.some((method) => {
+      if (method.result !== 'pass') return false;
+      const domains = [method.params['header.i'], method.params.i, method.params['header.d'], method.params.d]
+        .map(dkimIdentityDomain)
+        .filter((domain): domain is string => Boolean(domain));
+      return domains.some((domain) => domain === expectedDomain);
+    }),
+  );
+}
+
+function dkimIdentityDomain(value: string | undefined): string | null {
+  if (!value) return null;
+  const normalized = value.trim().toLowerCase().replace(/\.$/, '');
+  const at = normalized.lastIndexOf('@');
+  return at === -1 ? normalized : normalized.slice(at + 1);
+}
+
+function senderDomain(senderEmail: string): string {
+  return senderEmail.split('@')[1]!.toLowerCase().replace(/\.$/, '');
+}
+
+function authFailureDetail(
+  method: string,
+  requirement: AgentMailAuthResultRequirement,
+  methods: ParsedAuthMethod[] | undefined,
+): string {
+  const actual = methods?.map((entry) => entry.result).join(',') || 'missing';
+  return `${method}=${requirement} is required; actual ${method} result(s): ${actual}`;
 }
 
 export function htmlToPlainText(html: string): string {
