@@ -1,8 +1,14 @@
-import { AgentMailClient, type AgentMail } from 'agentmail';
+import { HttpsProxyAgent } from 'https-proxy-agent';
+import { AgentMailClient, AgentMailEnvironment, type AgentMail } from 'agentmail';
+import WebSocket from 'ws';
 
 import type { AgentMailMessageLike } from './agentmail-config.js';
 
 export const AGENTMAIL_ONECLI_PLACEHOLDER = 'onecli-managed';
+const AGENTMAIL_WEBSOCKET_PATH = '/v0';
+const AGENTMAIL_WEBSOCKET_MAX_RETRIES = 30;
+const AGENTMAIL_WEBSOCKET_MIN_RECONNECT_MS = 1000;
+const AGENTMAIL_WEBSOCKET_MAX_RECONNECT_MS = 10000;
 
 export type AgentMailSocketLike = {
   on(event: 'open', handler: () => void): void;
@@ -61,6 +67,30 @@ export type AgentMailDownloadedAttachment = {
 
 export type AgentMailApiAuthOptions = { mode: 'onecli' } | { mode: 'api-key'; apiKey: string };
 
+type WebSocketOptions = { headers?: Record<string, string>; agent?: unknown };
+type WebSocketConstructor = new (
+  url: string,
+  protocols?: string | string[],
+  options?: WebSocketOptions,
+) => WebSocketConnectionLike;
+
+type WebSocketConnectionLike = {
+  readyState: number;
+  on(event: 'open', handler: () => void): void;
+  on(event: 'message', handler: (data: unknown) => void): void;
+  on(event: 'close', handler: (code?: number, reason?: Buffer | string) => void): void;
+  on(event: 'error', handler: (error: unknown) => void): void;
+  send(data: string): void;
+  close(code?: number, reason?: string): void;
+};
+
+export type AgentMailOneCliWebSocketOptions = {
+  env?: NodeJS.ProcessEnv;
+  url?: string;
+  websocketCtor?: WebSocketConstructor;
+  proxyAgentFactory?: (proxyUrl: string) => unknown;
+};
+
 export function agentMailClientOptions(options: AgentMailApiAuthOptions): AgentMailClient.Options {
   if (options.mode === 'api-key') {
     return { apiKey: options.apiKey };
@@ -78,7 +108,8 @@ export function createAgentMailApi(options: AgentMailApiAuthOptions): AgentMailA
   const client = new AgentMailClient(agentMailClientOptions(options));
 
   return {
-    connectWebSocket: () => client.websockets.connect(),
+    connectWebSocket:
+      options.mode === 'onecli' ? () => createAgentMailOneCliWebSocket() : () => client.websockets.connect(),
     async listMessages(inboxId, options) {
       const response = await client.inboxes.messages.list(inboxId, {
         limit: options.limit,
@@ -126,6 +157,136 @@ export function createAgentMailApi(options: AgentMailApiAuthOptions): AgentMailA
       };
     },
   };
+}
+
+export async function createAgentMailOneCliWebSocket(
+  options: AgentMailOneCliWebSocketOptions = {},
+): Promise<AgentMailSocketLike> {
+  return new OneCliAgentMailSocket(options);
+}
+
+class OneCliAgentMailSocket implements AgentMailSocketLike {
+  private readonly handlers: {
+    open?: () => void;
+    message?: (event: unknown) => void | Promise<void>;
+    close?: (event: { code?: number; reason?: string }) => void;
+    error?: (error: unknown) => void;
+  } = {};
+  private readonly url: string;
+  private readonly websocketCtor: WebSocketConstructor;
+  private readonly proxyAgentFactory: (proxyUrl: string) => unknown;
+  private readonly proxyUrl: string;
+  private ws: WebSocketConnectionLike | null = null;
+  private closeRequested = false;
+  private retryCount = 0;
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private openWaiters: Array<{ resolve: () => void; reject: (error: unknown) => void }> = [];
+
+  constructor(options: AgentMailOneCliWebSocketOptions) {
+    const env = options.env ?? process.env;
+    this.proxyUrl = agentMailProxyUrl(env);
+    this.url = options.url ?? `${AgentMailEnvironment.Prod.websockets}${AGENTMAIL_WEBSOCKET_PATH}`;
+    this.websocketCtor = options.websocketCtor ?? (WebSocket as unknown as WebSocketConstructor);
+    this.proxyAgentFactory = options.proxyAgentFactory ?? ((proxyUrl) => new HttpsProxyAgent(proxyUrl));
+    this.connect();
+  }
+
+  on(event: 'open', handler: () => void): void;
+  on(event: 'message', handler: (event: unknown) => void | Promise<void>): void;
+  on(event: 'close', handler: (event: { code?: number; reason?: string }) => void): void;
+  on(event: 'error', handler: (error: unknown) => void): void;
+  on(event: 'open' | 'message' | 'close' | 'error', handler: unknown): void {
+    this.handlers[event] = handler as never;
+  }
+
+  sendSubscribe(payload: { type: 'subscribe'; inboxIds: string[]; eventTypes: AgentMail.EventType[] }): void {
+    if (this.ws?.readyState !== WebSocket.OPEN) throw new Error('Socket is not open.');
+    this.ws.send(JSON.stringify(payload));
+  }
+
+  waitForOpen(): Promise<unknown> {
+    if (this.ws?.readyState === WebSocket.OPEN) return Promise.resolve(this.ws);
+    return new Promise((resolve, reject) => {
+      this.openWaiters.push({ resolve: () => resolve(this.ws), reject });
+    });
+  }
+
+  close(): void {
+    this.closeRequested = true;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
+    for (const waiter of this.openWaiters.splice(0)) waiter.reject(new Error('AgentMail WebSocket closed'));
+    this.ws?.close(1000, 'closed');
+    this.ws = null;
+  }
+
+  private connect(): void {
+    if (this.closeRequested) return;
+    const ws = new this.websocketCtor(this.url, [], {
+      headers: { Authorization: `Bearer ${AGENTMAIL_ONECLI_PLACEHOLDER}` },
+      agent: this.proxyAgentFactory(this.proxyUrl),
+    });
+    this.ws = ws;
+    ws.on('open', () => {
+      this.retryCount = 0;
+      for (const waiter of this.openWaiters.splice(0)) waiter.resolve();
+      this.handlers.open?.();
+    });
+    ws.on('message', (data) => {
+      const parsed = parseAgentMailWebSocketMessage(data);
+      if (parsed.ok) {
+        void this.handlers.message?.(parsed.value);
+      } else {
+        this.handlers.error?.(parsed.error);
+      }
+    });
+    ws.on('error', (error) => {
+      this.handlers.error?.(error);
+      for (const waiter of this.openWaiters.splice(0)) waiter.reject(error);
+    });
+    ws.on('close', (code, reason) => {
+      const closeEvent = { code, reason: reasonToString(reason) };
+      this.handlers.close?.(closeEvent);
+      if (!this.closeRequested) this.scheduleReconnect();
+    });
+  }
+
+  private scheduleReconnect(): void {
+    if (this.retryCount >= AGENTMAIL_WEBSOCKET_MAX_RETRIES) {
+      this.handlers.error?.(new Error('AgentMail WebSocket reconnect attempts exhausted'));
+      return;
+    }
+    const delay = Math.min(
+      AGENTMAIL_WEBSOCKET_MAX_RECONNECT_MS,
+      AGENTMAIL_WEBSOCKET_MIN_RECONNECT_MS * Math.max(1, 2 ** this.retryCount),
+    );
+    this.retryCount += 1;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.connect();
+    }, delay);
+  }
+}
+
+function agentMailProxyUrl(env: NodeJS.ProcessEnv): string {
+  const proxy = env.HTTPS_PROXY?.trim() || env.https_proxy?.trim() || env.HTTP_PROXY?.trim() || env.http_proxy?.trim();
+  if (!proxy) throw new Error('AgentMail WebSocket requires OneCLI proxy env');
+  return proxy;
+}
+
+function parseAgentMailWebSocketMessage(data: unknown): { ok: true; value: unknown } | { ok: false; error: Error } {
+  try {
+    const text = typeof data === 'string' ? data : Buffer.isBuffer(data) ? data.toString('utf8') : String(data);
+    return { ok: true, value: JSON.parse(text) };
+    // eslint-disable-next-line no-catch-all/no-catch-all -- Invalid WebSocket frames are expected protocol errors.
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error : new Error(String(error)) };
+  }
+}
+
+function reasonToString(reason: Buffer | string | undefined): string | undefined {
+  if (Buffer.isBuffer(reason)) return reason.toString('utf8');
+  return reason;
 }
 
 export function normalizeMessageEvent(event: unknown): AgentMailMessageLike | null {
