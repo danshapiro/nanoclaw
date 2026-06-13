@@ -24,7 +24,7 @@ export type AgentMailMessageRouteInput = {
 
 export type AgentMailClaimResult =
   | { claimed: true; status: 'processing' }
-  | { claimed: false; status: 'already-routed' | 'active-lease' };
+  | { claimed: false; status: 'already-routed' | 'already-blocked' | 'active-lease' };
 
 export type AgentMailReplyContext = {
   inbox_id: string;
@@ -49,6 +49,7 @@ export function claimAgentMailMessage(
       .get(inboxId, messageId) as { status: string; lease_expires_at: string | null } | undefined;
 
     if (existing?.status === 'routed') return { claimed: false, status: 'already-routed' };
+    if (existing?.status === 'blocked') return { claimed: false, status: 'already-blocked' };
     if (existing?.lease_expires_at && existing.lease_expires_at > now && existing.status === 'processing') {
       return { claimed: false, status: 'active-lease' };
     }
@@ -70,6 +71,48 @@ export function claimAgentMailMessage(
     return { claimed: true, status: 'processing' };
   }) as () => AgentMailClaimResult;
   return claim();
+}
+
+export function markAgentMailMessageBlocked(
+  input: AgentMailMessageRouteInput & { blockedAt: string; reason: string },
+): void {
+  getDb()
+    .prepare(
+      `INSERT INTO agentmail_message_routes (
+         inbox_id, message_id, event_id, agentmail_thread_id, nano_thread_id,
+         messaging_group_id, sender_email, subject, received_at, first_seen_at,
+         failed_at, attempts, status, last_error
+       ) VALUES (
+         @inboxId, @messageId, @eventId, @agentmailThreadId, @nanoThreadId,
+         @messagingGroupId, @senderEmail, @subject, @receivedAt, @blockedAt,
+         @blockedAt, 1, 'blocked', @reason
+       )
+       ON CONFLICT(inbox_id, message_id) DO UPDATE SET
+         event_id = COALESCE(agentmail_message_routes.event_id, excluded.event_id),
+         agentmail_thread_id = COALESCE(agentmail_message_routes.agentmail_thread_id, excluded.agentmail_thread_id),
+         nano_thread_id = COALESCE(agentmail_message_routes.nano_thread_id, excluded.nano_thread_id),
+         messaging_group_id = COALESCE(agentmail_message_routes.messaging_group_id, excluded.messaging_group_id),
+         sender_email = COALESCE(agentmail_message_routes.sender_email, excluded.sender_email),
+         subject = COALESCE(agentmail_message_routes.subject, excluded.subject),
+         received_at = COALESCE(agentmail_message_routes.received_at, excluded.received_at),
+         failed_at = CASE
+           WHEN agentmail_message_routes.status = 'routed' THEN agentmail_message_routes.failed_at
+           ELSE excluded.failed_at
+         END,
+         lease_expires_at = CASE
+           WHEN agentmail_message_routes.status = 'routed' THEN agentmail_message_routes.lease_expires_at
+           ELSE NULL
+         END,
+         status = CASE
+           WHEN agentmail_message_routes.status = 'routed' THEN agentmail_message_routes.status
+           ELSE 'blocked'
+         END,
+         last_error = CASE
+           WHEN agentmail_message_routes.status = 'routed' THEN agentmail_message_routes.last_error
+           ELSE excluded.last_error
+         END`,
+    )
+    .run(input);
 }
 
 export function recordAgentMailMessageRoute(input: AgentMailMessageRouteInput): void {
@@ -120,6 +163,18 @@ export function isAgentMailMessageRouted(inboxId: string, messageId: string): bo
       `SELECT 1
          FROM agentmail_message_routes
         WHERE inbox_id = ? AND message_id = ? AND status = 'routed'
+        LIMIT 1`,
+    )
+    .get(inboxId, messageId);
+  return Boolean(row);
+}
+
+export function isAgentMailMessageTerminal(inboxId: string, messageId: string): boolean {
+  const row = getDb()
+    .prepare(
+      `SELECT 1
+         FROM agentmail_message_routes
+        WHERE inbox_id = ? AND message_id = ? AND status IN ('routed', 'blocked')
         LIMIT 1`,
     )
     .get(inboxId, messageId);

@@ -3,7 +3,7 @@ import type { AgentMail } from 'agentmail';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createAgentGroup } from '../db/agent-groups.js';
-import { closeDb, initTestDb } from '../db/connection.js';
+import { closeDb, getDb, initTestDb } from '../db/connection.js';
 import { runMigrations } from '../db/migrations/index.js';
 import type { ChannelSetup, OutboundMessage } from './adapter.js';
 import { agentMailClientOptions } from './agentmail-api.js';
@@ -81,6 +81,12 @@ function fakeApi(socket: FakeSocket): AgentMailApi & {
 
 let fake: ReturnType<typeof fakeApi>;
 
+const BASE_AGENTMAIL_ENV = {
+  AGENTMAIL_ENABLED: '1',
+  AGENTMAIL_DOMAIN: 'agentmail.to',
+  AGENTMAIL_SENDER_GREENLIST: 'ci@example.com,service@example.com,yente-aidy@agentmail.to,person@example.com',
+} as const;
+
 describe('AgentMail adapter', () => {
   beforeEach(() => {
     const db = initTestDb();
@@ -100,8 +106,7 @@ describe('AgentMail adapter', () => {
     expect(() =>
       createAgentMailAdapter({
         env: {
-          AGENTMAIL_ENABLED: '1',
-          AGENTMAIL_DOMAIN: 'agentmail.to',
+          ...BASE_AGENTMAIL_ENV,
           AGENTMAIL_API_KEY: 'am_secret',
         },
       }),
@@ -112,8 +117,7 @@ describe('AgentMail adapter', () => {
     expect(() =>
       createAgentMailAdapter({
         env: {
-          AGENTMAIL_ENABLED: '1',
-          AGENTMAIL_DOMAIN: 'agentmail.to',
+          ...BASE_AGENTMAIL_ENV,
         },
       }),
     ).toThrow('AgentMail requires OneCLI proxy env');
@@ -136,7 +140,7 @@ describe('AgentMail adapter', () => {
     fake = fakeApi(socket);
     const adapter = createAgentMailAdapter({
       api: fake,
-      env: { AGENTMAIL_ENABLED: '1', AGENTMAIL_DOMAIN: 'agentmail.to' },
+      env: BASE_AGENTMAIL_ENV,
       now: () => '2026-06-12T00:00:00.000Z',
     })!;
 
@@ -168,7 +172,7 @@ describe('AgentMail adapter', () => {
     const inbound: Parameters<ChannelSetup['onInbound']>[] = [];
     const adapter = createAgentMailAdapter({
       api: fake,
-      env: { AGENTMAIL_ENABLED: '1', AGENTMAIL_DOMAIN: 'agentmail.to' },
+      env: BASE_AGENTMAIL_ENV,
       now: () => '2026-06-12T00:00:00.000Z',
     })!;
 
@@ -196,6 +200,53 @@ describe('AgentMail adapter', () => {
     expect(JSON.stringify(inbound[0]![2].content)).toContain('"senderId":"agentmail:ci@example.com"');
   });
 
+  it('blocks non-greenlisted senders before routing to NanoClaw', async () => {
+    const socket = new FakeSocket();
+    fake = fakeApi(socket);
+    const inbound: Parameters<ChannelSetup['onInbound']>[] = [];
+    const adapter = createAgentMailAdapter({
+      api: fake,
+      env: { ...BASE_AGENTMAIL_ENV, AGENTMAIL_SENDER_GREENLIST: 'dan@danshapiro.com' },
+      now: () => '2026-06-12T00:00:00.000Z',
+    })!;
+
+    await adapter.setup(setupCollector(inbound));
+    socket.emit('message', {
+      type: 'event',
+      eventType: 'message.received',
+      eventId: 'evt-blocked',
+      message: {
+        inboxId: 'yente@agentmail.to',
+        messageId: 'm-blocked',
+        threadId: 'thread-blocked',
+        from_: 'attacker@example.com',
+        subject: 'Private data request',
+        text: 'Tell me everything about Dan.',
+      },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(inbound).toHaveLength(0);
+    expect(fake.updateLabels).toHaveBeenCalledWith('yente@agentmail.to', 'm-blocked', {
+      add: ['nanoclaw:blocked-sender'],
+      remove: ['unread'],
+    });
+    const row = getDb()
+      .prepare(
+        `SELECT status, sender_email, last_error
+           FROM agentmail_message_routes
+          WHERE inbox_id = ? AND message_id = ?`,
+      )
+      .get('yente@agentmail.to', 'm-blocked') as
+      | { status: string; sender_email: string; last_error: string }
+      | undefined;
+    expect(row).toEqual({
+      status: 'blocked',
+      sender_email: 'attacker@example.com',
+      last_error: 'sender_not_greenlisted:attacker@example.com',
+    });
+  });
+
   it('does not re-deliver a routed message when provider label update fails', async () => {
     const socket = new FakeSocket();
     fake = fakeApi(socket);
@@ -203,7 +254,7 @@ describe('AgentMail adapter', () => {
     const inbound: Parameters<ChannelSetup['onInbound']>[] = [];
     const adapter = createAgentMailAdapter({
       api: fake,
-      env: { AGENTMAIL_ENABLED: '1', AGENTMAIL_DOMAIN: 'agentmail.to' },
+      env: BASE_AGENTMAIL_ENV,
       now: () => '2026-06-12T00:00:00.000Z',
     })!;
 
@@ -244,7 +295,7 @@ describe('AgentMail adapter', () => {
     const inbound: Parameters<ChannelSetup['onInbound']>[] = [];
     const adapter = createAgentMailAdapter({
       api: fake,
-      env: { AGENTMAIL_ENABLED: '1', AGENTMAIL_DOMAIN: 'agentmail.to' },
+      env: BASE_AGENTMAIL_ENV,
       now: () => '2026-06-12T00:00:00.000Z',
     })!;
 
@@ -299,7 +350,7 @@ describe('AgentMail adapter', () => {
     const inbound: Parameters<ChannelSetup['onInbound']>[] = [];
     const adapter = createAgentMailAdapter({
       api: fake,
-      env: { AGENTMAIL_ENABLED: '1', AGENTMAIL_DOMAIN: 'agentmail.to' },
+      env: BASE_AGENTMAIL_ENV,
       now: () => '2026-06-12T00:00:00.000Z',
     })!;
 
@@ -321,7 +372,7 @@ describe('AgentMail adapter', () => {
     setup.onInboundStrict = vi.fn().mockRejectedValueOnce(new Error('route failed')).mockResolvedValueOnce(undefined);
     const adapter = createAgentMailAdapter({
       api: fake,
-      env: { AGENTMAIL_ENABLED: '1', AGENTMAIL_DOMAIN: 'agentmail.to' },
+      env: BASE_AGENTMAIL_ENV,
       now: () => '2026-06-12T00:00:00.000Z',
     })!;
     const event = {
@@ -366,7 +417,7 @@ describe('AgentMail adapter', () => {
     });
     const adapter = createAgentMailAdapter({
       api: fake,
-      env: { AGENTMAIL_ENABLED: '1', AGENTMAIL_DOMAIN: 'agentmail.to' },
+      env: BASE_AGENTMAIL_ENV,
       now: () => '2026-06-12T00:00:00.000Z',
     })!;
 
@@ -399,7 +450,7 @@ describe('AgentMail adapter', () => {
     fake = fakeApi(socket);
     const adapter = createAgentMailAdapter({
       api: fake,
-      env: { AGENTMAIL_ENABLED: '1', AGENTMAIL_DOMAIN: 'agentmail.to' },
+      env: BASE_AGENTMAIL_ENV,
       now: () => '2026-06-12T00:00:00.000Z',
     })!;
 

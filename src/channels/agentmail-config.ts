@@ -17,6 +17,8 @@ const ALLOWED_AGENTMAIL_EVENT_TYPES = new Set<AgentMailEventType>([
   'message.received.unauthenticated',
 ]);
 
+export const AGENTMAIL_SENDER_GREENLIST_ENV = 'AGENTMAIL_SENDER_GREENLIST';
+
 export type AgentMailRouteFile = {
   version: 1;
   domainEnv: 'AGENTMAIL_DOMAIN';
@@ -185,6 +187,22 @@ export function agentMailEventTypesFromEnv(env: NodeJS.ProcessEnv): AgentMailEve
     }
     return value as AgentMailEventType;
   });
+}
+
+export function agentMailSenderGreenlistFromEnv(env: NodeJS.ProcessEnv): Set<string> {
+  const raw = env[AGENTMAIL_SENDER_GREENLIST_ENV]?.trim() ?? '';
+  const senders = raw
+    .split(/[\s,]+/)
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean);
+
+  for (const sender of senders) {
+    if (!/^[^@\s<>]+@[^@\s<>]+$/.test(sender)) {
+      throw new Error(`${AGENTMAIL_SENDER_GREENLIST_ENV} contains an invalid email address: ${sender}`);
+    }
+  }
+
+  return new Set(senders);
 }
 
 export function nanoThreadIdForAgentMailMessage(route: AgentMailResolvedRoute, message: AgentMailMessageLike): string {

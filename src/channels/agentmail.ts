@@ -9,6 +9,7 @@ import {
   type AgentMailSocketLike,
 } from './agentmail-api.js';
 import {
+  agentMailSenderGreenlistFromEnv,
   agentMailEventTypesFromEnv,
   buildAgentMailInboundContent,
   catchupMaxPagesFromEnv,
@@ -26,8 +27,9 @@ import {
 import {
   claimAgentMailMessage,
   findLatestAgentMailReplyContext,
-  isAgentMailMessageRouted,
+  isAgentMailMessageTerminal,
   markAgentMailMessageFailed,
+  markAgentMailMessageBlocked,
   markAgentMailMessageRouted,
   reconcileAgentMailRoutes,
   recordAgentMailMessageRoute,
@@ -59,6 +61,7 @@ export function createAgentMailAdapter(deps: AgentMailAdapterDeps = {}): Channel
   const catchupMaxPages = catchupMaxPagesFromEnv(env);
   const eventTypes = agentMailEventTypesFromEnv(env);
   const routeLeaseMs = positiveIntegerEnv(env, 'AGENTMAIL_ROUTE_LEASE_MS', DEFAULT_AGENTMAIL_ROUTE_LEASE_MS);
+  const senderGreenlist = agentMailSenderGreenlistFromEnv(env);
   const catchupIntervalMs = positiveIntegerEnv(
     env,
     'AGENTMAIL_CATCHUP_INTERVAL_MS',
@@ -101,12 +104,60 @@ export function createAgentMailAdapter(deps: AgentMailAdapterDeps = {}): Channel
       return;
     }
 
+    if (isAgentMailMessageTerminal(message.inboxId, message.messageId)) {
+      log.debug('AgentMail message already terminal', {
+        inboxId: message.inboxId,
+        messageId: message.messageId,
+        source,
+      });
+      return;
+    }
+
     if (shouldSuppressAgentMailMessage(message)) {
       log.info('AgentMail message suppressed before routing', {
         inboxId: message.inboxId,
         messageId: message.messageId,
         source,
       });
+      return;
+    }
+
+    const senderEmail = senderEmailForAgentMailMessage(message);
+    if (!senderGreenlist.has(senderEmail)) {
+      const blockedAt = now();
+      const nanoThreadId = nanoThreadIdForAgentMailMessage(route, message);
+      const reason = `sender_not_greenlisted:${senderEmail}`;
+      markAgentMailMessageBlocked({
+        inboxId: message.inboxId,
+        messageId: message.messageId,
+        eventId: message.eventId ?? null,
+        agentmailThreadId: message.threadId ?? null,
+        nanoThreadId,
+        messagingGroupId: route.messagingGroupId,
+        senderEmail,
+        subject: message.subject ?? '',
+        receivedAt: message.timestamp ?? message.receivedAt ?? message.createdAt ?? blockedAt,
+        blockedAt,
+        reason,
+      });
+      log.warn('AgentMail message blocked by sender greenlist', {
+        inboxId: message.inboxId,
+        messageId: message.messageId,
+        senderEmail,
+        source,
+      });
+      try {
+        await api.updateLabels(message.inboxId, message.messageId, {
+          add: ['nanoclaw:blocked-sender'],
+          remove: ['unread'],
+        });
+      } catch (err) {
+        log.warn('AgentMail label update failed after sender-greenlist block', {
+          inboxId: message.inboxId,
+          messageId: message.messageId,
+          err,
+        });
+      }
       return;
     }
 
@@ -205,7 +256,7 @@ export function createAgentMailAdapter(deps: AgentMailAdapterDeps = {}): Channel
           });
           for (const item of [...result.messages].reverse()) {
             try {
-              if (isAgentMailMessageRouted(route.inboxId, item.messageId)) continue;
+              if (isAgentMailMessageTerminal(route.inboxId, item.messageId)) continue;
               const fullMessage = await Promise.resolve(api.getMessage(route.inboxId, item.messageId)).catch(
                 () => item,
               );
