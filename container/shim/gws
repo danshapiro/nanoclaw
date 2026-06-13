@@ -72,16 +72,129 @@ active_input_file="${NANOCLAW_ACTIVE_INPUT_FILE:-/workspace/.active-input.json}"
 # does not mis-correlate a fresh tool call. Env-overridable for tests/operators.
 active_input_max_age_ms="${NANOCLAW_ACTIVE_INPUT_MAX_AGE_MS:-21600000}"
 
+tmp_headers="$(mktemp)"
+tmp_body="$(mktemp)"
+tmp_arg_plan="$(mktemp)"
+tmp_output_body=""
+cleanup() {
+  rm -f "$tmp_headers" "$tmp_body" "$tmp_arg_plan"
+  if [ -n "$tmp_output_body" ]; then
+    rm -f "$tmp_output_body"
+  fi
+}
+trap cleanup EXIT
+
+parse_status=0
+readonly_output_roots="/workspace/agent:/workspace/outbox"
+GWS_ARG_PLAN_FILE="$tmp_arg_plan" \
+  NODE_NO_WARNINGS=1 \
+  GWS_SHIM_READONLY_OUTPUT_ROOTS="$readonly_output_roots" \
+  node -e '
+    const fs = require("fs");
+    const path = require("path");
+
+    const args = process.argv.slice(1);
+    const roots = (process.env.GWS_SHIM_READONLY_OUTPUT_ROOTS || "/workspace/agent:/workspace/outbox")
+      .split(":")
+      .filter(Boolean)
+      .map((root) => {
+        try {
+          return fs.realpathSync(root);
+        } catch {
+          return path.resolve(root);
+        }
+      });
+
+    function fail(message) {
+      process.stderr.write(`Error: ${message}\n`);
+      process.exit(2);
+    }
+
+    function insideRoot(candidate, root) {
+      const rel = path.relative(root, candidate);
+      return rel === "" || (!!rel && !rel.startsWith("..") && !path.isAbsolute(rel));
+    }
+
+    let outputArg = null;
+    const proxyArgs = [];
+    for (let i = 0; i < args.length; i++) {
+      const arg = args[i];
+      let value = null;
+      if (arg === "-o" || arg === "--output") {
+        if (i + 1 >= args.length) fail(`${arg} requires a path value`);
+        value = args[++i];
+      } else if (arg.startsWith("--output=")) {
+        value = arg.slice("--output=".length);
+      } else if (arg.startsWith("-o=")) {
+        value = arg.slice("-o=".length);
+      } else if (arg.startsWith("-o") && arg.length > 2) {
+        fail("attached -oPATH output syntax is not supported; use -o PATH or --output PATH");
+      }
+
+      if (value !== null) {
+        if (outputArg !== null) fail("multiple output paths were provided");
+        if (value === "") fail("output path must not be empty");
+        outputArg = value;
+        continue;
+      }
+
+      proxyArgs.push(arg);
+    }
+
+    const plan = { proxyArgs, output: null, roots };
+    if (outputArg !== null) {
+      const lexicalResolved = path.resolve(process.cwd(), outputArg);
+      const parent = path.dirname(lexicalResolved);
+      const base = path.basename(lexicalResolved);
+      if (base === "." || base === ".." || base === "") fail("output path must name a file");
+      let stat;
+      let parentReal;
+      try {
+        stat = fs.statSync(parent);
+        parentReal = fs.realpathSync(parent);
+      } catch {
+        fail(`output parent directory does not exist: ${parent}`);
+      }
+      if (!stat.isDirectory()) {
+        fail(`output parent path is not a directory: ${parent}`);
+      }
+      if (!roots.some((root) => insideRoot(parentReal, root))) {
+        fail(`output path ${lexicalResolved} is outside allowed output roots: ${roots.join(":")}`);
+      }
+      const resolved = path.join(parentReal, base);
+      try {
+        const targetStat = fs.lstatSync(resolved);
+        if (targetStat.isSymbolicLink()) fail(`output target is a symlink: ${resolved}`);
+        fail(`output target already exists: ${resolved}`);
+      } catch (e) {
+        if (e && e.code !== "ENOENT") throw e;
+      }
+      plan.output = {
+        requestedPath: outputArg,
+        resolvedPath: resolved,
+        parent: parentReal,
+        basename: base,
+      };
+    }
+
+    fs.writeFileSync(process.env.GWS_ARG_PLAN_FILE, JSON.stringify(plan));
+  ' -- "$@" || parse_status=$?
+if [ "$parse_status" -ne 0 ]; then
+  exit "$parse_status"
+fi
+
 # Build the request body, folding in inputId/routeKey from the active-input file
 # so the proxy's audit store is correlated for crash-window discovery even when a
 # kill happens before the JSONL append. The shim NEVER adds an Authorization
 # header (OneCLI injects it at the gateway).
 request_body="$(
   NODE_NO_WARNINGS=1 NANOCLAW_ACTIVE_INPUT_FILE="$active_input_file" \
+  GWS_ARG_PLAN_FILE="$tmp_arg_plan" \
   NANOCLAW_ACTIVE_INPUT_MAX_AGE_MS="$active_input_max_age_ms" node -e '
     const fs = require("fs");
-    const args = process.argv.slice(1);
-    const body = { args };
+    const plan = JSON.parse(fs.readFileSync(process.env.GWS_ARG_PLAN_FILE, "utf8"));
+    const body = { args: plan.proxyArgs };
+    if (plan.output) body.output = { mode: "return_file" };
     try {
       const ai = JSON.parse(fs.readFileSync(process.env.NANOCLAW_ACTIVE_INPUT_FILE, "utf8"));
       // Stale-by-timestamp ⇒ uncorrelated. updatedAt is refreshed each
@@ -100,27 +213,56 @@ request_body="$(
   ' -- "$@"
 )"
 
-tmp_headers="$(mktemp)"
-tmp_body="$(mktemp)"
-cleanup() {
-  rm -f "$tmp_headers" "$tmp_body"
-}
-trap cleanup EXIT
+output_resolved_path="$(
+  NODE_NO_WARNINGS=1 node -e '
+    const fs = require("fs");
+    const plan = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    process.stdout.write(plan.output ? plan.output.resolvedPath : "");
+  ' "$tmp_arg_plan"
+)"
+output_parent="$(
+  NODE_NO_WARNINGS=1 node -e '
+    const fs = require("fs");
+    const plan = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    process.stdout.write(plan.output ? plan.output.parent : "");
+  ' "$tmp_arg_plan"
+)"
+output_basename="$(
+  NODE_NO_WARNINGS=1 node -e '
+    const fs = require("fs");
+    const plan = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    process.stdout.write(plan.output ? plan.output.basename : "");
+  ' "$tmp_arg_plan"
+)"
 
+curl_body_target="$tmp_body"
+if [ -n "$output_resolved_path" ]; then
+  tmp_output_body="$(mktemp "$output_parent/.gws-output.XXXXXX")"
+  curl_body_target="$tmp_output_body"
+fi
+
+curl_status=0
 http_code="$(
-  curl_with_configured_proxy -sS -o "$tmp_body" -D "$tmp_headers" -w "%{http_code}" \
+  curl_with_configured_proxy -sS -o "$curl_body_target" -D "$tmp_headers" -w "%{http_code}" \
     -X POST \
     -H "Content-Type: application/json" \
     -d "$request_body" \
-    "$GWS_PROXY_URL/exec" 2>/dev/null || true
-)"
+    "$GWS_PROXY_URL/exec" 2>/dev/null
+)" || curl_status=$?
+if [ "$curl_status" -ne 0 ]; then
+  rm -f "$tmp_output_body"
+  tmp_output_body=""
+  printf 'Error: GWS proxy transfer failed while receiving output bytes.\n' >&2
+  exit 1
+fi
 
 if [ -z "$http_code" ] || [ "$http_code" = "000" ]; then
+  rm -f "$tmp_output_body"
+  tmp_output_body=""
   echo "Error: unable to reach GWS proxy at $GWS_PROXY_URL" >&2
   exit 1
 fi
 
-body="$(cat "$tmp_body")"
 exit_code="$(awk 'BEGIN{IGNORECASE=1} /^X-Exit-Code:/ {gsub("\r","",$2); print $2; exit}' "$tmp_headers")"
 exit_code="${exit_code:-0}"
 
@@ -133,8 +275,129 @@ header_value() {
   }' "$tmp_headers"
 }
 
+file_size_bytes() {
+  NODE_NO_WARNINGS=1 node -e '
+    const fs = require("fs");
+    process.stdout.write(String(fs.statSync(process.argv[1]).size));
+  ' "$1"
+}
+
+file_sha256() {
+  NODE_NO_WARNINGS=1 node -e '
+    const crypto = require("crypto");
+    const fs = require("fs");
+    const hash = crypto.createHash("sha256");
+    const input = fs.createReadStream(process.argv[1]);
+    input.on("data", (chunk) => hash.update(chunk));
+    input.on("error", (err) => {
+      process.stderr.write(String(err && err.message ? err.message : err));
+      process.exit(1);
+    });
+    input.on("end", () => process.stdout.write(hash.digest("hex")));
+  ' "$1"
+}
+
+revalidate_output_destination() {
+  NODE_NO_WARNINGS=1 node -e '
+    const fs = require("fs");
+    const path = require("path");
+    const plan = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    if (!plan.output) process.exit(0);
+
+    function fail(message) {
+      process.stderr.write(`Error: ${message}\n`);
+      process.exit(2);
+    }
+
+    function insideRoot(candidate, root) {
+      const rel = path.relative(root, candidate);
+      return rel === "" || (!!rel && !rel.startsWith("..") && !path.isAbsolute(rel));
+    }
+
+    let parentReal;
+    try {
+      const stat = fs.statSync(plan.output.parent);
+      parentReal = fs.realpathSync(plan.output.parent);
+      if (!stat.isDirectory()) fail(`output parent path is not a directory: ${plan.output.parent}`);
+    } catch {
+      fail(`output parent directory does not exist: ${plan.output.parent}`);
+    }
+    if (parentReal !== plan.output.parent) {
+      fail(`output parent directory changed before publish: ${plan.output.parent}`);
+    }
+    if (!plan.roots.some((root) => insideRoot(parentReal, root))) {
+      fail(`output path ${plan.output.resolvedPath} is outside allowed output roots: ${plan.roots.join(":")}`);
+    }
+    const resolved = path.join(parentReal, plan.output.basename);
+    if (resolved !== plan.output.resolvedPath) {
+      fail("output destination changed before publish");
+    }
+    try {
+      const targetStat = fs.lstatSync(resolved);
+      if (targetStat.isSymbolicLink()) fail(`output target is a symlink: ${resolved}`);
+      fail(`output target already exists: ${resolved}`);
+    } catch (e) {
+      if (e && e.code !== "ENOENT") throw e;
+    }
+  ' "$tmp_arg_plan"
+}
+
+print_output_success_json() {
+  bytes="$(header_value 'X-GWS-Output-Bytes')"
+  sha256="$(header_value 'X-GWS-Output-SHA256')"
+  NODE_NO_WARNINGS=1 \
+    GWS_OUTPUT_PATH="$output_resolved_path" \
+    GWS_OUTPUT_BYTES="${bytes:-0}" \
+    GWS_OUTPUT_SHA256="$sha256" \
+    node -e '
+      const savedFile = process.env.GWS_OUTPUT_PATH || "";
+      const bytes = Number(process.env.GWS_OUTPUT_BYTES || "0");
+      const sha256 = process.env.GWS_OUTPUT_SHA256 || "";
+      process.stdout.write(JSON.stringify({ status: "success", saved_file: savedFile, bytes, sha256 }));
+    '
+}
+
+body=""
+if [ -z "$output_resolved_path" ] || [ "$http_code" != "200" ]; then
+  body="$(cat "$curl_body_target" 2>/dev/null || true)"
+fi
+
 case "$http_code" in
   200)
+    if [ -n "$output_resolved_path" ]; then
+      proxy_output_kind="$(header_value 'X-GWS-Proxy-Output')"
+      if [ "$exit_code" = "0" ] && [ "$proxy_output_kind" = "file" ]; then
+        expected_bytes="$(header_value 'X-GWS-Output-Bytes')"
+        expected_sha256="$(header_value 'X-GWS-Output-SHA256')"
+        actual_bytes="$(file_size_bytes "$tmp_output_body")"
+        actual_sha256="$(file_sha256 "$tmp_output_body")"
+        if [ -z "$expected_bytes" ] || [ -z "$expected_sha256" ] || \
+           [ "$actual_bytes" != "$expected_bytes" ] || [ "$actual_sha256" != "$expected_sha256" ]; then
+          rm -f "$tmp_output_body"
+          tmp_output_body=""
+          printf 'Error: GWS proxy output integrity check failed.\n' >&2
+          exit 1
+        fi
+        revalidate_output_destination
+        if ! ln "$tmp_output_body" "$output_resolved_path" 2>/dev/null; then
+          rm -f "$tmp_output_body"
+          tmp_output_body=""
+          printf 'Error: output target already exists or cannot be created: %s\n' "$output_resolved_path" >&2
+          exit 1
+        fi
+        rm -f "$tmp_output_body"
+        tmp_output_body=""
+        print_output_success_json
+        exit 0
+      fi
+      rm -f "$tmp_output_body"
+      tmp_output_body=""
+      if [ "$exit_code" = "0" ]; then
+        printf 'Error: GWS proxy did not return output bytes for -o/--output request.\n' >&2
+        exit 1
+      fi
+      body="$(cat "$curl_body_target" 2>/dev/null || true)"
+    fi
     api_effect="$(header_value 'X-GWS-Api-Effect')"
     op_succeeded="$(header_value 'X-GWS-Operation-Succeeded')"
     # Stage a sanitized gmail_draft_created ledger record ONLY for a successful

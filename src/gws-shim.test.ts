@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
@@ -42,7 +43,7 @@ async function withProxy(
   };
 }
 
-async function runShim(args: string[], env: NodeJS.ProcessEnv = {}) {
+async function runShim(args: string[], env: NodeJS.ProcessEnv = {}, cwd = process.cwd(), shim = shimPath) {
   const cleanProxyEnv: NodeJS.ProcessEnv = {
     HTTP_PROXY: undefined,
     http_proxy: undefined,
@@ -54,8 +55,8 @@ async function runShim(args: string[], env: NodeJS.ProcessEnv = {}) {
     no_proxy: undefined,
   };
   return await new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve, reject) => {
-    const child = spawn('sh', [shimPath, ...args], {
-      cwd: process.cwd(),
+    const child = spawn('sh', [shim, ...args], {
+      cwd,
       env: {
         ...process.env,
         ...cleanProxyEnv,
@@ -77,6 +78,32 @@ async function runShim(args: string[], env: NodeJS.ProcessEnv = {}) {
     child.on('error', reject);
     child.on('close', (status) => resolve({ status, stdout, stderr }));
   });
+}
+
+function shimWithOutputRootsForTest(roots: string[]): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-shim-root-test-'));
+  const shim = path.join(dir, 'gws');
+  let source = fs.readFileSync(shimPath, 'utf8');
+  source = source.replace(
+    'readonly_output_roots="/workspace/agent:/workspace/outbox"',
+    `readonly_output_roots=${JSON.stringify(roots.join(':'))}`,
+  );
+  if (!source.includes(roots.join(':'))) throw new Error('test shim root replacement failed');
+  fs.writeFileSync(shim, source, { mode: 0o755 });
+  return shim;
+}
+
+function writeOutputProxyResponse(res: http.ServerResponse, bytes: Buffer | string): void {
+  const body = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
+  const hash = crypto.createHash('sha256').update(body).digest('hex');
+  res.writeHead(200, {
+    'Content-Type': 'application/octet-stream',
+    'X-Exit-Code': '0',
+    'X-GWS-Proxy-Output': 'file',
+    'X-GWS-Output-Bytes': String(body.length),
+    'X-GWS-Output-SHA256': hash,
+  });
+  res.end(body);
 }
 
 afterEach(async () => {
@@ -251,6 +278,325 @@ describe('gws proxy shim', () => {
     expect(result.status).toBe(1);
     expect(result.stderr).toContain('GWS proxy authentication failed');
     expect(result.stderr).toContain('OneCLI');
+  });
+
+  it('writes relative -o output in the caller cwd and strips the path before proxy execution', async () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-shim-workspace-'));
+    const shim = shimWithOutputRootsForTest([workspace]);
+    fs.mkdirSync(path.join(workspace, 'enrichment_runs', 'run-1', 'drive', 'contents'), { recursive: true });
+    const records: RequestRecord[] = [];
+    const proxy = await withProxy((req, res, body) => {
+      records.push({
+        method: req.method,
+        url: req.url,
+        authorization: req.headers.authorization,
+        contentType: headerValue(req.headers['content-type']),
+        body,
+      });
+      writeOutputProxyResponse(res, 'drive file text\n');
+    });
+
+    const result = await runShim(
+      [
+        'drive',
+        'files',
+        'export',
+        '--params',
+        '{"fileId":"doc-1","mimeType":"text/plain"}',
+        '-o',
+        'enrichment_runs/run-1/drive/contents/doc.txt',
+        '--format',
+        'json',
+      ],
+      { GWS_PROXY_URL: proxy.url },
+      workspace,
+      shim,
+    );
+
+    const outputPath = path.join(workspace, 'enrichment_runs', 'run-1', 'drive', 'contents', 'doc.txt');
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe('');
+    expect(fs.readFileSync(outputPath, 'utf8')).toBe('drive file text\n');
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      status: 'success',
+      saved_file: outputPath,
+      bytes: 16,
+      sha256: crypto.createHash('sha256').update('drive file text\n').digest('hex'),
+    });
+    expect(records).toHaveLength(1);
+    const posted = JSON.parse(records[0].body) as { args: string[]; output?: { mode: string } };
+    expect(posted.output).toEqual({ mode: 'return_file' });
+    expect(posted.args).toEqual([
+      'drive',
+      'files',
+      'export',
+      '--params',
+      '{"fileId":"doc-1","mimeType":"text/plain"}',
+      '--format',
+      'json',
+    ]);
+  });
+
+  it('writes absolute --output paths inside the shim-owned workspace root', async () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-shim-workspace-'));
+    const shim = shimWithOutputRootsForTest([workspace]);
+    const outDir = path.join(workspace, 'tmp', 'gws_drive_probe');
+    fs.mkdirSync(outDir, { recursive: true });
+    const outputPath = path.join(outDir, 'current_probe.txt');
+    const proxy = await withProxy((_req, res) => {
+      writeOutputProxyResponse(res, 'absolute text\n');
+    });
+
+    const result = await runShim(
+      [
+        'drive',
+        'files',
+        'export',
+        '--params',
+        '{"fileId":"doc-1","mimeType":"text/plain"}',
+        '--output',
+        outputPath,
+        '--format',
+        'json',
+      ],
+      { GWS_PROXY_URL: proxy.url },
+      workspace,
+      shim,
+    );
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe('');
+    expect(fs.readFileSync(outputPath, 'utf8')).toBe('absolute text\n');
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      status: 'success',
+      saved_file: outputPath,
+      bytes: 14,
+    });
+  });
+
+  it('preserves binary output bytes that cannot round-trip through shell variables', async () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-shim-workspace-'));
+    const shim = shimWithOutputRootsForTest([workspace]);
+    const outputPath = path.join(workspace, 'binary.bin');
+    const bytes = Buffer.from([0x67, 0x77, 0x73, 0x0a, 0x00, 0xff, 0x41]);
+    const proxy = await withProxy((_req, res) => {
+      writeOutputProxyResponse(res, bytes);
+    });
+
+    const result = await runShim(
+      ['drive', 'files', 'download', '--params', '{"fileId":"bin-1"}', '-o', outputPath],
+      { GWS_PROXY_URL: proxy.url },
+      workspace,
+      shim,
+    );
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe('');
+    expect(fs.readFileSync(outputPath)).toEqual(bytes);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      status: 'success',
+      saved_file: outputPath,
+      bytes: bytes.length,
+      sha256: crypto.createHash('sha256').update(bytes).digest('hex'),
+    });
+  });
+
+  it('rejects output paths outside allowed roots before contacting the proxy', async () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-shim-workspace-'));
+    const shim = shimWithOutputRootsForTest([workspace]);
+    const records: RequestRecord[] = [];
+    const proxy = await withProxy((req, res, body) => {
+      records.push({ method: req.method, url: req.url, body });
+      res.writeHead(500);
+      res.end('proxy should not be called');
+    });
+
+    const result = await runShim(
+      ['drive', 'files', 'export', '--params', '{"fileId":"doc-1"}', '-o', '/tmp/outside.txt'],
+      { GWS_PROXY_URL: proxy.url },
+      workspace,
+      shim,
+    );
+
+    expect(result.status).not.toBe(0);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('outside allowed output roots');
+    expect(records).toHaveLength(0);
+  });
+
+  it('rejects output paths whose parent directory does not exist before contacting the proxy', async () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-shim-workspace-'));
+    const shim = shimWithOutputRootsForTest([workspace]);
+    const records: RequestRecord[] = [];
+    const proxy = await withProxy((req, res, body) => {
+      records.push({ method: req.method, url: req.url, body });
+      res.writeHead(500);
+      res.end('proxy should not be called');
+    });
+
+    const result = await runShim(
+      ['drive', 'files', 'export', '--params', '{"fileId":"doc-1"}', '-o', 'missing/doc.txt'],
+      { GWS_PROXY_URL: proxy.url },
+      workspace,
+      shim,
+    );
+
+    expect(result.status).not.toBe(0);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('output parent directory does not exist');
+    expect(records).toHaveLength(0);
+  });
+
+  it('rejects a symlink output target before contacting the proxy', async () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-shim-workspace-'));
+    const shim = shimWithOutputRootsForTest([workspace]);
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-shim-outside-'));
+    const outputPath = path.join(workspace, 'linked-out.txt');
+    fs.symlinkSync(path.join(outside, 'real.txt'), outputPath);
+    const records: RequestRecord[] = [];
+    const proxy = await withProxy((req, res, body) => {
+      records.push({ method: req.method, url: req.url, body });
+      res.writeHead(500);
+      res.end('proxy should not be called');
+    });
+
+    const result = await runShim(
+      ['drive', 'files', 'export', '--params', '{"fileId":"doc-1"}', '-o', outputPath],
+      { GWS_PROXY_URL: proxy.url },
+      workspace,
+      shim,
+    );
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('output target is a symlink');
+    expect(records).toHaveLength(0);
+  });
+
+  it('rejects a symlink parent that resolves outside allowed roots before contacting the proxy', async () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-shim-workspace-'));
+    const shim = shimWithOutputRootsForTest([workspace]);
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-shim-outside-'));
+    fs.symlinkSync(outside, path.join(workspace, 'outside-link'));
+    const records: RequestRecord[] = [];
+    const proxy = await withProxy((req, res, body) => {
+      records.push({ method: req.method, url: req.url, body });
+      res.writeHead(500);
+      res.end('proxy should not be called');
+    });
+
+    const result = await runShim(
+      ['drive', 'files', 'export', '--params', '{"fileId":"doc-1"}', '-o', 'outside-link/out.txt'],
+      { GWS_PROXY_URL: proxy.url },
+      workspace,
+      shim,
+    );
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('outside allowed output roots');
+    expect(records).toHaveLength(0);
+  });
+
+  it('fails when output was requested but the proxy does not stream output bytes', async () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-shim-workspace-'));
+    const shim = shimWithOutputRootsForTest([workspace]);
+    const outputPath = path.join(workspace, 'out.txt');
+    const proxy = await withProxy((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/plain', 'X-Exit-Code': '0' });
+      res.end('{"status":"success","saved_file":"/app/out.txt"}');
+    });
+
+    const result = await runShim(
+      ['drive', 'files', 'export', '--params', '{"fileId":"doc-1"}', '-o', outputPath],
+      { GWS_PROXY_URL: proxy.url },
+      workspace,
+      shim,
+    );
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('did not return output bytes');
+    expect(fs.existsSync(outputPath)).toBe(false);
+  });
+
+  it('rejects an existing output target before contacting the proxy', async () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-shim-workspace-'));
+    const shim = shimWithOutputRootsForTest([workspace]);
+    const outputPath = path.join(workspace, 'out.txt');
+    fs.writeFileSync(outputPath, 'do not replace\n');
+    const records: RequestRecord[] = [];
+    const proxy = await withProxy((req, res, body) => {
+      records.push({ method: req.method, url: req.url, body });
+      res.writeHead(500);
+      res.end('proxy should not be called');
+    });
+
+    const result = await runShim(
+      ['drive', 'files', 'export', '--params', '{"fileId":"doc-1"}', '-o', outputPath],
+      { GWS_PROXY_URL: proxy.url },
+      workspace,
+      shim,
+    );
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('output target already exists');
+    expect(fs.readFileSync(outputPath, 'utf8')).toBe('do not replace\n');
+    expect(records).toHaveLength(0);
+  });
+
+  it('rejects multiple output paths and attached -oPATH syntax before contacting the proxy', async () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-shim-workspace-'));
+    const shim = shimWithOutputRootsForTest([workspace]);
+    const records: RequestRecord[] = [];
+    const proxy = await withProxy((req, res, body) => {
+      records.push({ method: req.method, url: req.url, body });
+      res.writeHead(500);
+      res.end('proxy should not be called');
+    });
+
+    const multiple = await runShim(
+      ['drive', 'files', 'export', '--params', '{"fileId":"doc-1"}', '-o', 'a.txt', '--output=b.txt'],
+      { GWS_PROXY_URL: proxy.url },
+      workspace,
+      shim,
+    );
+    expect(multiple.status).not.toBe(0);
+    expect(multiple.stderr).toContain('multiple output paths were provided');
+
+    const attached = await runShim(
+      ['drive', 'files', 'export', '--params', '{"fileId":"doc-1"}', `-o${path.join(workspace, 'attached.txt')}`],
+      { GWS_PROXY_URL: proxy.url },
+      workspace,
+      shim,
+    );
+    expect(attached.status).not.toBe(0);
+    expect(attached.stderr).toContain('attached -oPATH output syntax is not supported');
+    expect(records).toHaveLength(0);
+  });
+
+  it('rejects a streamed body whose byte count or SHA-256 does not match proxy metadata', async () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-shim-workspace-'));
+    const shim = shimWithOutputRootsForTest([workspace]);
+    const outputPath = path.join(workspace, 'out.txt');
+    const proxy = await withProxy((_req, res) => {
+      res.writeHead(200, {
+        'Content-Type': 'application/octet-stream',
+        'X-Exit-Code': '0',
+        'X-GWS-Proxy-Output': 'file',
+        'X-GWS-Output-Bytes': '100',
+        'X-GWS-Output-SHA256': crypto.createHash('sha256').update('different').digest('hex'),
+      });
+      res.end('short');
+    });
+
+    const result = await runShim(
+      ['drive', 'files', 'export', '--params', '{"fileId":"doc-1"}', '-o', outputPath],
+      { GWS_PROXY_URL: proxy.url },
+      workspace,
+      shim,
+    );
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('output integrity check failed');
+    expect(fs.existsSync(outputPath)).toBe(false);
   });
 });
 
@@ -543,13 +889,11 @@ describe('gws proxy shim — side-effect ledger', () => {
       apiEffectSuccessProxy('Draft created: r-1', 'SIG', '{"audit_id":"aud-77"}', 'aud-77'),
     );
 
-    // Make ONLY the SECOND `node` invocation (the record-builder) fail, while the
-    // first (the request-body builder, which runs BEFORE the API call) succeeds.
-    // A counting fake `node` on PATH does this: invocation 1 delegates to the
-    // real node, invocation 2 exits non-zero. The record-build failure lands
-    // AFTER the API mutation succeeded, so the shim must take the recoverable
-    // exit-75 partial-success path (audit id, no raw body) rather than aborting
-    // with a bare generic failure under set -e.
+    // Make ONLY the record-builder `node -e` invocation fail, while earlier
+    // parse/request-body helpers succeed. The record-build failure lands AFTER
+    // the API mutation succeeded, so the shim must take the recoverable exit-75
+    // partial-success path (audit id, no raw body) rather than aborting with a
+    // bare generic failure under set -e.
     const realNode = process.execPath;
     const fakeBin = path.join(tmp, 'bin');
     fs.mkdirSync(fakeBin, { recursive: true });
@@ -562,7 +906,14 @@ describe('gws proxy shim — side-effect ledger', () => {
         `n=$(cat "${counterFile}" 2>/dev/null || echo 0)`,
         'n=$((n + 1))',
         `printf '%s' "$n" > "${counterFile}"`,
-        'if [ "$n" -ge 2 ]; then echo "record-builder boom" >&2; exit 1; fi',
+        'prev=""',
+        'for arg in "$@"; do',
+        '  if [ "$prev" = "-e" ] && printf "%s" "$arg" | grep -q "gmail_draft_created"; then',
+        '    echo "record-builder boom" >&2',
+        '    exit 1',
+        '  fi',
+        '  prev="$arg"',
+        'done',
         `exec "${realNode}" "$@"`,
         '',
       ].join('\n'),
