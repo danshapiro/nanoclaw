@@ -190,6 +190,33 @@ describe('gws proxy shim', () => {
     ]);
   });
 
+  it('does not treat -o-prefixed values for known flags as output syntax', async () => {
+    const records: RequestRecord[] = [];
+    const proxy = await withProxy((req, res, body) => {
+      records.push({
+        method: req.method,
+        url: req.url,
+        authorization: req.headers.authorization,
+        contentType: headerValue(req.headers['content-type']),
+        body,
+      });
+      res.writeHead(200, { 'Content-Type': 'application/json', 'X-Exit-Code': '0' });
+      res.end('{"ok":true}');
+    });
+
+    const result = await runShim(['gmail', 'messages', 'list', '--query', '-older_than:7d'], {
+      GWS_PROXY_URL: proxy.url,
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe('');
+    expect(records).toEqual([
+      expect.objectContaining({
+        body: JSON.stringify({ args: ['gmail', 'messages', 'list', '--query', '-older_than:7d'] }),
+      }),
+    ]);
+  });
+
   it('honors uppercase HTTP_PROXY for the OneCLI-mediated local proxy route', async () => {
     const records: RequestRecord[] = [];
     const onecliGateway = await withProxy((req, res, body) => {

@@ -115,14 +115,58 @@ GWS_ARG_PLAN_FILE="$tmp_arg_plan" \
       return rel === "" || (!!rel && !rel.startsWith("..") && !path.isAbsolute(rel));
     }
 
-    let outputArg = null;
-    const proxyArgs = [];
-    for (let i = 0; i < args.length; i++) {
-      const arg = args[i];
-      let value = null;
-      if (arg === "-o" || arg === "--output") {
-        if (i + 1 >= args.length) fail(`${arg} requires a path value`);
-        value = args[++i];
+	    let outputArg = null;
+	    const proxyArgs = [];
+	    const valueFlags = new Set([
+	      "--params",
+	      "--json",
+	      "--format",
+	      "--fields",
+	      "--filter",
+	      "--query",
+	      "--q",
+	      "--userId",
+	      "--user-id",
+	      "--fileId",
+	      "--file-id",
+	      "--documentId",
+	      "--document-id",
+	      "--spreadsheetId",
+	      "--spreadsheet-id",
+	      "--presentationId",
+	      "--presentation-id",
+	      "--calendarId",
+	      "--calendar-id",
+	      "--eventId",
+	      "--event-id",
+	      "--mimeType",
+	      "--mime-type",
+	      "--pageToken",
+	      "--page-token",
+	      "--pageSize",
+	      "--page-size",
+	    ]);
+	    let parseOptions = true;
+	    for (let i = 0; i < args.length; i++) {
+	      const arg = args[i];
+	      let value = null;
+	      if (!parseOptions) {
+	        proxyArgs.push(arg);
+	        continue;
+	      }
+	      if (arg === "--") {
+	        parseOptions = false;
+	        proxyArgs.push(arg);
+	        continue;
+	      }
+	      if (valueFlags.has(arg)) {
+	        proxyArgs.push(arg);
+	        if (i + 1 < args.length) proxyArgs.push(args[++i]);
+	        continue;
+	      }
+	      if (arg === "-o" || arg === "--output") {
+	        if (i + 1 >= args.length) fail(`${arg} requires a path value`);
+	        value = args[++i];
       } else if (arg.startsWith("--output=")) {
         value = arg.slice("--output=".length);
       } else if (arg.startsWith("-o=")) {
