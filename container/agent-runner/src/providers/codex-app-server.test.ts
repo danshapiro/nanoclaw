@@ -73,6 +73,12 @@ describe('Codex strict config compatibility', () => {
     }
   });
 
+  it('disables the hosted apps connector under strict config', () => {
+    // codex_apps cannot authenticate through the OneCLI-broker-mediated egress,
+    // so every Codex turn must start with the connector disabled.
+    expect(createCodexConfigOverrides()).toContain('features.apps=false');
+  });
+
   it('passes model_reasoning_effort as a strict config override', () => {
     process.env.CODEX_REASONING_EFFORT = 'xhigh';
     try {

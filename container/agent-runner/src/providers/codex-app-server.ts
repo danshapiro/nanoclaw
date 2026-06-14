@@ -413,7 +413,17 @@ export function writeCodexMcpConfigToml(servers: Record<string, CodexMcpServer>)
 }
 
 export function createCodexConfigOverrides(): string[] {
-  const overrides = ['features.use_linux_sandbox_bwrap=false'];
+  // Disable the hosted "apps"/connectors MCP (codex_apps). It is stable and ON
+  // by default in codex-cli; at startup the client opens a streamable-HTTP
+  // connection to OpenAI's apps backend that needs a ChatGPT-account connector
+  // OAuth bearer plus direct egress to that host. Yente's Codex auth is mediated
+  // by the OneCLI broker (model API only, no connector OAuth, no direct apps
+  // egress), so the connector's `initialize` reply comes back as a non-JSON-RPC
+  // body and the rmcp client throws "did not match any variant of untagged enum
+  // JsonRpcMessage". The connector is unwanted anyway — Yente uses its own local
+  // MCP/skills, not OpenAI's hosted connectors. `features.apps` is a known feature
+  // key, so it is accepted under --strict-config.
+  const overrides = ['features.apps=false', 'features.use_linux_sandbox_bwrap=false'];
   // Yente runs high reasoning by default; per-group override via
   // CODEX_REASONING_EFFORT forwarded by the host-side provider config.
   // `model_reasoning_effort` is the strict-config key codex app-server accepts.
