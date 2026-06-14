@@ -238,6 +238,26 @@ export function killCodexAppServer(server: AppServer): void {
 // accepts `denied` as the explicit refusal, and the `item/*/requestApproval`
 // family accepts `reject`. We use those real values — never an invented one.
 
+// Shapes verified with `codex app-server generate-ts` from codex-cli 0.139.0:
+// ToolRequestUserInputResponse and McpServerElicitationRequestResponse.
+function codexRequestUserInputDecline(params: unknown): { answers: Record<string, { answers: string[] }> } {
+  const answers: Record<string, { answers: string[] }> = {};
+  const record = params && typeof params === 'object' ? (params as Record<string, unknown>) : {};
+  const questions = Array.isArray(record.questions) ? record.questions : [];
+  for (const question of questions) {
+    if (!question || typeof question !== 'object') continue;
+    const id = (question as { id?: unknown }).id;
+    if (typeof id === 'string' && id.length > 0) {
+      answers[id] = { answers: [] };
+    }
+  }
+  return { answers };
+}
+
+function codexElicitationDecline(): { action: 'decline'; content: null; _meta: null } {
+  return { action: 'decline', content: null, _meta: null };
+}
+
 export function attachCodexAutoApproval(server: AppServer, { relay }: { relay: boolean } = { relay: false }): void {
   server.serverRequestHandlers.push((req) => {
     const method = req.method;
@@ -273,8 +293,10 @@ export function attachCodexAutoApproval(server: AppServer, { relay }: { relay: b
         break;
       }
       case 'item/tool/requestUserInput':
+        sendCodexResponse(server, req.id, codexRequestUserInputDecline(req.params));
+        break;
       case 'mcpServer/elicitation/request':
-        sendCodexResponse(server, req.id, { input: null });
+        sendCodexResponse(server, req.id, codexElicitationDecline());
         break;
       default:
         log(`[approval] Unknown method ${method}, generic accept`);

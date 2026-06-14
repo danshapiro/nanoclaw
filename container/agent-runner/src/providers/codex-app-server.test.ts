@@ -4,10 +4,12 @@ import os from 'os';
 import path from 'path';
 
 import {
+  attachCodexAutoApproval,
   createCodexConfigOverrides,
   STALE_THREAD_RE,
   tomlBasicString,
   writeCodexMcpConfigToml,
+  type AppServer,
 } from './codex-app-server.js';
 
 describe('tomlBasicString', () => {
@@ -86,5 +88,80 @@ describe('Codex strict config compatibility', () => {
     } finally {
       delete process.env.CODEX_REASONING_EFFORT;
     }
+  });
+});
+
+type CapturedCodexResponse = { id: number; result: unknown };
+
+function makeFakeAppServer(): { server: AppServer; responses: CapturedCodexResponse[] } {
+  const responses: CapturedCodexResponse[] = [];
+  const server = {
+    process: {
+      stdin: {
+        write(line: string) {
+          responses.push(JSON.parse(line) as CapturedCodexResponse);
+          return true;
+        },
+      },
+    },
+    readline: { close() {} },
+    pending: new Map(),
+    notificationHandlers: [],
+    serverRequestHandlers: [],
+  } as unknown as AppServer;
+  return { server, responses };
+}
+
+function dispatchServerRequest(server: AppServer, method: string, params: Record<string, unknown>): void {
+  const handler = server.serverRequestHandlers[0];
+  if (!handler) throw new Error('expected auto-approval handler to be registered');
+  handler({ jsonrpc: '2.0', id: 42, method, params } as never);
+}
+
+describe('attachCodexAutoApproval native user-input surfaces', () => {
+  it('answers requestUserInput with empty answers keyed by question id', () => {
+    const { server, responses } = makeFakeAppServer();
+    attachCodexAutoApproval(server);
+
+    dispatchServerRequest(server, 'item/tool/requestUserInput', {
+      questions: [
+        { id: 'color', kind: 'text', question: 'What color?' },
+        { id: 'size', kind: 'choice', question: 'What size?' },
+      ],
+    });
+
+    expect(responses[0]?.result).toEqual({
+      answers: {
+        color: { answers: [] },
+        size: { answers: [] },
+      },
+    });
+  });
+
+  it('answers requestUserInput with an empty map when question ids are missing', () => {
+    const { server, responses } = makeFakeAppServer();
+    attachCodexAutoApproval(server);
+
+    dispatchServerRequest(server, 'item/tool/requestUserInput', {
+      questions: [{ question: 'What color?' }],
+    });
+
+    expect(responses[0]?.result).toEqual({ answers: {} });
+  });
+
+  it('declines MCP elicitation with the Codex protocol shape', () => {
+    const { server, responses } = makeFakeAppServer();
+    attachCodexAutoApproval(server);
+
+    dispatchServerRequest(server, 'mcpServer/elicitation/request', {
+      serverName: 'example',
+      message: 'Need input',
+    });
+
+    expect(responses[0]?.result).toEqual({
+      action: 'decline',
+      content: null,
+      _meta: null,
+    });
   });
 });
