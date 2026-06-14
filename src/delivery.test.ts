@@ -26,7 +26,14 @@ vi.mock('./config.js', async () => {
 
 const TEST_DIR = '/tmp/nanoclaw-test-delivery';
 
-import { initTestDb, closeDb, runMigrations, createAgentGroup, createMessagingGroup } from './db/index.js';
+import {
+  initTestDb,
+  closeDb,
+  runMigrations,
+  createAgentGroup,
+  createMessagingGroup,
+  createMessagingGroupAgent,
+} from './db/index.js';
 import { archiveSession } from './db/sessions.js';
 import { resolveSession, outboundDbPath, inboundDbPath } from './session-manager.js';
 import {
@@ -56,6 +63,18 @@ function seedAgentAndChannel(): void {
     name: 'Test Chat',
     is_group: 0,
     unknown_sender_policy: 'public',
+    created_at: now(),
+  });
+  createMessagingGroupAgent({
+    id: 'mga-1',
+    messaging_group_id: 'mg-1',
+    agent_group_id: 'ag-1',
+    engage_mode: 'mention',
+    engage_pattern: null,
+    sender_scope: 'all',
+    ignored_message_policy: 'drop',
+    session_mode: 'shared',
+    priority: 0,
     created_at: now(),
   });
 }
@@ -118,6 +137,57 @@ afterEach(() => {
 });
 
 describe('deliverSessionMessages — concurrent invocations', () => {
+  it('blocks non-channel-wired origin-chat channel outbound before adapter delivery', async () => {
+    seedAgentAndChannel();
+    createAgentGroup({
+      id: 'ag-child',
+      name: 'Child Agent',
+      folder: 'child-agent',
+      agent_provider: null,
+      created_at: now(),
+    });
+    const { session } = resolveSession('ag-child', 'mg-1', null, 'shared');
+    insertOutbound('ag-child', session.id, 'out-child-channel', 'should not send');
+
+    const delivered: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        delivered.push(content);
+        return 'platform-message';
+      },
+    });
+
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(session);
+
+    expect(delivered).toEqual([]);
+    expect(deliveredRows('ag-child', session.id)).toEqual([
+      { message_out_id: 'out-child-channel', platform_message_id: null, status: 'failed' },
+    ]);
+  });
+
+  it('continues to allow primary channel-wired agent delivery', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-primary-channel', 'primary sends');
+
+    const delivered: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        delivered.push(JSON.parse(content).text as string);
+        return 'platform-message';
+      },
+    });
+
+    await deliverSessionMessages(session);
+
+    expect(delivered).toEqual(['primary sends']);
+    expect(deliveredRows('ag-1', session.id)).toEqual([
+      { message_out_id: 'out-primary-channel', platform_message_id: 'platform-message', status: 'delivered' },
+    ]);
+  });
+
   it('delivers a message exactly once when active and sweep polls overlap', async () => {
     seedAgentAndChannel();
     const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');

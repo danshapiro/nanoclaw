@@ -12,7 +12,7 @@ import type Database from 'better-sqlite3';
 import { getRunningSessions, getActiveSessions, createPendingQuestion, getSession } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
-import { getMessagingGroupByPlatform } from './db/messaging-groups.js';
+import { getMessagingGroupByPlatform, isAgentChannelWired } from './db/messaging-groups.js';
 import {
   getDueOutboundMessages,
   getDeliveredIds,
@@ -31,6 +31,8 @@ const ACTIVE_POLL_MS = 1000;
 const SWEEP_POLL_MS = 60_000;
 const MAX_DELIVERY_ATTEMPTS = 3;
 const SCHEDULING_ACTIONS = new Set(['schedule_task', 'cancel_task', 'pause_task', 'resume_task', 'update_task']);
+const SUBAGENT_CHANNEL_BLOCKED_MESSAGE =
+  'Subagents report to the caller/parent, not directly to the user. Only the primary channel-wired agent is authorized to communicate with user channels.';
 
 /** Track delivery attempt counts. Resets on process restart (gives failed messages a fresh chance). */
 const deliveryAttempts = new Map<string, number>();
@@ -391,12 +393,15 @@ async function deliverMessage(
     return;
   }
 
-  // Permission check: the source agent must be allowed to deliver to this
-  // channel destination. Two ways it passes:
+  // Permission check: only channel-wired primary agents may deliver to user
+  // channels. Subagents report to their caller/parent through agent routing.
+  // Once that invariant passes, the source agent must be allowed to deliver to
+  // this specific channel destination. Two ways it passes:
   //
   //   1. The target is the session's own origin chat (session.messaging_group_id
-  //      matches). An agent can always reply to the chat it was spawned from;
-  //      requiring a destinations row for the obvious case is a footgun.
+  //      matches). A primary channel-wired agent can always reply to the chat
+  //      it was spawned from; requiring a destinations row for the obvious case
+  //      is a footgun.
   //
   //   2. Otherwise, the agent must have an explicit agent_destinations row
   //      targeting that messaging group. createMessagingGroupAgent() inserts
@@ -411,6 +416,17 @@ async function deliverMessage(
     const mg = getMessagingGroupByPlatform(msg.channel_type, msg.platform_id);
     if (!mg) {
       throw new Error(`unknown messaging group for ${msg.channel_type}/${msg.platform_id} (message ${msg.id})`);
+    }
+    if (!isAgentChannelWired(session.agent_group_id)) {
+      log.warn('subagent_channel_delivery_blocked', {
+        agentGroupId: session.agent_group_id,
+        sessionId: session.id,
+        messageOutId: msg.id,
+        channelType: msg.channel_type,
+        platformId: msg.platform_id,
+        threadId: msg.thread_id,
+      });
+      throw new Error(SUBAGENT_CHANNEL_BLOCKED_MESSAGE);
     }
     const isOriginChat = session.messaging_group_id === mg.id;
     // Guarded: without the agent-to-agent module, `agent_destinations`

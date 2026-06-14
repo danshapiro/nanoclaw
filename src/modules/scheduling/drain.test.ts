@@ -18,7 +18,15 @@ vi.mock('../../config.js', async () => {
   return { ...actual, DATA_DIR: mocks.testDir };
 });
 
-import { closeDb, createAgentGroup, createMessagingGroup, getDb, initTestDb, runMigrations } from '../../db/index.js';
+import {
+  closeDb,
+  createAgentGroup,
+  createMessagingGroup,
+  createMessagingGroupAgent,
+  getDb,
+  initTestDb,
+  runMigrations,
+} from '../../db/index.js';
 import { withRuntimeLock, type RuntimeLockOwner } from '../../db/runtime-locks.js';
 import { deliverSessionMessages, setDeliveryAdapter } from '../../delivery.js';
 import { inboundDbPath, outboundDbPath, resolveSession } from '../../session-manager.js';
@@ -47,6 +55,18 @@ function seedAgentAndChannel(): void {
     name: 'Yente',
     is_group: 1,
     unknown_sender_policy: 'strict',
+    created_at: now(),
+  });
+  createMessagingGroupAgent({
+    id: 'mga-1',
+    messaging_group_id: 'mg-1',
+    agent_group_id: 'ag-1',
+    engage_mode: 'mention',
+    engage_pattern: null,
+    sender_scope: 'all',
+    ignored_message_policy: 'drop',
+    session_mode: 'shared',
+    priority: 0,
     created_at: now(),
   });
 }
