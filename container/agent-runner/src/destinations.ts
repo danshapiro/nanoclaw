@@ -12,6 +12,9 @@
  */
 import { getInboundDb } from './db/connection.js';
 
+export const SUBAGENT_CHANNEL_BLOCKED_MESSAGE =
+  'Subagents report to the caller/parent, not directly to the user. Only the primary channel-wired agent is authorized to communicate with user channels.';
+
 export interface DestinationEntry {
   name: string;
   displayName: string;
@@ -24,13 +27,15 @@ export interface DestinationEntry {
 interface DestRow {
   name: string;
   display_name: string | null;
-  type: 'channel' | 'agent';
+  type: 'channel' | 'agent' | 'blocked_channel';
   channel_type: string | null;
   platform_id: string | null;
   agent_group_id: string | null;
 }
 
-function rowToEntry(row: DestRow): DestinationEntry {
+type VisibleDestRow = DestRow & { type: 'channel' | 'agent' };
+
+function rowToEntry(row: VisibleDestRow): DestinationEntry {
   return {
     name: row.name,
     displayName: row.display_name ?? row.name,
@@ -42,13 +47,24 @@ function rowToEntry(row: DestRow): DestinationEntry {
 }
 
 export function getAllDestinations(): DestinationEntry[] {
-  const rows = getInboundDb().prepare('SELECT * FROM destinations ORDER BY name').all() as DestRow[];
+  const rows = getInboundDb()
+    .prepare("SELECT * FROM destinations WHERE type IN ('channel', 'agent') ORDER BY name")
+    .all() as VisibleDestRow[];
   return rows.map(rowToEntry);
 }
 
 export function findByName(name: string): DestinationEntry | undefined {
-  const row = getInboundDb().prepare('SELECT * FROM destinations WHERE name = ?').get(name) as DestRow | undefined;
+  const row = getInboundDb()
+    .prepare("SELECT * FROM destinations WHERE name = ? AND type IN ('channel', 'agent')")
+    .get(name) as VisibleDestRow | undefined;
   return row ? rowToEntry(row) : undefined;
+}
+
+export function isBlockedChannelName(name: string): boolean {
+  const row = getInboundDb()
+    .prepare("SELECT 1 FROM destinations WHERE name = ? AND type = 'blocked_channel' LIMIT 1")
+    .get(name);
+  return !!row;
 }
 
 /**
@@ -65,10 +81,10 @@ export function findByRouting(
     channelType === 'agent'
       ? (db
           .prepare("SELECT * FROM destinations WHERE type = 'agent' AND agent_group_id = ?")
-          .get(platformId) as DestRow | undefined)
+          .get(platformId) as VisibleDestRow | undefined)
       : (db
           .prepare("SELECT * FROM destinations WHERE type = 'channel' AND channel_type = ? AND platform_id = ?")
-          .get(channelType, platformId) as DestRow | undefined);
+          .get(channelType, platformId) as VisibleDestRow | undefined);
   return row ? rowToEntry(row) : undefined;
 }
 

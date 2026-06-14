@@ -4,7 +4,7 @@ import path from 'path';
 
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
-import { initTestSessionDb, closeSessionDb, getInboundDb } from '../db/connection.js';
+import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '../db/connection.js';
 import { getUndeliveredMessages } from '../db/messages-out.js';
 import { addReaction, editMessage, sendMessage } from './core.js';
 
@@ -103,6 +103,21 @@ function writeActiveInput(routeKey: string): string {
 }
 
 describe('core message action tools', () => {
+  it('returns a clear invariant error when a subagent guesses a blocked channel destination', async () => {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES ('user-channel', 'User Channel', 'blocked_channel', 'discord', 'chan-user', NULL)`,
+      )
+      .run();
+
+    const result = await sendMessage.handler({ to: 'user-channel', text: 'full diff text' });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain('Subagents report to the caller/parent, not directly to the user.');
+    expect(getOutboundDb().prepare('SELECT COUNT(*) AS count FROM messages_out').get()).toEqual({ count: 0 });
+  });
+
   it('stamps same-route send_message rows with the active route metadata', async () => {
     const routeKey = 'opencode|discord|chan-1|dm:mg-1';
     const dir = writeActiveInput(routeKey);

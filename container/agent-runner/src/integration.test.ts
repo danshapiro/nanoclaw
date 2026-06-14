@@ -36,6 +36,45 @@ function insertMessage(
 }
 
 describe('poll loop integration', () => {
+  it('does not route final message blocks to hidden blocked channel destinations', async () => {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES ('parent', 'Parent', 'agent', NULL, NULL, 'ag-parent')`,
+      )
+      .run();
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES ('user-channel', 'User Channel', 'blocked_channel', 'discord', 'chan-user', NULL)`,
+      )
+      .run();
+    insertMessage(
+      'm-blocked',
+      { sender: 'Parent', text: 'report only to parent' },
+      { platformId: 'ag-parent', channelType: 'agent' },
+    );
+
+    const provider = new MockProvider(
+      {},
+      () =>
+        '<message to="user-channel">should not reach user</message><message to="parent">complete report for parent</message>',
+    );
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
+
+    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    controller.abort();
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(out[0].channel_type).toBe('agent');
+    expect(out[0].platform_id).toBe('ag-parent');
+    expect(JSON.parse(out[0].content).text).toBe('complete report for parent');
+
+    await loopPromise.catch(() => {});
+  });
+
   it('should pick up a message, process it, and write a response', async () => {
     insertMessage(
       'm1',

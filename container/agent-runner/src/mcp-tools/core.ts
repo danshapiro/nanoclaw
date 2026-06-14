@@ -9,7 +9,7 @@
 import fs from 'fs';
 import path from 'path';
 
-import { findByName, getAllDestinations } from '../destinations.js';
+import { findByName, getAllDestinations, isBlockedChannelName, SUBAGENT_CHANNEL_BLOCKED_MESSAGE } from '../destinations.js';
 import { getMessageTargetBySeq, getRoutingBySeq, writeMessageOut } from '../db/messages-out.js';
 import { getSessionRouting } from '../db/session-routing.js';
 import { registerTools } from './server.js';
@@ -87,7 +87,10 @@ function resolveRouting(
     to = all[0].name;
   }
   const dest = findByName(to);
-  if (!dest) return { error: `Unknown destination "${to}". Known: ${destinationList()}` };
+  if (!dest) {
+    if (isBlockedChannelName(to)) return { error: SUBAGENT_CHANNEL_BLOCKED_MESSAGE };
+    return { error: `Unknown destination "${to}". Known: ${destinationList()}` };
+  }
   if (dest.type === 'channel') {
     // If the destination is the same channel the session is bound to,
     // preserve the thread_id so replies land in the correct thread.

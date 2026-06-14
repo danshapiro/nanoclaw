@@ -1,6 +1,13 @@
 import fs from 'fs';
 
-import { findByName, findByRouting, getAllDestinations, type DestinationEntry } from './destinations.js';
+import {
+  findByName,
+  findByRouting,
+  getAllDestinations,
+  isBlockedChannelName,
+  SUBAGENT_CHANNEL_BLOCKED_MESSAGE,
+  type DestinationEntry,
+} from './destinations.js';
 import {
   getPendingMessages,
   markProcessing,
@@ -1185,6 +1192,11 @@ function dispatchResultText(text: string, routing: RoutingContext): { sent: numb
 
     const dest = findByName(toName);
     if (!dest) {
+      if (isBlockedChannelName(toName)) {
+        log(`Blocked channel destination in <message to="${toName}">: ${SUBAGENT_CHANNEL_BLOCKED_MESSAGE}`);
+        scratchpadParts.push(`[dropped: ${SUBAGENT_CHANNEL_BLOCKED_MESSAGE}] ${body}`);
+        continue;
+      }
       log(`Unknown destination in <message to="${toName}">, dropping block`);
       scratchpadParts.push(`[dropped: unknown destination "${toName}"] ${body}`);
       continue;
