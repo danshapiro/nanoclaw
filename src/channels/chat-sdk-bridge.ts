@@ -227,6 +227,59 @@ export function splitForLimit(text: string, limit: number): string[] {
   return chunks;
 }
 
+type ChatSdkForwardSource = 'subscribed' | 'mention' | 'dm' | 'plain';
+
+type ChatSdkMessageIdentity = {
+  id?: string;
+  author?: {
+    isMe?: boolean;
+    isBot?: boolean | 'unknown';
+    userId?: string;
+    userName?: string;
+    fullName?: string;
+  };
+};
+
+export function isOwnChatSdkMessageForTest(message: ChatSdkMessageIdentity): boolean {
+  const author = message.author as { isMe?: boolean } | undefined;
+  return author?.isMe === true;
+}
+
+export async function forwardChatSdkInboundMessage<
+  TMessage extends {
+    id: string;
+    author?: { isMe?: boolean; userId?: string; userName?: string };
+  },
+>(opts: {
+  adapterName: string;
+  channelId: string;
+  threadId: string | null;
+  message: TMessage;
+  isMention: boolean;
+  isGroup: boolean;
+  source: ChatSdkForwardSource;
+  onInbound: ChannelSetup['onInbound'];
+  toInbound: (message: TMessage, isMention: boolean, isGroup: boolean) => Promise<InboundMessage>;
+}): Promise<'dropped' | 'forwarded'> {
+  const { adapterName, channelId, threadId, message, isMention, isGroup, source, onInbound, toInbound } = opts;
+  if (isOwnChatSdkMessageForTest(message)) {
+    const author = message.author;
+    log.warn('chat_sdk_same_bot_message_dropped', {
+      adapter: adapterName,
+      channelId,
+      threadId,
+      messageId: message.id,
+      authorId: author?.userId,
+      authorName: author?.userName,
+      source,
+    });
+    return 'dropped';
+  }
+
+  await onInbound(channelId, threadId, await toInbound(message, isMention, isGroup));
+  return 'forwarded';
+}
+
 export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter {
   const { adapter } = config;
   const transformText = (t: string): string => (config.transformOutboundText ? config.transformOutboundText(t) : t);
@@ -301,6 +354,27 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     };
   }
 
+  async function forwardInboundMessage(
+    channelId: string,
+    threadId: string,
+    message: ChatMessage,
+    isMention: boolean,
+    isGroup: boolean,
+    source: ChatSdkForwardSource,
+  ): Promise<void> {
+    await forwardChatSdkInboundMessage({
+      adapterName: adapter.name,
+      channelId,
+      threadId,
+      message,
+      isMention,
+      isGroup,
+      source,
+      onInbound: setupConfig.onInbound,
+      toInbound: messageToInbound,
+    });
+  }
+
   const bridge: ChannelAdapter = {
     name: adapter.name,
     channelType: adapter.name,
@@ -331,17 +405,13 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // wirings still fire on in-thread mentions.
       chat.onSubscribedMessage(async (thread, message) => {
         const channelId = adapter.channelIdFromThreadId(thread.id);
-        await setupConfig.onInbound(
-          channelId,
-          thread.id,
-          await messageToInbound(message, message.isMention === true, true),
-        );
+        await forwardInboundMessage(channelId, thread.id, message, message.isMention === true, true, 'subscribed');
       });
 
       // @mention in an unsubscribed thread — SDK-confirmed bot mention.
       chat.onNewMention(async (thread, message) => {
         const channelId = adapter.channelIdFromThreadId(thread.id);
-        await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, true, true));
+        await forwardInboundMessage(channelId, thread.id, message, true, true, 'mention');
       });
 
       // DMs — by definition addressed to the bot. Thread id flows through
@@ -356,7 +426,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           sender: (message.author as any)?.fullName ?? (message.author as any)?.userId ?? 'unknown',
           threadId: thread.id,
         });
-        await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, true, false));
+        await forwardInboundMessage(channelId, thread.id, message, true, false, 'dm');
       });
 
       // Plain messages in unsubscribed threads.
@@ -371,7 +441,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // flood gate.
       chat.onNewMessage(/./, async (thread, message) => {
         const channelId = adapter.channelIdFromThreadId(thread.id);
-        await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, false, true));
+        await forwardInboundMessage(channelId, thread.id, message, false, true, 'plain');
       });
 
       // Handle button clicks (ask_user_question)

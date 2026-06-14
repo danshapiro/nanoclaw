@@ -2,7 +2,13 @@ import { describe, expect, it, vi } from 'vitest';
 import type { Adapter } from 'chat';
 
 import type { ChannelSetup } from './adapter.js';
-import { createChatSdkBridge, handleForwardedEvent, serializeChatSdkAttachmentForInbound } from './chat-sdk-bridge.js';
+import {
+  createChatSdkBridge,
+  forwardChatSdkInboundMessage,
+  handleForwardedEvent,
+  isOwnChatSdkMessageForTest,
+  serializeChatSdkAttachmentForInbound,
+} from './chat-sdk-bridge.js';
 
 describe('Chat SDK bridge attachments', () => {
   it('downloads attachment data from serialized URLs when fetchData is unavailable', async () => {
@@ -41,6 +47,68 @@ describe('Chat SDK bridge attachments', () => {
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
+});
+
+describe('Chat SDK bridge same-bot ingress guard', () => {
+  const author = (userId: string, isBot: boolean, isMe: boolean) => ({
+    userId,
+    userName: userId,
+    fullName: userId,
+    isBot,
+    isMe,
+  });
+
+  it('drops only messages authored by the current bot identity', () => {
+    expect(
+      isOwnChatSdkMessageForTest({
+        id: 'm-self',
+        author: author('bot-1', true, true),
+      }),
+    ).toBe(true);
+
+    expect(
+      isOwnChatSdkMessageForTest({
+        id: 'm-other-bot',
+        author: author('bot-2', true, false),
+      }),
+    ).toBe(false);
+
+    expect(
+      isOwnChatSdkMessageForTest({
+        id: 'm-user',
+        author: author('user-1', false, false),
+      }),
+    ).toBe(false);
+  });
+
+  it('drops own messages before inbound serialization or storage', async () => {
+    const onInbound = vi.fn();
+    const toInbound = vi.fn().mockResolvedValue({
+      id: 'm-self',
+      kind: 'chat-sdk',
+      content: {},
+      timestamp: new Date().toISOString(),
+      isMention: true,
+      isGroup: true,
+    });
+
+    await expect(
+      forwardChatSdkInboundMessage({
+        adapterName: 'discord',
+        channelId: 'channel-1',
+        threadId: 'thread-1',
+        message: { id: 'm-self', author: author('bot-1', true, true) },
+        isMention: true,
+        isGroup: true,
+        source: 'mention',
+        onInbound,
+        toInbound,
+      }),
+    ).resolves.toBe('dropped');
+
+    expect(toInbound).not.toHaveBeenCalled();
+    expect(onInbound).not.toHaveBeenCalled();
   });
 });
 
