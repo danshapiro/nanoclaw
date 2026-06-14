@@ -26,6 +26,7 @@
 - Add or extend `container/agent-runner/src/mcp-tools/core.test.ts`: guessed blocked channel destination returns the clear error and does not write `messages_out`.
 - Extend `container/agent-runner/src/integration.test.ts`: final output to a blocked channel is not routed, while output to parent still routes.
 - Extend `src/delivery.test.ts`: stale/forged subagent channel outbound is blocked before adapter delivery and parent/primary behavior remains intact.
+- Modify `src/modules/scheduling/drain.test.ts`: seed channel wiring in the existing channel-delivery fixture so it remains a primary-agent fixture under the new invariant.
 
 ## Shared Constants
 
@@ -58,14 +59,28 @@ Create `src/modules/agent-to-agent/write-destinations.test.ts`:
 ```ts
 import Database from 'better-sqlite3';
 import fs from 'fs';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { closeDb, createAgentGroup, createMessagingGroup, createMessagingGroupAgent, initTestDb, runMigrations } from '../../db/index.js';
-import { createDestination } from './db/agent-destinations.js';
+const mocks = vi.hoisted(() => ({
+  testDir: '/tmp/nanoclaw-test-write-destinations',
+}));
+
+vi.mock('../../config.js', async () => {
+  const actual = await vi.importActual<typeof import('../../config.js')>('../../config.js');
+  return { ...actual, DATA_DIR: mocks.testDir };
+});
+
+import {
+  closeDb,
+  createAgentGroup,
+  createMessagingGroup,
+  createMessagingGroupAgent,
+  initTestDb,
+  runMigrations,
+} from '../../db/index.js';
 import { inboundDbPath, resolveSession } from '../../session-manager.js';
+import { createDestination } from './db/agent-destinations.js';
 import { writeDestinations } from './write-destinations.js';
-
-const TEST_DIR = '/tmp/nanoclaw-test-write-destinations';
 
 function now(): string {
   return new Date().toISOString();
@@ -91,9 +106,8 @@ function readDestinations(agentGroupId: string, sessionId: string): Array<{ name
 }
 
 beforeEach(() => {
-  fs.rmSync(TEST_DIR, { recursive: true, force: true });
-  fs.mkdirSync(TEST_DIR, { recursive: true });
-  process.env.DATA_DIR = TEST_DIR;
+  fs.rmSync(mocks.testDir, { recursive: true, force: true });
+  fs.mkdirSync(mocks.testDir, { recursive: true });
   const db = initTestDb();
   runMigrations(db);
 
@@ -113,8 +127,7 @@ beforeEach(() => {
 
 afterEach(() => {
   closeDb();
-  fs.rmSync(TEST_DIR, { recursive: true, force: true });
-  delete process.env.DATA_DIR;
+  fs.rmSync(mocks.testDir, { recursive: true, force: true });
 });
 
 describe('writeDestinations channel projection policy', () => {
@@ -123,7 +136,7 @@ describe('writeDestinations channel projection policy', () => {
       id: 'mga-primary',
       messaging_group_id: 'mg-user',
       agent_group_id: 'ag-primary',
-      engage_mode: 'always',
+      engage_mode: 'mention',
       engage_pattern: null,
       sender_scope: 'all',
       ignored_message_policy: 'drop',
@@ -207,7 +220,13 @@ In `container/agent-runner/src/db/connection.ts`, update the in-memory test sche
 
 - [ ] **Step 5: Project hidden blocked channel destinations for subagents**
 
-Replace the channel branch in `src/modules/agent-to-agent/write-destinations.ts` with:
+In `src/modules/agent-to-agent/write-destinations.ts`, merge the existing messaging-group import so it becomes:
+
+```ts
+import { getMessagingGroup, isAgentChannelWired } from '../../db/messaging-groups.js';
+```
+
+Then replace the full `for (const row of rows) { ... }` loop with:
 
 ```ts
   const allowChannelDestinations = isAgentChannelWired(agentGroupId);
@@ -235,12 +254,19 @@ Replace the channel branch in `src/modules/agent-to-agent/write-destinations.ts`
         platform_id: mg.platform_id,
         agent_group_id: null,
       });
-```
-
-Add the import:
-
-```ts
-import { getMessagingGroup, isAgentChannelWired } from '../../db/messaging-groups.js';
+    } else if (row.target_type === 'agent') {
+      const ag = getAgentGroup(row.target_id);
+      if (!ag) continue;
+      resolved.push({
+        name: row.local_name,
+        display_name: ag.name,
+        type: 'agent',
+        channel_type: null,
+        platform_id: null,
+        agent_group_id: ag.id,
+      });
+    }
+  }
 ```
 
 - [ ] **Step 6: Run the projection tests**
@@ -290,6 +316,12 @@ In `container/agent-runner/src/mcp-tools/core.test.ts`, add:
     expect(result.content[0].text).toContain('Subagents report to the caller/parent, not directly to the user.');
     expect(getOutboundDb().prepare('SELECT COUNT(*) AS count FROM messages_out').get()).toEqual({ count: 0 });
   });
+```
+
+Also update that file's import from `../db/connection.js` so it includes `getOutboundDb`:
+
+```ts
+import { closeSessionDb, getInboundDb, getOutboundDb, initTestSessionDb } from '../db/connection.js';
 ```
 
 In `container/agent-runner/src/integration.test.ts`, add:
@@ -462,10 +494,41 @@ git commit -m "Return clear errors for blocked channel destinations"
 **Files:**
 - Modify: `src/delivery.ts`
 - Test: `src/delivery.test.ts`
+- Test: `src/modules/scheduling/drain.test.ts`
 
 - [ ] **Step 1: Write failing delivery guard tests**
 
-In `src/delivery.test.ts`, add:
+First update the import from `./db/index.js` in `src/delivery.test.ts` to include `createMessagingGroupAgent`, and extend the existing `seedAgentAndChannel()` helper so all current channel-delivery tests represent a primary channel-wired agent:
+
+```ts
+import {
+  initTestDb,
+  closeDb,
+  runMigrations,
+  createAgentGroup,
+  createMessagingGroup,
+  createMessagingGroupAgent,
+} from './db/index.js';
+```
+
+At the end of `seedAgentAndChannel()` add:
+
+```ts
+  createMessagingGroupAgent({
+    id: 'mga-1',
+    messaging_group_id: 'mg-1',
+    agent_group_id: 'ag-1',
+    engage_mode: 'mention',
+    engage_pattern: null,
+    sender_scope: 'all',
+    ignored_message_policy: 'drop',
+    session_mode: 'shared',
+    priority: 0,
+    created_at: now(),
+  });
+```
+
+Then add this subagent guard test in `src/delivery.test.ts`:
 
 ```ts
   it('blocks stale or forged subagent channel outbound before adapter delivery', async () => {
@@ -497,21 +560,31 @@ In `src/delivery.test.ts`, add:
       { message_out_id: 'out-child-channel', platform_message_id: null, status: 'failed' },
     ]);
   });
+```
+
+Also update the existing `seedAgentAndChannel()` helper in `src/modules/scheduling/drain.test.ts` so its channel-delivery fixture is primary/channel-wired under the new guard. Add `createMessagingGroupAgent` to the import from `../../db/index.js`, then add this at the end of that helper:
+
+```ts
+  createMessagingGroupAgent({
+    id: 'mga-1',
+    messaging_group_id: 'mg-1',
+    agent_group_id: 'ag-1',
+    engage_mode: 'mention',
+    engage_pattern: null,
+    sender_scope: 'all',
+    ignored_message_policy: 'drop',
+    session_mode: 'shared',
+    priority: 0,
+    created_at: now(),
+  });
+```
+
+Finally add this explicit primary delivery test in `src/delivery.test.ts`:
+
+```ts
 
   it('continues to allow primary channel-wired agent delivery', async () => {
     seedAgentAndChannel();
-    createMessagingGroupAgent({
-      id: 'mga-1',
-      messaging_group_id: 'mg-1',
-      agent_group_id: 'ag-1',
-      engage_mode: 'always',
-      engage_pattern: null,
-      sender_scope: 'all',
-      ignored_message_policy: 'drop',
-      session_mode: 'shared',
-      priority: 0,
-      created_at: now(),
-    });
     const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
     insertOutbound('ag-1', session.id, 'out-primary-channel', 'primary sends');
 
@@ -532,14 +605,12 @@ In `src/delivery.test.ts`, add:
   });
 ```
 
-Update the import from `./db/index.js` in `src/delivery.test.ts` to include `createMessagingGroupAgent`.
-
 - [ ] **Step 2: Run the failing delivery tests**
 
 Run:
 
 ```bash
-pnpm test -- src/delivery.test.ts
+pnpm test -- src/delivery.test.ts src/modules/scheduling/drain.test.ts
 ```
 
 Expected: failure because a subagent channel outbound still reaches the adapter or fails for the wrong reason.
@@ -577,7 +648,7 @@ Keep the existing origin-chat and explicit `agent_destinations` checks after thi
 Run:
 
 ```bash
-pnpm test -- src/delivery.test.ts
+pnpm test -- src/delivery.test.ts src/modules/scheduling/drain.test.ts
 ```
 
 Expected: pass.
@@ -587,7 +658,7 @@ Expected: pass.
 Run:
 
 ```bash
-git add src/delivery.ts src/delivery.test.ts
+git add src/delivery.ts src/delivery.test.ts src/modules/scheduling/drain.test.ts
 git commit -m "Block subagent delivery to user channels"
 ```
 
@@ -610,7 +681,7 @@ The primary channel-wired agent owns communicating with the user. Subagents repo
 Run:
 
 ```bash
-pnpm test -- src/modules/agent-to-agent/write-destinations.test.ts container/agent-runner/src/mcp-tools/core.test.ts container/agent-runner/src/integration.test.ts src/delivery.test.ts
+pnpm test -- src/modules/agent-to-agent/write-destinations.test.ts container/agent-runner/src/mcp-tools/core.test.ts container/agent-runner/src/integration.test.ts src/delivery.test.ts src/modules/scheduling/drain.test.ts
 ```
 
 Expected: pass.
