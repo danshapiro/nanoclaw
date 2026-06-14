@@ -192,9 +192,9 @@ export type ProviderEvent =
       inputId: string;
       classification: string;
       severity: ProviderNoticeSeverity;
-      agentMessage: string;
+      agentMessage?: string;
       fallbackUserMessage: string;
-      relayRecommended: boolean;
+      relayRecommended?: boolean;
       liveness?: ProviderLivenessMetadata;
     }
   | ({ type: 'interruption' } & ProviderInterruption)

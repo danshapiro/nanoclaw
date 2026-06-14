@@ -33,7 +33,7 @@ import {
   type ProviderRecoveryScope,
 } from './db/session-state.js';
 import { formatMessages, extractRouting, normalizeRoute } from './formatter.js';
-import { runPollLoop } from './poll-loop.js';
+import { decideProviderStatusAction, runPollLoop } from './poll-loop.js';
 import { MockProvider } from './providers/mock.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, QueryInput, QueryTurnInput } from './providers/types.js';
 
@@ -2624,9 +2624,64 @@ function getAckStatus(messageId: string): string | null {
   return row?.status ?? null;
 }
 
-// ── Task 3 Step 2: inactivity relay + terminal recovery ─────────────────────
+describe('provider status actions', () => {
+  it('writes one inactivity status, suppresses later idle notices, and still writes terminal fallback', () => {
+    const state = { inactivityStatusSent: false, terminalFallbackSent: false };
 
-describe('poll-loop inactivity relay and terminal recovery', () => {
+    expect(
+      decideProviderStatusAction(state, {
+        type: 'notice',
+        inputId: 'in-1',
+        classification: 'inactivity',
+        severity: 'info',
+        fallbackUserMessage: "I'm still working on your request.",
+      }),
+    ).toEqual({ kind: 'write', text: "I'm still working on your request." });
+
+    expect(
+      decideProviderStatusAction(state, {
+        type: 'notice',
+        inputId: 'in-1',
+        classification: 'inactivity',
+        severity: 'info',
+        fallbackUserMessage: "I'm still working on your request.",
+      }),
+    ).toEqual({ kind: 'log', event: 'inactivity_notice_suppressed' });
+
+    expect(
+      decideProviderStatusAction(state, {
+        type: 'interruption',
+        inputId: 'in-1',
+        classification: 'opencode_native_question',
+        severity: 'warn',
+        terminal: true,
+        agentMessage: 'I need your answer before I can continue: Which account should I use?',
+        fallbackUserMessage: 'I need your answer before I can continue: Which account should I use?',
+        continuationPolicy: 'clear',
+      }),
+    ).toEqual({
+      kind: 'write',
+      text: 'I need your answer before I can continue: Which account should I use?',
+    });
+
+    expect(
+      decideProviderStatusAction(state, {
+        type: 'interruption',
+        inputId: 'in-1',
+        classification: 'opencode_native_question',
+        severity: 'warn',
+        terminal: true,
+        agentMessage: 'duplicate terminal',
+        fallbackUserMessage: 'duplicate terminal',
+        continuationPolicy: 'clear',
+      }),
+    ).toEqual({ kind: 'none' });
+  });
+});
+
+// ── Task 3 Step 2: inactivity status + terminal recovery ────────────────────
+
+describe('poll-loop inactivity status and terminal recovery', () => {
   function dmMsg(id: string, text: string): void {
     insertChannelDestination('relay-current');
     insertMessage(
@@ -2652,174 +2707,8 @@ describe('poll-loop inactivity relay and terminal recovery', () => {
     });
   }
 
-  it('starts a bounded Yente-authored relay while the original long turn keeps running (relay-capable provider)', async () => {
-    dmMsg('relay-init', 'do the long thing');
-
-    const relayQueries: QueryInput[] = [];
-    let releaseMain!: () => void;
-    const mainStarted = deferred();
-
-    class RelayCapableProvider implements AgentProvider {
-      readonly supportsNativeSlashCommands = false;
-      readonly capabilities = {
-        supportsSeparateRelayRuntime: true,
-        defaultRelayDeadlineMs: 30000,
-        relayToolPolicy: 'status_only' as const,
-      };
-      isSessionInvalid(): boolean {
-        return false;
-      }
-      query(input: QueryInput): AgentQuery {
-        if (input.relayMode) {
-          relayQueries.push(input);
-          // Relay turn: accept + result quickly.
-          return {
-            push() {},
-            end() {},
-            abort() {},
-            events: (async function* () {
-              yield { type: 'init', continuation: 'relay-sess' };
-              yield { type: 'input-accepted', inputId: input.inputId, scope: 'relay' };
-              yield {
-                type: 'result',
-                text: 'still working',
-                inputId: input.inputId,
-                resolvedInputIds: [input.inputId],
-              };
-            })(),
-          };
-        }
-        mainStarted.resolve();
-        return {
-          push() {},
-          end() {},
-          abort() {
-            releaseMain?.();
-          },
-          events: (async function* () {
-            yield { type: 'init', continuation: 'main-sess' };
-            yield { type: 'input-accepted', inputId: input.inputId, scope: 'initial' };
-            // Non-terminal inactivity notice — the original turn stays alive.
-            yield {
-              type: 'notice',
-              inputId: input.inputId,
-              classification: 'inactivity',
-              severity: 'info',
-              agentMessage: 'still working',
-              fallbackUserMessage: "I'm still on it",
-              relayRecommended: true,
-            };
-            // Keep the turn open until released, then resolve.
-            await new Promise<void>((resolve) => {
-              releaseMain = resolve;
-            });
-            yield {
-              type: 'result',
-              text: '<message to="relay-current">done at last</message>',
-              inputId: input.inputId,
-              resolvedInputIds: [input.inputId],
-            };
-          })(),
-        };
-      }
-    }
-
-    const provider = new RelayCapableProvider();
-    const controller = new AbortController();
-    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
-
-    await mainStarted.promise;
-    // The relay must be started while the original turn is still running.
-    await waitFor(() => relayQueries.length >= 1, 3000);
-    expect(relayQueries[0].relayMode).toBe(true);
-    expect(relayQueries[0].toolPolicy).toBe('status_only');
-    expect(typeof relayQueries[0].relayDeadlineMs).toBe('number');
-
-    releaseMain();
-    await waitFor(() => outboundTexts().includes('done at last'), 3000);
-
-    controller.abort();
-    await loopPromise.catch(() => {});
-  });
-
-  it('a relay child task that throws is observed (no unhandled rejection) and still sends ONE direct fallback', async () => {
-    dmMsg('relaythrow-init', 'do the long thing');
-
-    let releaseMain!: () => void;
-    const mainStarted = deferred();
-    let relayAttempts = 0;
-
-    class RelayThrowsProvider implements AgentProvider {
-      readonly supportsNativeSlashCommands = false;
-      readonly capabilities = {
-        supportsSeparateRelayRuntime: true,
-        defaultRelayDeadlineMs: 30000,
-        relayToolPolicy: 'status_only' as const,
-      };
-      isSessionInvalid(): boolean {
-        return false;
-      }
-      query(input: QueryInput): AgentQuery {
-        if (input.relayMode) {
-          // The relay query itself throws synchronously inside the void-ed child
-          // task — must be observed via .catch and fall back, not crash the loop.
-          relayAttempts++;
-          throw new Error('relay startup blew up');
-        }
-        mainStarted.resolve();
-        return {
-          push() {},
-          end() {},
-          abort() {
-            releaseMain?.();
-          },
-          events: (async function* () {
-            yield { type: 'init', continuation: 'main-sess' };
-            yield { type: 'input-accepted', inputId: input.inputId, scope: 'initial' };
-            yield {
-              type: 'notice',
-              inputId: input.inputId,
-              classification: 'inactivity',
-              severity: 'info',
-              agentMessage: 'still working',
-              fallbackUserMessage: "I'm still working on your request — it's taking a while.",
-              relayRecommended: true,
-            };
-            await new Promise<void>((resolve) => {
-              releaseMain = resolve;
-            });
-            yield {
-              type: 'result',
-              text: '<message to="relay-current">done at last</message>',
-              inputId: input.inputId,
-              resolvedInputIds: [input.inputId],
-            };
-          })(),
-        };
-      }
-    }
-
-    const provider = new RelayThrowsProvider();
-    const controller = new AbortController();
-    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
-
-    await mainStarted.promise;
-    await waitFor(() => relayAttempts >= 1, 3000);
-    // The relay failed, so exactly one sanitized direct fallback is delivered.
-    await waitFor(() => outboundTexts().some((t) => t.includes('still working on your request')), 3000);
-
-    releaseMain();
-    // The original turn still completes cleanly (the child rejection did not
-    // tear down the loop).
-    await waitFor(() => outboundTexts().includes('done at last'), 3000);
-    expect(outboundTexts().filter((t) => t.includes('still working on your request')).length).toBe(1);
-
-    controller.abort();
-    await loopPromise.catch(() => {});
-  });
-
-  it('sends one direct sanitized fallback for inactivity when the provider has NO relay capability', async () => {
-    dmMsg('norelay-init', 'do the long thing');
+  it('writes one direct inactivity status while the original long turn keeps running', async () => {
+    dmMsg('idle-init', 'do the long thing');
 
     let releaseMain!: () => void;
     const mainStarted = deferred();
@@ -2843,16 +2732,21 @@ describe('poll-loop inactivity relay and terminal recovery', () => {
               inputId: (input as QueryInput).inputId,
               classification: 'inactivity',
               severity: 'info',
-              agentMessage: 'still working',
-              fallbackUserMessage: "I'm still working on your request — it's taking a while, but I'm on it.",
-              relayRecommended: true,
+              fallbackUserMessage: "I'm still working on your request.",
+            };
+            yield {
+              type: 'notice',
+              inputId: (input as QueryInput).inputId,
+              classification: 'inactivity',
+              severity: 'info',
+              fallbackUserMessage: "I'm still working on your request.",
             };
             await new Promise<void>((resolve) => {
               releaseMain = resolve;
             });
             yield {
               type: 'result',
-              text: 'done',
+              text: '<message to="relay-current">done at last</message>',
               inputId: (input as QueryInput).inputId,
               resolvedInputIds: [(input as QueryInput).inputId],
             };
@@ -2865,10 +2759,12 @@ describe('poll-loop inactivity relay and terminal recovery', () => {
     const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
 
     await mainStarted.promise;
-    // One direct fallback notice is written (no relay capability).
-    await waitFor(() => outboundTexts().some((t) => t.includes('still working on your request')), 3000);
+    await waitFor(() => outboundTexts().some((t) => t === "I'm still working on your request."), 3000);
+    expect(outboundTexts().filter((t) => t === "I'm still working on your request.").length).toBe(1);
 
     releaseMain();
+    await waitFor(() => outboundTexts().includes('done at last'), 3000);
+
     controller.abort();
     await loopPromise.catch(() => {});
   });

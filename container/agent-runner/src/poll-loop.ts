@@ -34,7 +34,7 @@ import {
   stripInternalTags,
   type RoutingContext,
 } from './formatter.js';
-import type { AgentProvider, AgentQuery, ProviderCapabilities, ProviderEvent } from './providers/types.js';
+import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
@@ -574,6 +574,30 @@ interface InputLedgerEntry {
   outboundVisibleReplyCountBefore: number;
 }
 
+type ProviderStatusState = {
+  inactivityStatusSent: boolean;
+  terminalFallbackSent: boolean;
+};
+
+type ProviderStatusAction =
+  | { kind: 'write'; text: string }
+  | { kind: 'log'; event: string }
+  | { kind: 'none' };
+
+export function decideProviderStatusAction(state: ProviderStatusState, event: ProviderEvent): ProviderStatusAction {
+  if (event.type === 'notice' && event.classification === 'inactivity') {
+    if (state.inactivityStatusSent) return { kind: 'log', event: 'inactivity_notice_suppressed' };
+    state.inactivityStatusSent = true;
+    return { kind: 'write', text: event.fallbackUserMessage };
+  }
+  if (event.type === 'interruption' && event.terminal) {
+    if (state.terminalFallbackSent) return { kind: 'none' };
+    state.terminalFallbackSent = true;
+    return { kind: 'write', text: event.fallbackUserMessage };
+  }
+  return { kind: 'none' };
+}
+
 async function processQuery(
   query: AgentQuery,
   routing: RoutingContext,
@@ -608,12 +632,10 @@ async function processQuery(
   routing.messagingGroupId = ledgerCtx.activeRouteScope.messagingGroupId;
   routing.isGroup = ledgerCtx.activeRouteScope.isGroup;
 
-  // Inactivity relay state. At most ONE bounded relay per throttle window. While
-  // a relay is in flight, follow-up polling is disabled so unrelated pending
-  // rows stay pending (Invariant 169) and the relay never claims user rows.
-  const relayCaps = (config?.provider as { capabilities?: ProviderCapabilities } | undefined)?.capabilities;
-  let relayInFlight = false;
-  let directFallbackSent = false;
+  const providerStatusState: ProviderStatusState = {
+    inactivityStatusSent: false,
+    terminalFallbackSent: false,
+  };
   let unwrappedOutputNudged = false;
   let pendingUnwrappedOutputText: string | null = null;
   // Side-effect evidence carried on a terminal interruption's recovery seed, so
@@ -734,97 +756,12 @@ async function processQuery(
   // rather than close+reopen (no cold prompt cache, no reconnect).
   let pollingFollowups = false;
   const pollHandle = setInterval(() => {
-    // Disable follow-up polling while a bounded recovery relay is in flight so
-    // unrelated pending rows stay pending and the relay never claims user rows
-    // (Invariant 169).
-    if (done || pollingFollowups || relayInFlight) return;
+    if (done || pollingFollowups) return;
     pollingFollowups = true;
     void pollFollowups().finally(() => {
       pollingFollowups = false;
     });
   }, ACTIVE_POLL_INTERVAL_MS);
-
-  /**
-   * Run a bounded Yente-authored status relay through a SEPARATE restricted
-   * runtime. It has its own process/client/event pump/session id, no
-   * continuation, no mutation tools, and route-locked status-only output. The
-   * original long turn keeps running (we do NOT await this in the main loop —
-   * it runs as a child task). Failure/deadline falls back to one direct notice.
-   */
-  async function runInactivityRelay(notice: Extract<ProviderEvent, { type: 'notice' }>): Promise<void> {
-    if (!config) return;
-    relayInFlight = true;
-    const deadlineMs = relayCaps?.defaultRelayDeadlineMs ?? 30000;
-    const relayInputId = generateInputId('relay');
-    let delivered = false;
-    try {
-      const relayQuery = config.provider.query({
-        inputId: relayInputId,
-        prompt: notice.agentMessage,
-        cwd: config.cwd,
-        systemContext: config.systemContext,
-        relayMode: true,
-        relayDeadlineMs: deadlineMs,
-        toolPolicy: 'status_only',
-      });
-      const relayRun = (async () => {
-        for await (const ev of relayQuery.events) {
-          if (ev.type === 'result') {
-            // The relay's own MCP send_message appends the status row; if the
-            // relay returned text directly, deliver it as a status message.
-            if (ev.text) {
-              writeRoutedMessage(routing, ev.text);
-            }
-            delivered = true;
-            break;
-          }
-          if (ev.type === 'interruption') break;
-        }
-      })();
-      const timeout = new Promise<void>((resolve) => setTimeout(resolve, deadlineMs));
-      await Promise.race([relayRun, timeout]);
-      relayQuery.abort();
-    } catch (err) {
-      log(
-        JSON.stringify({
-          severity: 'warn',
-          event: 'inactivity_relay_failed',
-          route_key: ledgerCtx.activeRouteKey,
-          error: err instanceof Error ? err.message : String(err),
-        }),
-      );
-    } finally {
-      relayInFlight = false;
-      // If the relay could not deliver anything, send ONE sanitized direct
-      // fallback so the user is not left silent — but only once per turn. This
-      // runs in the void-ed child task's finally; a throw from writeMessageOut
-      // would otherwise surface as an UNOBSERVED rejection, so it is wrapped.
-      // `directFallbackSent` is set before the write to keep the once-per-turn
-      // contract even if the write itself fails (the attempt is consumed).
-      if (!delivered && !directFallbackSent) {
-        directFallbackSent = true;
-        try {
-          writeRoutedMessage(routing, notice.fallbackUserMessage);
-        } catch (err) {
-          log(
-            JSON.stringify({
-              severity: 'error',
-              event: 'inactivity_relay_fallback_write_failed',
-              route_key: ledgerCtx.activeRouteKey,
-              error: err instanceof Error ? err.message : String(err),
-            }),
-          );
-        }
-      }
-    }
-  }
-
-  /** One direct sanitized fallback for inactivity when relay is unsupported. */
-  function sendDirectInactivityFallback(notice: Extract<ProviderEvent, { type: 'notice' }>): void {
-    if (directFallbackSent) return;
-    directFallbackSent = true;
-    writeRoutedMessage(routing, notice.fallbackUserMessage);
-  }
 
   async function pollFollowups(): Promise<void> {
     // Only claim follow-ups on the ACTIVE route. Rows on other routes remain
@@ -893,31 +830,18 @@ async function processQuery(
       } else if (event.type === 'input-accepted') {
         onInputAccepted(event.inputId);
       } else if (event.type === 'notice') {
-        // Non-terminal liveness moment. If the provider supports a separate-
-        // runtime relay, start at most one bounded relay per throttle window as
-        // a CHILD task while the original turn keeps draining; otherwise send one
-        // sanitized direct fallback. Never push into the busy turn; never settle
-        // user rows; never clear continuation.
-        if (event.relayRecommended !== false) {
-          if (relayCaps?.supportsSeparateRelayRuntime && config) {
-            // Child task — never awaited here. Attach a .catch so any throw
-            // (including from the finally fallback write) is observed, not an
-            // unhandled rejection; reset relayInFlight defensively.
-            if (!relayInFlight)
-              void runInactivityRelay(event).catch((err) => {
-                relayInFlight = false;
-                log(
-                  JSON.stringify({
-                    severity: 'error',
-                    event: 'inactivity_relay_task_rejected',
-                    route_key: ledgerCtx.activeRouteKey,
-                    error: err instanceof Error ? err.message : String(err),
-                  }),
-                );
-              });
-          } else {
-            sendDirectInactivityFallback(event);
-          }
+        const action = decideProviderStatusAction(providerStatusState, event);
+        if (action.kind === 'write') {
+          writeRoutedMessage(routing, action.text);
+        } else if (action.kind === 'log') {
+          log(
+            JSON.stringify({
+              severity: 'info',
+              event: action.event,
+              input_id: event.inputId,
+              route_key: ledgerCtx.activeRouteKey,
+            }),
+          );
         }
       } else if (event.type === 'clear-continuation') {
         // Authoritative continuation clear from the provider (explicit clear /
@@ -968,21 +892,9 @@ async function processQuery(
         if (event.recoverySeed?.sideEffects && event.recoverySeed.sideEffects.length > 0) {
           interruptionSideEffects.push(...event.recoverySeed.sideEffects);
         }
-        // A terminal interruption ends this turn before any user-visible result.
-        // Every terminal path must leave the user with a visible next step (the
-        // Inactivity/terminal contract): write ONE direct fallback
-        // (route-stamped) so the user is never silently stranded — e.g. a denied
-        // native question whose recovery is the blocked question text. We write
-        // this fallback even if an earlier input in the same wake already produced
-        // result text, because the interrupted (usually follow-up) work needs its
-        // own visible recovery path. Guarded by `directFallbackSent` so a
-        // relay/inactivity fallback already sent this turn is not duplicated. When
-        // the provider supplied a display-oriented error message, it is included
-        // verbatim in fallbackUserMessage (trusted-operator policy — see
-        // buildInterruption in opencode.ts).
-        if (event.terminal && !directFallbackSent) {
-          directFallbackSent = true;
-          writeRoutedMessage(routing, event.fallbackUserMessage);
+        const action = decideProviderStatusAction(providerStatusState, event);
+        if (action.kind === 'write') {
+          writeRoutedMessage(routing, action.text);
         }
       } else if (event.type === 'result') {
         // A result — with or without text — means a turn segment is done.

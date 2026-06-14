@@ -997,10 +997,7 @@ export class OpenCodeProvider implements AgentProvider {
                   inputId: turnInputId,
                   classification: 'inactivity',
                   severity: 'info',
-                  agentMessage:
-                    "I'm still working on this — it's taking a while but the task is progressing. I'll keep going.",
-                  fallbackUserMessage: "I'm still working on your request — it's taking a while, but I'm on it.",
-                  relayRecommended: true,
+                  fallbackUserMessage: "I'm still working on your request.",
                   liveness: {
                     configuredTimeoutMs: res.metadata.configuredTimeoutMs,
                     elapsedMs: res.metadata.elapsedMs,

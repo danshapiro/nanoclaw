@@ -1000,11 +1000,13 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     delete process.env.OPENCODE_WAIT_TICK_MS;
     expect(stop).toBe(true);
     const notice = events.find((e) => e.type === 'notice') as
-      | { classification: string; relayRecommended: boolean; inputId: string }
+      | { classification: string; inputId: string; fallbackUserMessage: string; agentMessage?: string; relayRecommended?: boolean }
       | undefined;
     expect(notice).toBeDefined();
     expect(notice!.classification).toBe('inactivity');
-    expect(notice!.relayRecommended).toBe(true);
+    expect(notice!.fallbackUserMessage).toBe("I'm still working on your request.");
+    expect(notice).not.toHaveProperty('agentMessage');
+    expect(notice).not.toHaveProperty('relayRecommended');
     expect(notice!.inputId).toBe('in-n');
     query.abort();
   });
