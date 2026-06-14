@@ -539,10 +539,10 @@ At the end of `seedAgentAndChannel()` add:
   });
 ```
 
-Then add this subagent guard test in `src/delivery.test.ts`:
+Then add this subagent guard test in `src/delivery.test.ts`. The fixture deliberately binds `ag-child` to `mg-1` as its origin chat without adding a `messaging_group_agents` row for `ag-child`: the pre-existing origin-chat exception allows this delivery today, so this test fails before the new channel-wiring guard and passes only after the guard exists.
 
 ```ts
-  it('blocks stale or forged subagent channel outbound before adapter delivery', async () => {
+  it('blocks non-channel-wired origin-chat channel outbound before adapter delivery', async () => {
     seedAgentAndChannel();
     createAgentGroup({
       id: 'ag-child',
@@ -551,7 +551,7 @@ Then add this subagent guard test in `src/delivery.test.ts`:
       agent_provider: null,
       created_at: now(),
     });
-    const { session } = resolveSession('ag-child', null, null, 'agent-shared');
+    const { session } = resolveSession('ag-child', 'mg-1', null, 'shared');
     insertOutbound('ag-child', session.id, 'out-child-channel', 'should not send');
 
     const delivered: string[] = [];
@@ -624,7 +624,7 @@ Run:
 pnpm test -- src/delivery.test.ts src/modules/scheduling/drain.test.ts
 ```
 
-Expected: failure because a subagent channel outbound still reaches the adapter or fails for the wrong reason.
+Expected: failure because the pre-existing origin-chat exception still delivers the non-channel-wired agent's channel outbound to the adapter.
 
 - [ ] **Step 3: Add host delivery guard and warning**
 
