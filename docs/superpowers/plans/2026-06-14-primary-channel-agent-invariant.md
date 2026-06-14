@@ -17,8 +17,7 @@
 - Modify `src/modules/agent-to-agent/write-destinations.ts`: project channel destinations only for channel-wired primary agents; project blocked channel destination names for subagents as hidden `blocked_channel` rows so guessed names return a specific error.
 - Modify `src/db/session-db.ts`: widen the session destination row type to allow hidden `blocked_channel` rows.
 - Modify `src/db/schema.ts`: document the `blocked_channel` destination row type in the session DB schema comment.
-- Modify `container/agent-runner/src/db/connection.ts`: document the same session destination row type in the test/in-memory schema comment.
-- Modify `container/agent-runner/src/destinations.ts`: hide `blocked_channel` rows from destination listings and prompt text; expose `findBlockedChannelByName(name)` for precise guessed-channel errors.
+- Modify `container/agent-runner/src/destinations.ts`: hide `blocked_channel` rows from destination listings and prompt text; expose `isBlockedChannelName(name)` for precise guessed-channel errors.
 - Modify `container/agent-runner/src/mcp-tools/core.ts`: make `send_message` and other destination-resolving tools return the invariant error when a subagent guesses a blocked channel destination name.
 - Modify `container/agent-runner/src/poll-loop.ts`: make final `<message to="...">` blocks addressed to hidden blocked channels fail with the same invariant text and no outbound row.
 - Modify `src/delivery.ts`: add the authoritative host delivery guard and structured warning `subagent_channel_delivery_blocked`.
@@ -216,8 +215,6 @@ In `src/db/schema.ts`, update the `destinations.type` comment to:
   type            TEXT NOT NULL,   -- 'channel' | 'agent' | 'blocked_channel'
 ```
 
-In `container/agent-runner/src/db/connection.ts`, update the in-memory test schema comment around `destinations.type` only if there is a nearby comment; otherwise leave the SQL unchanged because SQLite has no CHECK constraint.
-
 - [ ] **Step 5: Project hidden blocked channel destinations for subagents**
 
 In `src/modules/agent-to-agent/write-destinations.ts`, merge the existing messaging-group import so it becomes:
@@ -368,7 +365,7 @@ In `container/agent-runner/src/integration.test.ts`, add:
 Run:
 
 ```bash
-pnpm test -- container/agent-runner/src/mcp-tools/core.test.ts container/agent-runner/src/integration.test.ts
+cd container/agent-runner && bun install --frozen-lockfile && bun test src/mcp-tools/core.test.ts src/integration.test.ts
 ```
 
 Expected: failure because `blocked_channel` is not recognized and guessed names return the generic unknown-destination path.
@@ -388,13 +385,25 @@ Change `DestRow.type` to:
   type: 'channel' | 'agent' | 'blocked_channel';
 ```
 
+Add this visible-row type immediately after `DestRow`:
+
+```ts
+type VisibleDestRow = DestRow & { type: 'channel' | 'agent' };
+```
+
+Change `rowToEntry` to accept only visible rows, keeping `DestinationEntry.type` unchanged:
+
+```ts
+function rowToEntry(row: VisibleDestRow): DestinationEntry {
+```
+
 Change `getAllDestinations()` to:
 
 ```ts
 export function getAllDestinations(): DestinationEntry[] {
   const rows = getInboundDb()
     .prepare("SELECT * FROM destinations WHERE type IN ('channel', 'agent') ORDER BY name")
-    .all() as DestRow[];
+    .all() as VisibleDestRow[];
   return rows.map(rowToEntry);
 }
 ```
@@ -405,15 +414,17 @@ Change `findByName(name)` to:
 export function findByName(name: string): DestinationEntry | undefined {
   const row = getInboundDb()
     .prepare("SELECT * FROM destinations WHERE name = ? AND type IN ('channel', 'agent')")
-    .get(name) as DestRow | undefined;
+    .get(name) as VisibleDestRow | undefined;
   return row ? rowToEntry(row) : undefined;
 }
 ```
 
+In `findByRouting`, keep the SQL filters as they are and change both row casts from `DestRow | undefined` to `VisibleDestRow | undefined`.
+
 Add:
 
 ```ts
-export function findBlockedChannelByName(name: string): boolean {
+export function isBlockedChannelName(name: string): boolean {
   const row = getInboundDb()
     .prepare("SELECT 1 FROM destinations WHERE name = ? AND type = 'blocked_channel' LIMIT 1")
     .get(name);
@@ -426,7 +437,7 @@ export function findBlockedChannelByName(name: string): boolean {
 In `container/agent-runner/src/mcp-tools/core.ts`, change the destinations import to:
 
 ```ts
-import { findBlockedChannelByName, findByName, getAllDestinations, SUBAGENT_CHANNEL_BLOCKED_MESSAGE } from '../destinations.js';
+import { findByName, getAllDestinations, isBlockedChannelName, SUBAGENT_CHANNEL_BLOCKED_MESSAGE } from '../destinations.js';
 ```
 
 In `resolveRouting`, replace the unknown-destination branch with:
@@ -434,7 +445,7 @@ In `resolveRouting`, replace the unknown-destination branch with:
 ```ts
   const dest = findByName(to);
   if (!dest) {
-    if (findBlockedChannelByName(to)) return { error: SUBAGENT_CHANNEL_BLOCKED_MESSAGE };
+    if (isBlockedChannelName(to)) return { error: SUBAGENT_CHANNEL_BLOCKED_MESSAGE };
     return { error: `Unknown destination "${to}". Known: ${destinationList()}` };
   }
 ```
@@ -445,10 +456,10 @@ In `container/agent-runner/src/poll-loop.ts`, change the destinations import to:
 
 ```ts
 import {
-  findBlockedChannelByName,
   findByName,
   findByRouting,
   getAllDestinations,
+  isBlockedChannelName,
   SUBAGENT_CHANNEL_BLOCKED_MESSAGE,
   type DestinationEntry,
 } from './destinations.js';
@@ -459,7 +470,7 @@ In `dispatchResultText`, replace the unknown-destination branch with:
 ```ts
     const dest = findByName(toName);
     if (!dest) {
-      if (findBlockedChannelByName(toName)) {
+      if (isBlockedChannelName(toName)) {
         log(`Blocked channel destination in <message to="${toName}">: ${SUBAGENT_CHANNEL_BLOCKED_MESSAGE}`);
         scratchpadParts.push(`[dropped: ${SUBAGENT_CHANNEL_BLOCKED_MESSAGE}] ${body}`);
         continue;
@@ -475,7 +486,7 @@ In `dispatchResultText`, replace the unknown-destination branch with:
 Run:
 
 ```bash
-pnpm test -- container/agent-runner/src/mcp-tools/core.test.ts container/agent-runner/src/integration.test.ts
+cd container/agent-runner && bun test src/mcp-tools/core.test.ts src/integration.test.ts
 ```
 
 Expected: pass.
@@ -678,15 +689,21 @@ The primary channel-wired agent owns communicating with the user. Subagents repo
 
 - [ ] **Step 2: Run focused verification**
 
-Run:
+Run the host-focused tests:
 
 ```bash
-pnpm test -- src/modules/agent-to-agent/write-destinations.test.ts container/agent-runner/src/mcp-tools/core.test.ts container/agent-runner/src/integration.test.ts src/delivery.test.ts src/modules/scheduling/drain.test.ts
+pnpm test -- src/modules/agent-to-agent/write-destinations.test.ts src/delivery.test.ts src/modules/scheduling/drain.test.ts
+```
+
+Run the container-focused tests:
+
+```bash
+cd container/agent-runner && bun install --frozen-lockfile && bun test src/mcp-tools/core.test.ts src/integration.test.ts
 ```
 
 Expected: pass.
 
-- [ ] **Step 3: Run typecheck**
+- [ ] **Step 3: Run host typecheck**
 
 Run:
 
@@ -696,7 +713,17 @@ pnpm typecheck
 
 Expected: pass.
 
-- [ ] **Step 4: Run full test suite**
+- [ ] **Step 4: Run container typecheck**
+
+Run:
+
+```bash
+pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit
+```
+
+Expected: pass.
+
+- [ ] **Step 5: Run full host test suite**
 
 Run:
 
@@ -706,7 +733,17 @@ pnpm test
 
 Expected: pass.
 
-- [ ] **Step 5: Commit Task 4**
+- [ ] **Step 6: Run full container test suite**
+
+Run:
+
+```bash
+cd container/agent-runner && bun test
+```
+
+Expected: pass.
+
+- [ ] **Step 7: Commit Task 4**
 
 Run:
 
