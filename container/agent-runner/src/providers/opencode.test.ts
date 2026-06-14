@@ -726,8 +726,14 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     expect(clear).toMatchObject({ type: 'clear-continuation', reason: 'native_question_denied' });
     const interruption = events.find((e) => e.type === 'interruption');
     expect(interruption).toBeDefined();
-    expect((interruption as { agentMessage: string }).agentMessage).toContain("Matt Van Horn's email");
-    expect((interruption as { continuationPolicy: string }).continuationPolicy).toBe('clear');
+    expect(interruption).toMatchObject({
+      type: 'interruption',
+      classification: 'opencode_native_question',
+      terminal: true,
+      continuationPolicy: 'clear',
+      agentMessage: "I need your answer before I can continue: What is Matt Van Horn's email?",
+      fallbackUserMessage: "I need your answer before I can continue: What is Matt Van Horn's email?",
+    });
   });
 
   it('auto-approves a non-question permission with always', async () => {

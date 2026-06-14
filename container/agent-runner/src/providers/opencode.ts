@@ -1213,10 +1213,11 @@ export class OpenCodeProvider implements AgentProvider {
                       attemptedContinuation: input.continuation,
                     };
                     setActiveSession(undefined);
+                    const visibleQuestion = `I need your answer before I can continue: ${questionText}`;
                     terminalInterruption = buildInterruption(
                       'opencode_native_question',
-                      `I need your input to continue: ${questionText}`,
-                      `I need more information before I can finish: ${questionText}`,
+                      visibleQuestion,
+                      visibleQuestion,
                       pump.liveness(),
                       'clear',
                     );
