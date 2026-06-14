@@ -10,7 +10,7 @@
 import fs from 'fs';
 
 import { getAgentGroup } from '../../db/agent-groups.js';
-import { getMessagingGroup } from '../../db/messaging-groups.js';
+import { getMessagingGroup, isAgentChannelWired } from '../../db/messaging-groups.js';
 import { replaceDestinations, type DestinationRow } from '../../db/session-db.js';
 import { log } from '../../log.js';
 import { inboundDbPath, openInboundDb } from '../../session-manager.js';
@@ -22,11 +22,23 @@ export function writeDestinations(agentGroupId: string, sessionId: string): void
 
   const rows = getDestinations(agentGroupId);
   const resolved: DestinationRow[] = [];
+  const allowChannelDestinations = isAgentChannelWired(agentGroupId);
 
   for (const row of rows) {
     if (row.target_type === 'channel') {
       const mg = getMessagingGroup(row.target_id);
       if (!mg) continue;
+      if (!allowChannelDestinations) {
+        resolved.push({
+          name: row.local_name,
+          display_name: mg.name ?? row.local_name,
+          type: 'blocked_channel',
+          channel_type: mg.channel_type,
+          platform_id: mg.platform_id,
+          agent_group_id: null,
+        });
+        continue;
+      }
       resolved.push({
         name: row.local_name,
         display_name: mg.name ?? row.local_name,

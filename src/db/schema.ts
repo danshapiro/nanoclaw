@@ -325,7 +325,7 @@ CREATE TABLE IF NOT EXISTS delivered (
 CREATE TABLE IF NOT EXISTS destinations (
   name            TEXT PRIMARY KEY,
   display_name    TEXT,
-  type            TEXT NOT NULL,   -- 'channel' | 'agent'
+  type            TEXT NOT NULL,   -- 'channel' | 'agent' | 'blocked_channel'
   channel_type    TEXT,            -- for type='channel'
   platform_id     TEXT,            -- for type='channel'
   agent_group_id  TEXT             -- for type='agent'

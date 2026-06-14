@@ -250,3 +250,11 @@ export function getMessagingGroupsByAgentGroup(agentGroupId: string): MessagingG
     )
     .all(agentGroupId) as MessagingGroup[];
 }
+
+/** True when an agent group is directly wired to at least one user channel. */
+export function isAgentChannelWired(agentGroupId: string): boolean {
+  const row = getDb()
+    .prepare('SELECT 1 FROM messaging_group_agents WHERE agent_group_id = ? LIMIT 1')
+    .get(agentGroupId);
+  return !!row;
+}
