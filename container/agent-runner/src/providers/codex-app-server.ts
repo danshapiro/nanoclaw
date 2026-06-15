@@ -445,7 +445,7 @@ export function createCodexConfigOverrides(): string[] {
   // JsonRpcMessage". The connector is unwanted anyway — Yente uses its own local
   // MCP/skills, not OpenAI's hosted connectors. `features.apps` is a known feature
   // key, so it is accepted under --strict-config.
-  const overrides = ['features.apps=false', 'features.use_linux_sandbox_bwrap=false'];
+  const overrides = ['features.apps=false'];
   // Yente runs high reasoning by default; per-group override via
   // CODEX_REASONING_EFFORT forwarded by the host-side provider config.
   // `model_reasoning_effort` is the strict-config key codex app-server accepts.
