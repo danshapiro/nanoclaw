@@ -7,7 +7,7 @@ description: Deploy apps to Vercel. Use when asked to deploy, ship, or publish a
 
 You can deploy web applications to Vercel using the `vercel` CLI.
 
-**HARD RULE: You MUST NOT write HTML, CSS, or JavaScript yourself. When asked to build a website or web app, you MUST delegate to a Frontend Engineer subagent (see "Building Websites" section below). This is not optional. Violation wastes your context window on code that belongs in a separate agent.**
+**HARD RULE: You MUST NOT write HTML, CSS, or JavaScript yourself. When asked to build a website or web app, you MUST use the `vercel-subagent` skill (see "Building Websites" section below). That skill owns the frontend build, visual QA, and deploy loop through a persisted Codex or OpenCode subprocess session.**
 
 ## Auth
 
@@ -88,31 +88,12 @@ echo "value" | vercel env add VAR_NAME production --token placeholder
 | `ENOTFOUND api.vercel.com` | Network issue. Check proxy connectivity |
 | Auth error after `vercel whoami` | Credential may be expired. Ask the user to refresh the Vercel token in OneCLI |
 
-## Building Websites — Delegate to Frontend Engineer
+## Building Websites — Use the Vercel Subagent Skill
 
-When asked to **build, create, or redesign** a website or web app, do NOT build it yourself. You MUST delegate to a Frontend Engineer agent. This is a two-step process and **both steps are required**:
-
-**Step 1 — Create the agent** (skip if you already have a "frontend-engineer" destination):
-
-```
-create_agent({
-  name: "Frontend Engineer",
-  instructions: "You are a dedicated frontend engineer. Your frontend-engineer skill has your full workflow. Build what is requested, test it visually with agent-browser, deploy to Vercel, and send back the live URL + screenshots to your parent agent when done."
-})
-```
-
-**Step 2 — Send the build request** (MANDATORY — do this immediately after step 1):
-
-```
-send_message(to: "frontend-engineer", text: "<full description of what to build, including design requirements, content, colors, and any assets>")
-```
-
-⚠️ **CRITICAL**: If you skip step 2, nothing happens. The agent exists but has no work. You MUST send the message. Do NOT tell the user "it's working on it" until you have actually called send_message.
-
-After sending, tell the user you've handed it off and will share the result when it comes back. The Frontend Engineer will send you the live URL + screenshots when done — forward those to the user.
+When asked to **build, create, or redesign** a website or web app, do not build it inline. Use the `vercel-subagent` skill. It runs a stateful Codex or OpenCode subprocess session, keeps its continuation state under `/workspace/agent/.nanoclaw/vercel-subagents/`, performs local build and visual verification, deploys through Vercel when requested, and records the live URL plus screenshots.
 
 **When to delegate vs do it yourself:**
-- **Delegate**: building new sites, redesigns, multi-page apps, anything that needs visual testing
+- **Use `vercel-subagent`**: building new sites, redesigns, multi-page apps, anything that needs visual testing
 - **Do yourself**: simple `vercel deploy` of an existing project, checking deployment status, managing domains/env vars
 
 ## Best Practices

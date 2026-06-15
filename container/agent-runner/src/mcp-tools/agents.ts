@@ -1,10 +1,6 @@
 /**
  * Agent management MCP tools: create_agent.
  *
- * send_to_agent was removed — sending to another agent is now just
- * send_message(to="agent-name") since agents and channels share the
- * unified destinations namespace.
- *
  * create_agent is admin-only. Non-admin containers never see this tool
  * (see mcp-tools/index.ts). The host re-checks permission on receive.
  */
@@ -32,11 +28,11 @@ export const createAgent: McpToolDefinition = {
   tool: {
     name: 'create_agent',
     description:
-      'Create a long-lived companion sub-agent (research assistant, task manager, specialist) — the name becomes your destination for it. Admin-only. Fire-and-forget.',
+      'Create a long-lived persistent companion agent with its own workspace and memory. Admin-only. Fire-and-forget.',
     inputSchema: {
       type: 'object' as const,
       properties: {
-        name: { type: 'string', description: 'Human-readable name (also becomes your destination name for this agent)' },
+        name: { type: 'string', description: 'Human-readable name (also becomes the message target for this agent)' },
         instructions: { type: 'string', description: 'CLAUDE.md content for the new agent (personality, role, instructions)' },
       },
       required: ['name'],

@@ -1,11 +1,11 @@
-## Companion and collaborator agents (`create_agent`)
+## Persistent Companion Agents (`create_agent`)
 
-`mcp__nanoclaw__create_agent({ name, instructions })` spins up a new long-lived agent and wires it as a destination — bidirectional, so you can send it tasks and it can message you back.
+`mcp__nanoclaw__create_agent({ name, instructions })` spins up a long-lived companion agent. Use it when a collaborator should keep its own workspace, memory, and role across more than one exchange.
 
 ### How it works
 
 - Creates a new agent with its own container, workspace, and session. Your `instructions` string seeds the agent's `CLAUDE.local.md` — its starting role and personality.
-- The agent's `name` becomes a destination on both sides: you address it via `send_message({ to: "<name>", ... })`, and its replies arrive as inbound messages with `from="<name>"`.
+- The agent's `name` becomes its message target. You address it by name, and its replies arrive as inbound messages from that name.
 - Each agent has its own persistent workspace under `groups/<folder>/` — memory, conversation history, and notes all survive across sessions. This is a full standalone agent, not a stateless sub-query.
 - **Fire-and-forget:** the call returns immediately without waiting for the agent to confirm it's ready. Messages you send will queue until it's up.
 
@@ -18,8 +18,9 @@ The right frame is: does this agent need its own memory and context that builds 
 
 ### When NOT to use
 
-- **One-off lookups or short tasks** — use the SDK `Agent` tool instead. It's stateless, spins up and completes in one shot, and leaves no persistent footprint.
+- **One-off lookups or short tasks** — use an inline tool or ordinary local command instead. Persistent companions are for durable collaboration, not quick sub-queries.
 - **Work that finishes before the user's next message** — agents persist indefinitely. Don't create one for something you could do inline.
+- **Vercel website or app builds** — use the `vercel-subagent` skill. It keeps Codex/OpenCode subprocess state under `/workspace/agent/.nanoclaw/vercel-subagents/` and is not a NanoClaw companion agent.
 
 ### Writing good `instructions`
 

@@ -1,6 +1,6 @@
 ---
 name: self-customize
-description: Customize your own agent — add capabilities, install packages, add MCP servers, edit code or CLAUDE.md. Use when the user asks you to add a feature, install a tool, or modify how you work. For non-trivial code changes, delegate to a builder agent via create_agent.
+description: Customize your own agent — add capabilities, install packages, add MCP servers, edit code or CLAUDE.md. Use when the user asks you to add a feature, install a tool, or modify how you work. For durable collaboration, create a long-lived companion agent.
 ---
 
 # Self-Customization
@@ -14,19 +14,19 @@ You can modify your own environment. Different kinds of changes have different w
 - **`CLAUDE.local.md` or files in your workspace** → Edit directly, no approval needed. Your workspace (`/workspace/agent/`) is persisted on the host. (Note: the composed `CLAUDE.md` itself is read-only and regenerated every spawn — write to `CLAUDE.local.md` instead.)
 - **System package (apt) or global npm package** → `install_packages`. Requires admin approval. On approval, image rebuild + container restart happen automatically.
 - **MCP server** → `add_mcp_server`. Requires admin approval. On approval, container restarts with the new server wired up (no rebuild — bun runs TS directly).
-- **Your source code or Dockerfile** → Delegate to a builder agent via `create_agent` (see below).
-- **A new specialist capability** → `create_agent` to spin up a dedicated agent for it.
+- **Your source code or Dockerfile** → Create a long-lived builder companion via `create_agent` (see below).
+- **A new specialist capability** → Create a persistent companion agent when it should keep memory across tasks.
 
 Installed skill dependencies are not self-customization. Check `/app/skills/.bin/<helper>`, `/app/skills/<skill>/scripts/`, or documented runtime shims such as `/usr/local/bin/gws`. If a helper for an installed skill is missing, report a NanoClaw deployment error instead of using `install_packages` or rebuilding.
 
-## Workflow: Code Changes via Builder Agent
+## Workflow: Code Changes via Persistent Builder Companion
 
-For anything that requires editing source files (your own code, Dockerfile, etc.), **do not edit directly** — delegate to a builder agent. This gives the user a reviewable boundary and keeps your main session focused.
+For anything that requires editing source files (your own code, Dockerfile, etc.), **do not edit directly**. Create a persistent builder companion when the work benefits from its own workspace, memory, and reviewable boundary.
 
 1. Describe what you need changed in concrete terms (files, behavior, acceptance criteria)
-2. Call `create_agent({ name: "Builder", instructions: "<builder prompt>" })` — the returned agent group ID is your builder
-3. Call `send_to_agent({ agentGroupId, text: "<task description with specific files and changes>" })`
-4. The builder works in its own container, makes the changes, and reports back
+2. Call `create_agent({ name: "Builder", instructions: "<builder prompt>" })`
+3. Send the builder a normal message by name with the concrete task description
+4. The builder works in its own persisted container workspace, makes the changes, and reports back
 5. You review the builder's summary and confirm with the user. Source-code edits inside `/app/src` are picked up automatically on the next container start — no rebuild step needed (bun runs TS directly). If the builder also installed packages, its own `install_packages` approval will have rebuilt the image.
 
 ### Builder Agent Instructions (use as CLAUDE.md when creating)
@@ -40,7 +40,7 @@ You are a builder agent. Your job is to make precise, minimal code changes to Na
 - **Diff size limits.** Reject any change that exceeds 200 new lines or 150 modified lines in a single task. If the change is larger, push back and ask for it to be split into smaller tasks.
 - **Read before writing.** Always read the target file fully before editing. Understand the existing patterns.
 - **Test if possible.** If there are relevant tests, run them after your change.
-- **Report back.** When done, use send_to_agent to tell the requesting agent: (a) what files you changed, (b) a summary of the changes, (c) any follow-up needed (rebuild, tests, migrations).
+- **Report back.** When done, reply to the requesting agent with: (a) what files you changed, (b) a summary of the changes, (c) any follow-up needed (rebuild, tests, migrations).
 - **No silent failures.** If you can't complete the task, explain why — don't produce partial work without flagging it.
 
 ## Safety
@@ -69,7 +69,7 @@ User: "Can you add a tool for reading RSS feeds?"
 2. If one exists → `add_mcp_server({ name: "rss", command: "npx", args: ["some-rss-mcp"] })` → admin approves → container restarts with the new server → done
 3. If nothing suitable exists → delegate to a builder agent:
    - `create_agent({ name: "RSS Tool Builder", instructions: "<builder prompt from above>" })`
-   - `send_to_agent({ agentGroupId, text: "Add an MCP tool 'read_rss' to container/agent-runner/src/mcp-tools/. It should fetch an RSS URL and return the latest N items. Register it in mcp-tools/index.ts. Target: <200 new lines." })`
+   - Send `RSS Tool Builder` a message: "Add an MCP tool 'read_rss' to container/agent-runner/src/mcp-tools/. It should fetch an RSS URL and return the latest N items. Register it in mcp-tools/index.ts. Target: <200 new lines."
    - Wait for builder's report — new tool code is picked up on the next container start (bun runs TS directly)
 
 ## Example: Installing a System Tool
