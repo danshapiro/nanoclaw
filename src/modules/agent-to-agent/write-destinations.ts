@@ -11,6 +11,8 @@ import fs from 'fs';
 
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { getMessagingGroup, isAgentChannelWired } from '../../db/messaging-groups.js';
+import { getSession } from '../../db/sessions.js';
+import type { MessagingGroup } from '../../types.js';
 import { replaceDestinations, type DestinationRow } from '../../db/session-db.js';
 import { log } from '../../log.js';
 import { inboundDbPath, openInboundDb } from '../../session-manager.js';
@@ -23,12 +25,16 @@ export function writeDestinations(agentGroupId: string, sessionId: string): void
   const rows = getDestinations(agentGroupId);
   const resolved: DestinationRow[] = [];
   const allowChannelDestinations = isAgentChannelWired(agentGroupId);
+  const session = getSession(sessionId);
+  const currentMessagingGroup = session?.messaging_group_id ? getMessagingGroup(session.messaging_group_id) : undefined;
 
   for (const row of rows) {
     if (row.target_type === 'channel') {
       const mg = getMessagingGroup(row.target_id);
       if (!mg) continue;
-      if (!allowChannelDestinations) {
+      const projectionType = resolveChannelProjectionType(mg, currentMessagingGroup, allowChannelDestinations);
+      if (!projectionType) continue;
+      if (projectionType === 'blocked_channel') {
         resolved.push({
           name: row.local_name,
           display_name: mg.name ?? row.local_name,
@@ -42,7 +48,7 @@ export function writeDestinations(agentGroupId: string, sessionId: string): void
       resolved.push({
         name: row.local_name,
         display_name: mg.name ?? row.local_name,
-        type: 'channel',
+        type: projectionType,
         channel_type: mg.channel_type,
         platform_id: mg.platform_id,
         agent_group_id: null,
@@ -68,4 +74,18 @@ export function writeDestinations(agentGroupId: string, sessionId: string): void
     db.close();
   }
   log.debug('Destination map written', { sessionId, count: resolved.length });
+}
+
+function resolveChannelProjectionType(
+  target: MessagingGroup,
+  current: MessagingGroup | undefined,
+  allowChannelDestinations: boolean,
+): 'channel' | 'blocked_channel' | null {
+  if (target.channel_type === 'cli') {
+    return allowChannelDestinations && current?.id === target.id ? 'channel' : null;
+  }
+
+  if (current?.channel_type === 'cli') return null;
+
+  return allowChannelDestinations ? 'channel' : 'blocked_channel';
 }
