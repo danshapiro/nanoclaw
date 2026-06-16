@@ -31,9 +31,18 @@ function extractReplyContext(raw: Record<string, any>): ReplyContext | null {
 
 registerChannelAdapter('discord', {
   factory: async () => {
-    const env = readEnvFile(['DISCORD_BOT_TOKEN', 'DISCORD_PUBLIC_KEY', 'DISCORD_APPLICATION_ID']);
+    const env = readEnvFile(['DISCORD_BOT_TOKEN', 'DISCORD_PUBLIC_KEY', 'DISCORD_APPLICATION_ID', 'DISCORD_AUTO_CREATE_THREAD_CHANNEL_IDS']);
     const botToken = process.env.DISCORD_BOT_TOKEN || env.DISCORD_BOT_TOKEN;
     if (!botToken) return null;
+    const autoCreateThreadChannelIds = new Set(
+      (process.env.DISCORD_AUTO_CREATE_THREAD_CHANNEL_IDS || env.DISCORD_AUTO_CREATE_THREAD_CHANNEL_IDS || '')
+        .split(',')
+        .map((id) => id.trim())
+        .filter(Boolean),
+    );
+    if (autoCreateThreadChannelIds.size > 0) {
+      log.info('Discord auto-create thread channels configured', { count: autoCreateThreadChannelIds.size });
+    }
     const commandSync = await syncYenteDiscordApplicationCommands({
       botToken,
       applicationId: process.env.DISCORD_APPLICATION_ID || env.DISCORD_APPLICATION_ID,
@@ -46,7 +55,7 @@ registerChannelAdapter('discord', {
       applicationId: process.env.DISCORD_APPLICATION_ID || env.DISCORD_APPLICATION_ID || commandSync.applicationId,
     });
     return createChatSdkBridge({
-      adapter: wrapYenteDiscordChannelIds(discordAdapter, botToken),
+      adapter: wrapYenteDiscordChannelIds(discordAdapter, botToken, autoCreateThreadChannelIds),
       concurrency: 'concurrent',
       botToken,
       extractReplyContext,
@@ -236,7 +245,11 @@ export async function toDiscordThreadId(platformId: string, botToken: string): P
   return `discord:${guildId}:${platformId}`;
 }
 
-function wrapYenteDiscordChannelIds(adapter: DiscordAdapterInstance, botToken: string): DiscordAdapterInstance {
+function wrapYenteDiscordChannelIds(
+  adapter: DiscordAdapterInstance,
+  botToken: string,
+  autoCreateThreadChannelIds: Set<string> = new Set(),
+): DiscordAdapterInstance {
   const cache = new Map<string, string>();
   const resolve = async (threadId: string): Promise<string> => {
     if (threadId.startsWith('discord:')) return threadId;
@@ -273,6 +286,41 @@ function wrapYenteDiscordChannelIds(adapter: DiscordAdapterInstance, botToken: s
   const startTyping = adapter.startTyping.bind(adapter);
   adapter.startTyping = (async (threadId, status) =>
     startTyping(await resolve(threadId), status)) as typeof adapter.startTyping;
+
+  if (autoCreateThreadChannelIds.size > 0) {
+    const rawAdapter = adapter as any;
+    const originalHandleForwardedMessage = rawAdapter.handleForwardedMessage.bind(rawAdapter);
+    rawAdapter.handleForwardedMessage = async (dataArg: unknown, optionsArg: unknown, ...rest: unknown[]) => {
+      const data = dataArg as Record<string, any> | undefined;
+      const options = optionsArg;
+      const channelId = data?.channel_id as string | undefined;
+      const messageId = data?.id as string | undefined;
+      const alreadyInThread = data?.thread != null || data?.channel_type === 11 || data?.channel_type === 12;
+      if (channelId && messageId && !alreadyInThread && autoCreateThreadChannelIds.has(channelId)) {
+        try {
+          const newThread = await rawAdapter.createDiscordThread(channelId, messageId);
+          if (newThread?.id) {
+            dataArg = {
+              ...data,
+              thread: { id: newThread.id, parent_id: channelId },
+            };
+            log.info('Created Discord thread for auto-thread channel', {
+              channelId,
+              messageId,
+              threadId: newThread.id,
+            });
+          }
+        } catch (error) {
+          log.warn('Failed to create Discord thread for auto-thread channel', {
+            channelId,
+            messageId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+      return originalHandleForwardedMessage(dataArg, options, ...rest);
+    };
+  }
 
   return adapter;
 }
