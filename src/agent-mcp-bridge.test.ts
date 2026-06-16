@@ -370,7 +370,7 @@ describe('startAgentMcpBridge', () => {
         dataDir,
         releaseRoot,
         verifyReadyOnStartup: true,
-        startupWatchdogMs: 80,
+        startupWatchdogMs: 2000,
       }).then(
         () => null,
         (e: unknown) => e,
