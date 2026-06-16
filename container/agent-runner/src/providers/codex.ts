@@ -39,7 +39,7 @@ import {
   spawnCodexAppServer,
   startCodexTurn,
   startOrResumeCodexThread,
-  waitForCodexNotification,
+  waitForCodexCompactionComplete,
   writeCodexMcpConfigToml,
 } from './codex-app-server.js';
 
@@ -131,7 +131,10 @@ export function isCompactCommand(messages: MessageInRow[] | undefined): boolean 
   const [msg] = messages;
   if (msg.kind !== 'chat' && msg.kind !== 'chat-sdk') return false;
   const info = categorizeMessage(msg);
-  return info.command === COMPACT_COMMAND_TEXT && info.text.trim() === COMPACT_COMMAND_TEXT;
+  return (
+    info.command === COMPACT_COMMAND_TEXT &&
+    info.text.trim().toLowerCase() === COMPACT_COMMAND_TEXT
+  );
 }
 
 /** @internal exported for unit tests */
@@ -343,6 +346,14 @@ export class CodexProvider implements AgentProvider {
 
         threadId = await startOrResumeCodexThread(server, threadId, threadParams);
 
+        // Emit the continuation as soon as we have a live thread. Compact turns
+        // bypass runOneTurn, so we must yield init here to match the path that
+        // normally yields it before turn/start.
+        if (threadId && !initYielded) {
+          initYielded = true;
+          yield { type: 'init', continuation: threadId };
+        }
+
         while (!aborted) {
           while (pending.length === 0 && !ended && !aborted) {
             await new Promise<void>((resolve) => {
@@ -360,12 +371,16 @@ export class CodexProvider implements AgentProvider {
             visibleDestinationName = turn.visibleDestinationName;
           }
 
-          // The turn is now committed — emit input-accepted so the poll-loop can
-          // correlate this input (mirrors opencode-container.ts:877-881). Scope
+          // The turn is now committed — emit input-accepted once so the poll-loop
+          // can correlate this input (mirrors opencode-container.ts:877-881). Scope
           // mirrors OpenCode: relay turns are 'relay'; the first normal turn is
           // 'initial'; subsequent normal turns are 'followup'.
           const scope: ProviderInputScope = relay ? 'relay' : turnIndex === 0 ? 'initial' : 'followup';
           turnIndex += 1;
+
+          if (turnInputId) {
+            yield { type: 'input-accepted', inputId: turnInputId, scope };
+          }
 
           // Intercept the admin slash command `/compact` for non-Claude providers.
           // Codex exposes native context compaction via `thread/compact/start`, so we
@@ -373,9 +388,6 @@ export class CodexProvider implements AgentProvider {
           // If the call fails we gracefully fall through to a normal turn so the
           // user still gets *some* response rather than a silent drop.
           if (scope !== 'relay' && isCompactCommand(turn.messages)) {
-            if (turnInputId) {
-              yield { type: 'input-accepted', inputId: turnInputId, scope };
-            }
             let compactFulfilled = false;
             try {
               yield* compactCodexThread(server, threadId!, turnInputId, visibleDestinationName, REAL_CLOCK);
@@ -388,10 +400,6 @@ export class CodexProvider implements AgentProvider {
               });
             }
             if (compactFulfilled) continue;
-          }
-
-          if (turnInputId) {
-            yield { type: 'input-accepted', inputId: turnInputId, scope };
           }
 
           // One turn = one channel of streaming events. Each notification
@@ -672,14 +680,10 @@ export async function* compactCodexThread(
     0,
     COMPACT_NOTIFICATION_TIMEOUT_MS - (clock.now() - startedAt),
   );
-  const notification = await waitForCodexNotification(
-    server,
-    'thread/compacted',
-    remainingNotificationMs,
-  );
-  if (!notification) {
-    warnStructured('codex_compact_notification_timeout', { threadId, inputId });
-  }
+  // Wait for the canonical v2 compaction signal. If it never arrives we throw
+  // so the outer loop can fall back to a normal model turn instead of falsely
+  // claiming the context was compacted.
+  await waitForCodexCompactionComplete(server, threadId, remainingNotificationMs);
 
   const resultText = buildCompactResultText(destinationName);
   yield { type: 'progress', inputId, message: COMPACT_RESULT_TEXT };

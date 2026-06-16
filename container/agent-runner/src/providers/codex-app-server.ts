@@ -258,6 +258,108 @@ export function waitForCodexNotification(
   });
 }
 
+export interface CodexCompactCompletionNotification {
+  method: 'item/completed' | 'turn/completed' | 'thread/compacted';
+  turnId?: string;
+}
+
+/**
+ * Wait for Codex to report that a `thread/compact/start` operation finished.
+ *
+ * Codex emits the legacy `thread/compacted` notification to some clients, but
+ * the pinned 0.139.0 app-server sends the canonical v2 signal instead:
+ * either an `item/completed` whose item has `type: 'contextCompaction'`, or a
+ * `turn/completed` whose turn contains such an item. We accept any of these
+ * signals so the code remains correct across protocol versions.
+ *
+ * Rejects if an explicit `error` notification arrives for the thread, or if
+ * the timeout expires without a completion signal.
+ */
+export function waitForCodexCompactionComplete(
+  server: AppServer,
+  threadId: string,
+  timeoutMs = 30_000,
+): Promise<CodexCompactCompletionNotification> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      remove();
+      reject(new Error(`Timeout waiting for Codex compaction completion on thread ${threadId}`));
+    }, timeoutMs);
+
+    function hasContextCompactionItem(items: unknown): boolean {
+      if (!Array.isArray(items)) return false;
+      return items.some(
+        (item) => item && typeof item === 'object' && (item as { type?: string }).type === 'contextCompaction',
+      );
+    }
+
+    function handler(n: JsonRpcNotification): void {
+      if (settled) return;
+
+      const params = n.params || {};
+      const eventThreadId =
+        (params.threadId as string | undefined) ??
+        ((params.thread as { id?: string } | undefined)?.id as string | undefined);
+      if (eventThreadId && eventThreadId !== threadId) return;
+
+      switch (n.method) {
+        case 'error': {
+          const error = (params.error as { message?: string } | undefined)?.message;
+          const msg = error || `Codex reported an error while compacting thread ${threadId}`;
+          settled = true;
+          clearTimeout(timer);
+          remove();
+          reject(new Error(msg));
+          return;
+        }
+        case 'item/completed': {
+          const item = params.item as { type?: string; threadId?: string } | undefined;
+          if (item?.type === 'contextCompaction') {
+            settled = true;
+            clearTimeout(timer);
+            remove();
+            resolve({ method: 'item/completed', turnId: params.turnId as string | undefined });
+          }
+          return;
+        }
+        case 'turn/completed': {
+          const turn = params.turn as { items?: unknown } | undefined;
+          if (hasContextCompactionItem(turn?.items)) {
+            settled = true;
+            clearTimeout(timer);
+            remove();
+            const items = (turn?.items as { type?: string; id?: string }[] | undefined) ?? [];
+            const compactionItem = items.find((item) => item?.type === 'contextCompaction');
+            resolve({ method: 'turn/completed', turnId: compactionItem?.id });
+          }
+          return;
+        }
+        case 'thread/compacted': {
+          // Legacy fallback; retained for compatibility with protocol versions
+          // that still fan this notification out to v2 clients.
+          settled = true;
+          clearTimeout(timer);
+          remove();
+          resolve({ method: 'thread/compacted', turnId: params.turnId as string | undefined });
+          return;
+        }
+        default:
+          return;
+      }
+    }
+
+    function remove(): void {
+      const idx = server.notificationHandlers.indexOf(handler);
+      if (idx >= 0) server.notificationHandlers.splice(idx, 1);
+    }
+
+    server.notificationHandlers.push(handler);
+  });
+}
+
 // ── Auto-approval ───────────────────────────────────────────────────────────
 // The container sandbox is already the security boundary; inside it, Codex's
 // own approval prompts would just block every tool call on a user that isn't

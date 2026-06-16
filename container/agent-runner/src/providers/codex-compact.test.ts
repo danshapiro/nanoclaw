@@ -85,6 +85,11 @@ describe('isCompactCommand', () => {
     expect(isCompactCommand(rows)).toBe(true);
   });
 
+  it('recognizes a single /compact message with odd casing', () => {
+    const rows = [makeMessageRow('/Compact')];
+    expect(isCompactCommand(rows)).toBe(true);
+  });
+
   it('rejects /compact with extra text', () => {
     const rows = [makeMessageRow('/compact something')];
     expect(isCompactCommand(rows)).toBe(false);
@@ -114,31 +119,37 @@ describe('buildCompactResultText', () => {
   });
 });
 
+async function drainCompactGenerator<T>(gen: AsyncGenerator<T>): Promise<T[]> {
+  const events: T[] = [];
+  for await (const ev of gen) {
+    events.push(ev);
+  }
+  return events;
+}
+
+function contextCompactionItem(id = 'ctx-compact-1'): { type: 'contextCompaction'; id: string } {
+  return { type: 'contextCompaction', id };
+}
+
 describe('compactCodexThread', () => {
-  it('calls thread/compact/start and emits progress + result after thread/compacted', async () => {
+  it('emits progress + result after item/completed with a contextCompaction item', async () => {
     const { server, requests, dispatchNotification, resolveAll } = makeFakeAppServer();
     const clock = { now: () => Date.now() };
     const gen = compactCodexThread(server, 'thread-abc', 'input-xyz', 'discord-current', clock);
+    const collectPromise = drainCompactGenerator(gen);
 
-    const collectPromise = (async () => {
-      const events: unknown[] = [];
-      for await (const ev of gen) {
-        events.push(ev);
-      }
-      return events;
-    })();
-
-    // Let the generator reach the compact request.
     await new Promise((r) => setTimeout(r, 10));
-
     expect(requests.length).toBe(1);
     expect(requests[0].method).toBe('thread/compact/start');
     expect(requests[0].params).toEqual({ threadId: 'thread-abc' });
 
-    // Resolve the compact request and dispatch the completion notification.
     resolveAll();
     await new Promise((r) => setTimeout(r, 10));
-    dispatchNotification('thread/compacted', { threadId: 'thread-abc', turnId: 'turn-1' });
+    dispatchNotification('item/completed', {
+      threadId: 'thread-abc',
+      turnId: 'turn-1',
+      item: contextCompactionItem(),
+    });
 
     const events = await collectPromise;
     expect(events).toEqual([
@@ -153,30 +164,48 @@ describe('compactCodexThread', () => {
     ]);
   });
 
-  it('still emits a result if the compacted notification times out', async () => {
-    const { server, requests, resolveAll } = makeFakeAppServer();
-    const start = Date.now();
-    let clockCalls = 0;
-    // Advance elapsed time past the 60s notification budget after the compact
-    // request is issued, so the zero-timeout path runs immediately.
-    const fastClock = {
-      now: () => {
-        clockCalls += 1;
-        return clockCalls === 1 ? start + 100 : start + 70_000;
-      },
-    };
-    const gen = compactCodexThread(server, 'thread-def', 'input-uvw', undefined, fastClock);
-
-    const events: unknown[] = [];
-    const collectPromise = (async () => {
-      for await (const ev of gen) events.push(ev);
-    })();
+  it('emits progress + result after turn/completed containing a contextCompaction item', async () => {
+    const { server, requests, dispatchNotification, resolveAll } = makeFakeAppServer();
+    const clock = { now: () => Date.now() };
+    const gen = compactCodexThread(server, 'thread-abc', 'input-xyz', 'discord-current', clock);
+    const collectPromise = drainCompactGenerator(gen);
 
     await new Promise((r) => setTimeout(r, 10));
-    expect(requests[0].method).toBe('thread/compact/start');
     resolveAll();
+    await new Promise((r) => setTimeout(r, 10));
+    dispatchNotification('turn/completed', {
+      threadId: 'thread-abc',
+      turn: {
+        id: 'turn-1',
+        items: [contextCompactionItem()],
+      },
+    });
 
-    await collectPromise;
+    const events = await collectPromise;
+    expect(events).toEqual([
+      { type: 'activity' },
+      { type: 'progress', inputId: 'input-xyz', message: COMPACT_RESULT_TEXT },
+      {
+        type: 'result',
+        text: buildCompactResultText('discord-current'),
+        inputId: 'input-xyz',
+        resolvedInputIds: ['input-xyz'],
+      },
+    ]);
+  });
+
+  it('still accepts the legacy thread/compacted notification', async () => {
+    const { server, requests, dispatchNotification, resolveAll } = makeFakeAppServer();
+    const clock = { now: () => Date.now() };
+    const gen = compactCodexThread(server, 'thread-legacy', 'input-uvw', undefined, clock);
+    const collectPromise = drainCompactGenerator(gen);
+
+    await new Promise((r) => setTimeout(r, 10));
+    resolveAll();
+    await new Promise((r) => setTimeout(r, 10));
+    dispatchNotification('thread/compacted', { threadId: 'thread-legacy', turnId: 'turn-1' });
+
+    const events = await collectPromise;
     expect(events).toEqual([
       { type: 'activity' },
       { type: 'progress', inputId: 'input-uvw', message: COMPACT_RESULT_TEXT },
@@ -187,5 +216,46 @@ describe('compactCodexThread', () => {
         resolvedInputIds: ['input-uvw'],
       },
     ]);
+  });
+
+  it('throws when no compaction completion signal arrives in time', async () => {
+    const { server, requests, resolveAll } = makeFakeAppServer();
+    const start = Date.now();
+    let clockCalls = 0;
+    // Advance elapsed time past the 60,000ms notification budget, so the helper
+    // sees a zero-ms timeout and throws before we have to wait on real timers.
+    const fastClock = {
+      now: () => {
+        clockCalls += 1;
+        return clockCalls === 1 ? start + 100 : start + 70_000;
+      },
+    };
+    const gen = compactCodexThread(server, 'thread-def', 'input-uvw', undefined, fastClock);
+    const collectPromise = drainCompactGenerator(gen);
+
+    await new Promise((r) => setTimeout(r, 10));
+    expect(requests[0].method).toBe('thread/compact/start');
+    resolveAll();
+
+    await expect(collectPromise).rejects.toThrow('Timeout waiting for Codex compaction completion');
+  });
+
+  it('throws when Codex reports an explicit error notification', async () => {
+    const { server, requests, dispatchNotification, resolveAll } = makeFakeAppServer();
+    const clock = { now: () => Date.now() };
+    const gen = compactCodexThread(server, 'thread-err', 'input-err', 'discord-current', clock);
+    const collectPromise = drainCompactGenerator(gen);
+
+    await new Promise((r) => setTimeout(r, 10));
+    resolveAll();
+    await new Promise((r) => setTimeout(r, 10));
+    dispatchNotification('error', {
+      threadId: 'thread-err',
+      turnId: 'turn-1',
+      error: { message: 'compaction failed internally' },
+      willRetry: false,
+    });
+
+    await expect(collectPromise).rejects.toThrow('compaction failed internally');
   });
 });
