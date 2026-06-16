@@ -308,7 +308,12 @@ export class CodexProvider implements AgentProvider {
       waiting?.();
     };
 
-    pending.push({ prompt: input.prompt, inputId: input.inputId });
+    pending.push({
+      prompt: input.prompt,
+      inputId: input.inputId,
+      messages: input.messages,
+      visibleDestinationName: input.visibleDestinationName,
+    });
 
     const self = this;
 
