@@ -1,0 +1,191 @@
+import { describe, it, expect } from 'bun:test';
+import {
+  type AppServer,
+  type JsonRpcNotification,
+} from './codex-app-server.js';
+import {
+  buildCompactResultText,
+  COMPACT_RESULT_TEXT,
+  compactCodexThread,
+  isCompactCommand,
+} from './codex.js';
+import type { MessageInRow } from '../db/messages-in.js';
+
+function makeMessageRow(text: string): MessageInRow {
+  return {
+    id: 'msg-1',
+    seq: 1,
+    kind: 'chat',
+    timestamp: '2026-06-16T01:20:00.000Z',
+    status: 'pending',
+    process_after: null,
+    recurrence: null,
+    tries: 0,
+    trigger: 1,
+    platform_id: 'plat-1',
+    platform_message_id: null,
+    channel_type: 'discord',
+    thread_id: null,
+    messaging_group_id: null,
+    is_group: 0,
+    content: JSON.stringify({ text, senderId: '123', sender: 'DanS' }),
+  } as MessageInRow;
+}
+
+type CapturedRequest = { id: number; method: string; params: Record<string, unknown> };
+
+function makeFakeAppServer(): {
+  server: AppServer;
+  requests: CapturedRequest[];
+  dispatchNotification: (method: string, params: Record<string, unknown>) => void;
+  resolveAll: () => void;
+} {
+  const requests: CapturedRequest[] = [];
+  const server = {
+    process: {
+      stdin: {
+        write(line: string) {
+          const req = JSON.parse(line) as CapturedRequest;
+          requests.push(req);
+          return true;
+        },
+      },
+    },
+    readline: { close() {} },
+    pending: new Map(),
+    notificationHandlers: [] as ((n: JsonRpcNotification) => void)[],
+    serverRequestHandlers: [],
+  } as unknown as AppServer;
+
+  function resolveAll() {
+    for (const req of requests) {
+      const pending = server.pending as Map<
+        number,
+        { resolve: (r: { id: number; result?: unknown }) => void; reject: (e: Error) => void }
+      >;
+      const handler = pending.get(req.id);
+      if (handler) {
+        handler.resolve({ id: req.id, result: {} });
+      }
+    }
+  }
+
+  function dispatchNotification(method: string, params: Record<string, unknown>): void {
+    for (const h of server.notificationHandlers) {
+      h({ jsonrpc: '2.0', method, params } as JsonRpcNotification);
+    }
+  }
+
+  return { server, requests, dispatchNotification, resolveAll };
+}
+
+describe('isCompactCommand', () => {
+  it('recognizes a single /compact chat message', () => {
+    const rows = [makeMessageRow('/compact')];
+    expect(isCompactCommand(rows)).toBe(true);
+  });
+
+  it('rejects /compact with extra text', () => {
+    const rows = [makeMessageRow('/compact something')];
+    expect(isCompactCommand(rows)).toBe(false);
+  });
+
+  it('requires exactly one chat message', () => {
+    expect(isCompactCommand(undefined)).toBe(false);
+    expect(isCompactCommand([])).toBe(false);
+    expect(isCompactCommand([makeMessageRow('/compact'), makeMessageRow('hi')])).toBe(false);
+  });
+
+  it('rejects non-chat messages', () => {
+    const row: MessageInRow = { ...makeMessageRow('/compact'), kind: 'system' };
+    expect(isCompactCommand([row])).toBe(false);
+  });
+});
+
+describe('buildCompactResultText', () => {
+  it('wraps the reply in a destination block when a name is given', () => {
+    expect(buildCompactResultText('discord-current')).toBe(
+      '<message to="discord-current">Context compacted.</message>',
+    );
+  });
+
+  it('returns plain text when no destination is known', () => {
+    expect(buildCompactResultText(undefined)).toBe('Context compacted.');
+  });
+});
+
+describe('compactCodexThread', () => {
+  it('calls thread/compact/start and emits progress + result after thread/compacted', async () => {
+    const { server, requests, dispatchNotification, resolveAll } = makeFakeAppServer();
+    const clock = { now: () => Date.now() };
+    const gen = compactCodexThread(server, 'thread-abc', 'input-xyz', 'discord-current', clock);
+
+    const collectPromise = (async () => {
+      const events: unknown[] = [];
+      for await (const ev of gen) {
+        events.push(ev);
+      }
+      return events;
+    })();
+
+    // Let the generator reach the compact request.
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(requests.length).toBe(1);
+    expect(requests[0].method).toBe('thread/compact/start');
+    expect(requests[0].params).toEqual({ threadId: 'thread-abc' });
+
+    // Resolve the compact request and dispatch the completion notification.
+    resolveAll();
+    await new Promise((r) => setTimeout(r, 10));
+    dispatchNotification('thread/compacted', { threadId: 'thread-abc', turnId: 'turn-1' });
+
+    const events = await collectPromise;
+    expect(events).toEqual([
+      { type: 'activity' },
+      { type: 'progress', inputId: 'input-xyz', message: COMPACT_RESULT_TEXT },
+      {
+        type: 'result',
+        text: buildCompactResultText('discord-current'),
+        inputId: 'input-xyz',
+        resolvedInputIds: ['input-xyz'],
+      },
+    ]);
+  });
+
+  it('still emits a result if the compacted notification times out', async () => {
+    const { server, requests, resolveAll } = makeFakeAppServer();
+    const start = Date.now();
+    let clockCalls = 0;
+    // Advance elapsed time past the 60s notification budget after the compact
+    // request is issued, so the zero-timeout path runs immediately.
+    const fastClock = {
+      now: () => {
+        clockCalls += 1;
+        return clockCalls === 1 ? start + 100 : start + 70_000;
+      },
+    };
+    const gen = compactCodexThread(server, 'thread-def', 'input-uvw', undefined, fastClock);
+
+    const events: unknown[] = [];
+    const collectPromise = (async () => {
+      for await (const ev of gen) events.push(ev);
+    })();
+
+    await new Promise((r) => setTimeout(r, 10));
+    expect(requests[0].method).toBe('thread/compact/start');
+    resolveAll();
+
+    await collectPromise;
+    expect(events).toEqual([
+      { type: 'activity' },
+      { type: 'progress', inputId: 'input-uvw', message: COMPACT_RESULT_TEXT },
+      {
+        type: 'result',
+        text: buildCompactResultText(undefined),
+        inputId: 'input-uvw',
+        resolvedInputIds: ['input-uvw'],
+      },
+    ]);
+  });
+});

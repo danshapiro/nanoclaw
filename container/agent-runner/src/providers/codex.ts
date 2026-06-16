@@ -35,18 +35,28 @@ import {
   createCodexConfigOverrides,
   initializeCodexAppServer,
   killCodexAppServer,
+  sendCodexRequest,
   spawnCodexAppServer,
   startCodexTurn,
   startOrResumeCodexThread,
+  waitForCodexNotification,
   writeCodexMcpConfigToml,
 } from './codex-app-server.js';
 
 import { CodexTurnTimers, codexTimingConfigFromEnv, type CodexTimingClock } from './codex-turn-timing.js';
 import { buildInactivityNotice, dedupeCodexSideEffect, codexCapabilities, codexThreadSandbox } from './codex-parity.js';
+import { categorizeMessage } from '../formatter.js';
+import type { MessageInRow } from '../db/messages-in.js';
 
 /** Real wall clock; tests inject a fake one via runOneTurn's deps. */
 const REAL_CLOCK: CodexTimingClock = { now: () => Date.now() };
 const NANOCLAW_SKILLS_ROOT = '/app/skills';
+/** @internal exported for unit tests */
+export const COMPACT_COMMAND_TEXT = '/compact';
+const COMPACT_REQUEST_TIMEOUT_MS = 30_000;
+const COMPACT_NOTIFICATION_TIMEOUT_MS = 60_000;
+/** @internal exported for unit tests */
+export const COMPACT_RESULT_TEXT = 'Context compacted.';
 
 const CODEX_NANOCLAW_BRIDGE_INSTRUCTIONS = [
   '## NanoClaw Codex bridge',
@@ -113,6 +123,22 @@ function readAgentAndGlobalClaudeMd(): string | undefined {
 
 function codexSkillsDir(): string {
   return path.join(process.env.HOME || '/home/node', '.codex', 'skills');
+}
+
+/** @internal exported for unit tests */
+export function isCompactCommand(messages: MessageInRow[] | undefined): boolean {
+  if (!messages || messages.length !== 1) return false;
+  const [msg] = messages;
+  if (msg.kind !== 'chat' && msg.kind !== 'chat-sdk') return false;
+  const info = categorizeMessage(msg);
+  return info.command === COMPACT_COMMAND_TEXT && info.text.trim() === COMPACT_COMMAND_TEXT;
+}
+
+/** @internal exported for unit tests */
+export function buildCompactResultText(destinationName: string | undefined): string {
+  const reply = COMPACT_RESULT_TEXT;
+  if (!destinationName) return reply;
+  return `<message to="${destinationName}">${reply}</message>`;
 }
 
 function logStructured(event: string, fields: Record<string, unknown> = {}): void {
@@ -299,6 +325,7 @@ export class CodexProvider implements AgentProvider {
       let threadId: string | undefined = input.continuation;
       let initYielded = false;
       let turnIndex = 0;
+      let visibleDestinationName: string | undefined = input.visibleDestinationName;
 
       try {
         await initializeCodexAppServer(server);
@@ -329,6 +356,9 @@ export class CodexProvider implements AgentProvider {
           const turn = pending.shift()!;
           const text = turn.prompt;
           const turnInputId = turn.inputId;
+          if (turn.visibleDestinationName) {
+            visibleDestinationName = turn.visibleDestinationName;
+          }
 
           // The turn is now committed — emit input-accepted so the poll-loop can
           // correlate this input (mirrors opencode-container.ts:877-881). Scope
@@ -336,6 +366,30 @@ export class CodexProvider implements AgentProvider {
           // 'initial'; subsequent normal turns are 'followup'.
           const scope: ProviderInputScope = relay ? 'relay' : turnIndex === 0 ? 'initial' : 'followup';
           turnIndex += 1;
+
+          // Intercept the admin slash command `/compact` for non-Claude providers.
+          // Codex exposes native context compaction via `thread/compact/start`, so we
+          // call that instead of treating the command as a normal model prompt.
+          // If the call fails we gracefully fall through to a normal turn so the
+          // user still gets *some* response rather than a silent drop.
+          if (scope !== 'relay' && isCompactCommand(turn.messages)) {
+            if (turnInputId) {
+              yield { type: 'input-accepted', inputId: turnInputId, scope };
+            }
+            let compactFulfilled = false;
+            try {
+              yield* compactCodexThread(server, threadId!, turnInputId, visibleDestinationName, REAL_CLOCK);
+              compactFulfilled = true;
+            } catch (err) {
+              warnStructured('codex_compact_failed', {
+                threadId,
+                inputId: turnInputId,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+            if (compactFulfilled) continue;
+          }
+
           if (turnInputId) {
             yield { type: 'input-accepted', inputId: turnInputId, scope };
           }
@@ -592,6 +646,49 @@ export async function* runOneTurn(
     const idx = server.notificationHandlers.indexOf(handler);
     if (idx >= 0) server.notificationHandlers.splice(idx, 1);
   }
+}
+
+/** @internal exported for unit tests */
+export async function* compactCodexThread(
+  server: AppServer,
+  threadId: string,
+  inputId: string | undefined,
+  destinationName: string | undefined,
+  clock: CodexTimingClock,
+): AsyncGenerator<ProviderEvent> {
+  yield { type: 'activity' };
+  const startedAt = clock.now();
+  const resp = await sendCodexRequest(
+    server,
+    'thread/compact/start',
+    { threadId },
+    COMPACT_REQUEST_TIMEOUT_MS,
+  );
+  if (resp.error) {
+    throw new Error(`thread/compact/start failed: ${resp.error.message}`);
+  }
+
+  const remainingNotificationMs = Math.max(
+    0,
+    COMPACT_NOTIFICATION_TIMEOUT_MS - (clock.now() - startedAt),
+  );
+  const notification = await waitForCodexNotification(
+    server,
+    'thread/compacted',
+    remainingNotificationMs,
+  );
+  if (!notification) {
+    warnStructured('codex_compact_notification_timeout', { threadId, inputId });
+  }
+
+  const resultText = buildCompactResultText(destinationName);
+  yield { type: 'progress', inputId, message: COMPACT_RESULT_TEXT };
+  yield {
+    type: 'result',
+    text: resultText,
+    inputId,
+    resolvedInputIds: inputId ? [inputId] : [],
+  };
 }
 
 registerProvider('codex', (opts) => new CodexProvider(opts));

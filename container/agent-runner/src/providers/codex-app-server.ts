@@ -222,6 +222,42 @@ export function killCodexAppServer(server: AppServer): void {
   }
 }
 
+/**
+ * Wait for a specific JSON-RPC notification from the app-server.
+ * Returns the notification if it arrives within `timeoutMs`, otherwise `undefined`.
+ */
+export function waitForCodexNotification(
+  server: AppServer,
+  method: string,
+  timeoutMs = 30_000,
+): Promise<JsonRpcNotification | undefined> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      remove();
+      resolve(undefined);
+    }, timeoutMs);
+
+    function handler(n: JsonRpcNotification): void {
+      if (n.method !== method) return;
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      remove();
+      resolve(n);
+    }
+
+    function remove(): void {
+      const idx = server.notificationHandlers.indexOf(handler);
+      if (idx >= 0) server.notificationHandlers.splice(idx, 1);
+    }
+
+    server.notificationHandlers.push(handler);
+  });
+}
+
 // ── Auto-approval ───────────────────────────────────────────────────────────
 // The container sandbox is already the security boundary; inside it, Codex's
 // own approval prompts would just block every tool call on a user that isn't

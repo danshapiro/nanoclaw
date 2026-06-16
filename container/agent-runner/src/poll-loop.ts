@@ -402,6 +402,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         log: logAttachmentEvent,
       });
 
+      const visibleDestination = findByRouting(routing.channelType, routing.platformId);
+      const visibleDestinationName = visibleDestination?.name;
+
       // Provider startup / session creation. A synchronous throw here (the
       // OpenCode server failing to spawn, session creation rejecting) is a
       // pre-acceptance failure: no input has been accepted, so it is recoverable.
@@ -409,6 +412,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         inputId: topLevelInputId,
         prompt,
         attachments,
+        messages: keep,
+        visibleDestinationName,
         continuation,
         cwd: config.cwd,
         systemContext: config.systemContext,
@@ -790,11 +795,19 @@ async function processQuery(
       inspectFile: inspectAttachmentFile,
       log: logAttachmentEvent,
     });
+    const followupDestination = findByRouting(routing.channelType, routing.platformId);
+
     log(`Pushing ${newMessages.length} follow-up message(s) into active query (input ${followupInputId})`);
     try {
       unwrappedOutputNudged = false;
       pendingUnwrappedOutputText = null;
-      query.push({ inputId: followupInputId, prompt, attachments });
+      query.push({
+        inputId: followupInputId,
+        prompt,
+        attachments,
+        messages: newMessages,
+        visibleDestinationName: followupDestination?.name,
+      });
     } catch (err) {
       log(
         JSON.stringify({

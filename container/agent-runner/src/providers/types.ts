@@ -31,6 +31,8 @@ export interface AgentProvider {
   isSessionInvalid(err: unknown, opts: { attemptedContinuation?: string }): boolean;
 }
 
+import type { MessageInRow } from '../db/messages-in.js';
+
 /**
  * Options passed to provider constructors. Fields are common to most
  * providers; individual providers may ignore any they don't need.
@@ -64,6 +66,21 @@ export interface QueryTurnInput {
 
   /** Validated files for this provider turn. Providers may ignore them. */
   attachments?: QueryAttachment[];
+
+  /**
+   * Original inbound message rows that produced this prompt. Providers may use
+   * this to inspect raw message metadata (e.g., to detect slash commands that
+   * the formatter wrapped in XML because the provider does not handle them
+   * natively).
+   */
+  messages?: MessageInRow[];
+
+  /**
+   * Canonical destination name for the active route. Providers can use it to
+   * synthesize properly addressed `<message>` blocks without re-deriving the
+   * current destination.
+   */
+  visibleDestinationName?: string;
 }
 
 export interface QueryInput extends QueryTurnInput {
