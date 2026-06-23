@@ -31,7 +31,7 @@ export const REQUIRED_YENTE_ONECLI_SECRET_NAMES = [
   'Yente Msgvault Proxy',
   'Yente Browser Handoff',
   'NanoClaw Anthropic',
-  'NanoClaw OpenAI',
+  'NanoClaw OpenAI Images',
   'NanoClaw Gemini',
   'NanoClaw OpenCode Go',
   'NanoClaw OpenCode Go Messages',

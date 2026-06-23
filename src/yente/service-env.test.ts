@@ -117,7 +117,7 @@ describe('Yente service env contract', () => {
           { id: 'secret-gws', name: 'Yente GWS Proxy' },
           { id: 'secret-msgvault', name: 'Yente Msgvault Proxy' },
           { id: 'secret-browser-handoff', name: 'Yente Browser Handoff' },
-          { id: 'secret-openai', name: 'NanoClaw OpenAI' },
+          { id: 'secret-openai', name: 'NanoClaw OpenAI Images' },
           { id: 'secret-gemini', name: 'NanoClaw Gemini' },
           { id: 'secret-opencode-go', name: 'NanoClaw OpenCode Go' },
           { id: 'secret-opencode-go-messages', name: 'NanoClaw OpenCode Go Messages' },
@@ -177,7 +177,7 @@ describe('Yente service env contract', () => {
           { id: 'secret-msgvault', name: 'Yente Msgvault Proxy' },
           { id: 'secret-browser-handoff', name: 'Yente Browser Handoff' },
           { id: 'secret-anthropic', name: 'NanoClaw Anthropic' },
-          { id: 'secret-openai', name: 'NanoClaw OpenAI' },
+          { id: 'secret-openai', name: 'NanoClaw OpenAI Images' },
           { id: 'secret-gemini', name: 'NanoClaw Gemini' },
           { id: 'secret-opencode-go', name: 'NanoClaw OpenCode Go' },
           { id: 'secret-opencode-go-messages', name: 'NanoClaw OpenCode Go Messages' },
@@ -225,7 +225,7 @@ describe('Yente service env contract', () => {
         fetchImpl,
       }),
     ).rejects.toThrow(
-      'Missing OneCLI secret(s): Yente Browser Handoff, NanoClaw Anthropic, NanoClaw OpenAI, NanoClaw Gemini, NanoClaw OpenCode Go, NanoClaw OpenCode Go Messages, AssemblyAI, Vercel',
+      'Missing OneCLI secret(s): Yente Browser Handoff, NanoClaw Anthropic, NanoClaw OpenAI Images, NanoClaw Gemini, NanoClaw OpenCode Go, NanoClaw OpenCode Go Messages, AssemblyAI, Vercel',
     );
   });
 });
