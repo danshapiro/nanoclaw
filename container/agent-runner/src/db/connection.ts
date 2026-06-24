@@ -45,56 +45,7 @@ export function getOutboundDb(): Database {
       db.exec('PRAGMA busy_timeout = 5000');
       db.exec('PRAGMA journal_mode = DELETE');
       db.exec('PRAGMA foreign_keys = ON');
-      // Lightweight forward-compat: session_state was added after the initial
-      // v2 schema, so older session DBs don't have it. Create it on demand
-      // instead of requiring a formal migration pass. Also handle the case
-      // where an earlier revision of this table existed without updated_at —
-      // ALTER TABLE to add any missing columns.
-      db.exec(`
-      CREATE TABLE IF NOT EXISTS session_state (
-        key        TEXT PRIMARY KEY,
-        value      TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-    `);
-      const cols = new Set(
-        (db.prepare("PRAGMA table_info('session_state')").all() as Array<{ name: string }>).map((c) => c.name),
-      );
-      if (!cols.has('updated_at')) {
-        db.exec(`ALTER TABLE session_state ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''`);
-      }
-      // container_state: tracks the current tool in flight (if any) so the host
-      // sweep can widen its stuck tolerance when Bash is running with a user-
-      // declared long timeout. Forward-compat for older outbound.db files.
-      db.exec(`
-      CREATE TABLE IF NOT EXISTS container_state (
-        id                       INTEGER PRIMARY KEY CHECK (id = 1),
-        current_tool             TEXT,
-        tool_declared_timeout_ms INTEGER,
-        tool_started_at          TEXT,
-        updated_at               TEXT NOT NULL
-      );
-    `);
-      // side_effect_ledger: validated, imported side effects. The host
-      // src/db/schema.ts is the authoritative creator, but a container opening an
-      // old-schema outbound.db must self-migrate (create-on-demand) so recovery
-      // and import work without a formal migration pass.
-      db.exec(`
-      CREATE TABLE IF NOT EXISTS side_effect_ledger (
-        id              TEXT PRIMARY KEY,
-        source          TEXT NOT NULL,
-        kind            TEXT NOT NULL,
-        operation       TEXT,
-        input_id        TEXT,
-        route_key       TEXT,
-        evidence_json   TEXT NOT NULL,
-        validation_json TEXT NOT NULL,
-        replay_policy   TEXT,
-        occurred_at     TEXT,
-        imported_at     TEXT NOT NULL
-      );
-    `);
-      ensureOutboundRouteColumns(db);
+      ensureOutboundSchema(db);
       _outbound = db;
     } catch (err) {
       db.close();
@@ -102,6 +53,106 @@ export function getOutboundDb(): Database {
     }
   }
   return _outbound;
+}
+
+/**
+ * Ensure the container-owned outbound.db has every table this process writes.
+ *
+ * The container is the SOLE WRITER of outbound.db, so it owns its own schema.
+ * Create-on-demand keeps the connection self-sufficient: a container that opens
+ * an outbound.db which was never seeded with the route/state tables (an older
+ * session DB) still migrates forward without a formal migration pass.
+ */
+export function ensureOutboundSchema(db: Database): void {
+  // Base outbound tables. The host's src/db/schema.ts (OUTBOUND_SCHEMA) is the
+  // authoritative creator when it pre-seeds outbound.db before the container
+  // starts, but the container is the SOLE WRITER of this file and some paths
+  // open it without that guarantee — an operator/fork container that never ran
+  // through the host session-manager, or a startup-order race where the
+  // container opens the path before the host writes the schema. Without
+  // messages_out, EVERY outbound write throws `no such table: messages_out`,
+  // which silently breaks send_message and turns apply_managed_repos /
+  // push_managed_repo into false failures (the host script still runs, but the
+  // agent only ever sees the enqueue crash). Create-on-demand here mirrors the
+  // forward-compat self-heal for the state tables below; the route-metadata
+  // columns added later are filled in by ensureOutboundRouteColumns().
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS messages_out (
+      id             TEXT PRIMARY KEY,
+      seq            INTEGER UNIQUE,
+      in_reply_to    TEXT,
+      timestamp      TEXT NOT NULL,
+      deliver_after  TEXT,
+      recurrence     TEXT,
+      kind           TEXT NOT NULL,
+      platform_id    TEXT,
+      channel_type   TEXT,
+      thread_id      TEXT,
+      input_id       TEXT,
+      route_key      TEXT,
+      messaging_group_id TEXT,
+      is_group       INTEGER,
+      content        TEXT NOT NULL
+    );
+  `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS processing_ack (
+      message_id     TEXT PRIMARY KEY,
+      status         TEXT NOT NULL,
+      status_changed TEXT NOT NULL,
+      notice_message_out_id TEXT
+    );
+  `);
+  // Lightweight forward-compat: session_state was added after the initial
+  // v2 schema, so older session DBs don't have it. Create it on demand
+  // instead of requiring a formal migration pass. Also handle the case
+  // where an earlier revision of this table existed without updated_at —
+  // ALTER TABLE to add any missing columns.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS session_state (
+      key        TEXT PRIMARY KEY,
+      value      TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+  `);
+  const cols = new Set(
+    (db.prepare("PRAGMA table_info('session_state')").all() as Array<{ name: string }>).map((c) => c.name),
+  );
+  if (!cols.has('updated_at')) {
+    db.exec(`ALTER TABLE session_state ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''`);
+  }
+  // container_state: tracks the current tool in flight (if any) so the host
+  // sweep can widen its stuck tolerance when Bash is running with a user-
+  // declared long timeout. Forward-compat for older outbound.db files.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS container_state (
+      id                       INTEGER PRIMARY KEY CHECK (id = 1),
+      current_tool             TEXT,
+      tool_declared_timeout_ms INTEGER,
+      tool_started_at          TEXT,
+      updated_at               TEXT NOT NULL
+    );
+  `);
+  // side_effect_ledger: validated, imported side effects. The host
+  // src/db/schema.ts is the authoritative creator, but a container opening an
+  // old-schema outbound.db must self-migrate (create-on-demand) so recovery
+  // and import work without a formal migration pass.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS side_effect_ledger (
+      id              TEXT PRIMARY KEY,
+      source          TEXT NOT NULL,
+      kind            TEXT NOT NULL,
+      operation       TEXT,
+      input_id        TEXT,
+      route_key       TEXT,
+      evidence_json   TEXT NOT NULL,
+      validation_json TEXT NOT NULL,
+      replay_policy   TEXT,
+      occurred_at     TEXT,
+      imported_at     TEXT NOT NULL
+    );
+  `);
+  ensureOutboundRouteColumns(db);
 }
 
 /**
