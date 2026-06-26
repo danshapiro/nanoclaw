@@ -1271,6 +1271,32 @@ describe('poll-loop /stop control messages', () => {
     expect(outboundTexts().filter((t) => t.includes('No active'))).toHaveLength(1);
   });
 
+  it('splits /stop out of a cold-start batch without dropping other work', async () => {
+    dmMsg('stop-mixed-control', '/stop');
+    dmMsg('stop-mixed-work', 'please keep working');
+    insertChannelDestination('discord-test', 'chan-1');
+
+    const prompts: string[] = [];
+    const provider = new ScriptedProvider(async function* (input) {
+      prompts.push(input.prompt);
+      expect(input.prompt).toContain('please keep working');
+      expect(input.prompt).not.toContain('/stop');
+      yield { type: 'result', text: '<message to="discord-test">continued work</message>' };
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal);
+
+    await waitFor(() => getAckStatus('stop-mixed-work') === 'completed', 3000);
+    controller.abort();
+    await loopPromise.catch(() => {});
+
+    expect(getAckStatus('stop-mixed-control')).toBe('completed');
+    expect(provider.calls).toBe(1);
+    expect(prompts).toHaveLength(1);
+    expect(outboundTexts().filter((t) => t.includes('No active'))).toHaveLength(1);
+    expect(outboundTexts()).toContain('continued work');
+  });
+
   it('does not treat /stop with arguments as a control message', async () => {
     dmMsg('stop-now-chat', '/stop now');
 
