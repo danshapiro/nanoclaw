@@ -1139,6 +1139,229 @@ describe('poll-loop conversational reply accounting', () => {
   });
 });
 
+describe('poll-loop /stop control messages', () => {
+  function dmMsg(id: string, text: string, messagingGroupId = 'mg-stop'): void {
+    insertMessage(
+      id,
+      'chat-sdk',
+      { sender: 'User', text },
+      {
+        platformId: 'chan-1',
+        channelType: 'discord',
+        messagingGroupId,
+        isGroup: 0,
+      },
+    );
+  }
+
+  function stopScope(messagingGroupId = 'mg-stop'): ProviderRecoveryScope {
+    const routeKey = normalizeRoute('test', {
+      platformId: 'chan-1',
+      channelType: 'discord',
+      threadId: null,
+      messagingGroupId,
+      isGroup: 0,
+    }).routeKey;
+    return {
+      providerName: 'test',
+      routeKey,
+      messagingGroupId,
+      isGroup: 0,
+      platformId: 'chan-1',
+      channelType: 'discord',
+      threadKey: null,
+    };
+  }
+
+  function outboundTexts(): string[] {
+    return getUndeliveredMessages().map((m) => {
+      try {
+        return (JSON.parse(m.content) as { text?: string }).text ?? '';
+      } catch {
+        return '';
+      }
+    });
+  }
+
+  it('aborts an active query on exact /stop and completes accepted work without recovery', async () => {
+    dmMsg('stop-active-init', 'long task');
+
+    let releaseQuery!: () => void;
+    const queryStarted = deferred();
+    const releaseReady = deferred();
+    const pushes: QueryTurnInput[] = [];
+    let abortCalls = 0;
+
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query(input) {
+        queryStarted.resolve();
+        return {
+          push(message) {
+            pushes.push(typeof message === 'string' ? { inputId: 'legacy', prompt: message } : message);
+          },
+          end() {
+            releaseQuery?.();
+          },
+          abort() {
+            abortCalls++;
+            releaseQuery?.();
+          },
+          events: (async function* () {
+            yield { type: 'init', continuation: 'stop-active-session' };
+            yield { type: 'input-accepted', inputId: (input as QueryInput).inputId, scope: 'initial' };
+            await new Promise<void>((resolve) => {
+              releaseQuery = resolve;
+              releaseReady.resolve();
+            });
+          })(),
+        };
+      },
+    };
+
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+    await queryStarted.promise;
+    await releaseReady.promise;
+    dmMsg('stop-active-control', '  /STOP  ');
+
+    await waitFor(() => abortCalls === 1 && getAckStatus('stop-active-init') === 'completed', 3000);
+    expect(abortCalls).toBe(1);
+    expect(pushes).toHaveLength(0);
+    expect(getAckStatus('stop-active-control')).toBe('completed');
+    expect(getAckStatus('stop-active-init')).toBe('completed');
+    expect(listRecoveryEntries(stopScope())).toHaveLength(0);
+    expect(outboundTexts().filter((t) => t.includes('Stopped'))).toHaveLength(1);
+
+    controller.abort();
+    await loopPromise.catch(() => {});
+  });
+
+  it('acknowledges a lone /stop without starting the provider', async () => {
+    dmMsg('stop-idle-control', '\n/Stop\t');
+
+    const provider = new ScriptedProvider(async function* () {
+      throw new Error('provider should not start for idle /stop');
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal);
+
+    await waitFor(() => getAckStatus('stop-idle-control') === 'completed', 3000);
+    controller.abort();
+    await loopPromise.catch(() => {});
+
+    expect(provider.calls).toBe(0);
+    expect(outboundTexts().filter((t) => t.includes('No active'))).toHaveLength(1);
+  });
+
+  it('does not treat /stop with arguments as a control message', async () => {
+    dmMsg('stop-now-chat', '/stop now');
+
+    const provider = new ScriptedProvider(async function* (input) {
+      expect(input.prompt).toContain('/stop now');
+      yield { type: 'result', text: '<message to="discord-test">not a control message</message>' };
+    });
+    insertChannelDestination('discord-test', 'chan-1');
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal);
+
+    await waitFor(() => getAckStatus('stop-now-chat') === 'completed', 3000);
+    controller.abort();
+    await loopPromise.catch(() => {});
+
+    expect(provider.calls).toBe(1);
+    expect(outboundTexts()).toContain('not a control message');
+  });
+
+  it('does not abort the active route for /stop on a different route', async () => {
+    dmMsg('stop-route-init', 'long task', 'mg-active');
+
+    let releaseQuery!: () => void;
+    const queryStarted = deferred();
+    const releaseReady = deferred();
+    let abortCalls = 0;
+
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query(input) {
+        queryStarted.resolve();
+        return {
+          push() {},
+          end() {
+            releaseQuery?.();
+          },
+          abort() {
+            abortCalls++;
+            releaseQuery?.();
+          },
+          events: (async function* () {
+            yield { type: 'init', continuation: 'stop-route-session' };
+            yield { type: 'input-accepted', inputId: (input as QueryInput).inputId, scope: 'initial' };
+            await new Promise<void>((resolve) => {
+              releaseQuery = resolve;
+              releaseReady.resolve();
+            });
+            yield {
+              type: 'result',
+              text: '<message to="discord-test">active route done</message>',
+              resolvedInputIds: [(input as QueryInput).inputId],
+            };
+          })(),
+        };
+      },
+    };
+
+    insertChannelDestination('discord-test', 'chan-1');
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+    await queryStarted.promise;
+    await releaseReady.promise;
+    dmMsg('stop-other-route', '/stop', 'mg-other');
+    await sleep(800);
+    expect(abortCalls).toBe(0);
+    expect(getAckStatus('stop-other-route')).toBeNull();
+
+    releaseQuery();
+    await waitFor(() => getAckStatus('stop-route-init') === 'completed', 3000);
+    controller.abort();
+    await loopPromise.catch(() => {});
+  });
+
+  it('does not pass /stop-prefixed text through as a provider-native slash command', async () => {
+    insertChannelDestination('discord-test');
+    insertMessage(
+      'stop-native',
+      'chat',
+      { sender: 'Admin', text: '/stop now' },
+      { platformId: 'chan-1', channelType: 'discord' },
+    );
+
+    const provider = new NativeScriptedProvider(async function* (input) {
+      expect(input.prompt).toContain('<message');
+      expect(input.prompt).toContain('/stop now');
+      expect(input.prompt.trim()).not.toBe('/stop now');
+      yield { type: 'result', text: '<message to="discord-test">provider saw wrapped stop text</message>' };
+    });
+
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({
+      provider,
+      providerName: 'test',
+      cwd: '/tmp',
+      signal: controller.signal,
+    });
+    await waitFor(() => getAckStatus('stop-native') === 'completed', 3000);
+    controller.abort();
+    await loopPromise.catch(() => {});
+
+    expect(outboundTexts()).toContain('provider saw wrapped stop text');
+  });
+});
+
 describe('route normalization', () => {
   it('collapses a null-thread DM and a threaded DM alias to the same route only when DM metadata matches', () => {
     const nullThreadDm = normalizeRoute('opencode', {

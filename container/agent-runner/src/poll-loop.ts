@@ -45,8 +45,11 @@ import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
-const HOST_OWNED_COMMANDS = new Set(['/new', '/clear']);
+const HOST_OWNED_COMMANDS = new Set(['/new', '/clear', '/stop']);
 const DEFAULT_ACTIVE_INPUT_PATH = '/workspace/.active-input.json';
+const STOP_COMMAND = '/stop';
+const STOP_ACTIVE_ACK = 'Stopped the active turn.';
+const STOP_IDLE_ACK = 'No active turn is running.';
 
 /**
  * Path to the per-input correlation file. Production uses the static
@@ -144,6 +147,17 @@ function textOfMessage(m: MessageInRow): string {
   } catch {
     return m.content;
   }
+}
+
+function isStopControlMessage(m: MessageInRow): boolean {
+  if (m.kind !== 'chat' && m.kind !== 'chat-sdk') return false;
+  return categorizeMessage(m).text.trim().toLowerCase() === STOP_COMMAND;
+}
+
+function stampRoutingScope(routing: RoutingContext, scope: ProviderRecoveryScope): void {
+  routing.routeKey = scope.routeKey;
+  routing.messagingGroupId = scope.messagingGroupId;
+  routing.isGroup = scope.isGroup;
 }
 
 /**
@@ -323,14 +337,33 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         }),
       );
     }
-    const activeMessages = activeRouteMessages;
-
-    const ids = activeMessages.map((m) => m.id);
     // Route scope for this wake — recovery is keyed by provider + the TRIGGER
     // route, never the first-row route. The wake-triggering rows on the active
     // route, in chronological order, become the recovery entry's originalTasks
     // (Invariant 166: not collapsed to a single newest task).
     const activeRouteScope = routeScopeForMessage(config.providerName, triggerRows[triggerRows.length - 1]);
+    let activeMessages = activeRouteMessages;
+    const idleStopMessages = activeMessages.filter(isStopControlMessage);
+    if (idleStopMessages.length > 0) {
+      const stopRouting = extractRouting(idleStopMessages);
+      stampRoutingScope(stopRouting, activeRouteScope);
+      markCompleted(idleStopMessages.map((m) => m.id));
+      writeRoutedMessage(stopRouting, STOP_IDLE_ACK);
+      log(
+        JSON.stringify({
+          severity: 'info',
+          event: 'idle_stop_acknowledged',
+          route_key: activeRouteKey,
+          message_ids: idleStopMessages.map((m) => m.id),
+        }),
+      );
+      activeMessages = activeMessages.filter((m) => !isStopControlMessage(m));
+      if (!activeMessages.some((m) => m.trigger === 1)) {
+        continue;
+      }
+    }
+
+    const ids = activeMessages.map((m) => m.id);
     const originalTasks: ProviderRecoveryEntry['originalTasks'] = activeMessages
       .filter((m) => m.trigger === 1)
       .map((m) => ({ messageId: m.id, text: textOfMessage(m), timestamp: m.timestamp }));
@@ -632,6 +665,7 @@ async function processQuery(
   let clearContinuationRequested = false;
   let zombieFailureCleared = false;
   let done = false;
+  let userStopRequested = false;
   let initialBatchSettled = false;
   const abortQuery = () => query.abort();
 
@@ -640,9 +674,7 @@ async function processQuery(
   // inactivity fallback) carries `route_key`/`messaging_group_id`/`is_group`.
   // This is what makes the agent's own user-visible progress harvestable into
   // route-scoped recovery (harvestRouteScopedProgress filters on route_key).
-  routing.routeKey = ledgerCtx.activeRouteScope.routeKey;
-  routing.messagingGroupId = ledgerCtx.activeRouteScope.messagingGroupId;
-  routing.isGroup = ledgerCtx.activeRouteScope.isGroup;
+  stampRoutingScope(routing, ledgerCtx.activeRouteScope);
 
   const providerStatusState: ProviderStatusState = {
     inactivityStatusSent: false,
@@ -780,7 +812,28 @@ async function processQuery(
     // pending and are excluded from this turn (route splitting also applies to
     // follow-ups, not just the initial batch).
     const candidates = getPendingMessages().filter((m) => m.kind !== 'system');
-    const newMessages = candidates.filter((m) => routeKeyForMessage(providerName, m) === ledgerCtx.activeRouteKey);
+    const routeMessages = candidates.filter((m) => routeKeyForMessage(providerName, m) === ledgerCtx.activeRouteKey);
+    const stopMessages = routeMessages.filter(isStopControlMessage);
+    if (stopMessages.length > 0) {
+      const stopIds = stopMessages.map((m) => m.id);
+      markProcessing(stopIds);
+      markCompleted(stopIds);
+      if (!userStopRequested) {
+        userStopRequested = true;
+        writeRoutedMessage(routing, STOP_ACTIVE_ACK);
+        log(
+          JSON.stringify({
+            severity: 'info',
+            event: 'active_stop_requested',
+            route_key: ledgerCtx.activeRouteKey,
+            message_ids: stopIds,
+          }),
+        );
+        query.abort();
+      }
+      return;
+    }
+    const newMessages = routeMessages;
     if (newMessages.length === 0) return;
 
     const newIds = newMessages.map((m) => m.id);
@@ -850,6 +903,18 @@ async function processQuery(
       } else if (event.type === 'input-accepted') {
         onInputAccepted(event.inputId);
       } else if (event.type === 'notice') {
+        if (userStopRequested) {
+          log(
+            JSON.stringify({
+              severity: 'info',
+              event: 'user_stop_provider_notice_suppressed',
+              input_id: event.inputId,
+              classification: event.classification,
+              route_key: ledgerCtx.activeRouteKey,
+            }),
+          );
+          continue;
+        }
         const action = decideProviderStatusAction(providerStatusState, event);
         if (action.kind === 'write') {
           writeRoutedMessage(routing, action.text);
@@ -912,11 +977,36 @@ async function processQuery(
         if (event.recoverySeed?.sideEffects && event.recoverySeed.sideEffects.length > 0) {
           interruptionSideEffects.push(...event.recoverySeed.sideEffects);
         }
+        if (userStopRequested) {
+          log(
+            JSON.stringify({
+              severity: 'info',
+              event: 'user_stop_provider_interruption_suppressed',
+              input_id: event.inputId,
+              classification: event.classification,
+              route_key: ledgerCtx.activeRouteKey,
+            }),
+          );
+          continue;
+        }
         const action = decideProviderStatusAction(providerStatusState, event);
         if (action.kind === 'write') {
           writeRoutedMessage(routing, action.text);
         }
       } else if (event.type === 'result') {
+        if (userStopRequested) {
+          const resolved = resolveResult(event.resolvedInputIds ?? []);
+          if (resolved.length > 0) completeResolved(resolved);
+          log(
+            JSON.stringify({
+              severity: 'info',
+              event: 'user_stop_provider_result_suppressed',
+              route_key: ledgerCtx.activeRouteKey,
+              resolved_input_ids: resolved,
+            }),
+          );
+          continue;
+        }
         // A result — with or without text — means a turn segment is done.
         // Resolve exact input ids first without mutating the ledger, then dispatch
         // text so reply accounting sees direct result text and MCP send_message
@@ -985,71 +1075,88 @@ async function processQuery(
     //    drop work the provider may have partially done).
     const acceptedUnresolved = [...ledger.values()].filter((e) => e.state === 'accepted');
     if (acceptedUnresolved.length > 0) {
-      const scope = ledgerCtx.activeRouteScope;
-      const now = new Date().toISOString();
-      // Harvest route-scoped progress / MCP send_message rows written during the
-      // accepted-input window — ONLY for the active route, so a shared session's
-      // other conversation can never leak in (Invariants 167; A2).
-      const priorProgress = harvestRouteScopedProgress(scope.routeKey).map((p) => ({
-        messageOutId: p.messageOutId,
-        text: p.text,
-        source: p.source,
-        timestamp: p.timestamp,
-      }));
-      const recoveryId = recoveryIdFor(scope.routeKey);
-      const ownedIds: string[] = [];
-      const acceptedUnresolvedInputs = acceptedUnresolved.map((e) => {
-        ownedIds.push(...e.messageIds);
-        return { inputId: e.inputId, messageIds: [...e.messageIds], prompt: e.prompt };
-      });
-      const entry: ProviderRecoveryEntry = {
-        id: recoveryId,
-        status: 'pending',
-        classification: zombieFailureCleared
-          ? 'continuation_zombie_restart'
-          : 'terminal_interruption_accepted_unresolved',
-        agentMessage: zombieFailureCleared
-          ? 'The previous session became unusable after repeated failures; I am restarting this work from scratch.'
-          : 'I was interrupted mid-turn and will resume this work.',
-        fallbackUserMessage: zombieFailureCleared
-          ? 'I had to restart your request after the session repeatedly failed — I still have it and am retrying from scratch.'
-          : 'Something interrupted me while I was working on your request. I still have it queued — no need to resend.',
-        // Ordered same-route wake-triggering rows (A3, Invariant 166).
-        originalTasks: ledgerCtx.originalTasks,
-        acceptedUnresolvedInputs,
-        pendingFollowups: [],
-        priorProgress,
-        observations: [],
-        // Provider-collected side-effect evidence (Step 7) so the next Yente
-        // turn reports existing work rather than duplicating it.
-        sideEffects: [...interruptionSideEffects],
-        continuationPolicy: clearContinuationRequested ? 'clear' : 'preserve',
-        attemptedContinuation: queryContinuation,
-        createdAt: now,
-        updatedAt: now,
-      };
-      try {
-        const res = appendRecoveryEntryAndOwnRows(scope, entry, ownedIds, { recoveryId });
-        if (res.pressureExceeded) {
-          // Fail closed: don't complete or lose the rows. Write one user-visible
-          // fallback and leave the rows claimed (recovery pressure is structurally
-          // alerted; host sweep is the backstop).
-          writeMissingVisibleReplyError(routing);
-        } else {
-          for (const e of acceptedUnresolved) e.state = 'recovery_owned';
+      if (userStopRequested) {
+        const idsToComplete: string[] = [];
+        for (const entry of acceptedUnresolved) {
+          idsToComplete.push(...entry.messageIds);
+          entry.state = 'resolved';
         }
-      } catch (recErr) {
-        // Atomic transaction rolled back (no partial state). Surface a structured
-        // alert; the rows remain in 'processing' and stay retryable.
+        markCompleted(idsToComplete);
         log(
           JSON.stringify({
-            severity: 'error',
-            event: 'recovery_ownership_failed',
-            route_key: scope.routeKey,
-            recovery_id: recoveryId,
-            error: recErr instanceof Error ? recErr.message : String(recErr),
+            severity: 'info',
+            event: 'user_stop_completed_accepted_unresolved',
+            route_key: ledgerCtx.activeRouteKey,
+            message_ids: idsToComplete,
           }),
         );
+      } else {
+        const scope = ledgerCtx.activeRouteScope;
+        const now = new Date().toISOString();
+        // Harvest route-scoped progress / MCP send_message rows written during the
+        // accepted-input window — ONLY for the active route, so a shared session's
+        // other conversation can never leak in (Invariants 167; A2).
+        const priorProgress = harvestRouteScopedProgress(scope.routeKey).map((p) => ({
+          messageOutId: p.messageOutId,
+          text: p.text,
+          source: p.source,
+          timestamp: p.timestamp,
+        }));
+        const recoveryId = recoveryIdFor(scope.routeKey);
+        const ownedIds: string[] = [];
+        const acceptedUnresolvedInputs = acceptedUnresolved.map((e) => {
+          ownedIds.push(...e.messageIds);
+          return { inputId: e.inputId, messageIds: [...e.messageIds], prompt: e.prompt };
+        });
+        const entry: ProviderRecoveryEntry = {
+          id: recoveryId,
+          status: 'pending',
+          classification: zombieFailureCleared
+            ? 'continuation_zombie_restart'
+            : 'terminal_interruption_accepted_unresolved',
+          agentMessage: zombieFailureCleared
+            ? 'The previous session became unusable after repeated failures; I am restarting this work from scratch.'
+            : 'I was interrupted mid-turn and will resume this work.',
+          fallbackUserMessage: zombieFailureCleared
+            ? 'I had to restart your request after the session repeatedly failed — I still have it and am retrying from scratch.'
+            : 'Something interrupted me while I was working on your request. I still have it queued — no need to resend.',
+          // Ordered same-route wake-triggering rows (A3, Invariant 166).
+          originalTasks: ledgerCtx.originalTasks,
+          acceptedUnresolvedInputs,
+          pendingFollowups: [],
+          priorProgress,
+          observations: [],
+          // Provider-collected side-effect evidence (Step 7) so the next Yente
+          // turn reports existing work rather than duplicating it.
+          sideEffects: [...interruptionSideEffects],
+          continuationPolicy: clearContinuationRequested ? 'clear' : 'preserve',
+          attemptedContinuation: queryContinuation,
+          createdAt: now,
+          updatedAt: now,
+        };
+        try {
+          const res = appendRecoveryEntryAndOwnRows(scope, entry, ownedIds, { recoveryId });
+          if (res.pressureExceeded) {
+            // Fail closed: don't complete or lose the rows. Write one user-visible
+            // fallback and leave the rows claimed (recovery pressure is structurally
+            // alerted; host sweep is the backstop).
+            writeMissingVisibleReplyError(routing);
+          } else {
+            for (const e of acceptedUnresolved) e.state = 'recovery_owned';
+          }
+        } catch (recErr) {
+          // Atomic transaction rolled back (no partial state). Surface a structured
+          // alert; the rows remain in 'processing' and stay retryable.
+          log(
+            JSON.stringify({
+              severity: 'error',
+              event: 'recovery_ownership_failed',
+              route_key: scope.routeKey,
+              recovery_id: recoveryId,
+              error: recErr instanceof Error ? recErr.message : String(recErr),
+            }),
+          );
+        }
       }
     }
 
