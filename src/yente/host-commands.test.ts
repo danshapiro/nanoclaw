@@ -95,9 +95,11 @@ describe('parseYenteHostCommandFromContent', () => {
     expect(parseYenteHostCommandFromContent(JSON.stringify({ text: '/status now' }))).toBe('status');
     expect(parseYenteHostCommandFromContent(JSON.stringify({ text: '<@1464490804734197938> /new' }))).toBe('new');
     expect(parseYenteHostCommandFromContent('<@!1464490804734197938> /clear')).toBe('clear');
+    expect(parseYenteHostCommandFromContent(JSON.stringify({ text: '/stop' }))).toBe('stop');
     expect(parseYenteHostCommandFromContent('new')).toBe('new');
     expect(parseYenteHostCommandFromContent('clear')).toBe('clear');
     expect(parseYenteHostCommandFromContent('compact')).toBe('compact');
+    expect(parseYenteHostCommandFromContent('stop')).toBe('stop');
     expect(parseYenteHostCommandFromContent('status please')).toBeNull();
     expect(parseYenteHostCommandFromContent('new session')).toBeNull();
     expect(parseYenteHostCommandFromContent('clear history')).toBeNull();
@@ -109,12 +111,12 @@ describe('parseYenteHostCommandFromContent', () => {
       type: 2,
       guild_id: 'guild',
       channel_id: 'channel',
-      data: { type: 1, name: 'clear' },
+      data: { type: 1, name: 'stop' },
       member: { user: { id: 'u-1', username: 'Admin' } },
     });
 
-    expect(normalized?.text).toBe('/clear');
-    expect(parseYenteHostCommandFromContent(JSON.stringify({ text: normalized?.text }))).toBe('clear');
+    expect(normalized?.text).toBe('/stop');
+    expect(parseYenteHostCommandFromContent(JSON.stringify({ text: normalized?.text }))).toBe('stop');
   });
 });
 
@@ -171,14 +173,21 @@ describe('handleYenteHostCommand', () => {
 
     const deniedNew = await handleYenteHostCommand(context('/new', 'discord:member'));
     const deniedClear = await handleYenteHostCommand(context('/clear', 'discord:member'));
+    const deniedStop = await handleYenteHostCommand(context('/stop', 'discord:member'));
     expect(deniedNew).toMatchObject({ handled: true, outboundText: 'Permission denied: /new requires admin access.' });
     expect(deniedClear).toMatchObject({
       handled: true,
       outboundText: 'Permission denied: /clear requires admin access.',
     });
+    expect(deniedStop).toMatchObject({
+      handled: true,
+      outboundText: 'Permission denied: /stop requires admin access.',
+    });
 
     grantAdmin('discord:admin');
     const compact = await handleYenteHostCommand(context('/compact', 'discord:admin'));
     expect(compact).toEqual({ handled: false });
+    const stop = await handleYenteHostCommand(context('/stop', 'discord:admin'));
+    expect(stop).toEqual({ handled: false });
   });
 });

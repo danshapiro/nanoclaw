@@ -248,7 +248,7 @@ describe('Yente host command routing', () => {
     expect(wakeMock).toHaveBeenCalledTimes(1);
   });
 
-  it('denies unauthorized /new and /clear before waking a container', async () => {
+  it('denies unauthorized /new, /clear, and /stop before waking a container', async () => {
     const { routeInbound } = await import('./router.js');
     const { wakeContainer } = await import('./container-runner.js');
     const wakeMock = wakeContainer as unknown as ReturnType<typeof vi.fn>;
@@ -257,38 +257,58 @@ describe('Yente host command routing', () => {
 
     await routeInbound(event('/new', 'msg-deny-new'));
     await routeInbound(event('clear', 'msg-deny-clear'));
+    await routeInbound(event('/stop', 'msg-deny-stop'));
 
     const session = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
     expect(outboundTexts(session.id)).toEqual([
       'Permission denied: /new requires admin access.',
       'Permission denied: /clear requires admin access.',
+      'Permission denied: /stop requires admin access.',
     ]);
+    expect(inboundTexts(session.id)).toEqual([]);
     expect(getSessionsByAgentGroup('ag-yente')).toHaveLength(1);
     expect(wakeMock).not.toHaveBeenCalled();
   });
 
-  it('keeps authorized compact on the generic command path and handles Discord command interactions', async () => {
+  it('keeps authorized compact and stop on the generic command path', async () => {
     const { routeInbound } = await import('./router.js');
     const { wakeContainer } = await import('./container-runner.js');
     const wakeMock = wakeContainer as unknown as ReturnType<typeof vi.fn>;
     wakeMock.mockClear();
 
     await routeInbound(event('/compact', 'msg-compact'));
-    const compactSession = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
-    expect(inboundTexts(compactSession.id)).toEqual(['/compact']);
-    expect(wakeMock).toHaveBeenCalledTimes(1);
+    await routeInbound(event('/stop', 'msg-stop'));
 
     const normalized = normalizeDiscordApplicationCommandInteraction({
       type: 2,
       guild_id: 'guild',
       channel_id: 'channel',
-      data: { type: 1, name: 'status' },
+      data: { type: 1, name: 'stop' },
       member: { user: { id: 'admin', username: 'Admin' } },
     });
     expect(normalized).not.toBeNull();
 
-    await routeInbound(event(JSON.stringify({ text: normalized!.text }), 'msg-discord-status'));
-    expect(outboundTexts(compactSession.id)[0]).toContain('Uptime:');
+    await routeInbound({
+      channelType: 'discord',
+      platformId: normalized!.platformId,
+      threadId: normalized!.threadId,
+      message: {
+        id: 'msg-discord-stop',
+        kind: 'chat-sdk',
+        content: JSON.stringify({
+          text: normalized!.text,
+          applicationCommand: true,
+          commandName: normalized!.commandName,
+        }),
+        timestamp: now(),
+        isMention: true,
+        isGroup: true,
+      },
+    });
+
+    const commandSession = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
+    expect(inboundTexts(commandSession.id)).toEqual(['/compact', '/stop', '/stop']);
+    expect(wakeMock).toHaveBeenCalledTimes(3);
   });
 
   it('routes normalized Discord slash commands to the same per-thread session as normal messages', async () => {

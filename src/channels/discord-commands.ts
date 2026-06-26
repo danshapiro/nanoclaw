@@ -1,7 +1,7 @@
 const DISCORD_API_BASE = 'https://discord.com/api/v10';
 
 export interface YenteDiscordCommand {
-  name: 'help' | 'status' | 'new' | 'clear' | 'compact';
+  name: 'help' | 'status' | 'new' | 'clear' | 'compact' | 'stop';
   description: string;
   requiresAdmin: boolean;
 }
@@ -30,6 +30,11 @@ export const YENTE_DISCORD_COMMANDS = [
   {
     name: 'compact',
     description: 'Compact the active Yente session.',
+    requiresAdmin: true,
+  },
+  {
+    name: 'stop',
+    description: 'Stop the active Yente turn.',
     requiresAdmin: true,
   },
 ] as const satisfies readonly YenteDiscordCommand[];

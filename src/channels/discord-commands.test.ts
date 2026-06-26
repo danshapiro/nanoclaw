@@ -18,11 +18,13 @@ describe('Yente Discord application commands', () => {
       'new',
       'clear',
       'compact',
+      'stop',
     ]);
     expect(YENTE_DISCORD_COMMANDS.filter((command) => command.requiresAdmin).map((command) => command.name)).toEqual([
       'new',
       'clear',
       'compact',
+      'stop',
     ]);
 
     expect(buildYenteDiscordGuildCommandPayloads()).toEqual([
@@ -31,6 +33,7 @@ describe('Yente Discord application commands', () => {
       expect.objectContaining({ name: 'new', type: 1 }),
       expect.objectContaining({ name: 'clear', type: 1 }),
       expect.objectContaining({ name: 'compact', type: 1 }),
+      expect.objectContaining({ name: 'stop', type: 1 }),
     ]);
   });
 
@@ -135,12 +138,12 @@ describe('Yente Discord application commands', () => {
       guild_id: 'guild-1',
       channel_id: 'channel-1',
       member: { user: { id: 'user-1', username: 'User One' } },
-      data: { type: 1, name: 'clear' },
+      data: { type: 1, name: 'stop' },
     };
 
     expect(normalizeDiscordApplicationCommandInteraction(interaction)).toEqual({
-      commandName: 'clear',
-      text: '/clear',
+      commandName: 'stop',
+      text: '/stop',
       requiresAdmin: true,
       userId: 'discord:user-1',
       senderName: 'User One',

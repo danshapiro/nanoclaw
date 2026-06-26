@@ -4,7 +4,7 @@ import { type SessionMode } from '../session-manager.js';
 import type { AgentGroup, MessagingGroup, Session } from '../types.js';
 import { resetYenteSessionPreservingScheduler } from './scheduler-reset.js';
 
-export type YenteHostCommandName = 'help' | 'status' | 'new' | 'clear' | 'compact';
+export type YenteHostCommandName = 'help' | 'status' | 'new' | 'clear' | 'compact' | 'stop';
 
 export interface YenteHostCommandContext {
   content: string;
@@ -27,7 +27,7 @@ export type YenteHostCommandResult =
       deliveryMode?: 'session-outbound' | 'host-adapter';
     };
 
-const COMMANDS = new Set<YenteHostCommandName>(['help', 'status', 'new', 'clear', 'compact']);
+const COMMANDS = new Set<YenteHostCommandName>(['help', 'status', 'new', 'clear', 'compact', 'stop']);
 const STARTED_AT = Date.now();
 
 export function parseYenteHostCommandFromContent(content: string): YenteHostCommandName | null {
@@ -59,6 +59,7 @@ export async function handleYenteHostCommand(context: YenteHostCommandContext): 
         '/new - start a fresh session for this conversation.',
         '/clear - start a fresh session for this conversation.',
         '/compact - compact the active session.',
+        '/stop - stop the active turn.',
       ].join('\n'),
     };
   }
@@ -78,8 +79,8 @@ export async function handleYenteHostCommand(context: YenteHostCommandContext): 
     };
   }
 
-  if (command === 'compact') {
-    const gate = gateCommand('/compact', context.userId, context.agentGroup.id);
+  if (command === 'compact' || command === 'stop') {
+    const gate = gateCommand(`/${command}`, context.userId, context.agentGroup.id);
     if (gate.action === 'deny') {
       return denied(command, context.session);
     }
