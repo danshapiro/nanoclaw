@@ -244,4 +244,31 @@ describe('runOneTurn Codex interrupt handling', () => {
       terminal: true,
     });
   });
+
+  it('treats abort-related turn/failed as an interruption shape', async () => {
+    const { server, requests, dispatchNotification, resolveRequest } = makeFakeAppServer();
+    const abort = makeAbortControl();
+    const { started, events } = startFakeTurn(server, abort.signal);
+
+    await started;
+    dispatchNotification('turn/started', { threadId: 'thread-abc', turn: { id: 'turn-failed-after-stop' } });
+    abort.abort();
+
+    await waitFor(() => requests.length === 1, 'turn/interrupt request before failed notification');
+    resolveRequest(requests[0]);
+    dispatchNotification('turn/failed', {
+      threadId: 'thread-abc',
+      turnId: 'turn-failed-after-stop',
+      error: { message: 'interrupted by user' },
+    });
+
+    const collected = await withTimeout(events, 'abort-related failed turn events');
+    expect(collected.some((event) => event.type === 'result')).toBe(false);
+    expect(collected.find((event) => event.type === 'interruption')).toMatchObject({
+      type: 'interruption',
+      inputId: 'input-123',
+      classification: 'codex_turn_interrupted',
+      terminal: true,
+    });
+  });
 });

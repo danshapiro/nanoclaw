@@ -640,7 +640,11 @@ export async function* runOneTurn(
       }
       case 'turn/failed': {
         const e = params.error as { message?: string } | undefined;
-        turnState.error = new Error(e?.message || 'Turn failed');
+        if (abortRequested) {
+          turnInterrupted = true;
+        } else {
+          turnState.error = new Error(e?.message || 'Turn failed');
+        }
         turnDone = true;
         break;
       }
