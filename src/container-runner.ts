@@ -541,7 +541,9 @@ function resolveProviderContribution(
     provider = resolveProviderName(session.agent_provider, agentGroup.agent_provider, containerConfig.provider);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    throw new Error(`Agent group ${agentGroup.id} (${agentGroup.folder}) has invalid provider config: ${message}`);
+    throw new Error(`Agent group ${agentGroup.id} (${agentGroup.folder}) has invalid provider config: ${message}`, {
+      cause: err,
+    });
   }
   const fn = getProviderContainerConfig(provider);
   const contribution = fn

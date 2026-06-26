@@ -152,8 +152,8 @@ function assertCodexAuthGatedProxyTemplate(
   let url: URL;
   try {
     url = new URL(value);
-  } catch {
-    throw new Error(`Native OneCLI codex env ${key} is not a valid proxy URL`);
+  } catch (err) {
+    throw new Error(`Native OneCLI codex env ${key} is not a valid proxy URL`, { cause: err });
   }
   const expectedHost = config.onecliAuthGateHost || authGateHostFromEnv(hostEnv);
   const expectedPort = String(config.onecliAuthGatePort || authGatePortFromEnv(hostEnv));
