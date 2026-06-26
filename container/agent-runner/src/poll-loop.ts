@@ -934,6 +934,18 @@ async function processQuery(
         clearContinuationRequested = true;
         queryContinuation = undefined;
       } else if (event.type === 'interruption') {
+        if (userStopRequested) {
+          log(
+            JSON.stringify({
+              severity: 'info',
+              event: 'user_stop_provider_interruption_suppressed',
+              input_id: event.inputId,
+              classification: event.classification,
+              route_key: ledgerCtx.activeRouteKey,
+            }),
+          );
+          continue;
+        }
         // Typed terminal recoverable interruption (Invariant 159). The accepted-
         // but-unresolved rows are routed into recovery ownership by the
         // finally-block via the existing seam. Here we only honor the
@@ -976,18 +988,6 @@ async function processQuery(
         // the next Yente turn can report existing work rather than duplicate it.
         if (event.recoverySeed?.sideEffects && event.recoverySeed.sideEffects.length > 0) {
           interruptionSideEffects.push(...event.recoverySeed.sideEffects);
-        }
-        if (userStopRequested) {
-          log(
-            JSON.stringify({
-              severity: 'info',
-              event: 'user_stop_provider_interruption_suppressed',
-              input_id: event.inputId,
-              classification: event.classification,
-              route_key: ledgerCtx.activeRouteKey,
-            }),
-          );
-          continue;
         }
         const action = decideProviderStatusAction(providerStatusState, event);
         if (action.kind === 'write') {

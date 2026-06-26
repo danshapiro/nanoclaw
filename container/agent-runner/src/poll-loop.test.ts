@@ -1215,6 +1215,16 @@ describe('poll-loop /stop control messages', () => {
               releaseQuery = resolve;
               releaseReady.resolve();
             });
+            yield {
+              type: 'interruption',
+              inputId: (input as QueryInput).inputId,
+              classification: 'codex_turn_interrupted',
+              severity: 'info',
+              terminal: true,
+              agentMessage: 'interrupted',
+              fallbackUserMessage: 'provider fallback should be suppressed',
+              continuationPolicy: 'preserve',
+            };
           })(),
         };
       },
@@ -1234,6 +1244,11 @@ describe('poll-loop /stop control messages', () => {
     expect(getAckStatus('stop-active-init')).toBe('completed');
     expect(listRecoveryEntries(stopScope())).toHaveLength(0);
     expect(outboundTexts().filter((t) => t.includes('Stopped'))).toHaveLength(1);
+    expect(outboundTexts()).not.toContain('provider fallback should be suppressed');
+    const zombieRows = getOutboundDb()
+      .prepare("SELECT key FROM session_state WHERE key LIKE 'zombie_failures:%'")
+      .all() as Array<{ key: string }>;
+    expect(zombieRows).toHaveLength(0);
 
     controller.abort();
     await loopPromise.catch(() => {});

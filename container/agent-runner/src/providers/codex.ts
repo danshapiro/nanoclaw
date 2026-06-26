@@ -692,7 +692,7 @@ export async function* runOneTurn(
         severity: 'info',
         terminal: true,
         agentMessage: 'The Codex turn was interrupted before completing.',
-        fallbackUserMessage: 'I stopped the active Codex turn.',
+        fallbackUserMessage: 'The active Codex turn was interrupted before completing.',
         continuationPolicy: 'preserve',
         ...(collectedSideEffects.length > 0 ? { recoverySeed: { sideEffects: [...collectedSideEffects] } } : {}),
       };
