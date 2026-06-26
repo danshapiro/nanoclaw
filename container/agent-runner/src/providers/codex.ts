@@ -34,6 +34,7 @@ import {
   attachCodexAutoApproval,
   createCodexConfigOverrides,
   initializeCodexAppServer,
+  interruptCodexTurn,
   killCodexAppServer,
   sendCodexRequest,
   spawnCodexAppServer,
@@ -57,6 +58,11 @@ const COMPACT_REQUEST_TIMEOUT_MS = 30_000;
 const COMPACT_NOTIFICATION_TIMEOUT_MS = 60_000;
 /** @internal exported for unit tests */
 export const COMPACT_RESULT_TEXT = 'Context compacted.';
+
+export interface CodexAbortSignal {
+  isAborted(): boolean;
+  onAbort(handler: () => void): () => void;
+}
 
 const CODEX_NANOCLAW_BRIDGE_INSTRUCTIONS = [
   '## NanoClaw Codex bridge',
@@ -301,9 +307,20 @@ export class CodexProvider implements AgentProvider {
     // follow-up `push({ prompt, inputId })` therefore queues the object intact
     // instead of being coerced to `[object Object]`.
     const pending: QueryTurnInput[] = [];
+    const abortHandlers = new Set<() => void>();
     let waiting: (() => void) | null = null;
     let ended = false;
     let aborted = false;
+    const abortSignal: CodexAbortSignal = {
+      isAborted: () => aborted,
+      onAbort: (handler) => {
+        abortHandlers.add(handler);
+        if (aborted) handler();
+        return () => {
+          abortHandlers.delete(handler);
+        };
+      },
+    };
     const kick = (): void => {
       waiting?.();
     };
@@ -422,6 +439,7 @@ export class CodexProvider implements AgentProvider {
             () => {
               initYielded = true;
             },
+            { abortSignal },
           );
           // A terminal interruption (timeout / turn failure) ENDS the whole
           // query stream — mirrors opencode-container.ts:1238-1240. Without this
@@ -449,7 +467,9 @@ export class CodexProvider implements AgentProvider {
         kick();
       },
       abort: () => {
+        if (aborted) return;
         aborted = true;
+        for (const handler of [...abortHandlers]) handler();
         kick();
       },
       events: gen(),
@@ -472,16 +492,29 @@ export async function* runOneTurn(
   hasInit: () => boolean,
   markInit: () => void,
   deps: {
-    clock: CodexTimingClock;
-    setTimer: (ms: number, cb: () => void) => ReturnType<typeof setTimeout>;
-    startTurn: typeof startCodexTurn;
-  } = { clock: REAL_CLOCK, setTimer: (ms, cb) => setTimeout(cb, ms), startTurn: startCodexTurn },
+    clock?: CodexTimingClock;
+    setTimer?: (ms: number, cb: () => void) => ReturnType<typeof setTimeout>;
+    startTurn?: typeof startCodexTurn;
+    interruptTurn?: typeof interruptCodexTurn;
+    abortSignal?: CodexAbortSignal;
+  } = {},
 ): AsyncGenerator<ProviderEvent, boolean> {
+  const runDeps = {
+    clock: deps.clock ?? REAL_CLOCK,
+    setTimer: deps.setTimer ?? ((ms: number, cb: () => void) => setTimeout(cb, ms)),
+    startTurn: deps.startTurn ?? startCodexTurn,
+    interruptTurn: deps.interruptTurn ?? interruptCodexTurn,
+    abortSignal: deps.abortSignal,
+  };
   // Mutable refs via object properties — TS can't track closure assignments
   // for narrowing, but property access keeps the declared type visible.
   const turnState: { error: Error | null } = { error: null };
   let resultText = '';
   let turnDone = false;
+  let turnInterrupted = false;
+  let activeTurnId: string | undefined;
+  let abortRequested = runDeps.abortSignal?.isAborted() ?? false;
+  let interruptRequested = false;
 
   // Buffered event queue so we can `yield` across the async notification
   // callback. Each notification pushes zero or more ProviderEvents; the
@@ -493,7 +526,7 @@ export async function* runOneTurn(
     waker = null;
   };
 
-  const timers = new CodexTurnTimers(deps.clock, codexTimingConfigFromEnv());
+  const timers = new CodexTurnTimers(runDeps.clock, codexTimingConfigFromEnv());
   let terminalTimeout: 'transport' | 'absolute' | null = null;
   let liveness: import('./codex-turn-timing.js').CodexLiveness | null = null;
   let wakeHandle: ReturnType<typeof setTimeout> | null = null;
@@ -507,13 +540,33 @@ export async function* runOneTurn(
   // correlation id (F1). Undefined only when the caller has no inputId; ?? '' is
   // safe for the message builders.
   const inputId: string | undefined = turnInputId;
+  const requestInterrupt = (): void => {
+    if (!abortRequested || interruptRequested || !activeTurnId || turnDone) return;
+    const turnId = activeTurnId;
+    interruptRequested = true;
+    void runDeps.interruptTurn(server, { threadId, turnId }).catch((err) => {
+      warnStructured('codex_turn_interrupt_failed', {
+        threadId,
+        turnId,
+        inputId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      turnState.error = err instanceof Error ? err : new Error(String(err));
+      turnDone = true;
+      kick();
+    });
+  };
+  const unsubscribeAbort = runDeps.abortSignal?.onAbort(() => {
+    abortRequested = true;
+    requestInterrupt();
+  });
   const armWake = (): void => {
     // Never (re-)arm once the turn is terminal: a wedged app-server would keep
     // re-polling transport-timeout and re-arming forever (an infinite timeout
     // loop). After a terminal decision the turn is done and drains via kick().
     if (terminalTimeout || turnDone) return;
     if (wakeHandle) clearTimeout(wakeHandle);
-    wakeHandle = deps.setTimer(timers.nextWakeMs(), onWake);
+    wakeHandle = runDeps.setTimer(timers.nextWakeMs(), onWake);
   };
   function onWake(): void {
     const d = timers.poll();
@@ -554,6 +607,15 @@ export async function* runOneTurn(
         }
         break;
       }
+      case 'turn/started': {
+        const turn = params.turn as { id?: string } | undefined;
+        const turnId = turn?.id ?? (params.turnId as string | undefined);
+        if (turnId) {
+          activeTurnId = turnId;
+          requestInterrupt();
+        }
+        break;
+      }
       case 'item/agentMessage/delta': {
         const delta = params.delta as string;
         if (delta) resultText += delta;
@@ -569,9 +631,13 @@ export async function* runOneTurn(
         }
         break;
       }
-      case 'turn/completed':
+      case 'turn/completed': {
+        const turn = params.turn as { status?: string } | undefined;
+        const status = turn?.status ?? (params.status as string | undefined);
+        if (status === 'interrupted') turnInterrupted = true;
         turnDone = true;
         break;
+      }
       case 'turn/failed': {
         const e = params.error as { message?: string } | undefined;
         turnState.error = new Error(e?.message || 'Turn failed');
@@ -602,7 +668,7 @@ export async function* runOneTurn(
       buffer.push({ type: 'init', continuation: threadId });
     }
 
-    await deps.startTurn(server, { threadId, inputText, model, cwd });
+    await runDeps.startTurn(server, { threadId, inputText, model, cwd });
 
     while (true) {
       while (buffer.length > 0) {
@@ -617,6 +683,21 @@ export async function* runOneTurn(
     }
 
     while (buffer.length > 0) yield buffer.shift()!;
+
+    if (turnInterrupted) {
+      yield {
+        type: 'interruption',
+        inputId: inputId ?? '',
+        classification: 'codex_turn_interrupted',
+        severity: 'info',
+        terminal: true,
+        agentMessage: 'The Codex turn was interrupted before completing.',
+        fallbackUserMessage: 'I stopped the active Codex turn.',
+        continuationPolicy: 'preserve',
+        ...(collectedSideEffects.length > 0 ? { recoverySeed: { sideEffects: [...collectedSideEffects] } } : {}),
+      };
+      return true;
+    }
 
     if (turnState.error) {
       const classification = terminalTimeout === 'transport' ? 'codex_transport_timeout'
@@ -656,6 +737,7 @@ export async function* runOneTurn(
     return false;
   } finally {
     if (wakeHandle) clearTimeout(wakeHandle);
+    unsubscribeAbort?.();
     const idx = server.notificationHandlers.indexOf(handler);
     if (idx >= 0) server.notificationHandlers.splice(idx, 1);
   }

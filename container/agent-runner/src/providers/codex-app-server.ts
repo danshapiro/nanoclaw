@@ -530,6 +530,25 @@ export async function startCodexTurn(server: AppServer, params: TurnParams): Pro
   if (resp.error) throw new Error(`turn/start failed: ${resp.error.message}`);
 }
 
+export interface TurnInterruptParams {
+  threadId: string;
+  turnId: string;
+}
+
+export async function interruptCodexTurn(
+  server: AppServer,
+  params: TurnInterruptParams,
+  timeoutMs = 30_000,
+): Promise<void> {
+  const resp = await sendCodexRequest(
+    server,
+    'turn/interrupt',
+    { threadId: params.threadId, turnId: params.turnId },
+    timeoutMs,
+  );
+  if (resp.error) throw new Error(`turn/interrupt failed: ${resp.error.message}`);
+}
+
 // ── MCP config.toml ─────────────────────────────────────────────────────────
 // Codex discovers MCP servers by reading ~/.codex/config.toml at startup.
 // We rewrite it on every spawn from whatever mcpServers the agent-runner
