@@ -1254,6 +1254,213 @@ describe('poll-loop /stop control messages', () => {
     await loopPromise.catch(() => {});
   });
 
+  it('completes the active row when /stop lands before provider input acceptance', async () => {
+    dmMsg('stop-preaccept-init', 'long startup task');
+
+    let releaseQuery!: () => void;
+    const queryStarted = deferred();
+    const releaseReady = deferred();
+    let abortCalls = 0;
+
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query(input) {
+        queryStarted.resolve();
+        return {
+          push() {},
+          end() {
+            releaseQuery?.();
+          },
+          abort() {
+            abortCalls++;
+            releaseQuery?.();
+          },
+          events: (async function* () {
+            yield { type: 'init', continuation: 'stop-preaccept-session' };
+            await new Promise<void>((resolve) => {
+              releaseQuery = resolve;
+              releaseReady.resolve();
+            });
+            yield {
+              type: 'interruption',
+              inputId: (input as QueryInput).inputId,
+              classification: 'codex_turn_interrupted',
+              severity: 'info',
+              terminal: true,
+              agentMessage: 'interrupted',
+              fallbackUserMessage: 'provider fallback should be suppressed',
+              continuationPolicy: 'preserve',
+            };
+          })(),
+        };
+      },
+    };
+
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+    await queryStarted.promise;
+    await releaseReady.promise;
+    dmMsg('stop-preaccept-control', '/stop');
+
+    await waitFor(() => abortCalls === 1 && getAckStatus('stop-preaccept-init') === 'completed', 3000);
+    expect(getAckStatus('stop-preaccept-control')).toBe('completed');
+    expect(listRecoveryEntries(stopScope())).toHaveLength(0);
+    expect(getPendingMessages().map((m) => m.id)).not.toContain('stop-preaccept-init');
+    expect(outboundTexts()).not.toContain('provider fallback should be suppressed');
+
+    controller.abort();
+    await loopPromise.catch(() => {});
+  });
+
+  it('completes same-route pending follow-ups that arrive beside active /stop', async () => {
+    dmMsg('stop-active-mixed-init', 'long task');
+
+    let releaseQuery!: () => void;
+    const queryStarted = deferred();
+    const releaseReady = deferred();
+    const pushes: QueryTurnInput[] = [];
+    let abortCalls = 0;
+
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query(input) {
+        queryStarted.resolve();
+        return {
+          push(message) {
+            pushes.push(typeof message === 'string' ? { inputId: 'legacy', prompt: message } : message);
+          },
+          end() {
+            releaseQuery?.();
+          },
+          abort() {
+            abortCalls++;
+            releaseQuery?.();
+          },
+          events: (async function* () {
+            yield { type: 'init', continuation: 'stop-active-mixed-session' };
+            yield { type: 'input-accepted', inputId: (input as QueryInput).inputId, scope: 'initial' };
+            await new Promise<void>((resolve) => {
+              releaseQuery = resolve;
+              releaseReady.resolve();
+            });
+            yield {
+              type: 'interruption',
+              inputId: (input as QueryInput).inputId,
+              classification: 'codex_turn_interrupted',
+              severity: 'info',
+              terminal: true,
+              agentMessage: 'interrupted',
+              fallbackUserMessage: 'provider fallback should be suppressed',
+              continuationPolicy: 'preserve',
+            };
+          })(),
+        };
+      },
+    };
+
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+    await queryStarted.promise;
+    await releaseReady.promise;
+    dmMsg('stop-active-mixed-followup', 'please also do this');
+    dmMsg('stop-active-mixed-control', '/stop');
+
+    await waitFor(() => abortCalls === 1 && getAckStatus('stop-active-mixed-followup') === 'completed', 3000);
+    expect(getAckStatus('stop-active-mixed-control')).toBe('completed');
+    expect(getAckStatus('stop-active-mixed-init')).toBe('completed');
+    expect(pushes).toHaveLength(0);
+    expect(listRecoveryEntries(stopScope())).toHaveLength(0);
+
+    controller.abort();
+    await loopPromise.catch(() => {});
+  });
+
+  it('resolves resumed recovery ownership when /stop cancels the resumed turn', async () => {
+    dmMsg('stop-recovery-trigger', 'resume the old work');
+    const scope = stopScope();
+    const now = new Date().toISOString();
+    appendRecoveryEntry(scope, {
+      id: 'stop-rec-1',
+      status: 'pending',
+      classification: 'terminal_interruption_accepted_unresolved',
+      agentMessage: 'I was interrupted mid-turn and will resume this work.',
+      fallbackUserMessage: 'I still have your earlier request.',
+      originalTasks: [{ messageId: 'stop-recovery-prior', text: 'older interrupted work', timestamp: now }],
+      acceptedUnresolvedInputs: [
+        { inputId: 'stop-recovery-input', messageIds: ['stop-recovery-prior'], prompt: 'older interrupted work' },
+      ],
+      pendingFollowups: [],
+      priorProgress: [],
+      observations: [],
+      sideEffects: [],
+      continuationPolicy: 'preserve',
+      createdAt: now,
+      updatedAt: now,
+    });
+    markRecoveryOwned(['stop-recovery-prior'], 'stop-rec-1');
+
+    let releaseQuery!: () => void;
+    const queryStarted = deferred();
+    const releaseReady = deferred();
+    let abortCalls = 0;
+
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query(input) {
+        queryStarted.resolve();
+        return {
+          push() {},
+          end() {
+            releaseQuery?.();
+          },
+          abort() {
+            abortCalls++;
+            releaseQuery?.();
+          },
+          events: (async function* () {
+            yield { type: 'init', continuation: 'stop-recovery-session' };
+            yield { type: 'input-accepted', inputId: (input as QueryInput).inputId, scope: 'initial' };
+            await new Promise<void>((resolve) => {
+              releaseQuery = resolve;
+              releaseReady.resolve();
+            });
+            yield {
+              type: 'interruption',
+              inputId: (input as QueryInput).inputId,
+              classification: 'codex_turn_interrupted',
+              severity: 'info',
+              terminal: true,
+              agentMessage: 'interrupted',
+              fallbackUserMessage: 'provider fallback should be suppressed',
+              continuationPolicy: 'preserve',
+            };
+          })(),
+        };
+      },
+    };
+
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+    await queryStarted.promise;
+    await releaseReady.promise;
+    await waitFor(() => listRecoveryEntries(scope)[0]?.status === 'in_flight', 3000);
+    dmMsg('stop-recovery-control', '/stop');
+
+    await waitFor(() => abortCalls === 1 && getAckStatus('stop-recovery-prior') === 'completed', 3000);
+    expect(getAckStatus('stop-recovery-trigger')).toBe('completed');
+    expect(getAckStatus('stop-recovery-control')).toBe('completed');
+    expect(listRecoveryEntries(scope).map((e) => e.status)).toEqual(['resolved']);
+
+    controller.abort();
+    await loopPromise.catch(() => {});
+  });
+
   it('acknowledges a lone /stop without starting the provider', async () => {
     dmMsg('stop-idle-control', '\n/Stop\t');
 

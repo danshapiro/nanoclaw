@@ -624,10 +624,7 @@ type ProviderStatusState = {
   terminalFallbackSent: boolean;
 };
 
-type ProviderStatusAction =
-  | { kind: 'write'; text: string }
-  | { kind: 'log'; event: string }
-  | { kind: 'none' };
+type ProviderStatusAction = { kind: 'write'; text: string } | { kind: 'log'; event: string } | { kind: 'none' };
 
 export function decideProviderStatusAction(state: ProviderStatusState, event: ProviderEvent): ProviderStatusAction {
   if (event.type === 'notice' && event.classification === 'inactivity') {
@@ -761,17 +758,18 @@ async function processQuery(
     // Recovery is consumed ONLY on success, never on mere acceptance (Inv. 140).
     // The resuming turn supersedes the entry's own accepted-unresolved inputs, so
     // we resolve against THOSE owned input ids (not the new top-level id).
-    if (topLevelResolved && ledgerCtx.resumableRecoveryIds.length > 0) {
-      const entries = listRecoveryEntries(ledgerCtx.activeRouteScope);
-      for (const recId of ledgerCtx.resumableRecoveryIds) {
-        const ownedInputIds = (entries.find((e) => e.id === recId)?.acceptedUnresolvedInputs ?? []).map(
-          (a) => a.inputId,
-        );
-        const res = resolveRecoveryEntry(ledgerCtx.activeRouteScope, recId, { resolvedInputIds: ownedInputIds });
-        if (res.resolvedMessageIds.length > 0) markRecoveryCompleted(res.resolvedMessageIds, recId);
-      }
-    }
+    if (topLevelResolved) completeResumedRecoveryEntries();
     if (idsToComplete.length > 0) markCompleted(idsToComplete);
+  }
+
+  function completeResumedRecoveryEntries(): void {
+    if (ledgerCtx.resumableRecoveryIds.length === 0) return;
+    const entries = listRecoveryEntries(ledgerCtx.activeRouteScope);
+    for (const recId of ledgerCtx.resumableRecoveryIds) {
+      const ownedInputIds = (entries.find((e) => e.id === recId)?.acceptedUnresolvedInputs ?? []).map((a) => a.inputId);
+      const res = resolveRecoveryEntry(ledgerCtx.activeRouteScope, recId, { resolvedInputIds: ownedInputIds });
+      if (res.resolvedMessageIds.length > 0) markRecoveryCompleted(res.resolvedMessageIds, recId);
+    }
   }
 
   function hasMissingVisibleReply(inputIds: string[]): boolean {
@@ -816,8 +814,9 @@ async function processQuery(
     const stopMessages = routeMessages.filter(isStopControlMessage);
     if (stopMessages.length > 0) {
       const stopIds = stopMessages.map((m) => m.id);
-      markProcessing(stopIds);
-      markCompleted(stopIds);
+      const sameRouteIds = routeMessages.map((m) => m.id);
+      markProcessing(sameRouteIds);
+      markCompleted(sameRouteIds);
       if (!userStopRequested) {
         userStopRequested = true;
         writeRoutedMessage(routing, STOP_ACTIVE_ACK);
@@ -827,6 +826,7 @@ async function processQuery(
             event: 'active_stop_requested',
             route_key: ledgerCtx.activeRouteKey,
             message_ids: stopIds,
+            completed_same_route_message_ids: sameRouteIds,
           }),
         );
         query.abort();
@@ -1065,98 +1065,95 @@ async function processQuery(
     clearInterval(pollHandle);
     signal?.removeEventListener('abort', abortQuery);
 
-    // Terminal handling for un-resolved ledger entries. Two dispositions
-    // (Invariants 160/161/162):
-    //  - UNACCEPTED claimed rows (queued) → returned to pending so a later wake
-    //    retries them (never stranded in 'processing').
-    //  - ACCEPTED-but-unresolved rows → moved into recovery OWNERSHIP with an
-    //    enriched recovery payload, in ONE atomic transaction; NOT completed and
-    //    NOT returned to pending (the SDK accepted them, so a bare retry would
-    //    drop work the provider may have partially done).
+    // Terminal handling for un-resolved ledger entries. User-requested stop is a
+    // discard/complete path; ordinary terminal interruptions keep the existing
+    // retry/recovery split (Invariants 160/161/162).
     const acceptedUnresolved = [...ledger.values()].filter((e) => e.state === 'accepted');
-    if (acceptedUnresolved.length > 0) {
-      if (userStopRequested) {
-        const idsToComplete: string[] = [];
-        for (const entry of acceptedUnresolved) {
-          idsToComplete.push(...entry.messageIds);
-          entry.state = 'resolved';
-        }
-        markCompleted(idsToComplete);
+    if (userStopRequested) {
+      const idsToComplete: string[] = [];
+      for (const entry of ledger.values()) {
+        if (entry.state !== 'queued' && entry.state !== 'accepted') continue;
+        idsToComplete.push(...entry.messageIds);
+        entry.state = 'resolved';
+      }
+      markCompleted(idsToComplete);
+      completeResumedRecoveryEntries();
+      if (idsToComplete.length > 0) {
         log(
           JSON.stringify({
             severity: 'info',
-            event: 'user_stop_completed_accepted_unresolved',
+            event: 'user_stop_completed_unresolved_inputs',
             route_key: ledgerCtx.activeRouteKey,
             message_ids: idsToComplete,
           }),
         );
-      } else {
-        const scope = ledgerCtx.activeRouteScope;
-        const now = new Date().toISOString();
-        // Harvest route-scoped progress / MCP send_message rows written during the
-        // accepted-input window — ONLY for the active route, so a shared session's
-        // other conversation can never leak in (Invariants 167; A2).
-        const priorProgress = harvestRouteScopedProgress(scope.routeKey).map((p) => ({
-          messageOutId: p.messageOutId,
-          text: p.text,
-          source: p.source,
-          timestamp: p.timestamp,
-        }));
-        const recoveryId = recoveryIdFor(scope.routeKey);
-        const ownedIds: string[] = [];
-        const acceptedUnresolvedInputs = acceptedUnresolved.map((e) => {
-          ownedIds.push(...e.messageIds);
-          return { inputId: e.inputId, messageIds: [...e.messageIds], prompt: e.prompt };
-        });
-        const entry: ProviderRecoveryEntry = {
-          id: recoveryId,
-          status: 'pending',
-          classification: zombieFailureCleared
-            ? 'continuation_zombie_restart'
-            : 'terminal_interruption_accepted_unresolved',
-          agentMessage: zombieFailureCleared
-            ? 'The previous session became unusable after repeated failures; I am restarting this work from scratch.'
-            : 'I was interrupted mid-turn and will resume this work.',
-          fallbackUserMessage: zombieFailureCleared
-            ? 'I had to restart your request after the session repeatedly failed — I still have it and am retrying from scratch.'
-            : 'Something interrupted me while I was working on your request. I still have it queued — no need to resend.',
-          // Ordered same-route wake-triggering rows (A3, Invariant 166).
-          originalTasks: ledgerCtx.originalTasks,
-          acceptedUnresolvedInputs,
-          pendingFollowups: [],
-          priorProgress,
-          observations: [],
-          // Provider-collected side-effect evidence (Step 7) so the next Yente
-          // turn reports existing work rather than duplicating it.
-          sideEffects: [...interruptionSideEffects],
-          continuationPolicy: clearContinuationRequested ? 'clear' : 'preserve',
-          attemptedContinuation: queryContinuation,
-          createdAt: now,
-          updatedAt: now,
-        };
-        try {
-          const res = appendRecoveryEntryAndOwnRows(scope, entry, ownedIds, { recoveryId });
-          if (res.pressureExceeded) {
-            // Fail closed: don't complete or lose the rows. Write one user-visible
-            // fallback and leave the rows claimed (recovery pressure is structurally
-            // alerted; host sweep is the backstop).
-            writeMissingVisibleReplyError(routing);
-          } else {
-            for (const e of acceptedUnresolved) e.state = 'recovery_owned';
-          }
-        } catch (recErr) {
-          // Atomic transaction rolled back (no partial state). Surface a structured
-          // alert; the rows remain in 'processing' and stay retryable.
-          log(
-            JSON.stringify({
-              severity: 'error',
-              event: 'recovery_ownership_failed',
-              route_key: scope.routeKey,
-              recovery_id: recoveryId,
-              error: recErr instanceof Error ? recErr.message : String(recErr),
-            }),
-          );
+      }
+    } else if (acceptedUnresolved.length > 0) {
+      const scope = ledgerCtx.activeRouteScope;
+      const now = new Date().toISOString();
+      // Harvest route-scoped progress / MCP send_message rows written during the
+      // accepted-input window — ONLY for the active route, so a shared session's
+      // other conversation can never leak in (Invariants 167; A2).
+      const priorProgress = harvestRouteScopedProgress(scope.routeKey).map((p) => ({
+        messageOutId: p.messageOutId,
+        text: p.text,
+        source: p.source,
+        timestamp: p.timestamp,
+      }));
+      const recoveryId = recoveryIdFor(scope.routeKey);
+      const ownedIds: string[] = [];
+      const acceptedUnresolvedInputs = acceptedUnresolved.map((e) => {
+        ownedIds.push(...e.messageIds);
+        return { inputId: e.inputId, messageIds: [...e.messageIds], prompt: e.prompt };
+      });
+      const entry: ProviderRecoveryEntry = {
+        id: recoveryId,
+        status: 'pending',
+        classification: zombieFailureCleared
+          ? 'continuation_zombie_restart'
+          : 'terminal_interruption_accepted_unresolved',
+        agentMessage: zombieFailureCleared
+          ? 'The previous session became unusable after repeated failures; I am restarting this work from scratch.'
+          : 'I was interrupted mid-turn and will resume this work.',
+        fallbackUserMessage: zombieFailureCleared
+          ? 'I had to restart your request after the session repeatedly failed — I still have it and am retrying from scratch.'
+          : 'Something interrupted me while I was working on your request. I still have it queued — no need to resend.',
+        // Ordered same-route wake-triggering rows (A3, Invariant 166).
+        originalTasks: ledgerCtx.originalTasks,
+        acceptedUnresolvedInputs,
+        pendingFollowups: [],
+        priorProgress,
+        observations: [],
+        // Provider-collected side-effect evidence (Step 7) so the next Yente
+        // turn reports existing work rather than duplicating it.
+        sideEffects: [...interruptionSideEffects],
+        continuationPolicy: clearContinuationRequested ? 'clear' : 'preserve',
+        attemptedContinuation: queryContinuation,
+        createdAt: now,
+        updatedAt: now,
+      };
+      try {
+        const res = appendRecoveryEntryAndOwnRows(scope, entry, ownedIds, { recoveryId });
+        if (res.pressureExceeded) {
+          // Fail closed: don't complete or lose the rows. Write one user-visible
+          // fallback and leave the rows claimed (recovery pressure is structurally
+          // alerted; host sweep is the backstop).
+          writeMissingVisibleReplyError(routing);
+        } else {
+          for (const e of acceptedUnresolved) e.state = 'recovery_owned';
         }
+      } catch (recErr) {
+        // Atomic transaction rolled back (no partial state). Surface a structured
+        // alert; the rows remain in 'processing' and stay retryable.
+        log(
+          JSON.stringify({
+            severity: 'error',
+            event: 'recovery_ownership_failed',
+            route_key: scope.routeKey,
+            recovery_id: recoveryId,
+            error: recErr instanceof Error ? recErr.message : String(recErr),
+          }),
+        );
       }
     }
 

@@ -40,6 +40,7 @@ export function parseYenteHostCommandFromContent(content: string): YenteHostComm
   }
 
   const bare = text.toLowerCase();
+  if (bare === 'stop') return null;
   return isYenteCommand(bare) ? bare : null;
 }
 

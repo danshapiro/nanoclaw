@@ -99,7 +99,7 @@ describe('parseYenteHostCommandFromContent', () => {
     expect(parseYenteHostCommandFromContent('new')).toBe('new');
     expect(parseYenteHostCommandFromContent('clear')).toBe('clear');
     expect(parseYenteHostCommandFromContent('compact')).toBe('compact');
-    expect(parseYenteHostCommandFromContent('stop')).toBe('stop');
+    expect(parseYenteHostCommandFromContent('stop')).toBeNull();
     expect(parseYenteHostCommandFromContent('status please')).toBeNull();
     expect(parseYenteHostCommandFromContent('new session')).toBeNull();
     expect(parseYenteHostCommandFromContent('clear history')).toBeNull();
@@ -189,5 +189,7 @@ describe('handleYenteHostCommand', () => {
     expect(compact).toEqual({ handled: false });
     const stop = await handleYenteHostCommand(context('/stop', 'discord:admin'));
     expect(stop).toEqual({ handled: false });
+    const bareStop = await handleYenteHostCommand(context('stop', 'discord:admin'));
+    expect(bareStop).toEqual({ handled: false });
   });
 });
