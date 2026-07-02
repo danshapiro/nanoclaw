@@ -185,23 +185,13 @@ describe('codex host provider container config', () => {
       expect(contribution.env?.YENTE_CODEX_ONECLI_NATIVE).toBe('1');
       expect(contribution.env?.HTTPS_PROXY).toContain('aoc_test_agent_token');
       expect(contribution.env?.NO_PROXY?.split(',')).toEqual(
-        expect.arrayContaining([
-          '127.0.0.1',
-          'localhost',
-          'registry.npmjs.org',
-          'internal.example',
-          'yente-gws-proxy.local',
-          'yente-msgvault-proxy.local',
-          'yente-familiar-proxy.local',
-          'yente-nyne-proxy.local',
-          'yente-browser-handoff.local',
-        ]),
+        expect.arrayContaining(['127.0.0.1', 'localhost', 'registry.npmjs.org', 'internal.example']),
       );
       expect(contribution.env?.no_proxy?.split(',')).toEqual(
+        expect.arrayContaining(['127.0.0.1', 'localhost', 'registry.npmjs.org']),
+      );
+      expect(contribution.env?.NO_PROXY?.split(',')).not.toEqual(
         expect.arrayContaining([
-          '127.0.0.1',
-          'localhost',
-          'registry.npmjs.org',
           'yente-gws-proxy.local',
           'yente-msgvault-proxy.local',
           'yente-familiar-proxy.local',

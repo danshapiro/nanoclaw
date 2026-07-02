@@ -823,6 +823,7 @@ describe('session wake lifecycle', () => {
       expect(effectiveEnv.get('HTTPS_PROXY')).toBe('http://agent-token@yente-onecli-auth-gate.local:18055');
       expect(effectiveEnv.get('http_proxy')).toBe('http://agent-token@yente-onecli-auth-gate.local:18055');
       expect(effectiveEnv.get('https_proxy')).toBe('http://agent-token@yente-onecli-auth-gate.local:18055');
+      expect(effectiveEnv.get('YENTE_ONECLI_GATEWAY_PROXY_URL')).toBe('http://agent@host.docker.internal:10255');
       expect(args).toContain('--add-host=yente-onecli-auth-gate.local:host-gateway');
     } finally {
       harness.close();

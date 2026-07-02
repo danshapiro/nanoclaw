@@ -73,6 +73,15 @@ import {
 import type { AgentGroup, Session } from './types.js';
 
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
+const YENTE_ONECLI_GATEWAY_PROXY_URL_ENV = 'YENTE_ONECLI_GATEWAY_PROXY_URL';
+const ONECLI_GATEWAY_PROXY_ENV_KEYS = [
+  'HTTP_PROXY',
+  'http_proxy',
+  'HTTPS_PROXY',
+  'https_proxy',
+  'ALL_PROXY',
+  'all_proxy',
+] as const;
 
 /** Active containers tracked by session ID. */
 type ActiveContainer = { process: ChildProcess; containerName: string };
@@ -1116,6 +1125,10 @@ export async function applyOneCliGatewayForContainerArgs(
       agent: context.agentIdentifier,
     });
     assertOneCliApplied(applied);
+    const gatewayProxyUrl = latestDockerEnvValue(args, ONECLI_GATEWAY_PROXY_ENV_KEYS);
+    if (gatewayProxyUrl) {
+      args.push('-e', `${YENTE_ONECLI_GATEWAY_PROXY_URL_ENV}=${gatewayProxyUrl}`);
+    }
     log.info('OneCLI gateway applied', { containerName: context.containerName });
   } catch (err) {
     if (err instanceof Error && err.message.startsWith('OneCLI gateway did not apply')) {
@@ -1126,6 +1139,18 @@ export async function applyOneCliGatewayForContainerArgs(
       { cause: err },
     );
   }
+}
+
+function latestDockerEnvValue(args: readonly string[], keys: readonly string[]): string | undefined {
+  const keySet = new Set(keys);
+  for (let index = args.length - 2; index >= 0; index--) {
+    if (args[index] !== '-e') continue;
+    const entry = args[index + 1];
+    const eq = entry.indexOf('=');
+    if (eq <= 0) continue;
+    if (keySet.has(entry.slice(0, eq))) return entry.slice(eq + 1);
+  }
+  return undefined;
 }
 
 function shellSingleQuote(value: string): string {

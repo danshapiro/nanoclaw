@@ -249,6 +249,40 @@ describe('gws proxy shim', () => {
     ]);
   });
 
+  it('prefers the captured OneCLI gateway proxy over the Codex auth-gate proxy', async () => {
+    const records: RequestRecord[] = [];
+    const onecliGateway = await withProxy((req, res, body) => {
+      records.push({
+        method: req.method,
+        url: req.url,
+        authorization: req.headers.authorization,
+        contentType: headerValue(req.headers['content-type']),
+        body,
+      });
+      res.writeHead(200, { 'Content-Type': 'text/plain', 'X-Exit-Code': '0' });
+      res.end('generic-onecli-proxy-ok');
+    });
+
+    const result = await runShim(['gmail', '+triage'], {
+      GWS_PROXY_URL: 'http://yente-gws-proxy.local:8083',
+      HTTP_PROXY: 'http://codex-agent@yente-onecli-auth-gate.local:18055',
+      http_proxy: 'http://codex-agent@yente-onecli-auth-gate.local:18055',
+      YENTE_ONECLI_GATEWAY_PROXY_URL: onecliGateway.url,
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe('generic-onecli-proxy-ok');
+    expect(records).toEqual([
+      {
+        method: 'POST',
+        url: 'http://yente-gws-proxy.local:8083/exec',
+        authorization: undefined,
+        contentType: 'application/json',
+        body: JSON.stringify({ args: ['gmail', '+triage'] }),
+      },
+    ]);
+  });
+
   it('forces the configured proxy even when NO_PROXY would otherwise match the mediated host', async () => {
     const records: RequestRecord[] = [];
     const onecliGateway = await withProxy((req, res, body) => {
