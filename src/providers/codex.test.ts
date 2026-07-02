@@ -137,6 +137,7 @@ describe('codex host provider container config', () => {
           CODEX_MODEL: 'ignored-by-container-config',
           CODEX_REASONING_EFFORT: 'low',
           OPENAI_BASE_URL: 'https://chatgpt.com/backend-api/',
+          NO_PROXY: 'internal.example',
         },
         groupModel: 'gpt-5.4',
         groupReasoningEffort: 'medium',
@@ -183,6 +184,31 @@ describe('codex host provider container config', () => {
       expect(contribution.env?.OPENAI_BASE_URL).toBe('https://chatgpt.com/backend-api/');
       expect(contribution.env?.YENTE_CODEX_ONECLI_NATIVE).toBe('1');
       expect(contribution.env?.HTTPS_PROXY).toContain('aoc_test_agent_token');
+      expect(contribution.env?.NO_PROXY?.split(',')).toEqual(
+        expect.arrayContaining([
+          '127.0.0.1',
+          'localhost',
+          'registry.npmjs.org',
+          'internal.example',
+          'yente-gws-proxy.local',
+          'yente-msgvault-proxy.local',
+          'yente-familiar-proxy.local',
+          'yente-nyne-proxy.local',
+          'yente-browser-handoff.local',
+        ]),
+      );
+      expect(contribution.env?.no_proxy?.split(',')).toEqual(
+        expect.arrayContaining([
+          '127.0.0.1',
+          'localhost',
+          'registry.npmjs.org',
+          'yente-gws-proxy.local',
+          'yente-msgvault-proxy.local',
+          'yente-familiar-proxy.local',
+          'yente-nyne-proxy.local',
+          'yente-browser-handoff.local',
+        ]),
+      );
       expect(contribution.extraHosts).toContain('yente-onecli-auth-gate.local');
     } finally {
       await broker.close();
