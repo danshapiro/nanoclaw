@@ -1034,19 +1034,22 @@ async function buildContainerArgs(
     args.push('-e', `GWS_SIDE_EFFECT_VERIFY_KEY=${sideEffectVerifyKey}`);
   }
 
-  // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
-  if (providerContribution.env) {
-    for (const [key, value] of Object.entries(providerContribution.env)) {
-      args.push('-e', `${key}=${value}`);
-    }
-  }
-
   await applyOneCliGatewayForContainerArgs(args, {
     client: onecli,
     containerName,
     agentGroupName: agentGroup.name,
     agentIdentifier,
   });
+
+  // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
+  // Keep these after the generic OneCLI gateway contribution so providers with
+  // stricter proxy boundaries, such as Codex's auth-gated OneCLI proxy, remain
+  // the final Docker env values when keys overlap.
+  if (providerContribution.env) {
+    for (const [key, value] of Object.entries(providerContribution.env)) {
+      args.push('-e', `${key}=${value}`);
+    }
+  }
 
   // Host gateway
   args.push(

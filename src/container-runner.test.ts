@@ -85,7 +85,7 @@ async function loadContainerRunnerHarness(
     cb(null, '', '');
   });
   const execSyncMock = vi.fn();
-  const applyContainerConfigMock = vi.fn(async () => {
+  const applyContainerConfigMock = vi.fn(async (_args: string[]) => {
     oneCliStarted.resolve();
     await oneCliRelease.promise;
     return true;
@@ -767,6 +767,63 @@ describe('session wake lifecycle', () => {
       expect(args).toContain('GWS_PROXY_URL=http://yente-gws-proxy.local:8083');
       expect(args).toContain('--add-host=yente-browser-handoff.local:host-gateway');
       expect(args).toContain('--add-host=yente-gws-proxy.local:host-gateway');
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('keeps provider proxy env after generic OneCLI gateway env', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      const { registerProviderContainerConfig } = await import('./providers/provider-container-registry.js');
+      registerProviderContainerConfig('codex', () => ({
+        env: {
+          HTTP_PROXY: 'http://agent-token@yente-onecli-auth-gate.local:18055',
+          HTTPS_PROXY: 'http://agent-token@yente-onecli-auth-gate.local:18055',
+          http_proxy: 'http://agent-token@yente-onecli-auth-gate.local:18055',
+          https_proxy: 'http://agent-token@yente-onecli-auth-gate.local:18055',
+        },
+        extraHosts: ['yente-onecli-auth-gate.local'],
+      }));
+      harness.applyContainerConfigMock.mockImplementation(async (args: string[]) => {
+        harness.oneCliStarted.resolve();
+        args.push('-e', 'HTTP_PROXY=http://agent@host.docker.internal:10255');
+        args.push('-e', 'HTTPS_PROXY=http://agent@host.docker.internal:10255');
+        args.push('-e', 'http_proxy=http://agent@host.docker.internal:10255');
+        args.push('-e', 'https_proxy=http://agent@host.docker.internal:10255');
+        await harness.oneCliRelease.promise;
+        return true;
+      });
+      fs.mkdirSync(path.join(harness.groupsDir, 'agent'), { recursive: true });
+      fs.writeFileSync(
+        path.join(harness.groupsDir, 'agent', 'container.json'),
+        JSON.stringify({
+          mcpServers: {},
+          packages: { apt: [], npm: [] },
+          additionalMounts: [],
+          skills: 'all',
+          provider: 'codex',
+        }),
+      );
+
+      const wake = harness.containerRunner.wakeContainer(harness.session);
+      await harness.oneCliStarted.promise;
+      harness.oneCliRelease.resolve();
+      await wake;
+
+      const args = harness.spawnMock.mock.calls[0][1];
+      const effectiveEnv = new Map<string, string>();
+      for (let index = 0; index < args.length - 1; index++) {
+        if (args[index] !== '-e') continue;
+        const entry = args[index + 1];
+        const eq = entry.indexOf('=');
+        if (eq > 0) effectiveEnv.set(entry.slice(0, eq), entry.slice(eq + 1));
+      }
+      expect(effectiveEnv.get('HTTP_PROXY')).toBe('http://agent-token@yente-onecli-auth-gate.local:18055');
+      expect(effectiveEnv.get('HTTPS_PROXY')).toBe('http://agent-token@yente-onecli-auth-gate.local:18055');
+      expect(effectiveEnv.get('http_proxy')).toBe('http://agent-token@yente-onecli-auth-gate.local:18055');
+      expect(effectiveEnv.get('https_proxy')).toBe('http://agent-token@yente-onecli-auth-gate.local:18055');
+      expect(args).toContain('--add-host=yente-onecli-auth-gate.local:host-gateway');
     } finally {
       harness.close();
     }
