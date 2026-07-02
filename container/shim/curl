@@ -1,0 +1,35 @@
+#!/bin/sh
+# curl wrapper for Yente local service proxies.
+#
+# Codex containers use an auth-gate proxy for model traffic, but Yente-local
+# service URLs still need the generic OneCLI gateway so service credentials can
+# be injected. Route only those known local proxy hosts through the saved
+# generic gateway, and otherwise behave exactly like system curl.
+
+set -eu
+
+real_curl="${NANOCLAW_REAL_CURL:-/usr/bin/curl}"
+onecli_proxy="${YENTE_ONECLI_GATEWAY_PROXY_URL:-}"
+
+uses_explicit_proxy=0
+targets_yente_service=0
+
+for arg in "$@"; do
+  case "$arg" in
+    --proxy|--proxy=*|--preproxy|--preproxy=*|--noproxy|--noproxy=*|-x|-x*)
+      uses_explicit_proxy=1
+      ;;
+  esac
+
+  case "$arg" in
+    *yente-browser-handoff.local*|*yente-familiar-proxy.local*|*yente-gws-proxy.local*|*yente-msgvault-proxy.local*|*yente-nyne-proxy.local*)
+      targets_yente_service=1
+      ;;
+  esac
+done
+
+if [ -n "$onecli_proxy" ] && [ "$uses_explicit_proxy" -eq 0 ] && [ "$targets_yente_service" -eq 1 ]; then
+  exec "$real_curl" --noproxy "" --proxy "$onecli_proxy" "$@"
+fi
+
+exec "$real_curl" "$@"

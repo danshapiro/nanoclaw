@@ -84,7 +84,8 @@ describe('agent container Dockerfile', () => {
     const dockerfile = fs.readFileSync(path.join(process.cwd(), 'container', 'Dockerfile'), 'utf8');
 
     expect(dockerfile).toContain('COPY shim/gws /usr/local/bin/gws');
-    expect(dockerfile).toContain('chmod +x /usr/local/bin/gws');
+    expect(dockerfile).toContain('COPY shim/curl /usr/local/bin/curl');
+    expect(dockerfile).toContain('chmod +x /usr/local/bin/gws /usr/local/bin/curl');
     expect(dockerfile).not.toContain('GWS_CLI_VERSION');
     expect(dockerfile).not.toContain('@googleworkspace/cli');
   });

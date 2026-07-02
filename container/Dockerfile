@@ -160,7 +160,8 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
 # files. This CLI-shaped shim forwards to gws-proxy; OneCLI injects the proxy
 # authorization header for the configured GWS_PROXY_URL host.
 COPY shim/gws /usr/local/bin/gws
-RUN chmod +x /usr/local/bin/gws
+COPY shim/curl /usr/local/bin/curl
+RUN chmod +x /usr/local/bin/gws /usr/local/bin/curl
 
 # ---- Entrypoint --------------------------------------------------------------
 COPY entrypoint.sh /app/entrypoint.sh
