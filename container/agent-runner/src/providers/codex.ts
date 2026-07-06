@@ -510,6 +510,7 @@ export async function* runOneTurn(
   // for narrowing, but property access keeps the declared type visible.
   const turnState: { error: Error | null } = { error: null };
   let resultText = '';
+  let turnErrorText: string | null = null;
   let turnDone = false;
   let turnInterrupted = false;
   let activeTurnId: string | undefined;
@@ -632,9 +633,10 @@ export async function* runOneTurn(
         break;
       }
       case 'turn/completed': {
-        const turn = params.turn as { status?: string } | undefined;
+        const turn = params.turn as { status?: string; error?: { message?: string } } | undefined;
         const status = turn?.status ?? (params.status as string | undefined);
         if (status === 'interrupted') turnInterrupted = true;
+        if (!abortRequested && turn?.error?.message) turnErrorText = turn.error.message;
         turnDone = true;
         break;
       }
@@ -646,6 +648,17 @@ export async function* runOneTurn(
           turnState.error = new Error(e?.message || 'Turn failed');
         }
         turnDone = true;
+        break;
+      }
+      case 'error': {
+        // Top-level error notification (e.g. usage-limit/quota) that does NOT
+        // arrive as turn/failed. Capture the provider's verbatim text so the poll
+        // loop can surface it instead of the generic empty-reply fallback. Do not
+        // set turnDone/turnState.error — turn/completed still drives termination.
+        if (!abortRequested) {
+          const msg = (params.error as { message?: string } | undefined)?.message;
+          if (msg) turnErrorText = msg;
+        }
         break;
       }
       case 'thread/status/changed': {
@@ -736,6 +749,9 @@ export async function* runOneTurn(
       text: resultText || null,
       inputId: turnInputId,
       resolvedInputIds: turnInputId ? [turnInputId] : [],
+      // Empty turn + provider reason (e.g. usage limit): carry it verbatim so the
+      // poll loop surfaces it instead of the generic empty-reply fallback.
+      ...(resultText ? {} : turnErrorText ? { errorText: turnErrorText } : {}),
     };
     // Non-terminal: the outer loop continues to drain the next pending input.
     return false;

@@ -782,13 +782,13 @@ async function processQuery(
     });
   }
 
-  function settleInitialBatch(topLevelResolved: boolean): void {
+  function settleInitialBatch(topLevelResolved: boolean, providerErrorText: string | null = null): void {
     if (initialBatchSettled) return;
     if (!topLevelResolved) return;
     initialBatchSettled = true;
 
     if (hasMissingVisibleReply([ledgerCtx.topLevelInputId])) {
-      writeMissingVisibleReplyError(routing);
+      writeMissingVisibleReplyError(routing, providerErrorText);
     }
   }
 
@@ -1007,6 +1007,7 @@ async function processQuery(
           );
           continue;
         }
+        const currentResultErrorText = !event.text ? (event.errorText ?? null) : null;
         // A result — with or without text — means a turn segment is done.
         // Resolve exact input ids first without mutating the ledger, then dispatch
         // text so reply accounting sees direct result text and MCP send_message
@@ -1054,12 +1055,12 @@ async function processQuery(
         // A successful result on this continuation resets the zombie backstop —
         // the session proved live.
         if (queryContinuation) resetZombieCounter(providerName, queryContinuation, config?.provider.continuationScope);
-        settleInitialBatch(resolved.includes(ledgerCtx.topLevelInputId));
+        settleInitialBatch(resolved.includes(ledgerCtx.topLevelInputId), currentResultErrorText);
       }
     }
 
     // Stream ended. Settle reply accounting for the initial batch.
-    settleInitialBatch(topLevelResolvedAtLeastOnce);
+    settleInitialBatch(topLevelResolvedAtLeastOnce, null);
   } finally {
     done = true;
     clearInterval(pollHandle);
@@ -1208,7 +1209,36 @@ function countOutboundVisibleReplyMessages(routing: RoutingContext): number {
   return row.count;
 }
 
-function writeMissingVisibleReplyError(routing: RoutingContext): void {
+const PROVIDER_ERROR_MAX_LEN = 500;
+/**
+ * Defense-in-depth for surfacing provider error text to a user channel: strip
+ * control chars, redact secret-shaped substrings (API keys, bearer tokens,
+ * OneCLI gateway `aoc_` proxy tokens, token-bearing query params), and cap
+ * length. Usage-limit / quota text passes through unchanged.
+ */
+function sanitizeProviderErrorText(raw: string): string {
+  let s = raw.replace(/[\u0000-\u001F\u007F]/g, ' ').replace(/\s+/g, ' ').trim();
+  s = s
+    .replace(/\b(?:sk|rk|pk)-[A-Za-z0-9_-]{8,}/g, '[redacted-key]')
+    .replace(/\baoc_[A-Za-z0-9]{16,}/g, '[redacted-token]')
+    .replace(/\bBearer\s+[A-Za-z0-9._-]+/gi, 'Bearer [redacted]')
+    .replace(/([?&](?:token|api[_-]?key|secret|password|sig|access_token)=)[^\s&]+/gi, '$1[redacted]');
+  return s.length > PROVIDER_ERROR_MAX_LEN ? s.slice(0, PROVIDER_ERROR_MAX_LEN - 1) + '\u2026' : s;
+}
+
+function writeMissingVisibleReplyError(routing: RoutingContext, providerErrorText?: string | null): void {
+  const verbatim = providerErrorText?.trim();
+  if (verbatim) {
+    writeRoutedMessage(routing, sanitizeProviderErrorText(verbatim));
+    log(
+      JSON.stringify({
+        severity: 'info',
+        event: 'provider_error_surfaced_verbatim',
+        route_key: routing.routeKey ?? null,
+      }),
+    );
+    return;
+  }
   writeRoutedMessage(routing, 'Error: agent completed without sending a user-visible response in this conversation.');
 }
 

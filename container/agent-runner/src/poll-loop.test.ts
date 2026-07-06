@@ -572,6 +572,38 @@ describe('poll-loop conversational reply accounting', () => {
     await loopPromise.catch(() => {});
   });
 
+  it('surfaces provider error text verbatim when a turn ends with no user-visible reply', async () => {
+    insertMessage(
+      'limited-chat-sdk',
+      'chat-sdk',
+      { sender: 'User', text: 'please respond' },
+      { platformId: 'chan-1', channelType: 'discord', threadId: 'thread-1' },
+    );
+
+    const limitText =
+      "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 2:35 PM.";
+    const provider = new ScriptedProvider(async function* () {
+      yield { type: 'init', continuation: 'limited-session' };
+      yield { type: 'result', text: null, errorText: limitText };
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal);
+
+    await waitFor(() => getAckStatus('limited-chat-sdk') === 'completed', 1500);
+    controller.abort();
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(out[0].in_reply_to).toBe('limited-chat-sdk');
+    expect(out[0].platform_id).toBe('chan-1');
+    expect(out[0].channel_type).toBe('discord');
+    // The provider's verbatim reason is delivered instead of the generic fallback.
+    expect(JSON.parse(out[0].content).text).toBe(limitText);
+    expect(JSON.parse(out[0].content).text).not.toContain('user-visible response');
+
+    await loopPromise.catch(() => {});
+  });
+
   it('allows scheduled tasks to complete silently when their script says not to wake the agent', async () => {
     insertMessage('quiet-task', 'task', {
       prompt: 'Check whether anything changed.',

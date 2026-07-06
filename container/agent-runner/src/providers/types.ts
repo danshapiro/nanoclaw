@@ -202,7 +202,7 @@ export function normalizeQueryTurnInput(input: string | QueryTurnInput): QueryTu
 export type ProviderEvent =
   | { type: 'init'; continuation: string }
   | { type: 'input-accepted'; inputId: string; scope: ProviderInputScope }
-  | ({ type: 'result'; text: string | null } & ProviderInputResolution)
+  | ({ type: 'result'; text: string | null; errorText?: string } & ProviderInputResolution)
   | { type: 'progress'; inputId?: string; message: string }
   | {
       type: 'notice';
