@@ -107,6 +107,9 @@ describe('runOneTurn provider-error surfacing', () => {
         message:
           "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 2:35 PM.",
       },
+      willRetry: false,
+      threadId: 'thread-abc',
+      turnId: 't1',
     });
     dispatchNotification('turn/completed', { threadId: 'thread-abc', turn: { status: 'completed' } });
 
@@ -115,6 +118,22 @@ describe('runOneTurn provider-error surfacing', () => {
     expect(result).toBeDefined();
     expect(result?.text).toBeNull();
     expect(result?.errorText).toContain('usage limit');
+  });
+
+  it('ignores a transient (willRetry) error and does not surface it', async () => {
+    const { server, dispatchNotification } = makeFakeAppServer();
+    const { started, events } = startFakeTurn(server);
+    await started;
+    dispatchNotification('error', {
+      error: { message: 'temporary upstream blip' },
+      willRetry: true,
+      threadId: 'thread-abc',
+      turnId: 't1',
+    });
+    dispatchNotification('turn/completed', { threadId: 'thread-abc', turn: { status: 'completed' } });
+    const result = findResult(await withTimeout(events, 'transient error turn'));
+    expect(result?.text).toBeNull();
+    expect(result?.errorText).toBeUndefined();
   });
 
   it('carries a turn/completed failure reason verbatim on an empty turn', async () => {

@@ -640,6 +640,12 @@ export async function* runOneTurn(
         turnDone = true;
         break;
       }
+      // NOTE: `turn/failed` is NOT part of the codex app-server v2 protocol
+      // (verified against openai/codex@rust-v0.142.1 — the deployed pin; the
+      // ServerNotification enum has no `turn/failed`). A terminal failure arrives
+      // as an `error` notification (willRetry:false) plus `turn/completed` with
+      // status:"failed" and turn.error.message — both handled below. Retained as a
+      // defensive no-op in case a legacy/future server still fans it out.
       case 'turn/failed': {
         const e = params.error as { message?: string } | undefined;
         if (abortRequested) {
@@ -651,11 +657,13 @@ export async function* runOneTurn(
         break;
       }
       case 'error': {
-        // Top-level error notification (e.g. usage-limit/quota) that does NOT
-        // arrive as turn/failed. Capture the provider's verbatim text so the poll
-        // loop can surface it instead of the generic empty-reply fallback. Do not
-        // set turnDone/turnState.error — turn/completed still drives termination.
-        if (!abortRequested) {
+        // Top-level error notification (ErrorNotification: { error, willRetry,
+        // threadId, turnId }). Capture the provider's verbatim message so the poll
+        // loop can surface it instead of the generic empty-reply fallback — but
+        // ONLY for terminal errors. willRetry:true is a transient error Codex
+        // auto-retries; showing it would surface an already-recovered failure.
+        // Does not set turnDone/turnState.error — turn/completed still drives termination.
+        if (!abortRequested && params.willRetry !== true) {
           const msg = (params.error as { message?: string } | undefined)?.message;
           if (msg) turnErrorText = msg;
         }
