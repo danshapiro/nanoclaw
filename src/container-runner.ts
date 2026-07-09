@@ -147,6 +147,54 @@ export function waitForContainerExit(sessionId: string, timeoutMs = 30000): Prom
 }
 
 /**
+ * Drain every tracked container on shutdown: `docker stop` with a real grace
+ * period so agent work can finish, then wait for the host-side `docker run`
+ * client process to exit so nothing is left in the service cgroup. Failures
+ * are logged, never thrown — shutdown must proceed regardless. Bookkeeping
+ * (activeContainers cleanup, session markers) happens in
+ * finalizeContainerProcess via the process 'close' event.
+ */
+export async function drainAllContainers(graceSeconds = 30): Promise<void> {
+  if (activeContainers.size === 0) return;
+
+  const entries = [...activeContainers.entries()];
+  log.info('Draining active containers for shutdown', {
+    count: entries.length,
+    graceSeconds,
+    names: entries.map(([, entry]) => entry.containerName),
+  });
+
+  await Promise.all(
+    entries.map(async ([sessionId, entry]) => {
+      try {
+        await stopContainerAsync(entry.containerName, graceSeconds);
+      } catch (err) {
+        log.warn('Failed to stop container during drain', {
+          sessionId,
+          containerName: entry.containerName,
+          err,
+        });
+      }
+      try {
+        const exited = await waitForContainerExit(sessionId, (graceSeconds + 10) * 1000);
+        if (!exited) {
+          log.warn('Container process did not exit within drain window', {
+            sessionId,
+            containerName: entry.containerName,
+          });
+        }
+      } catch (err) {
+        log.warn('Failed waiting for container exit during drain', {
+          sessionId,
+          containerName: entry.containerName,
+          err,
+        });
+      }
+    }),
+  );
+}
+
+/**
  * Wake up a container for a session. If already running or mid-spawn, no-op
  * (the in-flight wake promise is reused).
  *

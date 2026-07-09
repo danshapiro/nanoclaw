@@ -13,6 +13,7 @@ import { runMigrations } from './db/migrations/index.js';
 import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
+import { drainAllContainers } from './container-runner.js';
 import { routeInbound } from './router.js';
 import { log } from './log.js';
 
@@ -176,9 +177,36 @@ async function main(): Promise<void> {
   log.info('NanoClaw running');
 }
 
-/** Graceful shutdown. */
-async function shutdown(signal: string): Promise<void> {
+let shutdownInProgress = false;
+
+/**
+ * Graceful shutdown. Exported for tests — `exit` is injectable so tests can
+ * observe the exit code without killing the test process.
+ *
+ * Order matters: pollers stop FIRST so nothing re-wakes containers mid-drain,
+ * then module shutdown callbacks, then the container drain (docker stop with
+ * a real grace period + wait for the `docker run` client processes to exit —
+ * otherwise systemd finds them lingering in the cgroup and SIGKILLs the unit
+ * into a spurious failure), then channel adapter teardown.
+ */
+export async function runShutdown(signal: string, exit: (code: number) => void = process.exit): Promise<void> {
+  if (shutdownInProgress) {
+    log.warn('Repeated shutdown signal — exiting immediately', { signal });
+    exit(0);
+    return;
+  }
+  shutdownInProgress = true;
   log.info('Shutdown signal received', { signal });
+
+  // Watchdog: if anything below hangs, exit cleanly before systemd's
+  // TimeoutStopSec expires and turns the stop into a unit failure.
+  setTimeout(() => exit(0), 60_000).unref();
+
+  // 1. Stop pollers first so nothing re-wakes containers during the drain.
+  stopDeliveryPolls();
+  stopHostSweep();
+
+  // 2. Module shutdown callbacks.
   for (const cb of getShutdownCallbacks()) {
     try {
       await cb();
@@ -186,14 +214,17 @@ async function shutdown(signal: string): Promise<void> {
       log.error('Shutdown callback threw', { err });
     }
   }
-  stopDeliveryPolls();
-  stopHostSweep();
+
+  // 3. Drain active containers so no docker run clients outlive the process.
+  await drainAllContainers(30);
+
+  // 4. Channel adapter teardown.
   await teardownChannelAdapters();
-  process.exit(0);
+  exit(0);
 }
 
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => void runShutdown('SIGTERM'));
+process.on('SIGINT', () => void runShutdown('SIGINT'));
 
 main().catch((err) => {
   log.fatal('Startup failed', { err });

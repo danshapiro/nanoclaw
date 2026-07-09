@@ -40,15 +40,20 @@ export function stopContainer(name: string): void {
   execSync(`${CONTAINER_RUNTIME_BIN} stop -t 1 ${name}`, { stdio: 'pipe' });
 }
 
-export function stopContainerAsync(name: string): Promise<void> {
+export function stopContainerAsync(name: string, graceSeconds = 1): Promise<void> {
   if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(name)) {
     return Promise.reject(new Error(`Invalid container name: ${name}`));
   }
   return new Promise((resolve, reject) => {
-    execFile(CONTAINER_RUNTIME_BIN, ['stop', '-t', '1', name], { timeout: 5000 }, (err) => {
-      if (err) reject(err);
-      else resolve();
-    });
+    execFile(
+      CONTAINER_RUNTIME_BIN,
+      ['stop', '-t', String(graceSeconds), name],
+      { timeout: (graceSeconds + 10) * 1000 },
+      (err) => {
+        if (err) reject(err);
+        else resolve();
+      },
+    );
   });
 }
 

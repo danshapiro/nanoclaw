@@ -14,10 +14,12 @@ vi.mock('./log.js', () => ({
   },
 }));
 
-// Mock child_process — store the mock fn so tests can configure it
+// Mock child_process — store the mock fns so tests can configure them
 const mockExecSync = vi.fn();
+const mockExecFile = vi.fn();
 vi.mock('child_process', () => ({
   execSync: (...args: unknown[]) => mockExecSync(...args),
+  execFile: (...args: unknown[]) => mockExecFile(...args),
 }));
 
 import {
@@ -25,6 +27,7 @@ import {
   readonlyMountArgs,
   hostGatewayArgs,
   stopContainer,
+  stopContainerAsync,
   ensureContainerRuntimeRunning,
   cleanupOrphans,
 } from './container-runtime.js';
@@ -141,6 +144,49 @@ describe('stopContainer', () => {
     expect(() => stopContainer('foo$(whoami)')).toThrow('Invalid container name');
     expect(() => stopContainer('foo`id`')).toThrow('Invalid container name');
     expect(mockExecSync).not.toHaveBeenCalled();
+  });
+});
+
+// --- stopContainerAsync ---
+
+describe('stopContainerAsync', () => {
+  it('defaults to a 1s grace period and 11s exec timeout', async () => {
+    mockExecFile.mockImplementation((_bin, _args, _opts, cb) => (cb as (err: null) => void)(null));
+
+    await stopContainerAsync('nanoclaw-test-123');
+
+    expect(mockExecFile).toHaveBeenCalledWith(
+      CONTAINER_RUNTIME_BIN,
+      ['stop', '-t', '1', 'nanoclaw-test-123'],
+      { timeout: 11000 },
+      expect.any(Function),
+    );
+  });
+
+  it('passes -t 30 and widens the exec timeout when graceSeconds=30', async () => {
+    mockExecFile.mockImplementation((_bin, _args, _opts, cb) => (cb as (err: null) => void)(null));
+
+    await stopContainerAsync('nanoclaw-test-123', 30);
+
+    expect(mockExecFile).toHaveBeenCalledWith(
+      CONTAINER_RUNTIME_BIN,
+      ['stop', '-t', '30', 'nanoclaw-test-123'],
+      { timeout: 40000 },
+      expect.any(Function),
+    );
+  });
+
+  it('rejects invalid container names without invoking docker', async () => {
+    await expect(stopContainerAsync('foo; rm -rf /', 30)).rejects.toThrow('Invalid container name');
+    expect(mockExecFile).not.toHaveBeenCalled();
+  });
+
+  it('rejects when docker stop fails', async () => {
+    mockExecFile.mockImplementation((_bin, _args, _opts, cb) =>
+      (cb as (err: Error) => void)(new Error('no such container')),
+    );
+
+    await expect(stopContainerAsync('nanoclaw-test-123', 30)).rejects.toThrow('no such container');
   });
 });
 

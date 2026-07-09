@@ -862,7 +862,7 @@ describe('session wake lifecycle', () => {
       expect(harness.execFileMock).toHaveBeenCalledWith(
         'docker',
         ['stop', '-t', '1', containerName],
-        { timeout: 5000 },
+        { timeout: 11000 },
         expect.any(Function),
       );
     } finally {
@@ -1342,6 +1342,120 @@ describe('side-effect ledger container env', () => {
       const args = await buildArgs(harness);
       expect(args.some((a) => a.includes('NANOCLAW_ACTIVE_INPUT_ID'))).toBe(false);
       expect(args.some((a) => a.startsWith('NANOCLAW_ROUTE_KEY='))).toBe(false);
+    } finally {
+      harness.close();
+    }
+  });
+});
+
+describe('drainAllContainers', () => {
+  it('resolves immediately when no containers are tracked', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      harness.execFileMock.mockClear();
+
+      await harness.containerRunner.drainAllContainers(30);
+
+      const stopCalls = harness.execFileMock.mock.calls.filter((call) => (call[1] as string[])[0] === 'stop');
+      expect(stopCalls).toHaveLength(0);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('stops all tracked containers in parallel with the drain grace period', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      // Second session for the same agent group via a second messaging group.
+      const db = await import('./db/index.js');
+      const sessionManager = await import('./session-manager.js');
+      db.createMessagingGroup({
+        id: 'mg-2',
+        channel_type: 'telegram',
+        platform_id: 'telegram:456',
+        name: 'Test Chat 2',
+        is_group: 0,
+        unknown_sender_policy: 'public',
+        created_at: new Date().toISOString(),
+      });
+      const { session: session2 } = sessionManager.resolveSession('ag-1', 'mg-2', null, 'shared');
+
+      harness.oneCliRelease.resolve();
+      await harness.containerRunner.wakeContainer(harness.session);
+      await harness.containerRunner.wakeContainer(session2);
+      expect(harness.containerRunner.getActiveContainerCount()).toBe(2);
+
+      const stopArgs: string[][] = [];
+      const stopCallbacks: Array<() => void> = [];
+      harness.execFileMock.mockImplementation((_file, args, _opts, cb) => {
+        if ((args as string[])[0] === 'stop') {
+          stopArgs.push(args as string[]);
+          stopCallbacks.push(() => (cb as (err: null) => void)(null));
+          return;
+        }
+        (cb as (err: null, stdout: string, stderr: string) => void)(null, '', '');
+      });
+
+      const drain = harness.containerRunner.drainAllContainers(30);
+
+      // Both docker stop invocations were issued before either completed:
+      // the stops run in parallel, not sequentially.
+      expect(stopArgs).toHaveLength(2);
+      for (const args of stopArgs) {
+        expect(args.slice(0, 3)).toEqual(['stop', '-t', '30']);
+      }
+
+      for (const complete of stopCallbacks) complete();
+      for (const proc of harness.spawnedProcesses) proc.emit('close', 0);
+
+      await drain;
+      expect(harness.containerRunner.getActiveContainerCount()).toBe(0);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('resolves even when one docker stop rejects', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      const db = await import('./db/index.js');
+      const sessionManager = await import('./session-manager.js');
+      db.createMessagingGroup({
+        id: 'mg-2',
+        channel_type: 'telegram',
+        platform_id: 'telegram:456',
+        name: 'Test Chat 2',
+        is_group: 0,
+        unknown_sender_policy: 'public',
+        created_at: new Date().toISOString(),
+      });
+      const { session: session2 } = sessionManager.resolveSession('ag-1', 'mg-2', null, 'shared');
+
+      harness.oneCliRelease.resolve();
+      await harness.containerRunner.wakeContainer(harness.session);
+      await harness.containerRunner.wakeContainer(session2);
+      expect(harness.containerRunner.getActiveContainerCount()).toBe(2);
+
+      let stopCount = 0;
+      harness.execFileMock.mockImplementation((_file, args, _opts, cb) => {
+        if ((args as string[])[0] === 'stop') {
+          stopCount += 1;
+          if (stopCount === 1) {
+            (cb as (err: Error) => void)(new Error('docker stop failed'));
+          } else {
+            (cb as (err: null) => void)(null);
+          }
+          return;
+        }
+        (cb as (err: null, stdout: string, stderr: string) => void)(null, '', '');
+      });
+
+      const drain = harness.containerRunner.drainAllContainers(30);
+      for (const proc of harness.spawnedProcesses) proc.emit('close', 0);
+
+      await expect(drain).resolves.toBeUndefined();
+      expect(stopCount).toBe(2);
+      expect(harness.containerRunner.getActiveContainerCount()).toBe(0);
     } finally {
       harness.close();
     }
