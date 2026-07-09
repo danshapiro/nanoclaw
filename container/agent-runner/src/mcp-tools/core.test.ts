@@ -5,7 +5,7 @@ import path from 'path';
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '../db/connection.js';
-import { getUndeliveredMessages } from '../db/messages-out.js';
+import { getMessageTargetBySeq, getUndeliveredMessages, writeMessageOut } from '../db/messages-out.js';
 import { addReaction, editMessage, sendMessage } from './core.js';
 
 beforeEach(() => {
@@ -195,5 +195,93 @@ describe('core message action tools', () => {
     expect(result.isError).toBe(true);
     expect(result.content[0]?.text).toContain('Cannot edit inbound message #4');
     expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+});
+
+describe('undelivered-target guards (no internal-id fallback)', () => {
+  it('add_reaction on an inbound row with NULL platform_message_id returns a tool error and enqueues nothing', async () => {
+    insertInboundMessage({
+      seq: 4,
+      id: '111122223333444455:ag-discord-test-agent',
+      platformMessageId: null,
+    });
+
+    expect(getMessageTargetBySeq(4)).toBeNull();
+
+    const result = await addReaction.handler({ messageId: 4, emoji: 'white_check_mark' });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toContain('not yet delivered');
+    expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+
+  it('add_reaction on an undelivered outbound row returns a tool error and enqueues nothing', async () => {
+    const seq = writeMessageOut({
+      id: 'msg-123-abc',
+      kind: 'chat',
+      platform_id: '987654321098765432',
+      channel_type: 'discord',
+      content: JSON.stringify({ text: 'original' }),
+    });
+
+    // No `delivered` row yet — the internal msg-<ts>-<rand> id must not leak.
+    expect(getMessageTargetBySeq(seq)).toBeNull();
+
+    const result = await addReaction.handler({ messageId: seq, emoji: 'check' });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toContain('not yet delivered');
+    // Only the original outbound row exists — no doomed reaction row.
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(out[0].id).toBe('msg-123-abc');
+  });
+
+  it('edit_message on an undelivered outbound row returns a tool error and enqueues nothing', async () => {
+    const seq = writeMessageOut({
+      id: 'msg-456-def',
+      kind: 'chat',
+      platform_id: '987654321098765432',
+      channel_type: 'discord',
+      content: JSON.stringify({ text: 'original' }),
+    });
+
+    const result = await editMessage.handler({ messageId: seq, text: 'updated' });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toContain('not yet delivered');
+    expect(getUndeliveredMessages()).toHaveLength(1);
+  });
+
+  it('add_reaction resolves the delivered platform id for delivered outbound rows', async () => {
+    const seq = writeMessageOut({
+      id: 'msg-789-ghi',
+      kind: 'chat',
+      platform_id: '987654321098765432',
+      channel_type: 'discord',
+      content: JSON.stringify({ text: 'original' }),
+    });
+    getInboundDb()
+      .prepare(
+        `INSERT INTO delivered (message_out_id, platform_message_id, status, delivered_at)
+         VALUES ('msg-789-ghi', '555566667777', 'delivered', datetime('now'))`,
+      )
+      .run();
+
+    const result = await addReaction.handler({ messageId: seq, emoji: 'clock3' });
+    expect(result.isError).toBeUndefined();
+
+    const out = getUndeliveredMessages().filter((m) => m.id !== 'msg-789-ghi');
+    expect(out).toHaveLength(1);
+    expect(JSON.parse(out[0].content)).toMatchObject({
+      operation: 'reaction',
+      messageId: '555566667777',
+    });
+  });
+
+  it('still reports not-found for unknown seq numbers', async () => {
+    const result = await addReaction.handler({ messageId: 99, emoji: 'check' });
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toContain('not found');
   });
 });

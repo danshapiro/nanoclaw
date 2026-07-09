@@ -145,6 +145,11 @@ export function harvestRouteScopedProgress(routeKey: string): HarvestedProgress[
  * For outbound messages, the internal ID (msg-xxx) won't work for edits/reactions.
  * Instead, look up the platform_message_id from the delivered table (host writes this
  * after successful delivery).
+ *
+ * Returns null when no platform message ID is available yet -- internal ids
+ * (routed inbound ids, msg-<ts>-<rand> outbound ids) are meaningless to the
+ * platform and would deterministically 4xx, so callers must not enqueue
+ * edits/reactions against them.
  */
 export function getMessageTargetBySeq(seq: number): MessageTarget | null {
   const inbound = getInboundDb();
@@ -162,8 +167,9 @@ export function getMessageTargetBySeq(seq: number): MessageTarget | null {
           seq,
         }),
       );
+      return null;
     }
-    return { messageId: inRow.platform_message_id ?? inRow.id, source: 'inbound' };
+    return { messageId: inRow.platform_message_id, source: 'inbound' };
   }
 
   // Outbound messages: look up platform message ID from delivered table
@@ -178,8 +184,8 @@ export function getMessageTargetBySeq(seq: number): MessageTarget | null {
     .get(outRow.id) as { platform_message_id: string | null } | undefined;
   if (deliveredRow?.platform_message_id) return { messageId: deliveredRow.platform_message_id, source: 'outbound' };
 
-  // Fallback to internal ID (edits/reactions on undelivered messages won't work)
-  return { messageId: outRow.id, source: 'outbound' };
+  // Not yet delivered -- there is no platform message ID to target.
+  return null;
 }
 
 export function getMessageIdBySeq(seq: number): string | null {

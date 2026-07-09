@@ -256,3 +256,98 @@ describe('Chat SDK bridge Discord gateway forwarding', () => {
     );
   });
 });
+
+describe('Chat SDK bridge deliver — reactions', () => {
+  function makeBridge() {
+    const addReaction = vi.fn().mockResolvedValue(undefined);
+    const editMessage = vi.fn().mockResolvedValue(undefined);
+    const adapter = {
+      name: 'discord',
+      addReaction,
+      editMessage,
+    } as unknown as Adapter;
+    const bridge = createChatSdkBridge({ adapter, supportsThreads: true });
+    return { bridge, addReaction, editMessage };
+  }
+
+  const reactionMessage = (messageId: string, emoji: string) => ({
+    kind: 'chat',
+    content: { operation: 'reaction', messageId, emoji },
+  });
+
+  it('swallows 4xx adapter errors so the delivery row succeeds-as-skipped', async () => {
+    const { bridge, addReaction } = makeBridge();
+    addReaction.mockRejectedValue(new Error('Discord API error: 404 {"message": "Unknown Message", "code": 10008}'));
+
+    await expect(
+      bridge.deliver('discord:guild-1:chan-1', 'discord:guild-1:chan-1', reactionMessage('msg-1', '✅')),
+    ).resolves.toBeUndefined();
+    expect(addReaction).toHaveBeenCalledTimes(1);
+  });
+
+  it('retargets thread-starter reactions to the parent channel', async () => {
+    const { bridge, addReaction } = makeBridge();
+
+    // Discord thread id == starter message id; the starter message lives in
+    // the PARENT channel, so the reaction must target discord:guild:parent.
+    await bridge.deliver(
+      'discord:guild-1:parent-1',
+      'discord:guild-1:parent-1:thread-9',
+      reactionMessage('thread-9', '✅'),
+    );
+
+    expect(addReaction).toHaveBeenCalledWith('discord:guild-1:parent-1', 'thread-9', '✅');
+  });
+
+  it('does not retarget reactions to regular in-thread messages', async () => {
+    const { bridge, addReaction } = makeBridge();
+
+    await bridge.deliver(
+      'discord:guild-1:parent-1',
+      'discord:guild-1:parent-1:thread-9',
+      reactionMessage('other-msg', '✅'),
+    );
+
+    expect(addReaction).toHaveBeenCalledWith('discord:guild-1:parent-1:thread-9', 'other-msg', '✅');
+  });
+
+  it('resolves white_check_mark shortcode to the unicode emoji', async () => {
+    const { bridge, addReaction } = makeBridge();
+
+    await bridge.deliver(
+      'discord:guild-1:chan-1',
+      'discord:guild-1:chan-1',
+      reactionMessage('msg-1', 'white_check_mark'),
+    );
+
+    expect(addReaction).toHaveBeenCalledWith('discord:guild-1:chan-1', 'msg-1', '✅');
+  });
+
+  it('passes unicode emoji through untouched', async () => {
+    const { bridge, addReaction } = makeBridge();
+
+    await bridge.deliver('discord:guild-1:chan-1', 'discord:guild-1:chan-1', reactionMessage('msg-1', '🎯'));
+
+    expect(addReaction).toHaveBeenCalledWith('discord:guild-1:chan-1', 'msg-1', '🎯');
+  });
+
+  it('rethrows 5xx adapter errors so transient failures still retry', async () => {
+    const { bridge, addReaction } = makeBridge();
+    addReaction.mockRejectedValue(new Error('Discord API error: 502 Bad Gateway'));
+
+    await expect(
+      bridge.deliver('discord:guild-1:chan-1', 'discord:guild-1:chan-1', reactionMessage('msg-1', '✅')),
+    ).rejects.toThrow('502');
+  });
+
+  it('retargets thread-starter edits to the parent channel', async () => {
+    const { bridge, editMessage } = makeBridge();
+
+    await bridge.deliver('discord:guild-1:parent-1', 'discord:guild-1:parent-1:thread-9', {
+      kind: 'chat',
+      content: { operation: 'edit', messageId: 'thread-9', text: 'updated' },
+    });
+
+    expect(editMessage).toHaveBeenCalledWith('discord:guild-1:parent-1', 'thread-9', { markdown: 'updated' });
+  });
+});

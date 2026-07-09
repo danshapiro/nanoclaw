@@ -274,7 +274,14 @@ export const editMessage: McpToolDefinition = {
     if (!seq || !text) return err('messageId and text are required');
 
     const target = getMessageTargetBySeq(seq);
-    if (!target) return err(`Message #${seq} not found`);
+    if (!target) {
+      // Known seq without a platform id means the row exists but the host has
+      // not delivered it yet -- do NOT enqueue an edit against an internal id
+      // (it would deterministically 4xx on the platform).
+      return getRoutingBySeq(seq)
+        ? err(`Message #${seq} not yet delivered — retry shortly`)
+        : err(`Message #${seq} not found`);
+    }
     if (target.source === 'inbound') return err(`Cannot edit inbound message #${seq}`);
 
     const routing = getRoutingBySeq(seq);
@@ -316,7 +323,14 @@ export const addReaction: McpToolDefinition = {
     if (!seq || !emoji) return err('messageId and emoji are required');
 
     const target = getMessageTargetBySeq(seq);
-    if (!target) return err(`Message #${seq} not found`);
+    if (!target) {
+      // Known seq without a platform id means the row exists but the host has
+      // not delivered it yet -- do NOT enqueue a reaction against an internal
+      // id (it would deterministically 4xx on the platform).
+      return getRoutingBySeq(seq)
+        ? err(`Message #${seq} not yet delivered — retry shortly`)
+        : err(`Message #${seq} not found`);
+    }
 
     const routing = getRoutingBySeq(seq);
     if (!routing || !routing.channel_type || !routing.platform_id) {

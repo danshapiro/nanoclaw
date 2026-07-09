@@ -31,7 +31,12 @@ function extractReplyContext(raw: Record<string, any>): ReplyContext | null {
 
 registerChannelAdapter('discord', {
   factory: async () => {
-    const env = readEnvFile(['DISCORD_BOT_TOKEN', 'DISCORD_PUBLIC_KEY', 'DISCORD_APPLICATION_ID', 'DISCORD_AUTO_CREATE_THREAD_CHANNEL_IDS']);
+    const env = readEnvFile([
+      'DISCORD_BOT_TOKEN',
+      'DISCORD_PUBLIC_KEY',
+      'DISCORD_APPLICATION_ID',
+      'DISCORD_AUTO_CREATE_THREAD_CHANNEL_IDS',
+    ]);
     const botToken = process.env.DISCORD_BOT_TOKEN || env.DISCORD_BOT_TOKEN;
     if (!botToken) return null;
     const autoCreateThreadChannelIds = new Set(

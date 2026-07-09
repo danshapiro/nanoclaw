@@ -17,6 +17,7 @@ import {
   type Message as ChatMessage,
 } from 'chat';
 import { log } from '../log.js';
+import { extractHttpStatusFromError } from '../delivery-errors.js';
 import { SqliteStateAdapter } from '../state-sqlite.js';
 import { registerWebhookAdapter } from '../webhook-server.js';
 import { getAskQuestionRender } from '../db/sessions.js';
@@ -43,6 +44,59 @@ type FetchLike = (
 
 const MAX_ATTACHMENT_DOWNLOAD_BYTES = 10 * 1024 * 1024;
 const ATTACHMENT_DOWNLOAD_TIMEOUT_MS = 15_000;
+
+/**
+ * Minimal shortcode -> unicode map for reaction emoji. Agents routinely pass
+ * shortcodes like `white_check_mark` that @chat-adapter/discord's emoji table
+ * does not resolve; the literal name is then sent to Discord which rejects it
+ * with 400 (code 10014 Unknown Emoji). Resolve the common ones locally.
+ */
+const REACTION_EMOJI_SHORTCODES: Record<string, string> = {
+  white_check_mark: '✅',
+  check: '✅',
+  thumbsup: '👍',
+  thumbs_up: '👍',
+  '+1': '👍',
+  thumbsdown: '👎',
+  thumbs_down: '👎',
+  '-1': '👎',
+  heart: '❤️',
+  eyes: '👀',
+  tada: '🎉',
+  fire: '🔥',
+  rocket: '🚀',
+  laughing: '😂',
+  joy: '😂',
+  thinking: '🤔',
+  thinking_face: '🤔',
+  wave: '👋',
+  pray: '🙏',
+  clap: '👏',
+  '100': '💯',
+};
+
+/** Resolve an emoji shortcode to unicode; pass unicode emoji through as-is. */
+function resolveReactionEmoji(emoji: string): string {
+  // Already unicode (contains a non-ASCII code point) -- pass through untouched.
+  if ([...emoji].some((ch) => (ch.codePointAt(0) ?? 0) > 0x7f)) return emoji;
+  const key = emoji.replace(/^:+|:+$/g, '').toLowerCase();
+  return REACTION_EMOJI_SHORTCODES[key] ?? emoji;
+}
+
+/**
+ * Discord thread ids have the 4-part shape `discord:guild:parentChannel:thread`,
+ * and a thread's id equals its starter message's id -- but the starter message
+ * row lives in the PARENT channel. Reacting to / editing the starter message
+ * via the thread channel 404s (Discord 10008 Unknown Message), so retarget to
+ * the parent channel (`discord:guild:parentChannel`).
+ */
+function retargetThreadStarterTid(tid: string, messageId: string): string {
+  const parts = tid.split(':');
+  if (parts.length === 4 && parts[0] === 'discord' && parts[3] === messageId) {
+    return `${parts[0]}:${parts[1]}:${parts[2]}`;
+  }
+  return tid;
+}
 
 /** Reply context extracted from a platform's raw message. */
 export interface ReplyContext {
@@ -536,14 +590,32 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       const content = message.content as Record<string, unknown>;
 
       if (content.operation === 'edit' && content.messageId) {
-        await adapter.editMessage(tid, content.messageId as string, {
-          markdown: transformText((content.text as string) || (content.markdown as string) || ''),
-        });
+        await adapter.editMessage(
+          retargetThreadStarterTid(tid, content.messageId as string),
+          content.messageId as string,
+          {
+            markdown: transformText((content.text as string) || (content.markdown as string) || ''),
+          },
+        );
         return;
       }
 
       if (content.operation === 'reaction' && content.messageId && content.emoji) {
-        await adapter.addReaction(tid, content.messageId as string, content.emoji as string);
+        const messageId = content.messageId as string;
+        const emoji = resolveReactionEmoji(content.emoji as string);
+        try {
+          await adapter.addReaction(retargetThreadStarterTid(tid, messageId), messageId, emoji);
+        } catch (err) {
+          const status = extractHttpStatusFromError(err);
+          if (status !== null && status >= 400 && status < 500) {
+            // Deterministic client error (unknown message/emoji) -- retrying
+            // cannot succeed and a missing reaction is cosmetic. Log and let
+            // the delivery row succeed-as-skipped.
+            log.warn('reaction skipped', { messageId, emoji, status });
+            return;
+          }
+          throw err; // 5xx / network errors are transient -- let delivery retry
+        }
         return;
       }
 

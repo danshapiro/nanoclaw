@@ -21,6 +21,7 @@ import {
   migrateDeliveredTable,
 } from './db/session-db.js';
 import { log } from './log.js';
+import { isNonRetryableDeliveryError } from './delivery-errors.js';
 import { normalizeOptions } from './channels/ask-question.js';
 import { clearOutbox, openInboundDb, openOutboundDb, readOutboxFiles } from './session-manager.js';
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
@@ -327,13 +328,22 @@ async function drainSession(session: Session, options: DrainSessionOptions = {})
       } catch (err) {
         const attempts = (deliveryAttempts.get(msg.id) ?? 0) + 1;
         deliveryAttempts.set(msg.id, attempts);
-        if (attempts >= MAX_DELIVERY_ATTEMPTS) {
-          log.error('Message delivery failed permanently, giving up', {
+        // Deterministic client errors (HTTP 4xx) fail identically on every
+        // retry -- mark failed immediately instead of burning 3 attempts.
+        const nonRetryable = isNonRetryableDeliveryError(err);
+        if (nonRetryable || attempts >= MAX_DELIVERY_ATTEMPTS) {
+          const details = {
             messageId: msg.id,
             sessionId: session.id,
             attempts,
+            nonRetryable,
             err,
-          });
+          };
+          if (isReactionOutbound(msg)) {
+            log.warn('Message delivery failed permanently, giving up', details);
+          } else {
+            log.error('Message delivery failed permanently, giving up', details);
+          }
           markDeliveryFailed(inDb, msg.id);
           deliveryAttempts.delete(msg.id);
         } else {
@@ -352,6 +362,18 @@ async function drainSession(session: Session, options: DrainSessionOptions = {})
   } finally {
     outDb.close();
     inDb.close();
+  }
+}
+
+/**
+ * True when the outbound row is an emoji reaction. A permanently failed
+ * reaction is cosmetic noise, not an incident -- log it at WARN, not ERROR.
+ */
+function isReactionOutbound(msg: { content: string }): boolean {
+  try {
+    return (JSON.parse(msg.content) as { operation?: unknown }).operation === 'reaction';
+  } catch {
+    return false;
   }
 }
 

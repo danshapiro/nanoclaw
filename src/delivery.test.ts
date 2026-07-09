@@ -88,6 +88,15 @@ function insertOutbound(agentGroupId: string, sessionId: string, msgId: string, 
   db.close();
 }
 
+function insertReactionOutbound(agentGroupId: string, sessionId: string, msgId: string): void {
+  const db = new Database(outboundDbPath(agentGroupId, sessionId));
+  db.prepare(
+    `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, thread_id, content)
+     VALUES (?, datetime('now'), 'chat', 'telegram:123', 'telegram', NULL, ?)`,
+  ).run(msgId, JSON.stringify({ operation: 'reaction', messageId: 'plat-1', emoji: 'x' }));
+  db.close();
+}
+
 function insertSchedulingOutbound(
   agentGroupId: string,
   sessionId: string,
@@ -431,6 +440,65 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     expect(deliveredRows('ag-1', session.id)).toEqual([
       { message_out_id: 'out-1', platform_message_id: 'platform-first', status: 'delivered' },
       { message_out_id: 'out-2', platform_message_id: null, status: 'delivered' },
+    ]);
+  });
+
+  it('marks 4xx delivery errors failed after a single attempt without retries', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertReactionOutbound('ag-1', session.id, 'out-4xx');
+    insertOutbound('ag-1', session.id, 'out-ok', 'still delivers');
+
+    const attempts: string[] = [];
+    const delivered: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        const parsed = JSON.parse(content) as { operation?: string; text?: string };
+        if (parsed.operation === 'reaction') {
+          attempts.push('reaction');
+          throw new Error('Discord API error: 404 {"message": "Unknown Message", "code": 10008}');
+        }
+        delivered.push(parsed.text as string);
+        return 'plat-ok';
+      },
+    });
+
+    await deliverSessionMessages(session);
+    // 4xx is deterministic — marked failed on attempt 1, other rows unaffected.
+    expect(attempts).toHaveLength(1);
+    expect(delivered).toEqual(['still delivers']);
+    expect(deliveredRows('ag-1', session.id)).toEqual([
+      { message_out_id: 'out-4xx', platform_message_id: null, status: 'failed' },
+      { message_out_id: 'out-ok', platform_message_id: 'plat-ok', status: 'delivered' },
+    ]);
+
+    // Subsequent polls must not retry the failed row.
+    await deliverSessionMessages(session);
+    expect(attempts).toHaveLength(1);
+  });
+
+  it('keeps the 3-attempt retry behavior for transient (non-4xx) errors', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-flaky', 'transient');
+
+    let calls = 0;
+    setDeliveryAdapter({
+      async deliver() {
+        calls++;
+        throw new Error('Discord API error: 502 Bad Gateway');
+      },
+    });
+
+    await deliverSessionMessages(session);
+    expect(calls).toBe(1);
+    expect(deliveredRows('ag-1', session.id)).toEqual([]);
+
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(session);
+    expect(calls).toBe(3);
+    expect(deliveredRows('ag-1', session.id)).toEqual([
+      { message_out_id: 'out-flaky', platform_message_id: null, status: 'failed' },
     ]);
   });
 
