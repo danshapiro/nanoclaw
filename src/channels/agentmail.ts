@@ -415,7 +415,10 @@ export function createAgentMailAdapter(deps: AgentMailAdapterDeps = {}): Channel
       socket.on('close', (event) => {
         connected = false;
         subscribed = false;
-        log.warn('AgentMail WebSocket closed', { code: event.code, reason: event.reason });
+        log.warn('AgentMail WebSocket closed', {
+          code: typeof event.code === 'number' ? event.code : 'none',
+          reason: event.reason ? event.reason : 'none',
+        });
       });
       socket.on('error', (err) => {
         log.error('AgentMail WebSocket error', { err });

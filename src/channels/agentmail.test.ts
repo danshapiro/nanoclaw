@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createAgentGroup } from '../db/agent-groups.js';
 import { closeDb, getDb, initTestDb } from '../db/connection.js';
 import { runMigrations } from '../db/migrations/index.js';
+import { log } from '../log.js';
 import type { ChannelSetup, OutboundMessage } from './adapter.js';
 import { agentMailClientOptions } from './agentmail-api.js';
 import type { AgentMailApi, AgentMailSocketLike } from './agentmail-api.js';
@@ -108,7 +109,10 @@ describe('AgentMail adapter', () => {
     });
   });
 
-  afterEach(() => closeDb());
+  afterEach(() => {
+    vi.restoreAllMocks();
+    closeDb();
+  });
 
   it('refuses raw AgentMail API keys in NanoClaw env', () => {
     expect(() =>
@@ -539,6 +543,55 @@ describe('AgentMail adapter', () => {
     releaseFirst();
     await new Promise((resolve) => setImmediate(resolve));
     expect(routed).toEqual(['agentmail:yente-threads@agentmail.to:m1', 'agentmail:yente-threads@agentmail.to:m2']);
+  });
+
+  it('logs the actual close code and reason, with fallbacks when they are missing', async () => {
+    const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
+    const socket = new FakeSocket();
+    fake = fakeApi(socket);
+    const adapter = createAgentMailAdapter({
+      api: fake,
+      env: BASE_AGENTMAIL_ENV,
+      now: () => '2026-06-12T00:00:00.000Z',
+    })!;
+
+    await adapter.setup(setupCollector());
+    socket.emit('close', { code: 1006, reason: 'idle timeout' });
+    expect(warnSpy).toHaveBeenCalledWith('AgentMail WebSocket closed', { code: 1006, reason: 'idle timeout' });
+
+    socket.emit('close', {});
+    expect(warnSpy).toHaveBeenCalledWith('AgentMail WebSocket closed', { code: 'none', reason: 'none' });
+  });
+
+  it('re-subscribes and runs catch-up backfill after the socket reconnects', async () => {
+    const socket = new FakeSocket();
+    fake = fakeApi(socket);
+    const adapter = createAgentMailAdapter({
+      api: fake,
+      env: BASE_AGENTMAIL_ENV,
+      now: () => '2026-06-12T00:00:00.000Z',
+    })!;
+    const inboxIds = ['yente@agentmail.to', 'yente-threads@agentmail.to', 'yente-aidy@agentmail.to'];
+
+    await adapter.setup(setupCollector());
+    socket.emit('open');
+    socket.emit('message', { type: 'subscribed', inboxIds });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(socket.subscriptions).toHaveLength(1);
+    const listedAfterFirstSubscribe = fake.listed.length;
+    expect(listedAfterFirstSubscribe).toBe(3);
+
+    socket.emit('close', { code: 1006, reason: '' });
+    expect(adapter.isConnected()).toBe(false);
+
+    socket.emit('open');
+    expect(socket.subscriptions).toHaveLength(2);
+    expect(adapter.isConnected()).toBe(true);
+
+    socket.emit('message', { type: 'subscribed', inboxIds });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(fake.listed.length).toBe(listedAfterFirstSubscribe * 2);
+    expect(fake.listed.slice(listedAfterFirstSubscribe).map((entry) => entry.inboxId)).toEqual(inboxIds);
   });
 
   it('replies through AgentMail using the latest stored provider message', async () => {

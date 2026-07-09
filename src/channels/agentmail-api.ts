@@ -2,13 +2,16 @@ import { HttpsProxyAgent } from 'https-proxy-agent';
 import { AgentMailClient, AgentMailEnvironment, type AgentMail } from 'agentmail';
 import WebSocket from 'ws';
 
+import { log } from '../log.js';
 import type { AgentMailMessageLike } from './agentmail-config.js';
 
 export const AGENTMAIL_ONECLI_PLACEHOLDER = 'onecli-managed';
 const AGENTMAIL_WEBSOCKET_PATH = '/v0';
-const AGENTMAIL_WEBSOCKET_MAX_RETRIES = 30;
 const AGENTMAIL_WEBSOCKET_MIN_RECONNECT_MS = 1000;
 const AGENTMAIL_WEBSOCKET_MAX_RECONNECT_MS = 10000;
+const AGENTMAIL_WEBSOCKET_RETRY_WARN_EVERY = 30;
+const AGENTMAIL_WEBSOCKET_PING_INTERVAL_MS = 30000;
+const AGENTMAIL_WEBSOCKET_IDLE_MULTIPLIER = 2;
 
 export type AgentMailSocketLike = {
   on(event: 'open', handler: () => void): void;
@@ -74,14 +77,18 @@ type WebSocketConstructor = new (
   options?: WebSocketOptions,
 ) => WebSocketConnectionLike;
 
+type WebSocketCloseEventLike = { code?: unknown; reason?: unknown };
+
 type WebSocketConnectionLike = {
   readyState: number;
   on(event: 'open', handler: () => void): void;
   on(event: 'message', handler: (data: unknown) => void): void;
-  on(event: 'close', handler: (code?: number, reason?: Buffer | string) => void): void;
+  on(event: 'close', handler: (codeOrEvent?: number | WebSocketCloseEventLike, reason?: Buffer | string) => void): void;
   on(event: 'error', handler: (error: unknown) => void): void;
   send(data: string): void;
   close(code?: number, reason?: string): void;
+  ping?(): void;
+  terminate?(): void;
 };
 
 export type AgentMailOneCliWebSocketOptions = {
@@ -180,11 +187,15 @@ class OneCliAgentMailSocket implements AgentMailSocketLike {
   private closeRequested = false;
   private retryCount = 0;
   private reconnectTimer: NodeJS.Timeout | null = null;
+  private keepaliveTimer: NodeJS.Timeout | null = null;
+  private lastActivityAt = 0;
+  private readonly pingIntervalMs: number;
   private openWaiters: Array<{ resolve: () => void; reject: (error: unknown) => void }> = [];
 
   constructor(options: AgentMailOneCliWebSocketOptions) {
     const env = options.env ?? process.env;
     this.proxyUrl = agentMailProxyUrl(env);
+    this.pingIntervalMs = agentMailPingIntervalMs(env);
     this.url = options.url ?? `${AgentMailEnvironment.Prod.websockets}${AGENTMAIL_WEBSOCKET_PATH}`;
     this.websocketCtor = options.websocketCtor ?? (WebSocket as unknown as WebSocketConstructor);
     this.proxyAgentFactory = options.proxyAgentFactory ?? ((proxyUrl) => new HttpsProxyAgent(proxyUrl));
@@ -215,6 +226,7 @@ class OneCliAgentMailSocket implements AgentMailSocketLike {
     this.closeRequested = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
+    this.stopKeepalive();
     for (const waiter of this.openWaiters.splice(0)) waiter.reject(new Error('AgentMail WebSocket closed'));
     this.ws?.close(1000, 'closed');
     this.ws = null;
@@ -229,10 +241,18 @@ class OneCliAgentMailSocket implements AgentMailSocketLike {
     this.ws = ws;
     ws.on('open', () => {
       this.retryCount = 0;
+      this.lastActivityAt = Date.now();
+      this.startKeepalive(ws);
       for (const waiter of this.openWaiters.splice(0)) waiter.resolve();
       this.handlers.open?.();
     });
+    if (typeof ws.ping === 'function') {
+      (ws as unknown as { on(event: string, handler: () => void): void }).on('pong', () => {
+        this.lastActivityAt = Date.now();
+      });
+    }
     ws.on('message', (data) => {
+      this.lastActivityAt = Date.now();
       const parsed = parseAgentMailWebSocketMessage(data);
       if (parsed.ok) {
         void this.handlers.message?.(parsed.value);
@@ -244,27 +264,50 @@ class OneCliAgentMailSocket implements AgentMailSocketLike {
       this.handlers.error?.(error);
       for (const waiter of this.openWaiters.splice(0)) waiter.reject(error);
     });
-    ws.on('close', (code, reason) => {
-      const closeEvent = { code, reason: reasonToString(reason) };
-      this.handlers.close?.(closeEvent);
+    ws.on('close', (codeOrEvent, reason) => {
+      if (this.ws === ws) this.stopKeepalive();
+      this.handlers.close?.(normalizeCloseEvent(codeOrEvent, reason));
       if (!this.closeRequested) this.scheduleReconnect();
     });
   }
 
   private scheduleReconnect(): void {
-    if (this.retryCount >= AGENTMAIL_WEBSOCKET_MAX_RETRIES) {
-      this.handlers.error?.(new Error('AgentMail WebSocket reconnect attempts exhausted'));
-      return;
-    }
+    if (this.reconnectTimer) return;
+    this.retryCount += 1;
     const delay = Math.min(
       AGENTMAIL_WEBSOCKET_MAX_RECONNECT_MS,
-      AGENTMAIL_WEBSOCKET_MIN_RECONNECT_MS * Math.max(1, 2 ** this.retryCount),
+      AGENTMAIL_WEBSOCKET_MIN_RECONNECT_MS * 2 ** Math.min(this.retryCount - 1, 30),
     );
-    this.retryCount += 1;
+    if (this.retryCount % AGENTMAIL_WEBSOCKET_RETRY_WARN_EVERY === 0) {
+      log.warn('AgentMail WebSocket reconnect still failing', { consecutiveFailures: this.retryCount });
+    }
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this.connect();
     }, delay);
+  }
+
+  private startKeepalive(ws: WebSocketConnectionLike): void {
+    this.stopKeepalive();
+    if (this.pingIntervalMs <= 0) return;
+    this.keepaliveTimer = setInterval(() => {
+      if (this.ws !== ws || ws.readyState !== WebSocket.OPEN) return;
+      const idleMs = Date.now() - this.lastActivityAt;
+      if (idleMs >= this.pingIntervalMs * AGENTMAIL_WEBSOCKET_IDLE_MULTIPLIER) {
+        this.stopKeepalive();
+        this.handlers.error?.(new Error(`AgentMail WebSocket idle for ${idleMs}ms; forcing reconnect`));
+        if (typeof ws.terminate === 'function') ws.terminate();
+        else ws.close();
+        return;
+      }
+      if (typeof ws.ping === 'function') ws.ping();
+    }, this.pingIntervalMs);
+    this.keepaliveTimer.unref?.();
+  }
+
+  private stopKeepalive(): void {
+    if (this.keepaliveTimer) clearInterval(this.keepaliveTimer);
+    this.keepaliveTimer = null;
   }
 }
 
@@ -284,9 +327,33 @@ function parseAgentMailWebSocketMessage(data: unknown): { ok: true; value: unkno
   }
 }
 
-function reasonToString(reason: Buffer | string | undefined): string | undefined {
-  if (Buffer.isBuffer(reason)) return reason.toString('utf8');
-  return reason;
+function reasonToString(reason: unknown): string | undefined {
+  if (Buffer.isBuffer(reason)) {
+    const text = reason.toString('utf8');
+    return text.length > 0 ? text : undefined;
+  }
+  if (typeof reason === 'string') return reason.length > 0 ? reason : undefined;
+  return undefined;
+}
+
+function normalizeCloseEvent(
+  codeOrEvent: number | WebSocketCloseEventLike | undefined,
+  reason: Buffer | string | undefined,
+): { code?: number; reason?: string } {
+  if (codeOrEvent && typeof codeOrEvent === 'object') {
+    return {
+      code: typeof codeOrEvent.code === 'number' ? codeOrEvent.code : undefined,
+      reason: reasonToString(codeOrEvent.reason),
+    };
+  }
+  return { code: typeof codeOrEvent === 'number' ? codeOrEvent : undefined, reason: reasonToString(reason) };
+}
+
+function agentMailPingIntervalMs(env: NodeJS.ProcessEnv): number {
+  const raw = env.AGENTMAIL_WS_PING_INTERVAL_MS?.trim();
+  if (!raw) return AGENTMAIL_WEBSOCKET_PING_INTERVAL_MS;
+  const parsed = Number(raw);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : AGENTMAIL_WEBSOCKET_PING_INTERVAL_MS;
 }
 
 export function normalizeMessageEvent(event: unknown): AgentMailMessageLike | null {
