@@ -1,14 +1,28 @@
+import http from 'http';
+
 import { describe, expect, it, vi } from 'vitest';
 import type { Adapter } from 'chat';
 
 import type { ChannelSetup } from './adapter.js';
 import {
   createChatSdkBridge,
+  disableWebhookServerKeepAlive,
   forwardChatSdkInboundMessage,
   handleForwardedEvent,
   isOwnChatSdkMessageForTest,
   serializeChatSdkAttachmentForInbound,
 } from './chat-sdk-bridge.js';
+
+describe('local webhook server keep-alive', () => {
+  it('disables keepAliveTimeout so undici cannot race a server-side idle close', () => {
+    const server = http.createServer();
+    // Node default is 5000ms -- the exact window that produced the
+    // burst -> idle gap -> first-forward `TypeError: fetch failed` race.
+    expect(server.keepAliveTimeout).toBeGreaterThan(0);
+    disableWebhookServerKeepAlive(server);
+    expect(server.keepAliveTimeout).toBe(0);
+  });
+});
 
 describe('Chat SDK bridge attachments', () => {
   it('downloads attachment data from serialized URLs when fetchData is unavailable', async () => {

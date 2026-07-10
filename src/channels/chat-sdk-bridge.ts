@@ -743,6 +743,21 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
 }
 
 /**
+ * Disable HTTP keep-alive idle-timeout races on the local webhook server.
+ * Node's default keepAliveTimeout is 5s: after an idle gap the server closes
+ * the kept-alive socket, and undici's pooled client (globalThis.fetch in the
+ * Gateway forwarder) occasionally dispatches the next forward onto that
+ * just-closed socket -> `TypeError: fetch failed` on the first forward after
+ * a burst. Setting keepAliveTimeout = 0 removes the server-side idle close
+ * entirely, so the client can never race a server-initiated close. Traffic
+ * is low-volume and same-host (127.0.0.1), so connection handling cost is
+ * negligible. Exported for tests.
+ */
+export function disableWebhookServerKeepAlive(server: http.Server): void {
+  server.keepAliveTimeout = 0;
+}
+
+/**
  * Start a local HTTP server to receive forwarded Gateway events.
  * This is needed because the Gateway listener in webhook-forwarding mode
  * sends ALL raw events (including INTERACTION_CREATE for button clicks)
@@ -771,6 +786,8 @@ function startLocalWebhookServer(
           });
       });
     });
+
+    disableWebhookServerKeepAlive(server);
 
     server.listen(0, '127.0.0.1', () => {
       const addr = server.address() as { port: number };
