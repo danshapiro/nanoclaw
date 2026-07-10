@@ -81,6 +81,10 @@ export function buildNoProxy(env: NodeJS.ProcessEnv): string {
     // Bypassing the proxy prevents fd exhaustion from large concurrent
     // npm installs during agent-container startup surges.
     'registry.npmjs.org',
+    // Host-service alias documented in skills (e.g. yente-history-reader on
+    // host.docker.internal:8086). The auth-gate proxy cannot reach host
+    // services, so requests must go direct over the bridge.
+    'host.docker.internal',
   ]);
   const mediatedHosts = new Set<string>();
   for (const entry of REQUIRED_YENTE_PROXY_URLS) {

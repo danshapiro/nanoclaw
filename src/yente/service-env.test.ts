@@ -72,8 +72,8 @@ describe('Yente service env contract', () => {
       NYNE_PROXY_URL: `http://${YENTE_LOCAL_PROXY_HOSTS.nyne}:8082`,
       NYNE_API_URL: `http://${YENTE_LOCAL_PROXY_HOSTS.nyne}:8082`,
       YENTE_BROWSER_HANDOFF_URL: YENTE_BROWSER_HANDOFF_PRODUCTION_URL,
-      NO_PROXY: 'localhost,127.0.0.1,registry.npmjs.org',
-      no_proxy: 'localhost,127.0.0.1,registry.npmjs.org',
+      NO_PROXY: 'localhost,127.0.0.1,registry.npmjs.org,host.docker.internal',
+      no_proxy: 'localhost,127.0.0.1,registry.npmjs.org,host.docker.internal',
     });
     expect(result.containerEnv).not.toHaveProperty('GOOGLE_APPLICATION_CREDENTIALS');
     expect(result.containerEnv).not.toHaveProperty('ANTHROPIC_API_KEY');
@@ -91,7 +91,9 @@ describe('Yente service env contract', () => {
       NO_PROXY: `localhost,127.0.0.1,${YENTE_LOCAL_PROXY_HOSTS.gws},${YENTE_LOCAL_PROXY_HOSTS.msgvault}:8084,${YENTE_LOCAL_PROXY_HOSTS.browserHandoff}:6081,internal.example`,
     }).split(',');
 
-    expect(entries).toEqual(expect.arrayContaining(['localhost', '127.0.0.1', 'internal.example']));
+    expect(entries).toEqual(
+      expect.arrayContaining(['localhost', '127.0.0.1', 'host.docker.internal', 'internal.example']),
+    );
     expect(entries).not.toContain(YENTE_LOCAL_PROXY_HOSTS.gws);
     expect(entries).not.toContain(`${YENTE_LOCAL_PROXY_HOSTS.msgvault}:8084`);
     expect(entries).not.toContain(YENTE_LOCAL_PROXY_HOSTS.familiar);

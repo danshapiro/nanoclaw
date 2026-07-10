@@ -205,8 +205,8 @@ async function loadContainerRunnerHarness(
         NYNE_PROXY_URL: 'http://yente-nyne-proxy.local:8082',
         NYNE_API_URL: 'http://yente-nyne-proxy.local:8082',
         YENTE_BROWSER_HANDOFF_URL: 'http://yente-browser-handoff.local:6081',
-        NO_PROXY: 'localhost,127.0.0.1,registry.npmjs.org',
-        no_proxy: 'localhost,127.0.0.1,registry.npmjs.org',
+        NO_PROXY: 'localhost,127.0.0.1,registry.npmjs.org,host.docker.internal',
+        no_proxy: 'localhost,127.0.0.1,registry.npmjs.org,host.docker.internal',
       },
     }),
   }));
