@@ -5,7 +5,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../db/index.js';
 import { inboundDbPath, resolveSession, writeSessionMessage } from '../session-manager.js';
-import { normalizeDiscordOutboundMarkdown, toDiscordThreadId, yenteDiscordPlatformIdFromThreadId } from './discord.js';
+import { log } from '../log.js';
+import {
+  forwardDiscordGatewayEventWithRetry,
+  normalizeDiscordOutboundMarkdown,
+  toDiscordThreadId,
+  yenteDiscordPlatformIdFromThreadId,
+} from './discord.js';
 
 vi.mock('../config.js', async () => {
   const actual = await vi.importActual('../config.js');
@@ -190,5 +196,134 @@ describe('Discord outbound Markdown normalization', () => {
 
   it('still escapes numbered-list lines that Discord would autoformat', () => {
     expect(normalizeDiscordOutboundMarkdown('1.\n2.')).toBe('1\\.\n2\\.');
+  });
+});
+
+describe('forwardDiscordGatewayEventWithRetry', () => {
+  const EVENT = { type: 'GATEWAY_MESSAGE_CREATE' };
+  const URL = 'http://127.0.0.1:9999/webhook';
+  const noSleep = async () => {};
+
+  function okResponse(): Response {
+    return { ok: true, status: 200, text: async () => '' } as unknown as Response;
+  }
+
+  function errorResponse(status: number, body = 'boom'): Response {
+    return { ok: false, status, text: async () => body } as unknown as Response;
+  }
+
+  function fetchFailed(): TypeError {
+    const cause = Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:9999'), { code: 'ECONNREFUSED' });
+    const err = new TypeError('fetch failed');
+    (err as { cause?: unknown }).cause = cause;
+    return err;
+  }
+
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+  let errorSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    errorSpy = vi.spyOn(log, 'error').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    warnSpy.mockRestore();
+    errorSpy.mockRestore();
+  });
+
+  it('retries a transient network failure and forwards exactly once, WARN but no ERROR', async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockRejectedValueOnce(fetchFailed()).mockResolvedValueOnce(okResponse());
+    const sleeps: number[] = [];
+
+    await forwardDiscordGatewayEventWithRetry(URL, EVENT, 'bot-token', {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+    });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(sleeps).toEqual([250]);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(warnSpy).toHaveBeenCalledWith(
+      'Transient error forwarding Gateway event, retrying',
+      expect.objectContaining({ attempt: 1, type: EVENT.type }),
+    );
+    expect(errorSpy).not.toHaveBeenCalled();
+    // The forward request is preserved verbatim across the retry.
+    expect(fetchImpl).toHaveBeenLastCalledWith(URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-discord-gateway-token': 'bot-token' },
+      body: JSON.stringify(EVENT),
+    });
+  });
+
+  it('gives up with ERROR after 3 network failures (backoff 250ms then 1000ms)', async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockRejectedValue(fetchFailed());
+    const sleeps: number[] = [];
+
+    await forwardDiscordGatewayEventWithRetry(URL, EVENT, 'bot-token', {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+    });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+    expect(sleeps).toEqual([250, 1000]);
+    expect(warnSpy).toHaveBeenCalledTimes(2);
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    expect(errorSpy).toHaveBeenCalledWith(
+      'Error forwarding Gateway event',
+      expect.objectContaining({ attempt: 3, type: EVENT.type }),
+    );
+  });
+
+  it('does NOT retry a 4xx response — immediate ERROR', async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(errorResponse(400, 'bad request'));
+
+    await forwardDiscordGatewayEventWithRetry(URL, EVENT, 'bot-token', {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep: noSleep,
+    });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(warnSpy).not.toHaveBeenCalled();
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    expect(errorSpy).toHaveBeenCalledWith(
+      'Failed to forward Gateway event',
+      expect.objectContaining({ status: 400, attempt: 1, type: EVENT.type }),
+    );
+  });
+
+  it('retries a 5xx response and succeeds without ERROR', async () => {
+    const fetchImpl = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(errorResponse(503, 'unavailable'))
+      .mockResolvedValueOnce(okResponse());
+
+    await forwardDiscordGatewayEventWithRetry(URL, EVENT, 'bot-token', {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep: noSleep,
+    });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+    expect(errorSpy).not.toHaveBeenCalled();
+  });
+
+  it('does NOT retry a non-transient thrown error — immediate ERROR', async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockRejectedValue(new Error('certificate has expired'));
+
+    await forwardDiscordGatewayEventWithRetry(URL, EVENT, 'bot-token', {
+      fetchImpl: fetchImpl as unknown as typeof fetch,
+      sleep: noSleep,
+    });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(warnSpy).not.toHaveBeenCalled();
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    expect(errorSpy).toHaveBeenCalledWith('Error forwarding Gateway event', expect.objectContaining({ attempt: 1 }));
   });
 });

@@ -250,11 +250,121 @@ export async function toDiscordThreadId(platformId: string, botToken: string): P
   return `discord:${guildId}:${platformId}`;
 }
 
+/** Backoff schedule for Gateway event forwarding retries (attempt 1 -> wait 250ms -> attempt 2 -> wait 1000ms -> attempt 3). */
+export const GATEWAY_FORWARD_RETRY_DELAYS_MS: readonly number[] = [250, 1000];
+
+/**
+ * Network-level failures worth retrying when forwarding a Gateway event to
+ * the local webhook server: undici's `TypeError: fetch failed` wrapper and
+ * the usual transient socket errors seen around service restart windows.
+ * Other thrown errors are NOT matched here — those fail immediately.
+ */
+function isTransientGatewayForwardError(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  let current: unknown = error;
+  while (current !== undefined && current !== null && !seen.has(current)) {
+    seen.add(current);
+    const message = current instanceof Error ? current.message : String(current);
+    const code = (current as { code?: unknown }).code;
+    if (
+      /fetch failed|ECONNREFUSED|ECONNRESET|socket hang up/i.test(message) ||
+      code === 'ECONNREFUSED' ||
+      code === 'ECONNRESET'
+    ) {
+      return true;
+    }
+    current = current instanceof Error ? current.cause : undefined;
+  }
+  return false;
+}
+
+/**
+ * Forward a Discord Gateway event to the local webhook server with a small
+ * bounded retry (3 attempts total, 250ms then 1000ms backoff).
+ *
+ * Replaces @chat-adapter/discord's `forwardGatewayEvent`, which does a single
+ * fetch and drops the event on `TypeError: fetch failed` (seen ~9/week in
+ * prod, clustered around service restart windows). Retries ONLY transient
+ * network-level failures and 5xx responses — never 4xx. Logs WARN per retry
+ * attempt; the ERROR (same messages as the upstream adapter) is emitted only
+ * after the final attempt fails. Never throws, matching upstream behavior.
+ */
+export async function forwardDiscordGatewayEventWithRetry(
+  webhookUrl: string,
+  event: { type: string },
+  botToken: string,
+  deps: {
+    fetchImpl?: typeof fetch;
+    sleep?: (ms: number) => Promise<void>;
+  } = {},
+): Promise<void> {
+  const fetchImpl = deps.fetchImpl ?? fetch;
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const maxAttempts = GATEWAY_FORWARD_RETRY_DELAYS_MS.length + 1;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    let response: Response;
+    try {
+      response = await fetchImpl(webhookUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-discord-gateway-token': botToken,
+        },
+        body: JSON.stringify(event),
+      });
+    } catch (error) {
+      if (attempt < maxAttempts && isTransientGatewayForwardError(error)) {
+        log.warn('Transient error forwarding Gateway event, retrying', {
+          type: event.type,
+          attempt,
+          maxAttempts,
+          error: String(error),
+        });
+        await sleep(GATEWAY_FORWARD_RETRY_DELAYS_MS[attempt - 1]);
+        continue;
+      }
+      log.error('Error forwarding Gateway event', { type: event.type, attempt, error: String(error) });
+      return;
+    }
+
+    if (response.ok) return;
+
+    if (response.status >= 500 && attempt < maxAttempts) {
+      log.warn('Failed to forward Gateway event (5xx), retrying', {
+        type: event.type,
+        attempt,
+        maxAttempts,
+        status: response.status,
+      });
+      await sleep(GATEWAY_FORWARD_RETRY_DELAYS_MS[attempt - 1]);
+      continue;
+    }
+
+    const errorText = await response.text().catch(() => '');
+    log.error('Failed to forward Gateway event', {
+      type: event.type,
+      status: response.status,
+      attempt,
+      error: errorText,
+    });
+    return;
+  }
+}
+
 function wrapYenteDiscordChannelIds(
   adapter: DiscordAdapterInstance,
   botToken: string,
   autoCreateThreadChannelIds: Set<string> = new Set(),
 ): DiscordAdapterInstance {
+  // Replace the vendored adapter's single-shot Gateway event forwarder with
+  // the bounded-retry version. The adapter awaits forwardGatewayEvent per
+  // event, so sequencing is unchanged — a retry only delays that one event.
+  (
+    adapter as unknown as { forwardGatewayEvent: (webhookUrl: string, event: { type: string }) => Promise<void> }
+  ).forwardGatewayEvent = (webhookUrl: string, event: { type: string }) =>
+    forwardDiscordGatewayEventWithRetry(webhookUrl, event, botToken);
+
   const cache = new Map<string, string>();
   const resolve = async (threadId: string): Promise<string> => {
     if (threadId.startsWith('discord:')) return threadId;
