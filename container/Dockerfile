@@ -56,6 +56,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         jq \
         less \
         python3 \
+        python-is-python3 \
         python3-jsonschema \
         python3-pip \
         ripgrep \
