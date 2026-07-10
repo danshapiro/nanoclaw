@@ -256,6 +256,7 @@ async function spawnContainer(session: Session): Promise<void> {
   const agentIdentifier = agentGroup.id;
   let bridges: AgentMcpBridge[] = [];
   let args: string[];
+  let envFilePath = '';
   let managedSkillsRoot = '';
   let skillGeneration = '';
   try {
@@ -264,7 +265,7 @@ async function spawnContainer(session: Session): Promise<void> {
     managedSkillsRoot = buildResult.managedSkillsRoot;
     skillGeneration = buildResult.skillGeneration;
     bridges = await attachAgentMcpBridges(agentGroup, containerConfig, mounts);
-    args = await buildContainerArgs(
+    const built = await buildContainerArgs(
       mounts,
       containerName,
       session.id,
@@ -274,6 +275,8 @@ async function spawnContainer(session: Session): Promise<void> {
       contribution,
       agentIdentifier,
     );
+    args = built.args;
+    envFilePath = built.envFilePath;
   } catch (err) {
     cleanupTempSkillRoot(managedSkillsRoot);
     await stopAgentMcpBridges(bridges);
@@ -282,6 +285,7 @@ async function spawnContainer(session: Session): Promise<void> {
 
   if (!sessionIsActiveForWake(session.id)) {
     log.info('Aborting container spawn for inactive session', { sessionId: session.id, containerName });
+    removeContainerEnvFile(envFilePath);
     cleanupTempSkillRoot(managedSkillsRoot);
     await stopAgentMcpBridges(bridges);
     return;
@@ -296,6 +300,16 @@ async function spawnContainer(session: Session): Promise<void> {
   fs.rmSync(heartbeatPath(agentGroup.id, session.id), { force: true });
 
   const container = spawn(CONTAINER_RUNTIME_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+
+  // `docker run` reads --env-file client-side at create time. Delete the file
+  // at the earliest signal that create has completed: any container output,
+  // process exit, or spawn error. Crash leftovers are swept at startup by
+  // cleanupStaleContainerEnvFiles().
+  const removeEnvFile = () => removeContainerEnvFile(envFilePath);
+  container.stdout?.once('data', removeEnvFile);
+  container.stderr?.once('data', removeEnvFile);
+  container.once('close', removeEnvFile);
+  container.once('error', removeEnvFile);
 
   activeContainers.set(session.id, { process: container, containerName });
   if (bridges.length > 0) {
@@ -1040,6 +1054,86 @@ export async function resolveAgentImageForRun(
   return { imageTag: freshTag, rebuilt: true };
 }
 
+/**
+ * Directory holding per-container docker `--env-file` files. Lives under the
+ * service-owned data root (never world-readable /tmp): env values include
+ * auth-bearing proxy URLs that must not appear on the docker command line
+ * (visible in /proc/<pid>/cmdline and `systemctl status` output).
+ */
+function containerEnvDir(): string {
+  return path.join(DATA_DIR, 'container-env');
+}
+
+/**
+ * Rewrite docker-run args, moving every `-e KEY=value` pair into an env file
+ * at `envFilePath` (mode 0600) and inserting `--env-file <path>` in its place,
+ * so secret values never appear on the docker command line.
+ *
+ * Docker's env-file format has no quoting/escaping and no multiline values,
+ * so a value containing a newline could inject extra env entries — such
+ * values are rejected outright. Duplicate keys are deduped last-wins to
+ * mirror docker's `-e` semantics. Bare `-e KEY` passthrough entries (no `=`)
+ * carry no value on the command line and are left as-is.
+ */
+export function extractDockerEnvArgsToFile(args: readonly string[], envFilePath: string): string[] {
+  const entries: Array<[key: string, value: string]> = [];
+  const out: string[] = [];
+  let inserted = false;
+  for (let index = 0; index < args.length; index++) {
+    if (args[index] === '-e' && index + 1 < args.length) {
+      const entry = args[index + 1];
+      const eq = entry.indexOf('=');
+      if (eq > 0) {
+        entries.push([entry.slice(0, eq), entry.slice(eq + 1)]);
+        if (!inserted) {
+          out.push('--env-file', envFilePath);
+          inserted = true;
+        }
+        index++;
+        continue;
+      }
+    }
+    out.push(args[index]);
+  }
+  if (entries.length === 0) return out;
+  const merged = new Map<string, string>();
+  for (const [key, value] of entries) {
+    if (/[\r\n]/.test(key) || /[\r\n]/.test(value)) {
+      throw new Error(
+        `Container env var '${key.split(/[\r\n]/)[0]}' contains a newline; refusing to write docker env file`,
+      );
+    }
+    merged.set(key, value);
+  }
+  const lines = [...merged.entries()].map(([key, value]) => `${key}=${value}`);
+  fs.mkdirSync(path.dirname(envFilePath), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(envFilePath, `${lines.join('\n')}\n`, { mode: 0o600 });
+  return out;
+}
+
+/** Best-effort removal of a per-container env file (idempotent). */
+function removeContainerEnvFile(envFilePath: string): void {
+  if (!envFilePath) return;
+  try {
+    fs.rmSync(envFilePath, { force: true });
+  } catch {
+    // Non-fatal — stale env files are swept on next startup.
+  }
+}
+
+/**
+ * Sweep stale per-container env files left behind by a crash. Called at
+ * startup right after cleanupOrphans(), before any container spawns, so
+ * removing the whole directory is safe.
+ */
+export function cleanupStaleContainerEnvFiles(): void {
+  try {
+    fs.rmSync(containerEnvDir(), { recursive: true, force: true });
+  } catch (err) {
+    log.warn('Failed to clean up stale container env files', { err });
+  }
+}
+
 async function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
@@ -1049,7 +1143,7 @@ async function buildContainerArgs(
   _provider: string,
   providerContribution: ProviderContainerContribution,
   agentIdentifier?: string,
-): Promise<string[]> {
+): Promise<{ args: string[]; envFilePath: string }> {
   const args: string[] = [
     'run',
     '--rm',
@@ -1142,7 +1236,12 @@ async function buildContainerArgs(
 
   args.push('-c', 'exec bun run /app/src/index.ts');
 
-  return args;
+  // Move all `-e KEY=value` pairs (including OneCLI-gateway- and
+  // provider-contributed secrets) into a private 0600 env file so token-
+  // bearing values never appear in /proc/<pid>/cmdline. Written last so an
+  // earlier throw in this function leaves no file behind.
+  const envFilePath = path.join(containerEnvDir(), `${containerName}.env`);
+  return { args: extractDockerEnvArgsToFile(args, envFilePath), envFilePath };
 }
 
 export async function applyOneCliGatewayForContainerArgs(

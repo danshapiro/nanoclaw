@@ -13,7 +13,7 @@ import { runMigrations } from './db/migrations/index.js';
 import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
-import { drainAllContainers } from './container-runner.js';
+import { cleanupStaleContainerEnvFiles, drainAllContainers } from './container-runner.js';
 import { routeInbound } from './router.js';
 import { log } from './log.js';
 
@@ -71,6 +71,9 @@ async function main(): Promise<void> {
   // 2. Container runtime
   ensureContainerRuntimeRunning();
   cleanupOrphans();
+  // Sweep per-container --env-file leftovers from a previous crash — they hold
+  // secret-bearing env values and must not accumulate.
+  cleanupStaleContainerEnvFiles();
 
   // 3. Channel adapters
   await initChannelAdapters((adapter: ChannelAdapter): ChannelSetup => {

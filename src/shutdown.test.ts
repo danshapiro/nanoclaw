@@ -39,6 +39,7 @@ vi.mock('./host-sweep.js', () => ({
 }));
 vi.mock('./router.js', () => ({ routeInbound: vi.fn() }));
 vi.mock('./container-runner.js', () => ({
+  cleanupStaleContainerEnvFiles: vi.fn(),
   drainAllContainers: vi.fn((graceSeconds: number) => {
     h.calls.push(`drainAllContainers(${graceSeconds})`);
     return h.drainImpl ? h.drainImpl() : Promise.resolve();

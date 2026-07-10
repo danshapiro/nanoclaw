@@ -9,6 +9,7 @@ import { fileURLToPath } from 'url';
 import {
   applyOneCliGatewayForContainerArgs,
   assertNoReservedAgentCommandCollisionsShell,
+  extractDockerEnvArgsToFile,
   buildManagedReposIpcMount,
   buildManagedReposMounts,
   buildLocalSkillsMount,
@@ -19,6 +20,24 @@ import { AgentMcpCredentialUnavailableError, type AgentMcpBridgeOptions } from '
 import type { AgentMcpConfigForGroup } from './agent-mcp-config.js';
 import type { ContainerConfig } from './container-config.js';
 import type { AgentGroup } from './types.js';
+
+/**
+ * Parse the docker --env-file referenced by the spawn args. The file survives
+ * until the fake child emits output/close, so tests can read it after wake.
+ */
+function readSpawnEnvFile(args: string[]): { path: string; raw: string; env: Map<string, string> } {
+  const index = args.indexOf('--env-file');
+  if (index === -1 || !args[index + 1]) throw new Error('spawn args contain no --env-file');
+  const envFilePath = args[index + 1];
+  const raw = fs.readFileSync(envFilePath, 'utf-8');
+  const env = new Map<string, string>();
+  for (const line of raw.split('\n')) {
+    if (!line) continue;
+    const eq = line.indexOf('=');
+    env.set(line.slice(0, eq), line.slice(eq + 1));
+  }
+  return { path: envFilePath, raw, env };
+}
 
 type Deferred = {
   promise: Promise<void>;
@@ -33,7 +52,9 @@ function deferred(): Deferred {
   return { promise, resolve };
 }
 
-function fakeChildProcess(pid = 12345): NodeJS.EventEmitter & { pid: number; kill: ReturnType<typeof vi.fn> } {
+function fakeChildProcess(
+  pid = 12345,
+): NodeJS.EventEmitter & { pid: number; kill: ReturnType<typeof vi.fn>; stdout: EventEmitter; stderr: EventEmitter } {
   const proc = new EventEmitter() as NodeJS.EventEmitter & {
     pid: number;
     kill: ReturnType<typeof vi.fn>;
@@ -76,7 +97,19 @@ async function loadContainerRunnerHarness(
   const oneCliStarted = deferred();
   const oneCliRelease = deferred();
   const spawnedProcesses: Array<ReturnType<typeof fakeChildProcess>> = [];
-  const spawnMock = vi.fn((_command: string, _args: string[], _options?: unknown) => {
+  // Snapshot the --env-file at spawn time: it must exist (with content and
+  // 0600 mode) BEFORE docker is spawned, and may be deleted right after.
+  const envFileSnapshots: Array<{ path: string; content: string; mode: number }> = [];
+  const spawnMock = vi.fn((_command: string, args: string[], _options?: unknown) => {
+    const envFileIndex = args.indexOf('--env-file');
+    if (envFileIndex !== -1) {
+      const envFilePath = args[envFileIndex + 1];
+      envFileSnapshots.push({
+        path: envFilePath,
+        content: fs.readFileSync(envFilePath, 'utf-8'),
+        mode: fs.statSync(envFilePath).mode & 0o777,
+      });
+    }
     const proc = fakeChildProcess(12345 + spawnedProcesses.length);
     spawnedProcesses.push(proc);
     return proc;
@@ -232,6 +265,7 @@ async function loadContainerRunnerHarness(
     execFileMock,
     execSyncMock,
     dataDir,
+    envFileSnapshots,
     groupsDir,
     loadAgentMcpConfigForGroupMock,
     root,
@@ -734,8 +768,8 @@ describe('session wake lifecycle', () => {
       await wake;
 
       const args = harness.spawnMock.mock.calls[0][1];
-      expect(args).toContain(
-        'PATH=/app/skills/.bin:/pnpm/bin:/pnpm:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin',
+      expect(readSpawnEnvFile(args).env.get('PATH')).toBe(
+        '/app/skills/.bin:/pnpm/bin:/pnpm:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin',
       );
     } finally {
       harness.close();
@@ -763,8 +797,9 @@ describe('session wake lifecycle', () => {
       await wake;
 
       const args = harness.spawnMock.mock.calls[0][1];
-      expect(args).toContain('YENTE_BROWSER_HANDOFF_URL=http://yente-browser-handoff.local:6081');
-      expect(args).toContain('GWS_PROXY_URL=http://yente-gws-proxy.local:8083');
+      const { env } = readSpawnEnvFile(args);
+      expect(env.get('YENTE_BROWSER_HANDOFF_URL')).toBe('http://yente-browser-handoff.local:6081');
+      expect(env.get('GWS_PROXY_URL')).toBe('http://yente-gws-proxy.local:8083');
       expect(args).toContain('--add-host=yente-browser-handoff.local:host-gateway');
       expect(args).toContain('--add-host=yente-gws-proxy.local:host-gateway');
     } finally {
@@ -812,13 +847,7 @@ describe('session wake lifecycle', () => {
       await wake;
 
       const args = harness.spawnMock.mock.calls[0][1];
-      const effectiveEnv = new Map<string, string>();
-      for (let index = 0; index < args.length - 1; index++) {
-        if (args[index] !== '-e') continue;
-        const entry = args[index + 1];
-        const eq = entry.indexOf('=');
-        if (eq > 0) effectiveEnv.set(entry.slice(0, eq), entry.slice(eq + 1));
-      }
+      const effectiveEnv = readSpawnEnvFile(args).env;
       expect(effectiveEnv.get('HTTP_PROXY')).toBe('http://agent-token@yente-onecli-auth-gate.local:18055');
       expect(effectiveEnv.get('HTTPS_PROXY')).toBe('http://agent-token@yente-onecli-auth-gate.local:18055');
       expect(effectiveEnv.get('http_proxy')).toBe('http://agent-token@yente-onecli-auth-gate.local:18055');
@@ -1253,9 +1282,8 @@ describe('side-effect ledger container env', () => {
     const harness = await loadContainerRunnerHarness();
     try {
       const args = await buildArgs(harness);
-      // The flat docker-run arg list is ['-e', 'KEY=VALUE', ...].
-      // Verify the exact static value is present as a discrete arg.
-      expect(args).toContain('NANOCLAW_SIDE_EFFECT_LEDGER=/workspace/side-effects.jsonl');
+      // Env now travels via --env-file (never on the command line).
+      expect(readSpawnEnvFile(args).env.get('NANOCLAW_SIDE_EFFECT_LEDGER')).toBe('/workspace/side-effects.jsonl');
     } finally {
       harness.close();
     }
@@ -1265,8 +1293,9 @@ describe('side-effect ledger container env', () => {
     const harness = await loadContainerRunnerHarness();
     try {
       const args = await buildArgs(harness);
-      expect(args).toContain('NANOCLAW_AGENT_GROUP_ID=ag-1');
-      expect(args).toContain('NANOCLAW_AGENT_GROUP_FOLDER=agent');
+      const { env } = readSpawnEnvFile(args);
+      expect(env.get('NANOCLAW_AGENT_GROUP_ID')).toBe('ag-1');
+      expect(env.get('NANOCLAW_AGENT_GROUP_FOLDER')).toBe('agent');
     } finally {
       harness.close();
     }
@@ -1278,7 +1307,7 @@ describe('side-effect ledger container env', () => {
     try {
       process.env.GWS_SIDE_EFFECT_VERIFY_KEY = 'test-pub-key-base64';
       const args = await buildArgs(harness);
-      expect(args).toContain('GWS_SIDE_EFFECT_VERIFY_KEY=test-pub-key-base64');
+      expect(readSpawnEnvFile(args).env.get('GWS_SIDE_EFFECT_VERIFY_KEY')).toBe('test-pub-key-base64');
     } finally {
       if (saved === undefined) {
         delete process.env.GWS_SIDE_EFFECT_VERIFY_KEY;
@@ -1297,6 +1326,7 @@ describe('side-effect ledger container env', () => {
       const args = await buildArgs(harness);
       // The key must be absent so the in-container default applies.
       expect(args.some((a) => a.startsWith('GWS_SIDE_EFFECT_VERIFY_KEY='))).toBe(false);
+      expect(readSpawnEnvFile(args).env.has('GWS_SIDE_EFFECT_VERIFY_KEY')).toBe(false);
     } finally {
       if (saved !== undefined) {
         process.env.GWS_SIDE_EFFECT_VERIFY_KEY = saved;
@@ -1312,6 +1342,7 @@ describe('side-effect ledger container env', () => {
       process.env.GWS_SIDE_EFFECT_SIGN_KEY_FILE = '/run/secrets/sign-key';
       const args = await buildArgs(harness);
       expect(args.some((a) => a.includes('GWS_SIDE_EFFECT_SIGN_KEY_FILE'))).toBe(false);
+      expect(readSpawnEnvFile(args).raw).not.toContain('GWS_SIDE_EFFECT_SIGN_KEY_FILE');
     } finally {
       delete process.env.GWS_SIDE_EFFECT_SIGN_KEY_FILE;
       harness.close();
@@ -1326,6 +1357,9 @@ describe('side-effect ledger container env', () => {
       const args = await buildArgs(harness);
       expect(args.join('\n')).not.toContain('AGENTMAIL_API_KEY');
       expect(args.join('\n')).not.toContain('test-agentmail-secret');
+      const { raw } = readSpawnEnvFile(args);
+      expect(raw).not.toContain('AGENTMAIL_API_KEY');
+      expect(raw).not.toContain('test-agentmail-secret');
     } finally {
       if (saved === undefined) {
         delete process.env.AGENTMAIL_API_KEY;
@@ -1342,8 +1376,121 @@ describe('side-effect ledger container env', () => {
       const args = await buildArgs(harness);
       expect(args.some((a) => a.includes('NANOCLAW_ACTIVE_INPUT_ID'))).toBe(false);
       expect(args.some((a) => a.startsWith('NANOCLAW_ROUTE_KEY='))).toBe(false);
+      const { raw } = readSpawnEnvFile(args);
+      expect(raw).not.toContain('NANOCLAW_ACTIVE_INPUT_ID');
+      expect(raw).not.toContain('NANOCLAW_ROUTE_KEY=');
     } finally {
       harness.close();
+    }
+  });
+});
+
+describe('container env file (secrets off the command line)', () => {
+  async function wakeAndGetArgs(harness: Awaited<ReturnType<typeof loadContainerRunnerHarness>>): Promise<string[]> {
+    const wake = harness.containerRunner.wakeContainer(harness.session);
+    await harness.oneCliStarted.promise;
+    harness.oneCliRelease.resolve();
+    await wake;
+    return harness.spawnMock.mock.calls[0][1] as string[];
+  }
+
+  it('passes all env via --env-file with no -e KEY=value pairs on the command line', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      const args = await wakeAndGetArgs(harness);
+      expect(args).toContain('--env-file');
+      // No -e flags at all — every KEY=value moved off the command line.
+      expect(args).not.toContain('-e');
+      // No secret-bearing values visible in the args (proxy URLs, etc.).
+      expect(args.join('\n')).not.toContain('GWS_PROXY_URL=');
+      expect(args.join('\n')).not.toContain('http://yente-gws-proxy.local:8083');
+      // The same env still reaches the container via the file.
+      const { env } = readSpawnEnvFile(args);
+      expect(env.get('GWS_PROXY_URL')).toBe('http://yente-gws-proxy.local:8083');
+      expect(env.get('NANOCLAW_AGENT_GROUP_ID')).toBe('ag-1');
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('writes the env file (0600, expected content) before spawn and removes it after container start', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      const args = await wakeAndGetArgs(harness);
+      const envFilePath = args[args.indexOf('--env-file') + 1];
+
+      // Snapshot taken inside the spawn mock proves the file existed with
+      // full content and private mode BEFORE docker was spawned.
+      expect(harness.envFileSnapshots).toHaveLength(1);
+      const snapshot = harness.envFileSnapshots[0];
+      expect(snapshot.path).toBe(envFilePath);
+      expect(snapshot.mode).toBe(0o600);
+      expect(snapshot.content).toContain('GWS_PROXY_URL=http://yente-gws-proxy.local:8083');
+      expect(snapshot.content).toContain('NANOCLAW_AGENT_GROUP_ID=ag-1');
+      // Lives under the private data root, not /tmp.
+      expect(envFilePath.startsWith(path.join(harness.dataDir, 'container-env'))).toBe(true);
+
+      // First container output signals docker's create completed — the file
+      // is deleted immediately.
+      expect(fs.existsSync(envFilePath)).toBe(true);
+      harness.spawnedProcesses[0].stdout.emit('data', Buffer.from('started\n'));
+      expect(fs.existsSync(envFilePath)).toBe(false);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('removes the env file when the container exits without producing output', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      const args = await wakeAndGetArgs(harness);
+      const envFilePath = args[args.indexOf('--env-file') + 1];
+      expect(fs.existsSync(envFilePath)).toBe(true);
+      harness.spawnedProcesses[0].emit('close', 1);
+      expect(fs.existsSync(envFilePath)).toBe(false);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('sweeps stale env files left behind by a crash', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      const staleDir = path.join(harness.dataDir, 'container-env');
+      fs.mkdirSync(staleDir, { recursive: true });
+      const stale = path.join(staleDir, 'nanoclaw-v2-agent-123.env');
+      fs.writeFileSync(stale, 'SECRET=leftover\n');
+      harness.containerRunner.cleanupStaleContainerEnvFiles();
+      expect(fs.existsSync(stale)).toBe(false);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('rejects env values containing newlines (env-file injection)', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-envfile-'));
+    const envFilePath = path.join(dir, 'test.env');
+    try {
+      expect(() => extractDockerEnvArgsToFile(['run', '-e', 'FOO=bar\nEVIL=injected'], envFilePath)).toThrow(/newline/);
+      expect(() => extractDockerEnvArgsToFile(['run', '-e', 'FOO=bar\rbaz'], envFilePath)).toThrow(/newline/);
+      expect(fs.existsSync(envFilePath)).toBe(false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('dedupes duplicate keys last-wins, matching docker -e semantics', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-envfile-'));
+    const envFilePath = path.join(dir, 'test.env');
+    try {
+      const out = extractDockerEnvArgsToFile(
+        ['run', '-e', 'HTTP_PROXY=http://first', '--name', 'x', '-e', 'HTTP_PROXY=http://last', 'image'],
+        envFilePath,
+      );
+      expect(out).toEqual(['run', '--env-file', envFilePath, '--name', 'x', 'image']);
+      expect(fs.readFileSync(envFilePath, 'utf-8')).toBe('HTTP_PROXY=http://last\n');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 });
