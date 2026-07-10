@@ -84,7 +84,7 @@ const ONECLI_GATEWAY_PROXY_ENV_KEYS = [
 ] as const;
 
 /** Active containers tracked by session ID. */
-type ActiveContainer = { process: ChildProcess; containerName: string };
+type ActiveContainer = { process: ChildProcess; containerName: string; startedAtMs: number };
 const activeContainers = new Map<string, ActiveContainer>();
 const activeMcpBridges = new Map<string, AgentMcpBridge[]>();
 const containerExitWaiters = new Map<string, Set<() => void>>();
@@ -114,6 +114,17 @@ export function getActiveContainerCount(): number {
 
 export function isContainerRunning(sessionId: string): boolean {
   return activeContainers.has(sessionId);
+}
+
+/**
+ * Spawn time of the tracked container for a session, or 0 when none is
+ * tracked. Host-sweep uses this to clamp claim-stuck quiet-age: a claim's
+ * last-seen timestamp survives service restarts (it lives in the session DB),
+ * so a pre-restart claim must not count its age against a container that was
+ * only just spawned by THIS process.
+ */
+export function getContainerStartedAtMs(sessionId: string): number {
+  return activeContainers.get(sessionId)?.startedAtMs ?? 0;
 }
 
 function sessionIsActiveForWake(sessionId: string): boolean {
@@ -311,7 +322,7 @@ async function spawnContainer(session: Session): Promise<void> {
   container.once('close', removeEnvFile);
   container.once('error', removeEnvFile);
 
-  activeContainers.set(session.id, { process: container, containerName });
+  activeContainers.set(session.id, { process: container, containerName, startedAtMs: Date.now() });
   if (bridges.length > 0) {
     activeMcpBridges.set(session.id, bridges);
   }

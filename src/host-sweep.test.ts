@@ -201,6 +201,48 @@ describe('decideStuckAction', () => {
     expect(res.action).toBe('ok');
   });
 
+  it('does not kill on a stale pre-restart claim when the container just started (age clamped by container lifetime)', () => {
+    // Live incident: service restart left a ~10 min old 'processing' claim in
+    // the session DB; a fresh wake-container spawned and was kill-claimed 6ms
+    // later (claimAgeMs=613751 vs 60s tolerance) before it could heartbeat.
+    const res = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs: 0, // fresh container, never ticked
+      containerState: null,
+      claims: [claim('msg-1', 10 * 60 * 1000)], // claimed 10 min ago (pre-restart)
+      containerStartedAtMs: BASE - 5_000, // container started 5s ago
+    });
+    expect(res.action).toBe('ok');
+  });
+
+  it('still kill-claims when the container itself has outlived the tolerance since ITS OWN start', () => {
+    const containerAgeMs = CLAIM_STUCK_MS + 30_000;
+    const res = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs: 0, // still never heartbeat
+      containerState: null,
+      claims: [claim('msg-1', 10 * 60 * 1000)],
+      containerStartedAtMs: BASE - containerAgeMs, // started well past tolerance ago
+    });
+    expect(res.action).toBe('kill-claim');
+    if (res.action !== 'kill-claim') return;
+    expect(res.messageId).toBe('msg-1');
+    // Quiet-age is measured from the container's own start, not the stale claim.
+    expect(res.claimAgeMs).toBe(containerAgeMs);
+    expect(res.toleranceMs).toBe(CLAIM_STUCK_MS);
+  });
+
+  it('does not kill a fresh claim regardless of container start time', () => {
+    const res = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs: 0,
+      containerState: null,
+      claims: [claim('msg-1', 5_000)], // claimed 5s ago
+      containerStartedAtMs: BASE - 10 * 60 * 1000, // long-lived container
+    });
+    expect(res.action).toBe('ok');
+  });
+
   it('ignores claims with unparseable timestamps', () => {
     const res = decideStuckAction({
       now: BASE,

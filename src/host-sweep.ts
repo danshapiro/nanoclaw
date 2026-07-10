@@ -58,7 +58,7 @@ import {
   readSpawnSkillGeneration,
   sessionDir,
 } from './session-manager.js';
-import { isContainerRunning, killContainer, wakeContainer } from './container-runner.js';
+import { getContainerStartedAtMs, isContainerRunning, killContainer, wakeContainer } from './container-runner.js';
 import { currentManagedSkillGeneration } from './yente/managed-skills.js';
 import {
   ensureSessionSchedulerProjections,
@@ -128,8 +128,17 @@ export function decideStuckAction(args: {
   heartbeatMtimeMs: number; // 0 when heartbeat file absent
   containerState: ContainerState | null;
   claims: Array<{ message_id: string; status_changed: string }>;
+  /**
+   * Spawn time of the currently-running container (ms epoch), 0/absent when
+   * unknown. Claims persist in the session DB across service restarts, so a
+   * pre-restart claim can look minutes old the instant a fresh container
+   * spawns. A container cannot be claim-stuck-killed sooner than the claim
+   * tolerance after ITS OWN start: effective quiet-age is measured from
+   * max(claimLastSeen, containerStarted).
+   */
+  containerStartedAtMs?: number;
 }): StuckDecision {
-  const { now, heartbeatMtimeMs, containerState, claims } = args;
+  const { now, heartbeatMtimeMs, containerState, claims, containerStartedAtMs } = args;
   const declaredToolMs = declaredToolTimeoutMs(containerState);
 
   // Ceiling check only applies when we have an actual heartbeat timestamp.
@@ -154,7 +163,10 @@ export function decideStuckAction(args: {
   for (const claim of claims) {
     const claimedAt = parseSqliteUtc(claim.status_changed);
     if (Number.isNaN(claimedAt)) continue;
-    const claimAge = now - claimedAt;
+    // Clamp quiet-age by the container's own lifetime (see containerStartedAtMs
+    // doc above) so a fresh container gets the full tolerance to heartbeat
+    // before a stale pre-restart claim can kill it.
+    const claimAge = now - Math.max(claimedAt, containerStartedAtMs ?? 0);
     if (claimAge <= tolerance) continue;
     if (heartbeatMtimeMs > claimedAt) continue;
     return { action: 'kill-claim', messageId: claim.message_id, claimAgeMs: claimAge, toleranceMs: tolerance };
@@ -404,6 +416,7 @@ function enforceRunningContainerSla(
     heartbeatMtimeMs: heartbeat,
     containerState: getContainerState(outDb),
     claims,
+    containerStartedAtMs: getContainerStartedAtMs(session.id),
   });
 
   if (decision.action === 'kill-ceiling') {
