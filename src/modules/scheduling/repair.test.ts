@@ -102,7 +102,38 @@ describe('repairSchedulerProjections', () => {
 
     expect(projectedRows(active.id)).toEqual([]);
     expect(incidentKeys()).toEqual([expect.stringMatching(/^legacy-archived:/)]);
-    expect(getScheduledTask('ag-yente', 'task-orphan')).toBeUndefined();
+    expect(getScheduledTask('ag-yente', 'task-orphan')).toMatchObject({
+      status: 'cancelled',
+      last_error: expect.stringContaining('Auto-tombstoned'),
+    });
+  });
+
+  it('does not re-report or dedupe-log tombstoned archived rows on subsequent passes', async () => {
+    archivedSessionWithLegacyTask('task-orphan');
+    resolveSession('ag-yente', 'mg-discord', 'thread-1', 'per-thread');
+
+    await repairSchedulerProjections();
+    expect(incidentKeys()).toEqual([expect.stringMatching(/^legacy-archived:/)]);
+    expect(getScheduledTask('ag-yente', 'task-orphan')).toMatchObject({ status: 'cancelled' });
+
+    const stderrSpy = vi.spyOn(process.stderr, 'write');
+    await repairSchedulerProjections();
+
+    expect(incidentKeys()).toEqual([expect.stringMatching(/^legacy-archived:/)]);
+    const dedupeLogs = stderrSpy.mock.calls.filter((call) => String(call[0]).includes('scheduler_incident_deduped'));
+    expect(dedupeLogs).toEqual([]);
+    stderrSpy.mockRestore();
+  });
+
+  it('reports resetting-session live rows without tombstoning them', async () => {
+    archivedSessionWithLegacyTask('task-resetting', { sessionStatus: 'resetting' });
+    const { session: active } = resolveSession('ag-yente', 'mg-discord', 'thread-1', 'per-thread');
+
+    await repairSchedulerProjections();
+
+    expect(projectedRows(active.id)).toEqual([]);
+    expect(incidentKeys()).toEqual([expect.stringMatching(/^legacy-archived:/)]);
+    expect(getScheduledTask('ag-yente', 'task-resetting')).toBeUndefined();
   });
 
   it('reports archived completed recurring rows without central proof', async () => {
@@ -122,7 +153,10 @@ describe('repairSchedulerProjections', () => {
       recurrence: '0 9 * * *',
       reason: 'archived-live-task-without-central-proof',
     });
-    expect(getScheduledTask('ag-yente', 'task-orphan-recurring')).toBeUndefined();
+    expect(getScheduledTask('ag-yente', 'task-orphan-recurring')).toMatchObject({
+      status: 'cancelled',
+      last_error: expect.stringContaining('Auto-tombstoned'),
+    });
   });
 
   it('lets central live task proof drive projection instead of trusting the archived row', async () => {
@@ -194,7 +228,12 @@ async function seedCentralTask(seriesId: string, sessionId: string): Promise<voi
 
 function archivedSessionWithLegacyTask(
   seriesId: string,
-  overrides: Partial<{ status: string; processAfter: string | null; recurrence: string | null }> = {},
+  overrides: Partial<{
+    status: string;
+    processAfter: string | null;
+    recurrence: string | null;
+    sessionStatus: 'archived' | 'resetting';
+  }> = {},
 ): { id: string } {
   const row = {
     status: 'pending',
@@ -203,7 +242,7 @@ function archivedSessionWithLegacyTask(
     ...overrides,
   };
   const { session } = resolveSession('ag-yente', 'mg-discord', 'thread-1', 'per-thread');
-  updateSession(session.id, { status: 'archived', container_status: 'stopped' });
+  updateSession(session.id, { status: overrides.sessionStatus ?? 'archived', container_status: 'stopped' });
   initSessionFolder(session.agent_group_id, session.id);
   const inDb = openInboundDb(session.agent_group_id, session.id);
   try {

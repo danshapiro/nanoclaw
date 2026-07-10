@@ -9,7 +9,7 @@ import { inboundDbPath, openInboundDb } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { reportSchedulerIncident } from '../../yente/scheduler-alerts.js';
 import { reportUnsafeLegacyArchivedTask } from './legacy-import.js';
-import { getScheduledTask } from './ledger.js';
+import { getScheduledTask, tombstoneLegacyArchivedTask } from './ledger.js';
 import { ensureSessionSchedulerProjections, resolveProjectionContext } from './sync.js';
 
 interface LegacyTaskRow {
@@ -22,6 +22,8 @@ interface LegacyTaskRow {
   platform_id: string | null;
   thread_id: string | null;
   messaging_group_id: string | null;
+  is_group: 0 | 1 | null;
+  content: string;
 }
 
 export async function repairSchedulerProjections(): Promise<void> {
@@ -92,6 +94,33 @@ async function reportUnsafeArchivedSchedulerRows(): Promise<void> {
             recurrence: row.recurrence,
           },
         });
+
+        // Report-first: only after the incident report succeeded, tombstone the
+        // legacy row centrally so future sweeps short-circuit on the central-row
+        // check instead of re-reporting (and dedupe-logging) forever. Restricted
+        // to provably terminal sessions; transient states (e.g. 'resetting')
+        // stay report-only.
+        if (session.status === 'archived') {
+          await withRuntimeLock('scheduler-mutator', 120_000, (owner) => {
+            tombstoneLegacyArchivedTask(
+              {
+                seriesId: row.series_id,
+                agentGroupId: session.agent_group_id,
+                messagingGroupId: row.messaging_group_id ?? session.messaging_group_id,
+                threadId: row.thread_id ?? session.thread_id,
+                platformId: row.platform_id,
+                channelType: row.channel_type,
+                isGroup: row.is_group,
+                processAfter: row.process_after,
+                recurrence: row.recurrence,
+                content: row.content,
+                sessionId: session.id,
+                messageId: row.id,
+              },
+              owner,
+            );
+          });
+        }
       }
     } catch (err) {
       log.error('Archived scheduler row scan failed', { sessionId: session.id, err });
@@ -122,7 +151,9 @@ function listUnsafeLegacyRows(inDb: Database.Database): LegacyTaskRow[] {
               channel_type,
               platform_id,
               thread_id,
-              messaging_group_id
+              messaging_group_id,
+              is_group,
+              content
         FROM messages_in
         WHERE kind = 'task'
           AND series_id IS NOT NULL

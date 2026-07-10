@@ -13,6 +13,7 @@ import {
   markTaskProjected,
   pauseScheduledTask,
   resumeScheduledTask,
+  tombstoneLegacyArchivedTask,
   updateScheduledTask,
   type CreateScheduledTaskInput,
 } from './ledger.js';
@@ -197,6 +198,71 @@ describe('scheduler ledger', () => {
     });
     expect(getScheduledTask('ag-2', 'task-1')).toMatchObject({ status: 'pending' });
     expect(eventTypes('ag-1', 'task-1')).toEqual(['scheduled', 'cancelled']);
+  });
+
+  it('tombstones legacy archived tasks as cancelled without overwriting existing rows', async () => {
+    const tombstoneInput = {
+      seriesId: 'task-1',
+      agentGroupId: 'ag-1',
+      messagingGroupId: 'mg-1',
+      threadId: 'thread-1',
+      platformId: 'chan-1',
+      channelType: 'discord',
+      isGroup: 1 as const,
+      processAfter: '2026-06-05T12:00:00.000Z',
+      recurrence: '0 9 * * *',
+      content: JSON.stringify({ prompt: 'check heartbeat', script: null }),
+      sessionId: 'sess-archived',
+      messageId: 'legacy-task-1',
+    };
+
+    await withSchedulerLock((owner) => {
+      expect(tombstoneLegacyArchivedTask(tombstoneInput, owner)).toBe(1);
+      // Replay is a no-op (idempotent via the recorded event).
+      expect(tombstoneLegacyArchivedTask(tombstoneInput, owner)).toBe(0);
+    });
+
+    expect(getScheduledTask('ag-1', 'task-1')).toMatchObject({
+      status: 'cancelled',
+      recurrence: null,
+      process_after: '2026-06-05T12:00:00.000Z',
+      created_by_session_id: 'sess-archived',
+      last_error: expect.stringContaining('Auto-tombstoned'),
+    });
+    expect(eventTypes('ag-1', 'task-1')).toEqual(['legacy_archived_tombstoned']);
+
+    // The tombstone is terminal: createOrReplaceScheduledTask refuses to resurrect it.
+    await withSchedulerLock((owner) => {
+      expect(() => createOrReplaceScheduledTask(baseTask(), owner)).toThrow(/terminal task ag-1\/task-1/);
+    });
+  });
+
+  it('never overwrites an existing scheduled task with a legacy archived tombstone', async () => {
+    await withSchedulerLock((owner) => {
+      createOrReplaceScheduledTask(baseTask(), owner);
+      expect(
+        tombstoneLegacyArchivedTask(
+          {
+            seriesId: 'task-1',
+            agentGroupId: 'ag-1',
+            messagingGroupId: 'mg-1',
+            threadId: 'thread-1',
+            platformId: 'chan-1',
+            channelType: 'discord',
+            isGroup: 1,
+            processAfter: '2026-06-05T12:00:00.000Z',
+            recurrence: null,
+            content: JSON.stringify({ prompt: 'check heartbeat', script: null }),
+            sessionId: 'sess-archived',
+            messageId: 'legacy-task-1',
+          },
+          owner,
+        ),
+      ).toBe(0);
+    });
+
+    expect(getScheduledTask('ag-1', 'task-1')).toMatchObject({ status: 'pending', last_error: null });
+    expect(eventTypes('ag-1', 'task-1')).toEqual(['scheduled']);
   });
 
   it('updates only supplied fields, keeps stable identity, and does not duplicate unchanged updates', async () => {

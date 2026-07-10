@@ -52,6 +52,21 @@ export interface ImportLegacyScheduledTaskInput extends Omit<CreateScheduledTask
   projectedMessageId?: string | null;
 }
 
+export interface TombstoneLegacyArchivedTaskInput {
+  seriesId: string;
+  agentGroupId: string;
+  messagingGroupId: string | null;
+  threadId: string | null;
+  platformId: string | null;
+  channelType: string | null;
+  isGroup: 0 | 1 | null;
+  processAfter: string | null;
+  recurrence: string | null;
+  content: string;
+  sessionId: string;
+  messageId: string;
+}
+
 export interface ScheduledTaskUpdate {
   prompt?: string;
   script?: string | null;
@@ -379,6 +394,94 @@ export function importLegacyScheduledTask(input: ImportLegacyScheduledTaskInput,
       recurrence: input.recurrence,
       status: input.legacyStatus ?? input.status,
     });
+    return 1;
+  });
+}
+
+const LEGACY_ARCHIVED_TOMBSTONE_NOTE =
+  'Auto-tombstoned by scheduler repair: session is archived and cancellation intent cannot be proven, so the task was not auto-run.';
+
+export function tombstoneLegacyArchivedTask(input: TombstoneLegacyArchivedTaskInput, owner: RuntimeLockOwner): number {
+  return withSchedulerWrite(owner, (db) => {
+    if (
+      eventExists(
+        db,
+        input.agentGroupId,
+        input.seriesId,
+        'legacy_archived_tombstoned',
+        input.sessionId,
+        input.messageId,
+      )
+    ) {
+      return 0;
+    }
+
+    const existing = getScheduledTaskInDb(db, input.agentGroupId, input.seriesId);
+    if (existing) return 0;
+
+    const ts = nowIso();
+    const result = db
+      .prepare(
+        `INSERT INTO scheduled_tasks (
+           series_id,
+           agent_group_id,
+           messaging_group_id,
+           thread_id,
+           platform_id,
+           channel_type,
+           is_group,
+           status,
+           process_after,
+           recurrence,
+           content,
+           generation,
+           projected_session_id,
+           projected_message_id,
+           created_by_session_id,
+           updated_by_session_id,
+           created_at,
+           updated_at,
+           completed_at,
+           last_error
+         ) VALUES (
+           @seriesId,
+           @agentGroupId,
+           @messagingGroupId,
+           @threadId,
+           @platformId,
+           @channelType,
+           @isGroup,
+           'cancelled',
+           @processAfter,
+           NULL,
+           @content,
+           1,
+           NULL,
+           NULL,
+           @sessionId,
+           @sessionId,
+           @ts,
+           @ts,
+           NULL,
+           @note
+         )`,
+      )
+      .run({ ...input, ts, note: LEGACY_ARCHIVED_TOMBSTONE_NOTE });
+    if (result.changes !== 1) return 0;
+
+    recordEvent(
+      db,
+      input.agentGroupId,
+      input.seriesId,
+      'legacy_archived_tombstoned',
+      input.sessionId,
+      input.messageId,
+      {
+        note: LEGACY_ARCHIVED_TOMBSTONE_NOTE,
+        processAfter: input.processAfter,
+        recurrence: input.recurrence,
+      },
+    );
     return 1;
   });
 }
