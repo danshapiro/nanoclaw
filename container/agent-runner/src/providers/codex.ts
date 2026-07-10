@@ -599,6 +599,18 @@ export async function* runOneTurn(
     timers.onActivity(method ?? 'activity', meaningful);
     armWake();
 
+    // Thread scoping: codex subagent threads (multi_agent_v1 spawn_agent) share
+    // this app-server connection, and their notifications carry THEIR threadId.
+    // Without this guard a subagent's agentMessage pollutes resultText, the
+    // first subagent's turn/completed ends the MAIN turn mid-wait (poll-loop
+    // then fires the unwrapped-output nudge with the stolen token), and
+    // turn/started clobbers activeTurnId (corrupting interrupt targeting).
+    // Precedent: waitForCodexCompactionComplete in codex-app-server.ts.
+    // The generic activity push above is intentionally NOT gated — subagent
+    // work must still keep the idle timers alive.
+    const tid = params.threadId as string | undefined;
+    const foreignThread = Boolean(tid && tid !== threadId);
+
     switch (method) {
       case 'thread/started': {
         const thread = params.thread as { id?: string } | undefined;
@@ -609,6 +621,7 @@ export async function* runOneTurn(
         break;
       }
       case 'turn/started': {
+        if (foreignThread) break;
         const turn = params.turn as { id?: string } | undefined;
         const turnId = turn?.id ?? (params.turnId as string | undefined);
         if (turnId) {
@@ -618,11 +631,13 @@ export async function* runOneTurn(
         break;
       }
       case 'item/agentMessage/delta': {
+        if (foreignThread) break;
         const delta = params.delta as string;
         if (delta) resultText += delta;
         break;
       }
       case 'item/completed': {
+        if (foreignThread) break;
         const item = params.item as { type?: string; text?: string } | undefined;
         if (item?.type === 'agentMessage' && item.text) resultText = item.text;
         const se = dedupeCodexSideEffect(item as { id?: string; type?: string }, inputId ?? '', Date.now(), emittedSideEffectIds);
@@ -633,6 +648,7 @@ export async function* runOneTurn(
         break;
       }
       case 'turn/completed': {
+        if (foreignThread) break;
         const turn = params.turn as { status?: string; error?: { message?: string } } | undefined;
         const status = turn?.status ?? (params.status as string | undefined);
         if (status === 'interrupted') turnInterrupted = true;
@@ -647,6 +663,7 @@ export async function* runOneTurn(
       // status:"failed" and turn.error.message — both handled below. Retained as a
       // defensive no-op in case a legacy/future server still fans it out.
       case 'turn/failed': {
+        if (foreignThread) break;
         const e = params.error as { message?: string } | undefined;
         if (abortRequested) {
           turnInterrupted = true;
