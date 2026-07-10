@@ -93,6 +93,15 @@ export const OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS =
 // Stuck tolerance window applied per 'processing' claim — "did we see any
 // signs of life since this message was claimed?"
 export const CLAIM_STUCK_MS = 60 * 1000;
+// Idle-reap tier: a running container holding NO processing claims whose
+// heartbeat has been quiet this long is reaped well before the absolute
+// ceiling. Warm containers are pure cache: continuations are persisted at
+// turn init and pending work re-wakes a dead container via sweep step 3, so
+// reaping an idle container loses only warm-start time -- while a burst of
+// per-thread sessions would otherwise pin 20+ idle unbounded-memory runtimes
+// for up to 30 minutes. Operator-overridable via NANOCLAW_IDLE_REAP_MS
+// (same pattern as OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS).
+export const IDLE_REAP_MS = Number(process.env.NANOCLAW_IDLE_REAP_MS) || 10 * 60 * 1000;
 // A container whose skill generation is stale is recycled only once it has been
 // quiet at least this long — confident it is between turns, not mid-flush.
 export const IDLE_RECYCLE_GRACE_MS = 60 * 1000;
@@ -102,7 +111,8 @@ const BACKOFF_BASE_MS = 5000;
 export type StuckDecision =
   | { action: 'ok' }
   | { action: 'kill-ceiling'; heartbeatAgeMs: number; ceilingMs: number }
-  | { action: 'kill-claim'; messageId: string; claimAgeMs: number; toleranceMs: number };
+  | { action: 'kill-claim'; messageId: string; claimAgeMs: number; toleranceMs: number }
+  | { action: 'kill-idle'; idleAgeMs: number; idleReapMs: number };
 
 export type SkillRecycleDecision =
   | { action: 'ok' }
@@ -148,6 +158,20 @@ export function decideStuckAction(args: {
     if (claimAge <= tolerance) continue;
     if (heartbeatMtimeMs > claimedAt) continue;
     return { action: 'kill-claim', messageId: claim.message_id, claimAgeMs: claimAge, toleranceMs: tolerance };
+  }
+
+  // Idle-reap tier: only for containers holding NO claims -- a claim means an
+  // active turn, and active turns are governed exclusively by the ceiling and
+  // claim-stuck rules above. heartbeatMtimeMs === 0 (freshly spawned, never
+  // ticked) is left alone for the same reason as the ceiling check. A declared
+  // active long tool widens the idle threshold just like it widens the claim
+  // tolerance, so declared-long-tool extensions are unaffected.
+  if (claims.length === 0 && heartbeatMtimeMs !== 0) {
+    const idleThreshold = Math.max(IDLE_REAP_MS, declaredToolMs ?? 0);
+    const idleAge = now - heartbeatMtimeMs;
+    if (idleAge > idleThreshold) {
+      return { action: 'kill-idle', idleAgeMs: idleAge, idleReapMs: idleThreshold };
+    }
   }
 
   return { action: 'ok' };
@@ -402,6 +426,19 @@ function enforceRunningContainerSla(
     });
     killContainer(session.id, 'claim-stuck');
     resetStuckProcessingRows(inDb, outDb, session, 'claim-stuck');
+    return;
+  }
+
+  if (decision.action === 'kill-idle') {
+    // Same reap path as kill-ceiling (killContainer + resetStuckProcessingRows)
+    // so state handling is identical; distinct action name for prod logs.
+    log.info('Reaping idle container (kill-idle)', {
+      sessionId: session.id,
+      idleAgeMs: decision.idleAgeMs,
+      idleReapMs: decision.idleReapMs,
+    });
+    killContainer(session.id, 'kill-idle');
+    resetStuckProcessingRows(inDb, outDb, session, 'kill-idle');
     return;
   }
 

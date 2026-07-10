@@ -8,13 +8,14 @@ import os from 'os';
 import path from 'path';
 
 import Database from 'better-sqlite3';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { countDueMessagesExcludingRecovery, getProcessingClaims } from './db/session-db.js';
 import { OUTBOUND_SCHEMA } from './db/schema.js';
 import {
   ABSOLUTE_CEILING_MS,
   CLAIM_STUCK_MS,
+  IDLE_REAP_MS,
   IDLE_RECYCLE_GRACE_MS,
   OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS,
   clearProviderToolState,
@@ -208,6 +209,84 @@ describe('decideStuckAction', () => {
       claims: [{ message_id: 'x', status_changed: 'not-a-date' }],
     });
     expect(res.action).toBe('ok');
+  });
+
+  it('returns kill-idle when no claims and heartbeat quiet past IDLE_REAP_MS', () => {
+    const idleAgeMs = IDLE_REAP_MS + 60_000;
+    const res = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs: BASE - idleAgeMs,
+      containerState: null,
+      claims: [],
+    });
+    expect(res.action).toBe('kill-idle');
+    if (res.action !== 'kill-idle') return;
+    expect(res.idleAgeMs).toBe(idleAgeMs);
+    expect(res.idleReapMs).toBe(IDLE_REAP_MS);
+  });
+
+  it('does not idle-reap within the IDLE_REAP_MS threshold', () => {
+    const res = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs: BASE - IDLE_REAP_MS + 60_000, // quiet, but under threshold
+      containerState: null,
+      claims: [],
+    });
+    expect(res.action).toBe('ok');
+  });
+
+  it('never idle-reaps a claim-holding container -- existing rules apply instead', () => {
+    // Heartbeat quiet past the idle threshold, but a claim is present:
+    // a fresh claim means an active turn -> ok, not kill-idle.
+    const staleHeartbeat = BASE - IDLE_REAP_MS - 60_000;
+    const fresh = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs: staleHeartbeat,
+      containerState: null,
+      claims: [claim('msg-1', 5_000)],
+    });
+    expect(fresh.action).toBe('ok');
+
+    // A stale claim on the same container falls through to kill-claim,
+    // never kill-idle.
+    const stale = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs: staleHeartbeat,
+      containerState: null,
+      claims: [claim('msg-1', CLAIM_STUCK_MS + 10_000)],
+    });
+    expect(stale.action).toBe('kill-claim');
+  });
+
+  it('does not idle-reap when no heartbeat file exists (fresh container)', () => {
+    const res = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs: 0,
+      containerState: null,
+      claims: [],
+    });
+    expect(res.action).toBe('ok');
+  });
+
+  it('respects the NANOCLAW_IDLE_REAP_MS env override', async () => {
+    vi.stubEnv('NANOCLAW_IDLE_REAP_MS', '120000');
+    vi.resetModules();
+    try {
+      const mod = await import('./host-sweep.js');
+      expect(mod.IDLE_REAP_MS).toBe(120_000);
+      // 2.5 min idle: past the 2-min override, but well under the 10-min
+      // default -- proves the override is what fired.
+      const res = mod.decideStuckAction({
+        now: BASE,
+        heartbeatMtimeMs: BASE - 150_000,
+        containerState: null,
+        claims: [],
+      });
+      expect(res.action).toBe('kill-idle');
+    } finally {
+      vi.unstubAllEnvs();
+      vi.resetModules();
+    }
   });
 });
 
