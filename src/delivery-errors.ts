@@ -40,8 +40,15 @@ export function extractHttpStatusFromError(err: unknown): number | null {
   return null;
 }
 
-/** True when the error is a deterministic client error (HTTP 4xx). */
+/**
+ * True when the error is a deterministic client error (HTTP 4xx).
+ *
+ * 429 (rate limit) is excluded: it is transient -- Discord's retry_after is
+ * typically sub-second, well within the delivery retry backoff (>=250ms), so
+ * a retry succeeds where a "permanent" classification would silently drop
+ * the message.
+ */
 export function isNonRetryableDeliveryError(err: unknown): boolean {
   const status = extractHttpStatusFromError(err);
-  return status !== null && status >= 400 && status < 500;
+  return status !== null && status >= 400 && status < 500 && status !== 429;
 }

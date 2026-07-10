@@ -607,7 +607,10 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           await adapter.addReaction(retargetThreadStarterTid(tid, messageId), messageId, emoji);
         } catch (err) {
           const status = extractHttpStatusFromError(err);
-          if (status !== null && status >= 400 && status < 500) {
+          // 429 (rate limit) is transient -- rethrow so the delivery retry
+          // loop handles it like 5xx/network errors instead of dropping the
+          // reaction.
+          if (status !== null && status >= 400 && status < 500 && status !== 429) {
             // Deterministic client error (unknown message/emoji) -- retrying
             // cannot succeed and a missing reaction is cosmetic. Log and let
             // the delivery row succeed-as-skipped.

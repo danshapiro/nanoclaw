@@ -354,6 +354,27 @@ describe('Chat SDK bridge deliver — reactions', () => {
     ).rejects.toThrow('502');
   });
 
+  it('rethrows 429 rate-limit errors so the delivery retry loop handles them', async () => {
+    const { bridge, addReaction } = makeBridge();
+    addReaction.mockRejectedValue(
+      new Error('Discord API error: 429 {"message": "You are being rate limited.", "retry_after": 0.3}'),
+    );
+
+    await expect(
+      bridge.deliver('discord:guild-1:chan-1', 'discord:guild-1:chan-1', reactionMessage('msg-1', '✅')),
+    ).rejects.toThrow('429');
+  });
+
+  it.each([400, 403, 404])('still swallows deterministic %i client errors', async (status) => {
+    const { bridge, addReaction } = makeBridge();
+    addReaction.mockRejectedValue(new Error(`Discord API error: ${status} {"message": "client error"}`));
+
+    await expect(
+      bridge.deliver('discord:guild-1:chan-1', 'discord:guild-1:chan-1', reactionMessage('msg-1', '✅')),
+    ).resolves.toBeUndefined();
+    expect(addReaction).toHaveBeenCalledTimes(1);
+  });
+
   it('retargets thread-starter edits to the parent channel', async () => {
     const { bridge, editMessage } = makeBridge();
 

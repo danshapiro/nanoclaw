@@ -502,6 +502,34 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     ]);
   });
 
+  it('treats 429 rate-limit errors as transient and retries them', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-limited', 'rate limited once');
+
+    let calls = 0;
+    setDeliveryAdapter({
+      async deliver() {
+        calls++;
+        if (calls === 1) {
+          throw new Error('Discord API error: 429 {"message": "You are being rate limited.", "retry_after": 0.3}');
+        }
+        return 'plat-limited';
+      },
+    });
+
+    await deliverSessionMessages(session);
+    // 429 is transient -- not marked failed on attempt 1.
+    expect(calls).toBe(1);
+    expect(deliveredRows('ag-1', session.id)).toEqual([]);
+
+    await deliverSessionMessages(session);
+    expect(calls).toBe(2);
+    expect(deliveredRows('ag-1', session.id)).toEqual([
+      { message_out_id: 'out-limited', platform_message_id: 'plat-limited', status: 'delivered' },
+    ]);
+  });
+
   it('does not stale-drop scheduling system actions during inactive suppression', async () => {
     seedAgentAndChannel();
     const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
