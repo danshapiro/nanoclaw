@@ -32,6 +32,7 @@ import {
   isAgentMailMessageTerminal,
   markAgentMailMessageFailed,
   markAgentMailMessageBlocked,
+  markAgentMailMessageSuppressed,
   markAgentMailMessageRouted,
   reconcileAgentMailRoutes,
   recordAgentMailMessageRoute,
@@ -116,11 +117,27 @@ export function createAgentMailAdapter(deps: AgentMailAdapterDeps = {}): Channel
       return;
     }
 
-    if (shouldSuppressAgentMailMessage(message)) {
+    const suppressionReason = shouldSuppressAgentMailMessage(message);
+    if (suppressionReason) {
+      const suppressedAt = now();
+      markAgentMailMessageSuppressed({
+        inboxId: message.inboxId,
+        messageId: message.messageId,
+        eventId: message.eventId ?? null,
+        agentmailThreadId: message.threadId ?? null,
+        nanoThreadId: nanoThreadIdForAgentMailMessage(route, message),
+        messagingGroupId: route.messagingGroupId,
+        senderEmail: senderEmailForAgentMailMessage(message),
+        subject: message.subject ?? '',
+        receivedAt: message.timestamp ?? message.receivedAt ?? message.createdAt ?? suppressedAt,
+        suppressedAt,
+        reason: suppressionReason,
+      });
       log.info('AgentMail message suppressed before routing', {
         inboxId: message.inboxId,
         messageId: message.messageId,
         source,
+        reason: suppressionReason,
       });
       return;
     }
@@ -331,10 +348,10 @@ export function createAgentMailAdapter(deps: AgentMailAdapterDeps = {}): Channel
     catchupTimer.unref?.();
   }
 
-  function shouldSuppressAgentMailMessage(message: AgentMailMessageLike): boolean {
+  function shouldSuppressAgentMailMessage(message: AgentMailMessageLike): string | null {
     const labels = new Set((message.labels ?? []).map((label) => label.toLowerCase()));
-    if (labels.has('nanoclaw:outbound')) return true;
-    if (labels.has('sent')) return true;
+    if (labels.has('nanoclaw:outbound')) return 'label:nanoclaw:outbound';
+    if (labels.has('sent')) return 'label:sent';
 
     const headers = Object.fromEntries(
       Object.entries(message.headers ?? {}).map(([key, value]) => [
@@ -343,12 +360,14 @@ export function createAgentMailAdapter(deps: AgentMailAdapterDeps = {}): Channel
       ]),
     );
     const autoSubmitted = headers['auto-submitted']?.trim().toLowerCase();
-    if (autoSubmitted && autoSubmitted !== 'no') return true;
-    if (headers['x-nanoclaw-outbound'] === '1') return true;
-    if (/^(bulk|junk|list)$/i.test(headers.precedence ?? '')) return true;
+    if (autoSubmitted && autoSubmitted !== 'no') return 'header:auto-submitted';
+    if (headers['x-nanoclaw-outbound'] === '1') return 'header:x-nanoclaw-outbound';
+    if (/^(bulk|junk|list)$/i.test(headers.precedence ?? '')) return 'header:precedence';
 
     const sender = senderEmailForAgentMailMessage(message).toLowerCase();
-    return sender.includes('mailer-daemon') || sender.includes('postmaster');
+    if (sender.includes('mailer-daemon')) return 'sender:mailer-daemon';
+    if (sender.includes('postmaster')) return 'sender:postmaster';
+    return null;
   }
 
   function errorMessage(error: unknown): string {

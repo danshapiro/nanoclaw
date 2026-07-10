@@ -383,7 +383,7 @@ describe('AgentMail adapter', () => {
   it('suppresses live auto-submitted messages after fetching full headers', async () => {
     const socket = new FakeSocket();
     fake = fakeApi(socket);
-    vi.mocked(fake.getMessage).mockResolvedValueOnce({
+    vi.mocked(fake.getMessage).mockResolvedValue({
       inboxId: 'yente@agentmail.to',
       messageId: 'm-auto',
       threadId: 'thread-auto',
@@ -392,6 +392,21 @@ describe('AgentMail adapter', () => {
       text: 'machine generated',
       headers: { 'auto-submitted': 'auto-generated' },
     });
+    vi.mocked(fake.listMessages).mockImplementation(async (inboxId: string) => ({
+      messages:
+        inboxId === 'yente@agentmail.to'
+          ? [
+              {
+                inboxId,
+                messageId: 'm-auto',
+                threadId: 'thread-auto',
+                from_: 'service@example.com',
+                subject: 'Automated',
+                text: 'machine generated',
+              },
+            ]
+          : [],
+    }));
     const inbound: Parameters<ChannelSetup['onInbound']>[] = [];
     const adapter = createAgentMailAdapter({
       api: fake,
@@ -416,6 +431,16 @@ describe('AgentMail adapter', () => {
     await new Promise((resolve) => setImmediate(resolve));
 
     expect(fake.getMessage).toHaveBeenCalledWith('yente@agentmail.to', 'm-auto');
+    expect(fake.getMessage).toHaveBeenCalledTimes(1);
+    expect(inbound).toHaveLength(0);
+
+    socket.emit('message', {
+      type: 'subscribed',
+      inboxIds: ['yente@agentmail.to', 'yente-threads@agentmail.to', 'yente-aidy@agentmail.to'],
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(fake.getMessage).toHaveBeenCalledTimes(1);
     expect(inbound).toHaveLength(0);
   });
 
@@ -447,12 +472,15 @@ describe('AgentMail adapter', () => {
       text: 'already sent',
       labels: ['sent'],
     }));
+    const infoSpy = vi.spyOn(log, 'info');
     const inbound: Parameters<ChannelSetup['onInbound']>[] = [];
     const adapter = createAgentMailAdapter({
       api: fake,
       env: BASE_AGENTMAIL_ENV,
       now: () => '2026-06-12T00:00:00.000Z',
     })!;
+    const suppressionLogs = () =>
+      infoSpy.mock.calls.filter(([message]) => message === 'AgentMail message suppressed before routing');
 
     await adapter.setup(setupCollector(inbound));
     socket.emit('message', {
@@ -463,6 +491,18 @@ describe('AgentMail adapter', () => {
 
     expect(inbound).toHaveLength(0);
     expect(fake.updateLabels).not.toHaveBeenCalled();
+    expect(fake.getMessage).toHaveBeenCalledTimes(1);
+    expect(suppressionLogs()).toHaveLength(1);
+
+    socket.emit('message', {
+      type: 'subscribed',
+      inboxIds: ['yente@agentmail.to', 'yente-threads@agentmail.to', 'yente-aidy@agentmail.to'],
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(inbound).toHaveLength(0);
+    expect(fake.getMessage).toHaveBeenCalledTimes(1);
+    expect(suppressionLogs()).toHaveLength(1);
   });
 
   it('marks strict routing failures failed so a later event can retry', async () => {
