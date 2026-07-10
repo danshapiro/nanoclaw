@@ -33,7 +33,7 @@ import { buildSystemPromptAddendum } from './destinations.js';
 import './providers/index.js';
 import { createProvider, type ProviderName } from './providers/factory.js';
 import { runPollLoop } from './poll-loop.js';
-import { ensureAgentRunnerPath } from './runtime-path.js';
+import { ensureAgentRunnerPath, suppressUndiciProxyWarning } from './runtime-path.js';
 
 function log(msg: string): void {
   console.error(`[agent-runner] ${msg}`);
@@ -43,6 +43,9 @@ const CWD = '/workspace/agent';
 
 async function main(): Promise<void> {
   ensureAgentRunnerPath();
+  // Node CLIs spawned below inherit process.env (see createProvider's env
+  // spread); suppress the per-spawn UNDICI-EHPA experimental-warning noise.
+  suppressUndiciProxyWarning();
 
   const config = loadConfig();
   const providerName = config.provider.toLowerCase() as ProviderName;

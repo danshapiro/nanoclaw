@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 
-import { ensureAgentRunnerPath } from './runtime-path.js';
+import { ensureAgentRunnerPath, suppressUndiciProxyWarning } from './runtime-path.js';
 
 describe('ensureAgentRunnerPath', () => {
   it('restores image tool paths when container env overrides PATH', () => {
@@ -21,3 +21,30 @@ describe('ensureAgentRunnerPath', () => {
   });
 });
 
+
+describe('suppressUndiciProxyWarning', () => {
+  it('sets NODE_OPTIONS with the targeted --disable-warning flag when unset', () => {
+    const env: NodeJS.ProcessEnv = {};
+
+    suppressUndiciProxyWarning(env);
+
+    expect(env.NODE_OPTIONS).toBe('--disable-warning=UNDICI-EHPA');
+  });
+
+  it('appends to existing NODE_OPTIONS without clobbering other options', () => {
+    const env: NodeJS.ProcessEnv = { NODE_OPTIONS: '--max-old-space-size=512' };
+
+    suppressUndiciProxyWarning(env);
+
+    expect(env.NODE_OPTIONS).toBe('--max-old-space-size=512 --disable-warning=UNDICI-EHPA');
+  });
+
+  it('is idempotent — does not duplicate the flag', () => {
+    const env: NodeJS.ProcessEnv = {};
+
+    suppressUndiciProxyWarning(env);
+    suppressUndiciProxyWarning(env);
+
+    expect(env.NODE_OPTIONS).toBe('--disable-warning=UNDICI-EHPA');
+  });
+});
