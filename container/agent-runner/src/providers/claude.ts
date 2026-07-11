@@ -276,6 +276,97 @@ const CLAUDE_CODE_AUTO_COMPACT_WINDOW = '165000';
  */
 const STALE_SESSION_RE = /no conversation found|ENOENT.*\.jsonl|session.*not found/i;
 
+// ── Claude Code executable resolution ──
+
+/**
+ * Where the base image's `pnpm install -g @anthropic-ai/claude-code` places the
+ * global bin shim (PNPM_HOME=/pnpm; container/Dockerfile). Per-agent-group
+ * images (buildAgentGroupImage in src/container-runner.ts) run a further
+ * `pnpm install -g <pkgs>` layer, which re-links pnpm's global bin dir and can
+ * drop this shim — so dynamically-created groups may boot without it.
+ */
+export const DEFAULT_CLAUDE_EXECUTABLE_PATH = '/pnpm/claude';
+
+export interface ClaudeExecutableResolution {
+  /** Resolved executable path, or undefined to let the SDK use its bundled default. */
+  path: string | undefined;
+  source: 'configured-path' | 'path-lookup' | 'sdk-default';
+  tried: string[];
+}
+
+/**
+ * Resolve the Claude Code executable robustly: the known image path first,
+ * then a PATH lookup (`which claude` equivalent), then fall back to the SDK's
+ * own bundled binary by omitting `pathToClaudeCodeExecutable` entirely.
+ */
+export function resolveClaudeCodeExecutable(
+  deps: {
+    existsSync?: (p: string) => boolean;
+    env?: { PATH?: string };
+    configuredPath?: string;
+  } = {},
+): ClaudeExecutableResolution {
+  const existsSync = deps.existsSync ?? fs.existsSync;
+  const configured = deps.configuredPath ?? DEFAULT_CLAUDE_EXECUTABLE_PATH;
+  const envPath = (deps.env ?? process.env).PATH ?? '';
+  const tried: string[] = [configured];
+  const exists = (p: string): boolean => {
+    try {
+      return existsSync(p);
+    } catch {
+      return false;
+    }
+  };
+  if (exists(configured)) return { path: configured, source: 'configured-path', tried };
+  for (const dir of envPath.split(path.delimiter).filter(Boolean)) {
+    const candidate = path.join(dir, 'claude');
+    tried.push(candidate);
+    if (exists(candidate)) return { path: candidate, source: 'path-lookup', tried };
+  }
+  return { path: undefined, source: 'sdk-default', tried };
+}
+
+let claudeExecutableFailureLogged = false;
+
+/** @internal test hook */
+export function resetClaudeExecutableResolutionLogForTests(): void {
+  claudeExecutableFailureLogged = false;
+}
+
+/**
+ * Resolve once at provider init and log the outcome. When NO executable is
+ * found, emit one loud structured error (not a per-turn retry loop) and fall
+ * back to the SDK's bundled binary resolution.
+ */
+export function resolveClaudeExecutableWithLogging(
+  deps: Parameters<typeof resolveClaudeCodeExecutable>[0] = {},
+): string | undefined {
+  const resolution = resolveClaudeCodeExecutable(deps);
+  if (resolution.source === 'path-lookup') {
+    console.error(
+      JSON.stringify({
+        severity: 'warn',
+        event: 'claude_executable_resolved_from_path',
+        path: resolution.path,
+        configured_path: resolution.tried[0],
+      }),
+    );
+  } else if (!resolution.path && !claudeExecutableFailureLogged) {
+    claudeExecutableFailureLogged = true;
+    console.error(
+      JSON.stringify({
+        severity: 'error',
+        event: 'claude_executable_not_found',
+        configured_path: resolution.tried[0],
+        tried_count: resolution.tried.length,
+        fallback: 'sdk_bundled_default',
+        hint: 'per-agent-group image may have re-linked /pnpm during pnpm install -g (buildAgentGroupImage)',
+      }),
+    );
+  }
+  return resolution.path;
+}
+
 export class ClaudeProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = true;
 
@@ -284,8 +375,11 @@ export class ClaudeProvider implements AgentProvider {
   private allowedTools: string[];
   private env: Record<string, string | undefined>;
   private additionalDirectories?: string[];
+  /** Resolved once at provider init; undefined lets the SDK resolve its bundled binary. */
+  private readonly claudeExecutablePath: string | undefined;
 
   constructor(options: ProviderOptions = {}) {
+    this.claudeExecutablePath = resolveClaudeExecutableWithLogging();
     this.assistantName = options.assistantName;
     this.mcpServers = options.mcpServers ?? {};
     this.allowedTools = buildClaudeToolAllowlist(options.allowedTools);
@@ -330,7 +424,7 @@ export class ClaudeProvider implements AgentProvider {
         cwd: input.cwd,
         additionalDirectories: this.additionalDirectories,
         resume: input.continuation,
-        pathToClaudeCodeExecutable: '/pnpm/claude',
+        ...(this.claudeExecutablePath ? { pathToClaudeCodeExecutable: this.claudeExecutablePath } : {}),
         systemPrompt: instructions
           ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions }
           : undefined,
