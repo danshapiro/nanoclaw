@@ -1122,6 +1122,66 @@ export function extractDockerEnvArgsToFile(args: readonly string[], envFilePath:
   return out;
 }
 
+/**
+ * Env keys whose files are treated as an EXCLUSIVE root store by their
+ * consumers (rustls-native-certs replaces the system roots with the
+ * SSL_CERT_FILE contents; codex reads CODEX_CA_CERTIFICATE the same way).
+ * NODE_EXTRA_CA_CERTS is deliberately NOT here — its semantics are additive,
+ * so pointing it at the gateway-only pem is already correct.
+ */
+const EXCLUSIVE_CA_ENV_KEYS = ['SSL_CERT_FILE', 'CODEX_CA_CERTIFICATE'];
+
+/**
+ * Re-point exclusive-root-store CA env vars at the SDK-provided COMBINED
+ * CA bundle (DENO_CERT's value).
+ *
+ * Why: the OneCLI SDK injects SSL_CERT_FILE / CODEX_CA_CERTIFICATE pointing
+ * at the gateway-CA-only pem. rustls-native-certs treats SSL_CERT_FILE as the
+ * EXCLUSIVE root store, so the codex websocket client trusts only the gateway
+ * CA and cannot verify TUNNELED (non-MITM'd) hosts like chatgpt.com —
+ * every ws connect fails with 'invalid peer certificate: UnknownIssuer'.
+ * The same SDK injection already provides DENO_CERT pointing at a combined
+ * bundle (public roots + gateway CA), delivered by the same host-side copy
+ * mechanism as the gateway pem, so it exists whenever the gateway pem does.
+ *
+ * This must happen HERE, host-side at env-assembly time: the pem files are
+ * docker-cp'd into the container's /tmp AFTER the container starts, so the
+ * entrypoint's CA-bundle fallback finds no files and correctly no-ops (it is
+ * kept in place as a fallback in case the pems ever become mounts).
+ *
+ * Mutates `args` in place. Returns the remap details when a rewrite happened
+ * (so the caller can log once per spawn), null when nothing changed —
+ * including when DENO_CERT is absent or the values already agree.
+ */
+export function remapCaEnvToCombinedBundle(args: string[]): { combinedBundle: string; remappedKeys: string[] } | null {
+  let combinedBundle: string | undefined;
+  for (let index = 0; index < args.length - 1; index++) {
+    if (args[index] !== '-e') continue;
+    const entry = args[index + 1];
+    if (entry.startsWith('DENO_CERT=')) {
+      // Last-wins, matching docker -e / env-file dedupe semantics.
+      const value = entry.slice('DENO_CERT='.length);
+      if (value) combinedBundle = value;
+    }
+  }
+  if (!combinedBundle) return null;
+
+  const remapped = new Set<string>();
+  for (let index = 0; index < args.length - 1; index++) {
+    if (args[index] !== '-e') continue;
+    const entry = args[index + 1];
+    const eq = entry.indexOf('=');
+    if (eq <= 0) continue;
+    const key = entry.slice(0, eq);
+    if (!EXCLUSIVE_CA_ENV_KEYS.includes(key)) continue;
+    if (entry.slice(eq + 1) === combinedBundle) continue;
+    args[index + 1] = `${key}=${combinedBundle}`;
+    remapped.add(key);
+  }
+  if (remapped.size === 0) return null;
+  return { combinedBundle, remappedKeys: [...remapped].sort() };
+}
+
 /** Best-effort removal of a per-container env file (idempotent). */
 function removeContainerEnvFile(envFilePath: string): void {
   if (!envFilePath) return;
@@ -1251,6 +1311,18 @@ async function buildContainerArgs(
   // provider-contributed secrets) into a private 0600 env file so token-
   // bearing values never appear in /proc/<pid>/cmdline. Written last so an
   // earlier throw in this function leaves no file behind.
+  // Re-point exclusive CA-store env vars (SSL_CERT_FILE, CODEX_CA_CERTIFICATE)
+  // at the combined bundle DENO_CERT names, so codex's rustls websocket can
+  // verify tunneled hosts. Must run before env extraction to the env file.
+  const caRemap = remapCaEnvToCombinedBundle(args);
+  if (caRemap) {
+    log.info('ca env remapped to combined bundle', {
+      container: containerName,
+      combinedBundle: caRemap.combinedBundle,
+      remappedKeys: caRemap.remappedKeys,
+    });
+  }
+
   const envFilePath = path.join(containerEnvDir(), `${containerName}.env`);
   return { args: extractDockerEnvArgsToFile(args, envFilePath), envFilePath };
 }

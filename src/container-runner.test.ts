@@ -10,6 +10,7 @@ import {
   applyOneCliGatewayForContainerArgs,
   assertNoReservedAgentCommandCollisionsShell,
   extractDockerEnvArgsToFile,
+  remapCaEnvToCombinedBundle,
   buildManagedReposIpcMount,
   buildManagedReposMounts,
   buildLocalSkillsMount,
@@ -1647,6 +1648,82 @@ describe('container env file (secrets off the command line)', () => {
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('remaps exclusive CA env vars to the DENO_CERT combined bundle in the env file', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-envfile-'));
+    const envFilePath = path.join(dir, 'test.env');
+    try {
+      const args = [
+        'run',
+        '-e',
+        'DENO_CERT=/tmp/onecli-combined-ca.pem',
+        '-e',
+        'SSL_CERT_FILE=/tmp/onecli-gateway-ca.pem',
+        '-e',
+        'CODEX_CA_CERTIFICATE=/tmp/onecli-gateway-ca.pem',
+        '-e',
+        'NODE_EXTRA_CA_CERTS=/tmp/onecli-gateway-ca.pem',
+        'image',
+      ];
+      const remap = remapCaEnvToCombinedBundle(args);
+      expect(remap).toEqual({
+        combinedBundle: '/tmp/onecli-combined-ca.pem',
+        remappedKeys: ['CODEX_CA_CERTIFICATE', 'SSL_CERT_FILE'],
+      });
+      extractDockerEnvArgsToFile(args, envFilePath);
+      const { env } = readSpawnEnvFile(['--env-file', envFilePath]);
+      // All three exclusive-store/deno keys point at the combined bundle.
+      expect(env.get('DENO_CERT')).toBe('/tmp/onecli-combined-ca.pem');
+      expect(env.get('SSL_CERT_FILE')).toBe('/tmp/onecli-combined-ca.pem');
+      expect(env.get('CODEX_CA_CERTIFICATE')).toBe('/tmp/onecli-combined-ca.pem');
+      // NODE_EXTRA_CA_CERTS is additive and must never be modified.
+      expect(env.get('NODE_EXTRA_CA_CERTS')).toBe('/tmp/onecli-gateway-ca.pem');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('leaves SSL_CERT_FILE untouched when DENO_CERT is absent', () => {
+    const args = ['run', '-e', 'SSL_CERT_FILE=/tmp/onecli-gateway-ca.pem', '-e', 'FOO=bar', 'image'];
+    const before = [...args];
+    expect(remapCaEnvToCombinedBundle(args)).toBeNull();
+    expect(args).toEqual(before);
+  });
+
+  it('does not rewrite (and reports no remap to log) when values already match DENO_CERT', () => {
+    const args = [
+      'run',
+      '-e',
+      'DENO_CERT=/tmp/onecli-combined-ca.pem',
+      '-e',
+      'SSL_CERT_FILE=/tmp/onecli-combined-ca.pem',
+      '-e',
+      'CODEX_CA_CERTIFICATE=/tmp/onecli-combined-ca.pem',
+      'image',
+    ];
+    const before = [...args];
+    // Null return is what gates the once-per-spawn log line in
+    // buildContainerArgs, so no rewrite means no log.
+    expect(remapCaEnvToCombinedBundle(args)).toBeNull();
+    expect(args).toEqual(before);
+  });
+
+  it('never modifies NODE_EXTRA_CA_CERTS even when a remap happens', () => {
+    const args = [
+      'run',
+      '-e',
+      'DENO_CERT=/tmp/onecli-combined-ca.pem',
+      '-e',
+      'NODE_EXTRA_CA_CERTS=/tmp/onecli-gateway-ca.pem',
+      '-e',
+      'SSL_CERT_FILE=/tmp/onecli-gateway-ca.pem',
+      'image',
+    ];
+    const remap = remapCaEnvToCombinedBundle(args);
+    expect(remap?.remappedKeys).toEqual(['SSL_CERT_FILE']);
+    expect(args).toContain('NODE_EXTRA_CA_CERTS=/tmp/onecli-gateway-ca.pem');
+    expect(args).toContain('SSL_CERT_FILE=/tmp/onecli-combined-ca.pem');
   });
 
   it('dedupes duplicate keys last-wins, matching docker -e semantics', () => {
