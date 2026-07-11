@@ -123,7 +123,13 @@ type FetchLike = (input: string | URL | Request, init?: RequestInit) => Promise<
 async function readJson<T>(fetchImpl: FetchLike, url: string, init: RequestInit): Promise<T> {
   const response = await fetchImpl(url, init);
   if (!response.ok) {
-    throw new Error(`OneCLI request failed for ${url}: HTTP ${response.status}`);
+    // Attach statusCode so callers (container-runner retry) can distinguish
+    // retryable 5xx from non-retryable 4xx without parsing message text.
+    const error = new Error(`OneCLI request failed for ${url}: HTTP ${response.status}`) as Error & {
+      statusCode: number;
+    };
+    error.statusCode = response.status;
+    throw error;
   }
   return (await response.json()) as T;
 }

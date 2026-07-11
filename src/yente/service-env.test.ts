@@ -206,6 +206,26 @@ describe('Yente service env contract', () => {
     ).rejects.toThrow('Missing required ONECLI_GATEWAY_URL');
   });
 
+  it('attaches statusCode to OneCLI HTTP failures so callers can classify 5xx vs 4xx', async () => {
+    const fetchImpl = async (): Promise<Response> => new Response('boom', { status: 503 });
+
+    const err = await ensureOneCliAgentSecretAccess({
+      onecliUrl: 'https://onecli.local',
+      onecliApiKey: 'onecli-key',
+      onecliGatewayUrl: 'https://onecli-gateway.local',
+      agentIdentifier: 'ag-main',
+      fetchImpl,
+    }).then(
+      () => {
+        throw new Error('expected rejection');
+      },
+      (e: Error & { statusCode?: number }) => e,
+    );
+
+    expect(err.message).toContain('HTTP 503');
+    expect(err.statusCode).toBe(503);
+  });
+
   it('fails closed when a required OneCLI secret is missing', async () => {
     const fetchImpl = async (input: string | URL | Request): Promise<Response> => {
       const url = String(input);

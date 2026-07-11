@@ -17,6 +17,7 @@ import {
   resolveProviderName,
 } from './container-runner.js';
 import { AgentMcpCredentialUnavailableError, type AgentMcpBridgeOptions } from './agent-mcp-bridge.js';
+import { log } from './log.js';
 import type { AgentMcpConfigForGroup } from './agent-mcp-config.js';
 import type { ContainerConfig } from './container-config.js';
 import type { AgentGroup } from './types.js';
@@ -473,11 +474,115 @@ describe('buildAgentGroupImage', () => {
 });
 
 describe('OneCLI container gateway', () => {
-  it('throws before spawn args are complete when OneCLI returns false', async () => {
+  it('throws before spawn args are complete when OneCLI returns false on every attempt', async () => {
+    vi.useFakeTimers();
+    try {
+      const args = ['run'];
+      const client = {
+        ensureAgent: vi.fn().mockResolvedValue(undefined),
+        applyContainerConfig: vi.fn().mockResolvedValue(false),
+      };
+
+      const promise = applyOneCliGatewayForContainerArgs(args, {
+        client,
+        containerName: 'container-1',
+        agentGroupName: 'Yente',
+        agentIdentifier: 'ag-main',
+        ensureSecretAccess: vi.fn().mockResolvedValue(undefined),
+      });
+      const expectation = expect(promise).rejects.toThrow('OneCLI gateway did not apply container credentials');
+      await vi.advanceTimersByTimeAsync(12_000);
+      await expectation;
+
+      expect(client.ensureAgent).toHaveBeenCalledWith({ name: 'Yente', identifier: 'ag-main' });
+      expect(client.applyContainerConfig).toHaveBeenCalledWith(args, { addHostMapping: false, agent: 'ag-main' });
+      expect(client.applyContainerConfig).toHaveBeenCalledTimes(4);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('retries transient network failures and succeeds, logging a WARN per failed attempt', async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    try {
+      const args = ['run'];
+      const networkError = Object.assign(new TypeError('fetch failed'), {
+        cause: Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:443'), { code: 'ECONNREFUSED' }),
+      });
+      const client = {
+        ensureAgent: vi
+          .fn()
+          .mockRejectedValueOnce(networkError)
+          .mockRejectedValueOnce(networkError)
+          .mockResolvedValue(undefined),
+        applyContainerConfig: vi.fn().mockResolvedValue(true),
+      };
+
+      const promise = applyOneCliGatewayForContainerArgs(args, {
+        client,
+        containerName: 'container-1',
+        agentGroupName: 'Yente',
+        agentIdentifier: 'ag-main',
+        ensureSecretAccess: vi.fn().mockResolvedValue(undefined),
+      });
+      await vi.advanceTimersByTimeAsync(4_000); // 1s + 3s retry delays
+      await promise;
+
+      expect(client.ensureAgent).toHaveBeenCalledTimes(3);
+      expect(client.applyContainerConfig).toHaveBeenCalledTimes(1);
+      const retryWarns = warnSpy.mock.calls.filter(([msg]) => msg === 'OneCLI gateway attempt failed; retrying');
+      expect(retryWarns).toHaveLength(2);
+      expect(retryWarns[0][1]).toMatchObject({
+        containerName: 'container-1',
+        attempt: 1,
+        maxAttempts: 4,
+        delayMs: 1000,
+      });
+      expect(retryWarns[1][1]).toMatchObject({ attempt: 2, delayMs: 3000 });
+    } finally {
+      warnSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it('retries when applyContainerConfig reports not-applied and eventually succeeds', async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    try {
+      const args = ['run'];
+      const client = {
+        ensureAgent: vi.fn().mockResolvedValue(undefined),
+        applyContainerConfig: vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(false).mockResolvedValue(true),
+      };
+
+      const promise = applyOneCliGatewayForContainerArgs(args, {
+        client,
+        containerName: 'container-1',
+        agentGroupName: 'Yente',
+        agentIdentifier: 'ag-main',
+        ensureSecretAccess: vi.fn().mockResolvedValue(undefined),
+      });
+      await vi.advanceTimersByTimeAsync(4_000);
+      await promise;
+
+      expect(client.applyContainerConfig).toHaveBeenCalledTimes(3);
+      expect(warnSpy.mock.calls.filter(([msg]) => msg === 'OneCLI gateway attempt failed; retrying')).toHaveLength(2);
+    } finally {
+      warnSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it('fails immediately on 4xx responses without retrying', async () => {
     const args = ['run'];
+    const unauthorized = Object.assign(new Error('OneCLI returned 401 Unauthorized'), {
+      name: 'OneCLIRequestError',
+      statusCode: 401,
+    });
     const client = {
-      ensureAgent: vi.fn().mockResolvedValue(undefined),
-      applyContainerConfig: vi.fn().mockResolvedValue(false),
+      ensureAgent: vi.fn().mockRejectedValue(unauthorized),
+      applyContainerConfig: vi.fn(),
     };
 
     await expect(
@@ -488,10 +593,75 @@ describe('OneCLI container gateway', () => {
         agentIdentifier: 'ag-main',
         ensureSecretAccess: vi.fn().mockResolvedValue(undefined),
       }),
-    ).rejects.toThrow('OneCLI gateway did not apply container credentials');
+    ).rejects.toThrow('OneCLI gateway failed; refusing to start Yente container without credential isolation');
 
-    expect(client.ensureAgent).toHaveBeenCalledWith({ name: 'Yente', identifier: 'ag-main' });
-    expect(client.applyContainerConfig).toHaveBeenCalledWith(args, { addHostMapping: false, agent: 'ag-main' });
+    expect(client.ensureAgent).toHaveBeenCalledTimes(1);
+    expect(client.applyContainerConfig).not.toHaveBeenCalled();
+  });
+
+  it('gives up after four retryable attempts and surfaces the underlying cause', async () => {
+    vi.useFakeTimers();
+    const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    try {
+      const networkError = Object.assign(new TypeError('fetch failed'), {
+        cause: Object.assign(new Error('connect ECONNRESET'), { code: 'ECONNRESET' }),
+      });
+      const client = {
+        ensureAgent: vi.fn().mockRejectedValue(networkError),
+        applyContainerConfig: vi.fn(),
+      };
+
+      const promise = applyOneCliGatewayForContainerArgs([], {
+        client,
+        containerName: 'container-1',
+        agentGroupName: 'Yente',
+        agentIdentifier: 'ag-main',
+        ensureSecretAccess: vi.fn().mockResolvedValue(undefined),
+      });
+      const expectation = promise.then(
+        () => {
+          throw new Error('expected rejection');
+        },
+        (err: Error) => err,
+      );
+      await vi.advanceTimersByTimeAsync(12_000);
+      const err = await expectation;
+
+      expect(err.message).toContain(
+        'OneCLI gateway failed; refusing to start Yente container without credential isolation',
+      );
+      expect(err.message).toContain('fetch failed');
+      expect(err.message).toContain('ECONNRESET');
+      expect(client.ensureAgent).toHaveBeenCalledTimes(4);
+      expect(warnSpy.mock.calls.filter(([msg]) => msg === 'OneCLI gateway attempt failed; retrying')).toHaveLength(3);
+    } finally {
+      warnSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it('fails immediately on semantic secret-access errors without retrying', async () => {
+    const client = {
+      ensureAgent: vi.fn().mockResolvedValue(undefined),
+      applyContainerConfig: vi.fn(),
+    };
+    const ensureSecretAccess = vi
+      .fn()
+      .mockRejectedValue(
+        new Error('Missing OneCLI secret(s): Yente GWS Proxy; configure Yente local proxy credentials'),
+      );
+
+    await expect(
+      applyOneCliGatewayForContainerArgs([], {
+        client,
+        containerName: 'container-1',
+        agentGroupName: 'Yente',
+        agentIdentifier: 'ag-main',
+        ensureSecretAccess,
+      }),
+    ).rejects.toThrow('OneCLI gateway failed; refusing to start Yente container without credential isolation');
+
+    expect(ensureSecretAccess).toHaveBeenCalledTimes(1);
   });
 
   it('rethrows OneCLI exceptions with Yente credential-isolation guidance', async () => {

@@ -1255,6 +1255,65 @@ async function buildContainerArgs(
   return { args: extractDockerEnvArgsToFile(args, envFilePath), envFilePath };
 }
 
+// Bounded retry for the single OneCLI gateway choke point. Post-restart wake
+// surges can overwhelm OneCLI briefly (5s SDK fetch timeout, zero retry);
+// every operation here is idempotent (ensureAgent absorbs 409, secret grants
+// converge, applyContainerConfig only mutates args after a successful fetch),
+// so retrying is safe. Worst-case added latency ~12s, under the host sweep's
+// ~65s cadence.
+const ONECLI_GATEWAY_MAX_ATTEMPTS = 4;
+const ONECLI_GATEWAY_RETRY_DELAYS_MS = [1_000, 3_000, 8_000];
+const RETRYABLE_NETWORK_ERROR_CODES = ['ECONNREFUSED', 'ECONNRESET', 'EPIPE'];
+// Semantic failures from ensureOneCliAgentSecretAccess -- retrying cannot fix these.
+const NON_RETRYABLE_ONECLI_MESSAGE_PATTERNS = [
+  'Missing OneCLI secret(s)',
+  'Missing required ONECLI_GATEWAY_URL',
+  'was not found after ensureAgent',
+  'internal error:',
+];
+
+function isRetryableOneCliGatewayError(err: unknown, depth = 0): boolean {
+  if (depth > 4 || !(err instanceof Error)) return false;
+  const statusCode = (err as { statusCode?: unknown }).statusCode;
+  if (typeof statusCode === 'number') return statusCode >= 500;
+  if (NON_RETRYABLE_ONECLI_MESSAGE_PATTERNS.some((pattern) => err.message.includes(pattern))) return false;
+  if (err.name === 'TimeoutError' || err.name === 'AbortError') return true;
+  const code = (err as { code?: unknown }).code;
+  if (typeof code === 'string' && RETRYABLE_NETWORK_ERROR_CODES.includes(code)) return true;
+  // undici fetch network failures, plus SDK OneCLIError variants that wrap
+  // them by copying only the message text (cause/code are dropped).
+  if (err.message.includes('fetch failed')) return true;
+  if (RETRYABLE_NETWORK_ERROR_CODES.some((c) => err.message.includes(c))) return true;
+  if (err.name === 'OneCLIError' && (err.message.includes('timeout') || err.message.includes('timed out'))) {
+    return true;
+  }
+  if (err.cause !== undefined) return isRetryableOneCliGatewayError(err.cause, depth + 1);
+  return false;
+}
+
+/** Serialize the underlying cause into loggable text; the logger drops err.cause. */
+function describeOneCliCause(err: unknown): string {
+  if (!(err instanceof Error)) return String(err);
+  const code = (err as { code?: unknown }).code;
+  const statusCode = (err as { statusCode?: unknown }).statusCode;
+  let text = err.message;
+  if (typeof code === 'string') text += ` [${code}]`;
+  if (typeof statusCode === 'number') text += ` [HTTP ${statusCode}]`;
+  if (err.cause instanceof Error && err.cause.message && !text.includes(err.cause.message)) {
+    text += `: ${describeOneCliCause(err.cause)}`;
+  }
+  return text;
+}
+
+/** Internal marker: applyContainerConfig returned false on a non-final attempt. */
+class OneCliGatewayRetryableApplyFailure extends Error {
+  constructor() {
+    super('OneCLI applyContainerConfig returned false');
+  }
+}
+
+const sleepMs = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
 export async function applyOneCliGatewayForContainerArgs(
   args: string[],
   context: {
@@ -1265,37 +1324,58 @@ export async function applyOneCliGatewayForContainerArgs(
     ensureSecretAccess?: (agentIdentifier: string) => Promise<void>;
   },
 ): Promise<void> {
-  try {
-    if (context.agentIdentifier) {
-      await context.client.ensureAgent({ name: context.agentGroupName, identifier: context.agentIdentifier });
-      await (
-        context.ensureSecretAccess ??
-        ((agentIdentifier) =>
-          ensureOneCliAgentSecretAccess({
-            onecliUrl: ONECLI_URL,
-            onecliApiKey: ONECLI_API_KEY,
-            agentIdentifier,
-          }))
-      )(context.agentIdentifier);
+  for (let attempt = 1; attempt <= ONECLI_GATEWAY_MAX_ATTEMPTS; attempt++) {
+    try {
+      if (context.agentIdentifier) {
+        await context.client.ensureAgent({ name: context.agentGroupName, identifier: context.agentIdentifier });
+        await (
+          context.ensureSecretAccess ??
+          ((agentIdentifier) =>
+            ensureOneCliAgentSecretAccess({
+              onecliUrl: ONECLI_URL,
+              onecliApiKey: ONECLI_API_KEY,
+              agentIdentifier,
+            }))
+        )(context.agentIdentifier);
+      }
+      const applied = await context.client.applyContainerConfig(args, {
+        addHostMapping: false,
+        agent: context.agentIdentifier,
+      });
+      // applyContainerConfig swallows its own network errors and returns
+      // false WITHOUT mutating args, so a retry starts from a clean slate.
+      if (!applied && attempt < ONECLI_GATEWAY_MAX_ATTEMPTS) {
+        throw new OneCliGatewayRetryableApplyFailure();
+      }
+      assertOneCliApplied(applied);
+      const gatewayProxyUrl = latestDockerEnvValue(args, ONECLI_GATEWAY_PROXY_ENV_KEYS);
+      if (gatewayProxyUrl) {
+        args.push('-e', `${YENTE_ONECLI_GATEWAY_PROXY_URL_ENV}=${gatewayProxyUrl}`);
+      }
+      log.info('OneCLI gateway applied', { containerName: context.containerName });
+      return;
+    } catch (err) {
+      const retryable = err instanceof OneCliGatewayRetryableApplyFailure || isRetryableOneCliGatewayError(err);
+      if (retryable && attempt < ONECLI_GATEWAY_MAX_ATTEMPTS) {
+        const delayMs = ONECLI_GATEWAY_RETRY_DELAYS_MS[attempt - 1];
+        log.warn('OneCLI gateway attempt failed; retrying', {
+          containerName: context.containerName,
+          attempt,
+          maxAttempts: ONECLI_GATEWAY_MAX_ATTEMPTS,
+          delayMs,
+          err,
+        });
+        await sleepMs(delayMs);
+        continue;
+      }
+      if (err instanceof Error && err.message.startsWith('OneCLI gateway did not apply')) {
+        throw err;
+      }
+      throw new Error(
+        `OneCLI gateway failed; refusing to start Yente container without credential isolation. Check ONECLI_URL and ONECLI_API_KEY. (cause: ${describeOneCliCause(err)})`,
+        { cause: err },
+      );
     }
-    const applied = await context.client.applyContainerConfig(args, {
-      addHostMapping: false,
-      agent: context.agentIdentifier,
-    });
-    assertOneCliApplied(applied);
-    const gatewayProxyUrl = latestDockerEnvValue(args, ONECLI_GATEWAY_PROXY_ENV_KEYS);
-    if (gatewayProxyUrl) {
-      args.push('-e', `${YENTE_ONECLI_GATEWAY_PROXY_URL_ENV}=${gatewayProxyUrl}`);
-    }
-    log.info('OneCLI gateway applied', { containerName: context.containerName });
-  } catch (err) {
-    if (err instanceof Error && err.message.startsWith('OneCLI gateway did not apply')) {
-      throw err;
-    }
-    throw new Error(
-      'OneCLI gateway failed; refusing to start Yente container without credential isolation. Check ONECLI_URL and ONECLI_API_KEY.',
-      { cause: err },
-    );
   }
 }
 
