@@ -190,6 +190,7 @@ describe('AgentMail API WebSocket boundary', () => {
 
   it('force-closes and reconnects when no pong or message arrives for 2x the ping interval', async () => {
     vi.useFakeTimers();
+    const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
     FakeWebSocket.instances = [];
     const socket = await createAgentMailOneCliWebSocket({
       env: { ...ONECLI_ENV, AGENTMAIL_WS_PING_INTERVAL_MS: '30000' },
@@ -206,9 +207,32 @@ describe('AgentMail API WebSocket boundary', () => {
     expect(instance.pings).toBe(1);
     vi.advanceTimersByTime(30_000);
 
-    expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining('idle') }));
+    // Idle force-reconnect is self-healing: it logs at WARN with idle fields
+    // and never surfaces through the error handler (which stays reserved for
+    // genuine socket errors logged at ERROR).
+    expect(warnSpy).toHaveBeenCalledWith('AgentMail WebSocket idle; forcing reconnect', {
+      idleMs: 60_000,
+      pingIntervalMs: 30_000,
+    });
+    expect(onError).not.toHaveBeenCalled();
     vi.advanceTimersByTime(1000);
     expect(FakeWebSocket.instances).toHaveLength(2);
+    socket.close();
+  });
+
+  it('still surfaces genuine socket errors through the error handler', async () => {
+    FakeWebSocket.instances = [];
+    const socket = await createAgentMailOneCliWebSocket({
+      env: ONECLI_ENV,
+      url: 'wss://ws.agentmail.test/v0',
+      websocketCtor: FakeWebSocket,
+      proxyAgentFactory: (proxyUrl) => ({ proxyUrl }),
+    });
+    const onError = vi.fn();
+    socket.on('error', onError);
+    const failure = new Error('ECONNRESET');
+    FakeWebSocket.instances[0]!.emit('error', failure);
+    expect(onError).toHaveBeenCalledWith(failure);
     socket.close();
   });
 

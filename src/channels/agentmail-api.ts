@@ -295,7 +295,13 @@ class OneCliAgentMailSocket implements AgentMailSocketLike {
       const idleMs = Date.now() - this.lastActivityAt;
       if (idleMs >= this.pingIntervalMs * AGENTMAIL_WEBSOCKET_IDLE_MULTIPLIER) {
         this.stopKeepalive();
-        this.handlers.error?.(new Error(`AgentMail WebSocket idle for ${idleMs}ms; forcing reconnect`));
+        // Idle force-reconnect is self-healing by design (the close handler
+        // schedules the reconnect) — log at WARN, not through the error
+        // handler, which channels genuine socket errors to ERROR logs.
+        log.warn('AgentMail WebSocket idle; forcing reconnect', {
+          idleMs,
+          pingIntervalMs: this.pingIntervalMs,
+        });
         if (typeof ws.terminate === 'function') ws.terminate();
         else ws.close();
         return;
