@@ -17,7 +17,7 @@ import path from 'path';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb } from './db/connection.js';
 import { getPendingMessages } from './db/messages-in.js';
-import { formatMessages, stripInternalTags } from './formatter.js';
+import { formatMessages, sanitizeDeliveredText, stripInternalTags } from './formatter.js';
 import { TIMEZONE } from './timezone.js';
 
 let originalLocalSkillsWorkspace: string | undefined;
@@ -196,5 +196,74 @@ describe('stripInternalTags', () => {
 
   it('preserves content that surrounds internal tags', () => {
     expect(stripInternalTags('<internal>thinking</internal>The answer is 42')).toBe('The answer is 42');
+  });
+});
+
+describe('sanitizeDeliveredText', () => {
+  const resolves = (known: string[]) => (name: string) => known.includes(name);
+
+  it('returns plain text unchanged (fast path, no resolver call)', () => {
+    const resolver = () => {
+      throw new Error('must not be called');
+    };
+    const result = sanitizeDeliveredText('Just a normal reply about <stuff>.', resolver);
+    expect(result.text).toBe('Just a normal reply about <stuff>.');
+    expect(result.changed).toBe(false);
+    expect(result.droppedDestinations).toEqual([]);
+  });
+
+  it('strips a well-formed resolvable wrapper, preserving the inner content', () => {
+    const result = sanitizeDeliveredText(
+      '<message to="discord-yente-threaded">Here is your answer.</message>',
+      resolves(['discord-yente-threaded']),
+    );
+    expect(result.text).toBe('Here is your answer.');
+    expect(result.changed).toBe(true);
+    expect(result.droppedDestinations).toEqual([]);
+  });
+
+  it('strips malformed/unclosed wrapper tags, preserving inner content', () => {
+    const result = sanitizeDeliveredText(
+      '<message to="discord-yente-threaded">Result summary: everything deployed fine.',
+      resolves(['discord-yente-threaded']),
+    );
+    expect(result.text).toBe('Result summary: everything deployed fine.');
+    expect(result.changed).toBe(true);
+  });
+
+  it('strips nested wrappers and <answer> tags from a nudge echo', () => {
+    const result = sanitizeDeliveredText(
+      '<answer>\n<message to="discord-current"><message to="discord-current">Done.</message></message>\n</answer>',
+      resolves(['discord-current']),
+    );
+    expect(result.text).toBe('Done.');
+    expect(result.changed).toBe(true);
+  });
+
+  it('drops blocks addressed to unresolvable destinations instead of delivering verbatim', () => {
+    const result = sanitizeDeliveredText(
+      '<answer> <message to="unknown:agent:ag-1783652082143-7lgfcl">Visible reply sent in-thread.</message></answer>',
+      resolves([]),
+    );
+    expect(result.text).toBe('');
+    expect(result.changed).toBe(true);
+    expect(result.droppedDestinations).toEqual(['unknown:agent:ag-1783652082143-7lgfcl']);
+  });
+
+  it('keeps resolvable content while dropping the unresolvable sibling block', () => {
+    const result = sanitizeDeliveredText(
+      '<message to="known">Real reply.</message><message to="unknown:agent:x">meta noise</message>',
+      resolves(['known']),
+    );
+    expect(result.text).toBe('Real reply.');
+    expect(result.droppedDestinations).toEqual(['unknown:agent:x']);
+  });
+
+  it('preserves inner content when the resolver itself throws', () => {
+    const result = sanitizeDeliveredText('<message to="known">Reply text.</message>', () => {
+      throw new Error('destinations table missing');
+    });
+    expect(result.text).toBe('Reply text.');
+    expect(result.droppedDestinations).toEqual([]);
   });
 });

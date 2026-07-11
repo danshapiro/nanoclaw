@@ -2,7 +2,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 
 import {
   initTestSessionDb,
@@ -568,6 +568,105 @@ describe('poll-loop conversational reply accounting', () => {
     expect(out[0].platform_id).toBe('chan-1');
     expect(out[0].channel_type).toBe('discord');
     expect(JSON.parse(out[0].content).text).toContain('completed without sending a user-visible response');
+
+    await loopPromise.catch(() => {});
+  });
+
+  it('suppresses the missing-visible-reply error for a2a/system-triggered turns and logs instead', async () => {
+    const errSpy = spyOn(console, 'error');
+    // Host-written a2a/system rows carry channel_type='agent' (see
+    // src/modules/agent-to-agent/agent-route.ts, src/modules/managed-repos/actions.ts).
+    insertMessage(
+      'silent-a2a',
+      'chat',
+      { sender: 'system', text: 'managed repos push completed' },
+      { platformId: 'ag-child-1', channelType: 'agent' },
+    );
+
+    const provider = new ScriptedProvider(async function* () {
+      yield { type: 'init', continuation: 'silent-a2a-session' };
+      yield { type: 'result', text: null };
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal);
+
+    await waitFor(() => getAckStatus('silent-a2a') === 'completed', 1500);
+    controller.abort();
+
+    // No user-visible fallback error row is enqueued (previously this wrote
+    // "Error: agent completed without sending a user-visible response...").
+    expect(getUndeliveredMessages()).toHaveLength(0);
+    const suppressedLog = errSpy.mock.calls.some((call) =>
+      String(call[0]).includes('missing_visible_reply_suppressed'),
+    );
+    expect(suppressedLog).toBe(true);
+    errSpy.mockRestore();
+
+    await loopPromise.catch(() => {});
+  });
+
+  it('still writes the missing-visible-reply error for user-triggered turns on user channels', async () => {
+    insertMessage(
+      'silent-user-chat',
+      'chat',
+      { sender: 'User', text: 'please respond' },
+      { platformId: 'chan-9', channelType: 'discord', threadId: 'thread-9' },
+    );
+
+    const provider = new ScriptedProvider(async function* () {
+      yield { type: 'init', continuation: 'silent-user-session' };
+      yield { type: 'result', text: null };
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal);
+
+    await waitFor(() => getAckStatus('silent-user-chat') === 'completed', 1500);
+    controller.abort();
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(out[0].channel_type).toBe('discord');
+    expect(JSON.parse(out[0].content).text).toContain('completed without sending a user-visible response');
+
+    await loopPromise.catch(() => {});
+  });
+
+  it('suppresses the terminal interruption notice for non-user-triggered turns', async () => {
+    const errSpy = spyOn(console, 'error');
+    insertMessage(
+      'interrupted-a2a',
+      'chat',
+      { sender: 'system', text: 'system notification' },
+      { platformId: 'ag-child-1', channelType: 'agent' },
+    );
+
+    const provider = new ScriptedProvider(async function* (input) {
+      yield { type: 'init', continuation: 'interrupted-a2a-session' };
+      yield { type: 'input-accepted', inputId: input.inputId, scope: 'initial' };
+      yield {
+        type: 'interruption',
+        inputId: input.inputId,
+        classification: 'codex_turn_interrupted',
+        severity: 'info',
+        terminal: true,
+        agentMessage: 'The Codex turn was interrupted before completing.',
+        fallbackUserMessage: 'The active Codex turn was interrupted before completing.',
+        continuationPolicy: 'preserve',
+      };
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal);
+
+    await waitFor(() => getAckStatus('interrupted-a2a') === 'recovery', 1500);
+    controller.abort();
+
+    const texts = getUndeliveredMessages().map((m) => JSON.parse(m.content).text as string);
+    expect(texts).not.toContain('The active Codex turn was interrupted before completing.');
+    const suppressedLog = errSpy.mock.calls.some((call) =>
+      String(call[0]).includes('interruption_notice_suppressed_non_user_turn'),
+    );
+    expect(suppressedLog).toBe(true);
+    errSpy.mockRestore();
 
     await loopPromise.catch(() => {});
   });

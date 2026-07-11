@@ -38,6 +38,7 @@ import {
   extractRouting,
   categorizeMessage,
   normalizeRoute,
+  sanitizeDeliveredText,
   stripInternalTags,
   type RoutingContext,
 } from './formatter.js';
@@ -126,6 +127,32 @@ function recoveryIdFor(routeKey: string): string {
  * are harvestable into route-scoped recovery and never leak across conversations.
  */
 function writeRoutedMessage(routing: RoutingContext, text: string): void {
+  // Delivery-side sanitation: fallback paths (e.g. delivering the agent's raw
+  // final text after an ignored unwrapped-output nudge) can carry leftover
+  // `<answer>`/`<message to=…>` wrapper tags or blocks addressed to
+  // unresolvable destinations. Strip the tags (preserving inner content) and
+  // drop unresolvable-destination blocks instead of delivering them verbatim.
+  const sanitized = sanitizeDeliveredText(text, (name) => Boolean(findByName(name)));
+  for (const dest of sanitized.droppedDestinations) {
+    log(
+      JSON.stringify({
+        severity: 'warn',
+        event: 'unresolvable_destination_block_dropped',
+        to: dest,
+        route_key: routing.routeKey ?? null,
+      }),
+    );
+  }
+  if (sanitized.changed && !sanitized.text) {
+    log(
+      JSON.stringify({
+        severity: 'warn',
+        event: 'delivered_text_empty_after_sanitization',
+        route_key: routing.routeKey ?? null,
+      }),
+    );
+    return;
+  }
   writeMessageOut({
     id: generateId(),
     in_reply_to: routing.inReplyTo,
@@ -136,7 +163,7 @@ function writeRoutedMessage(routing: RoutingContext, text: string): void {
     route_key: routing.routeKey ?? null,
     messaging_group_id: routing.messagingGroupId ?? null,
     is_group: routing.isGroup ?? null,
-    content: JSON.stringify({ text }),
+    content: JSON.stringify({ text: sanitized.text }),
   });
 }
 
@@ -493,6 +520,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const processingIds = ids.filter((id) => !skippedSet.has(id));
     const replyAccounting = {
       initialRequiresUserVisibleReply: requiresUserVisibleReply(keep),
+      initialUserTriggered: isUserTriggered(keep),
       outboundVisibleReplyCountBefore: countOutboundVisibleReplyMessages({
         ...routing,
         routeKey: activeRouteScope.routeKey,
@@ -604,6 +632,8 @@ interface QueryResult {
 
 interface ReplyAccounting {
   initialRequiresUserVisibleReply: boolean;
+  /** True when the initial batch was triggered by a real user message (not system/a2a). */
+  initialUserTriggered: boolean;
   outboundVisibleReplyCountBefore: number;
 }
 
@@ -679,6 +709,9 @@ async function processQuery(
   };
   let unwrappedOutputNudged = false;
   let pendingUnwrappedOutputText: string | null = null;
+  // Whether ANY input this turn (initial batch or a pushed follow-up) came from
+  // a real user message. Gates user-visible fallback/interruption notices.
+  let turnUserTriggered = replyAccounting.initialUserTriggered;
   // Side-effect evidence carried on a terminal interruption's recovery seed, so
   // the accepted-unresolved recovery entry records what already happened.
   const interruptionSideEffects: ProviderRecoveryEntry['sideEffects'] = [];
@@ -788,7 +821,7 @@ async function processQuery(
     initialBatchSettled = true;
 
     if (hasMissingVisibleReply([ledgerCtx.topLevelInputId])) {
-      writeMissingVisibleReplyError(routing, providerErrorText);
+      writeMissingVisibleReplyError(routing, providerErrorText, replyAccounting.initialUserTriggered);
     }
   }
 
@@ -887,6 +920,7 @@ async function processQuery(
       requiresUserVisibleReply: requiresUserVisibleReply(newMessages),
       outboundVisibleReplyCountBefore,
     });
+    if (isUserTriggered(newMessages)) turnUserTriggered = true;
   }
 
   let topLevelResolvedAtLeastOnce = false;
@@ -991,7 +1025,21 @@ async function processQuery(
         }
         const action = decideProviderStatusAction(providerStatusState, event);
         if (action.kind === 'write') {
-          writeRoutedMessage(routing, action.text);
+          if (turnUserTriggered) {
+            writeRoutedMessage(routing, action.text);
+          } else {
+            // Same rule as the missing-visible-reply fallback: interruption
+            // notices are log-only unless a real user triggered this turn.
+            log(
+              JSON.stringify({
+                severity: 'warn',
+                event: 'interruption_notice_suppressed_non_user_turn',
+                input_id: event.inputId,
+                classification: event.classification,
+                route_key: ledgerCtx.activeRouteKey,
+              }),
+            );
+          }
         }
       } else if (event.type === 'result') {
         if (userStopRequested) {
@@ -1139,7 +1187,7 @@ async function processQuery(
           // Fail closed: don't complete or lose the rows. Write one user-visible
           // fallback and leave the rows claimed (recovery pressure is structurally
           // alerted; host sweep is the backstop).
-          writeMissingVisibleReplyError(routing);
+          writeMissingVisibleReplyError(routing, null, turnUserTriggered);
         } else {
           for (const e of acceptedUnresolved) e.state = 'recovery_owned';
         }
@@ -1175,6 +1223,20 @@ async function processQuery(
 
 function requiresUserVisibleReply(messages: MessageInRow[]): boolean {
   return messages.some((m) => (m.kind === 'chat' || m.kind === 'chat-sdk') && m.trigger === 1);
+}
+
+/**
+ * True when the batch contains a wake trigger authored by a real user.
+ * System/scheduled notifications (`sys-*` rows) and agent-to-agent rows
+ * (`a2a-*`) are written by the host with `channel_type='agent'`, so any
+ * trigger=1 chat row on a non-'agent' channel is the user-triggered signal.
+ * Reply-accounting fallback errors and interruption notices are user-visible
+ * ONLY for user-triggered turns; non-user turns log host-visibly instead.
+ */
+function isUserTriggered(messages: MessageInRow[]): boolean {
+  return messages.some(
+    (m) => (m.kind === 'chat' || m.kind === 'chat-sdk') && m.trigger === 1 && m.channel_type !== 'agent',
+  );
 }
 
 function countOutboundVisibleReplyMessages(routing: RoutingContext): number {
@@ -1217,7 +1279,10 @@ const PROVIDER_ERROR_MAX_LEN = 500;
  * length. Usage-limit / quota text passes through unchanged.
  */
 function sanitizeProviderErrorText(raw: string): string {
-  let s = raw.replace(/[\u0000-\u001F\u007F]/g, ' ').replace(/\s+/g, ' ').trim();
+  let s = raw
+    .replace(/[\u0000-\u001F\u007F]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
   s = s
     .replace(/\b(?:sk|rk|pk)-[A-Za-z0-9_-]{8,}/g, '[redacted-key]')
     .replace(/\baoc_[A-Za-z0-9]{16,}/g, '[redacted-token]')
@@ -1226,7 +1291,29 @@ function sanitizeProviderErrorText(raw: string): string {
   return s.length > PROVIDER_ERROR_MAX_LEN ? s.slice(0, PROVIDER_ERROR_MAX_LEN - 1) + '\u2026' : s;
 }
 
-function writeMissingVisibleReplyError(routing: RoutingContext, providerErrorText?: string | null): void {
+function writeMissingVisibleReplyError(
+  routing: RoutingContext,
+  providerErrorText?: string | null,
+  userTriggered = true,
+): void {
+  // Non-user-triggered turns (system/scheduled `sys-*`, agent-to-agent `a2a-*`)
+  // never surface the fallback error into the channel: the reply-accounting
+  // scope is keyed to the TRIGGERING row's route, so the agent's real in-thread
+  // reply legitimately lands elsewhere. Same for 'agent' routes: the fallback
+  // error text is user-channel only, never enqueued to a2a destinations.
+  if (!userTriggered || routing.channelType === 'agent') {
+    log(
+      JSON.stringify({
+        severity: 'error',
+        event: 'missing_visible_reply_suppressed',
+        reason: !userTriggered ? 'non_user_triggered_turn' : 'a2a_destination',
+        route_key: routing.routeKey ?? null,
+        channel_type: routing.channelType ?? null,
+        provider_error: providerErrorText ? sanitizeProviderErrorText(providerErrorText) : null,
+      }),
+    );
+    return;
+  }
   const verbatim = providerErrorText?.trim();
   if (verbatim) {
     writeRoutedMessage(routing, sanitizeProviderErrorText(verbatim));

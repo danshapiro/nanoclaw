@@ -292,6 +292,59 @@ export function stripInternalTags(text: string): string {
   return text.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
 }
 
+/** Fast check: does delivered text still contain wrapper/routing tags? */
+const DELIVERY_WRAPPER_MARKER_RE = /<\/?answer>|<message\b|<\/message>/i;
+/** Well-formed routed block: `<message to="name">body</message>`. */
+const DELIVERY_MESSAGE_BLOCK_RE = /<message\s+to=(["'])([^"']*)\1\s*>([\s\S]*?)<\/message>/g;
+/** Leftover unmatched wrapper tags (open or close), stripped preserving inner content. */
+const DELIVERY_LEFTOVER_TAG_RE = /<\/?answer>|<message\b[^>]*>|<\/message>/g;
+
+export interface DeliveredTextSanitization {
+  text: string;
+  /** Destinations of well-formed blocks dropped because they were unresolvable. */
+  droppedDestinations: string[];
+  /** True when the text contained wrapper tags and was rewritten. */
+  changed: boolean;
+}
+
+/**
+ * Delivery-side defense for user-visible text (FIX for raw `<message to=…>` /
+ * `<answer>` wrappers reaching users verbatim): the poll loop's normal parser
+ * (dispatchResultText) handles well-formed output, but fallback paths deliver
+ * the agent's raw text — which can still carry malformed/nested wrapper tags
+ * or blocks addressed to unresolvable destinations (`unknown:…`). Before
+ * enqueueing, strip leftover wrapper tags (preserving inner content) and DROP
+ * well-formed blocks whose destination does not resolve.
+ *
+ * Text without wrapper markers is returned unchanged (fast path), so
+ * well-formed parsing/delivery behavior is untouched.
+ */
+export function sanitizeDeliveredText(
+  text: string,
+  isResolvableDestination: (name: string) => boolean,
+): DeliveredTextSanitization {
+  if (!DELIVERY_WRAPPER_MARKER_RE.test(text)) {
+    return { text, droppedDestinations: [], changed: false };
+  }
+  const droppedDestinations: string[] = [];
+  let out = text.replace(DELIVERY_MESSAGE_BLOCK_RE, (_match, _quote, to: string, body: string) => {
+    let resolvable = true;
+    try {
+      resolvable = isResolvableDestination(to);
+    } catch {
+      // Resolver failure must never destroy content — keep the inner text.
+      resolvable = true;
+    }
+    if (!resolvable) {
+      droppedDestinations.push(to);
+      return '';
+    }
+    return body;
+  });
+  out = out.replace(DELIVERY_LEFTOVER_TAG_RE, '').trim();
+  return { text: out, droppedDestinations, changed: true };
+}
+
 /**
  * Export the XML escape helper so other modules (recovery prompt injection in
  * the poll loop) can XML-escape untrusted recovery text without re-implementing
