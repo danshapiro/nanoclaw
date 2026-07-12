@@ -3595,3 +3595,166 @@ describe('poll-loop inactivity status and terminal recovery', () => {
     await loopPromise.catch(() => {});
   });
 });
+
+describe('routeless-trigger reply routing', () => {
+  // Host-owned table (src/db/session-db.ts INBOUND_SCHEMA); replicate the shape
+  // the runner reads via getSessionRouting().
+  function writeSessionRoutingRow(routing: {
+    channelType: string | null;
+    platformId: string | null;
+    threadId: string | null;
+    messagingGroupId?: string | null;
+    isGroup?: 0 | 1 | null;
+  }): void {
+    const db = getInboundDb();
+    db.prepare(
+      `CREATE TABLE IF NOT EXISTS session_routing (
+         id INTEGER PRIMARY KEY CHECK (id = 1),
+         channel_type TEXT,
+         platform_id TEXT,
+         thread_id TEXT,
+         messaging_group_id TEXT,
+         is_group INTEGER
+       )`,
+    ).run();
+    db.prepare(
+      `INSERT OR REPLACE INTO session_routing (id, channel_type, platform_id, thread_id, messaging_group_id, is_group)
+       VALUES (1, ?, ?, ?, ?, ?)`,
+    ).run(
+      routing.channelType,
+      routing.platformId,
+      routing.threadId,
+      routing.messagingGroupId ?? null,
+      routing.isGroup ?? null,
+    );
+  }
+
+  function chatRowsOut(): Array<{
+    platform_id: string | null;
+    channel_type: string | null;
+    thread_id: string | null;
+    messaging_group_id: string | null;
+    is_group: number | null;
+    text: string;
+  }> {
+    return (
+      getOutboundDb()
+        .prepare(
+          `SELECT platform_id, channel_type, thread_id, messaging_group_id, is_group, content
+           FROM messages_out WHERE kind = 'chat' ORDER BY seq`,
+        )
+        .all() as Array<{
+        platform_id: string | null;
+        channel_type: string | null;
+        thread_id: string | null;
+        messaging_group_id: string | null;
+        is_group: number | null;
+        content: string;
+      }>
+    ).map((r) => ({ ...r, text: (JSON.parse(r.content) as { text?: string }).text ?? '' }));
+  }
+
+  it('inherits the session default thread when an a2a-triggered reply targets the session channel', async () => {
+    // Regression: 2026-07-10 invoice-thread misroute. An injected a2a error row
+    // (channel_type 'agent', no thread) triggered a turn; the agent's reply to
+    // its own Discord destination was written thread-less and delivered to the
+    // PARENT channel instead of the session's thread.
+    insertChannelDestination('discord-current', 'chan-1');
+    writeSessionRoutingRow({
+      channelType: 'discord',
+      platformId: 'chan-1',
+      threadId: 'discord:guild:chan-1:thread-42',
+      messagingGroupId: 'mg-1',
+      isGroup: 0,
+    });
+    insertMessage(
+      'a2a-err-1',
+      'chat',
+      { sender: 'subagent', text: 'Error: agent completed without sending a user-visible response in this conversation.' },
+      { channelType: 'agent', platformId: 'ag-test' },
+    );
+
+    const provider = new ScriptedProvider(async function* () {
+      yield { type: 'result', text: '<message to="discord-current">resent answer</message>' };
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+    await waitFor(() => getAckStatus('a2a-err-1') === 'completed', 1500);
+    controller.abort();
+    await loopPromise.catch(() => {});
+
+    const rows = chatRowsOut().filter((r) => r.text === 'resent answer');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].platform_id).toBe('chan-1');
+    expect(rows[0].channel_type).toBe('discord');
+    expect(rows[0].thread_id).toBe('discord:guild:chan-1:thread-42');
+    expect(rows[0].messaging_group_id).toBe('mg-1');
+    expect(rows[0].is_group).toBe(0);
+  });
+
+  it('keeps cross-destination sends thread-less for user-triggered turns', async () => {
+    insertChannelDestination('discord-current', 'chan-1');
+    insertChannelDestination('discord-other', 'chan-2');
+    writeSessionRoutingRow({
+      channelType: 'discord',
+      platformId: 'chan-1',
+      threadId: 'discord:guild:chan-1:thread-42',
+      messagingGroupId: 'mg-1',
+      isGroup: 0,
+    });
+    insertMessage(
+      'user-msg-1',
+      'chat-sdk',
+      { sender: 'User', text: 'announce this elsewhere' },
+      { channelType: 'discord', platformId: 'chan-1', threadId: 'discord:guild:chan-1:thread-42' },
+    );
+
+    const provider = new ScriptedProvider(async function* () {
+      yield { type: 'result', text: '<message to="discord-other">announcement</message>' };
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+    await waitFor(() => getAckStatus('user-msg-1') === 'completed', 1500);
+    controller.abort();
+    await loopPromise.catch(() => {});
+
+    const rows = chatRowsOut().filter((r) => r.text === 'announcement');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].platform_id).toBe('chan-2');
+    expect(rows[0].thread_id).toBeNull();
+    expect(rows[0].messaging_group_id).toBeNull();
+  });
+
+  it('leaves the reply thread-less when session routing does not match the destination', async () => {
+    insertChannelDestination('discord-current', 'chan-1');
+    writeSessionRoutingRow({
+      channelType: 'discord',
+      platformId: 'chan-9',
+      threadId: 'discord:guild:chan-9:thread-7',
+      messagingGroupId: 'mg-9',
+      isGroup: 0,
+    });
+    insertMessage(
+      'a2a-err-2',
+      'chat',
+      { sender: 'subagent', text: 'Error: agent completed without sending a user-visible response in this conversation.' },
+      { channelType: 'agent', platformId: 'ag-test' },
+    );
+
+    const provider = new ScriptedProvider(async function* () {
+      yield { type: 'result', text: '<message to="discord-current">mismatched</message>' };
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+    await waitFor(() => getAckStatus('a2a-err-2') === 'completed', 1500);
+    controller.abort();
+    await loopPromise.catch(() => {});
+
+    const rows = chatRowsOut().filter((r) => r.text === 'mismatched');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].thread_id).toBeNull();
+  });
+});

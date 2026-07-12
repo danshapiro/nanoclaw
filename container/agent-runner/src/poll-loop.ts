@@ -31,6 +31,7 @@ import {
   type ProviderRecoveryScope,
 } from './db/session-state.js';
 import { markRecoveryCompleted } from './db/messages-in.js';
+import { getSessionRouting } from './db/session-routing.js';
 import { collectQueryAttachments, type InspectedFile } from './attachments.js';
 import {
   formatMessages,
@@ -1467,16 +1468,46 @@ function sendToDestination(dest: DestinationEntry, body: string, routing: Routin
   // Only the active route can inherit reply/thread metadata and recovery stamps.
   // Cross-destination final messages are delivered as new outbound messages, not
   // harvested as progress for the conversation that triggered this turn.
+  let threadId: string | null = sameRoute ? routing.threadId : null;
+  let messagingGroupId: string | null = sameRoute ? (routing.messagingGroupId ?? null) : null;
+  let isGroup: 0 | 1 | null = sameRoute ? (routing.isGroup ?? null) : null;
+  // Turns triggered by injected route-less rows (agent-to-agent errors/relays,
+  // legacy rows with no user route) carry no user thread, so a reply addressed
+  // to the session's own channel destination would otherwise be written
+  // thread-less and delivered to the PARENT channel instead of the
+  // conversation thread (2026-07-10 invoice-thread misroute). Fall back to the
+  // host-committed session_routing default — the same source of truth the MCP
+  // tools use for "reply in the thread this session belongs to". User-triggered
+  // cross-destination sends keep the existing thread-less behavior.
+  if (!sameRoute && dest.type === 'channel' && (routing.channelType === null || routing.channelType === 'agent')) {
+    const session = getSessionRouting();
+    if (session.channel_type === channelType && session.platform_id === platformId) {
+      threadId = session.thread_id;
+      messagingGroupId = session.messaging_group_id;
+      isGroup = session.is_group;
+      log(
+        JSON.stringify({
+          severity: 'info',
+          event: 'session_default_route_inherited',
+          reason: 'routeless_trigger',
+          trigger_channel_type: routing.channelType,
+          channel_type: channelType,
+          platform_id: platformId,
+          thread_id: threadId,
+        }),
+      );
+    }
+  }
   writeMessageOut({
     id: generateId(),
     in_reply_to: sameRoute ? routing.inReplyTo : null,
     kind: 'chat',
     platform_id: platformId,
     channel_type: channelType,
-    thread_id: sameRoute ? routing.threadId : null,
+    thread_id: threadId,
     route_key: sameRoute ? (routing.routeKey ?? null) : null,
-    messaging_group_id: sameRoute ? (routing.messagingGroupId ?? null) : null,
-    is_group: sameRoute ? (routing.isGroup ?? null) : null,
+    messaging_group_id: messagingGroupId,
+    is_group: isGroup,
     content: JSON.stringify({ text: body }),
   });
 }
