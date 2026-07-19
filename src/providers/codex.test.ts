@@ -7,7 +7,7 @@ import path from 'path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { codexHostContainerFactory, prepareCodexHost } from './codex.js';
+import { DEFAULT_CODEX_PROVISION_TIMEOUT_MS, codexHostContainerFactory, prepareCodexHost } from './codex.js';
 
 const tempRoots: string[] = [];
 
@@ -161,6 +161,11 @@ afterEach(() => {
 });
 
 describe('codex host preparation', () => {
+  it('keeps the default caller timeout above the bounded serialized host queue', () => {
+    expect(DEFAULT_CODEX_PROVISION_TIMEOUT_MS).toBe(300_000);
+    expect(DEFAULT_CODEX_PROVISION_TIMEOUT_MS).toBeGreaterThan(4 * (60_000 + 10_000));
+  });
+
   it('ensures the base OneCLI grants before requesting missing Codex artifacts', async () => {
     const root = tempDir('yente-codex-prepare-');
     const configPath = path.join(root, 'codex', 'onecli-codex-container-config.json');

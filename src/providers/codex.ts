@@ -56,7 +56,11 @@ interface CodexProvisionResponse {
 }
 
 const DEFAULT_CODEX_PROVISION_SOCKET = '/run/nanoclaw-runtime-broker/provision.sock';
-const DEFAULT_CODEX_PROVISION_TIMEOUT_MS = 30_000;
+// Host provisioning admits at most four outstanding requests and executes each
+// serialized helper for at most 60 seconds, with a bounded reload/register tail.
+// Five minutes therefore covers the entire admitted queue without a caller
+// timing out while the host is still completing an accepted request.
+export const DEFAULT_CODEX_PROVISION_TIMEOUT_MS = 300_000;
 const CODEX_BROKER_READINESS_TIMEOUT_MS = 1_000;
 const MAX_CODEX_PROVISION_RESPONSE_BYTES = 64 * 1024;
 
