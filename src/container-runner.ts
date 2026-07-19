@@ -58,7 +58,9 @@ import {
 import './providers/index.js';
 import {
   getProviderContainerConfig,
+  getProviderPrepare,
   type ProviderContainerContribution,
+  type ProviderContainerContext,
   type VolumeMount,
 } from './providers/provider-container-registry.js';
 import {
@@ -106,6 +108,14 @@ const wakePromises = new Map<string, Promise<void>>();
 interface OneCliGatewayClient {
   ensureAgent(args: { name: string; identifier: string }): Promise<unknown>;
   applyContainerConfig(args: string[], options: { addHostMapping: false; agent: string | undefined }): Promise<boolean>;
+}
+
+interface OneCliIdentityContext {
+  client: OneCliGatewayClient;
+  containerName: string;
+  agentGroupName: string;
+  agentIdentifier: string;
+  ensureSecretAccess?: (agentIdentifier: string) => Promise<void>;
 }
 
 export function getActiveContainerCount(): number {
@@ -259,7 +269,7 @@ async function spawnContainer(session: Session): Promise<void> {
   // Resolve the effective provider + any host-side contribution it declares
   // (extra mounts, env passthrough). Computed once and threaded through both
   // buildMounts and buildContainerArgs so side effects (mkdir, etc.) fire once.
-  const { provider, contribution } = resolveProviderContribution(session, agentGroup, containerConfig);
+  const { provider, contribution } = await resolveProviderContribution(session, agentGroup, containerConfig);
 
   const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
   // OneCLI agent identifier is always the agent group id — stable across
@@ -613,11 +623,11 @@ export function resolveProviderName(
   return provider;
 }
 
-function resolveProviderContribution(
+export async function resolveProviderContribution(
   session: Session,
   agentGroup: AgentGroup,
   containerConfig: import('./container-config.js').ContainerConfig,
-): { provider: string; contribution: ProviderContainerContribution } {
+): Promise<{ provider: string; contribution: ProviderContainerContribution }> {
   let provider: string;
   try {
     provider = resolveProviderName(session.agent_provider, agentGroup.agent_provider, containerConfig.provider);
@@ -627,18 +637,31 @@ function resolveProviderContribution(
       cause: err,
     });
   }
+  const context: ProviderContainerContext = {
+    sessionDir: sessionDir(agentGroup.id, session.id),
+    agentGroupId: agentGroup.id,
+    agentGroupFolder: agentGroup.folder,
+    agentGroupName: agentGroup.name,
+    containerConfig,
+    hostEnv: process.env,
+    groupModel: containerConfig.model,
+    groupReasoningEffort: containerConfig.reasoningEffort,
+  };
+  const prepare = getProviderPrepare(provider);
+  if (prepare) {
+    await prepare({
+      ...context,
+      ensureOneCliIdentityAndGrants: () =>
+        ensureOneCliIdentityAndGrants({
+          client: onecli,
+          containerName: `prepare-${agentGroup.folder}`,
+          agentGroupName: agentGroup.name,
+          agentIdentifier: agentGroup.id,
+        }),
+    });
+  }
   const fn = getProviderContainerConfig(provider);
-  const contribution = fn
-    ? fn({
-        sessionDir: sessionDir(agentGroup.id, session.id),
-        agentGroupId: agentGroup.id,
-        agentGroupFolder: agentGroup.folder,
-        containerConfig,
-        hostEnv: process.env,
-        groupModel: containerConfig.model,
-        groupReasoningEffort: containerConfig.reasoningEffort,
-      })
-    : {};
+  const contribution = fn ? fn(context) : {};
   return { provider, contribution };
 }
 
@@ -1388,13 +1411,7 @@ const sleepMs = (ms: number): Promise<void> => new Promise((resolve) => setTimeo
 
 export async function applyOneCliGatewayForContainerArgs(
   args: string[],
-  context: {
-    client: OneCliGatewayClient;
-    containerName: string;
-    agentGroupName: string;
-    agentIdentifier?: string;
-    ensureSecretAccess?: (agentIdentifier: string) => Promise<void>;
-  },
+  context: Omit<OneCliIdentityContext, 'agentIdentifier'> & { agentIdentifier?: string },
 ): Promise<void> {
   for (let attempt = 1; attempt <= ONECLI_GATEWAY_MAX_ATTEMPTS; attempt++) {
     try {
@@ -1449,6 +1466,16 @@ export async function applyOneCliGatewayForContainerArgs(
       );
     }
   }
+}
+
+/**
+ * Idempotently establish a group's base OneCLI identity and grants before a
+ * provider-specific privileged provisioner derives its own scoped identity.
+ * Reusing the normal gateway path keeps retry, grant, and cache-invalidation
+ * behavior identical; the generated Docker args are deliberately discarded.
+ */
+export async function ensureOneCliIdentityAndGrants(context: OneCliIdentityContext): Promise<void> {
+  await applyOneCliGatewayForContainerArgs([], context);
 }
 
 function latestDockerEnvValue(args: readonly string[], keys: readonly string[]): string | undefined {

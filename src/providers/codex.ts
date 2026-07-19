@@ -28,16 +28,37 @@
 import { execFileSync } from 'node:child_process';
 import crypto from 'crypto';
 import fs from 'fs';
+import net from 'node:net';
 import path from 'path';
 
 import { GROUPS_DIR } from '../config.js';
-import { registerProviderContainerConfig, type ProviderContainerContext } from './provider-container-registry.js';
+import { log } from '../log.js';
+import {
+  registerProviderContainerConfig,
+  registerProviderPrepare,
+  type ProviderContainerContext,
+  type ProviderPrepareContext,
+} from './provider-container-registry.js';
 
 interface CodexBrokerResponse {
   ok: boolean;
   store?: unknown;
   error?: string;
 }
+
+interface CodexProvisionResponse {
+  ok: boolean;
+  agentGroupId?: string;
+  status?: string;
+  brokerSocket?: string;
+  configPath?: string;
+  error?: string;
+}
+
+const DEFAULT_CODEX_PROVISION_SOCKET = '/run/nanoclaw-runtime-broker/provision.sock';
+const DEFAULT_CODEX_PROVISION_TIMEOUT_MS = 30_000;
+const CODEX_BROKER_READINESS_TIMEOUT_MS = 1_000;
+const MAX_CODEX_PROVISION_RESPONSE_BYTES = 64 * 1024;
 
 // ---------------------------------------------------------------------------
 // Auth-gated OneCLI egress.
@@ -363,6 +384,162 @@ function codexAuthGatePort(ctx: ProviderContainerContext): string {
   return String(ctx.containerConfig?.codex?.authGatePort ?? authGatePortFromEnv(ctx.hostEnv));
 }
 
+function sanitizeProvisionError(value: unknown): string {
+  return String(value || 'host provisioner rejected the request')
+    .replace(/\b(?:aoc|oc)_[A-Za-z0-9._-]+/g, '[REDACTED]')
+    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, '[REDACTED]')
+    .slice(0, 500);
+}
+
+function publishedPathMatches(expectedPath: string, reportedPath: unknown): boolean {
+  if (typeof reportedPath !== 'string' || !path.isAbsolute(reportedPath)) return false;
+  try {
+    // Release checkouts expose shared state through symlinks (for example,
+    // releases/<sha>/groups -> shared/groups). Compare the published artifacts,
+    // not the two valid spellings of the same path.
+    return fs.realpathSync(expectedPath) === fs.realpathSync(reportedPath);
+  } catch {
+    return false;
+  }
+}
+
+function canConnectToCodexBroker(socketPath: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = new net.Socket();
+    let settled = false;
+    const finish = (ready: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(ready);
+    };
+    const timer = setTimeout(() => finish(false), CODEX_BROKER_READINESS_TIMEOUT_MS);
+    socket.once('connect', () => finish(true));
+    socket.once('error', () => finish(false));
+    try {
+      socket.connect(socketPath);
+    } catch {
+      finish(false);
+    }
+  });
+}
+
+async function codexHostArtifactsReady(
+  ctx: ProviderContainerContext,
+  configPath: string,
+  brokerSocket: string,
+): Promise<boolean> {
+  try {
+    readNativeCodexOneCliConfig(configPath, ctx.hostEnv, ctx.agentGroupId);
+  } catch {
+    return false;
+  }
+  return canConnectToCodexBroker(brokerSocket);
+}
+
+function requestCodexProvision(
+  socketPath: string,
+  request: Record<string, unknown>,
+  timeoutMs: number,
+): Promise<CodexProvisionResponse> {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection(socketPath);
+    let settled = false;
+    let buffer = '';
+    const finish = (err?: Error, response?: CodexProvisionResponse) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      if (err) reject(err);
+      else resolve(response as CodexProvisionResponse);
+    };
+    const timer = setTimeout(
+      () => finish(new Error(`Codex host provisioning timed out after ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+    socket.setEncoding('utf8');
+    socket.on('connect', () => socket.write(`${JSON.stringify(request)}\n`));
+    socket.on('data', (chunk) => {
+      buffer += chunk;
+      if (Buffer.byteLength(buffer, 'utf8') > MAX_CODEX_PROVISION_RESPONSE_BYTES) {
+        finish(new Error('Codex host provisioning response exceeded the size limit'));
+        return;
+      }
+      const newline = buffer.indexOf('\n');
+      if (newline < 0) return;
+      try {
+        finish(undefined, JSON.parse(buffer.slice(0, newline)) as CodexProvisionResponse);
+      } catch {
+        finish(new Error('Codex host provisioning returned invalid JSON'));
+      }
+    });
+    socket.on('error', (err) => finish(new Error(`Codex host provisioning socket failed: ${err.message}`)));
+    socket.on('end', () => {
+      if (!settled) finish(new Error('Codex host provisioning closed without a response'));
+    });
+  });
+}
+
+/** Ensure a Codex group has its isolated OneCLI identity and broker target. */
+export async function prepareCodexHost(ctx: ProviderPrepareContext): Promise<void> {
+  const agentGroupFolder = requiredAgentGroupFolder(ctx);
+  const agentGroupName = ctx.agentGroupName?.trim();
+  if (!agentGroupName) throw new Error('codex provider requires agent group name context');
+
+  const configPath = codexOneCliConfigPath(ctx);
+  const brokerSocket = codexBrokerSocket(ctx);
+  if (await codexHostArtifactsReady(ctx, configPath, brokerSocket)) return;
+
+  // The root provisioner clones the base group's explicit grants into the
+  // Codex-specific auth-gate identity, so establish those grants first.
+  await ctx.ensureOneCliIdentityAndGrants();
+
+  const provisionSocket = ctx.hostEnv.NANOCLAW_CODEX_PROVISION_SOCKET?.trim() || DEFAULT_CODEX_PROVISION_SOCKET;
+  const configuredTimeout = Number(ctx.hostEnv.NANOCLAW_CODEX_PROVISION_TIMEOUT_MS);
+  const timeoutMs =
+    Number.isFinite(configuredTimeout) && configuredTimeout > 0
+      ? Math.floor(configuredTimeout)
+      : DEFAULT_CODEX_PROVISION_TIMEOUT_MS;
+  const response = await requestCodexProvision(
+    provisionSocket,
+    {
+      op: 'ensure-codex-target',
+      agentGroupId: ctx.agentGroupId,
+      agentGroupFolder,
+      agentGroupName,
+    },
+    timeoutMs,
+  );
+  if (!response?.ok) {
+    throw new Error(`Codex host provisioning failed: ${sanitizeProvisionError(response?.error)}`);
+  }
+
+  const statusMatches = response.status === 'created' || response.status === 'existing';
+  const identityMatches = response.agentGroupId === ctx.agentGroupId;
+  if (!statusMatches || !identityMatches) {
+    throw new Error('Codex host provisioning returned a mismatched provisioning response');
+  }
+  if (!fs.existsSync(configPath) || !fs.existsSync(brokerSocket)) {
+    throw new Error('Codex host provisioning reported success without publishing the required artifacts');
+  }
+  if (
+    !publishedPathMatches(configPath, response.configPath) ||
+    !publishedPathMatches(brokerSocket, response.brokerSocket)
+  ) {
+    throw new Error('Codex host provisioning returned a mismatched provisioning response');
+  }
+  if (!(await codexHostArtifactsReady(ctx, configPath, brokerSocket))) {
+    throw new Error('Codex host provisioning published invalid or unavailable artifacts');
+  }
+  log.info('Prepared Codex host identity', {
+    agentGroupId: ctx.agentGroupId,
+    agentGroupFolder,
+    status: response.status,
+  });
+}
+
 export const codexHostContainerFactory = (ctx: ProviderContainerContext) => {
   const codexDir = path.join(ctx.sessionDir, 'codex');
   fs.mkdirSync(codexDir, { recursive: true });
@@ -504,4 +681,5 @@ export const codexHostContainerFactory = (ctx: ProviderContainerContext) => {
 
   return { mounts, env, extraHosts: [codexAuthGateHost(ctx)] };
 };
+registerProviderPrepare('codex', prepareCodexHost);
 registerProviderContainerConfig('codex', codexHostContainerFactory);

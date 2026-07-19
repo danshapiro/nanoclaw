@@ -15,12 +15,14 @@ import {
   buildManagedReposMounts,
   buildLocalSkillsMount,
   resolveAgentImageForRun,
+  resolveProviderContribution,
   resolveProviderName,
 } from './container-runner.js';
 import { AgentMcpCredentialUnavailableError, type AgentMcpBridgeOptions } from './agent-mcp-bridge.js';
 import { log } from './log.js';
 import type { AgentMcpConfigForGroup } from './agent-mcp-config.js';
 import type { ContainerConfig } from './container-config.js';
+import { registerProviderContainerConfig, registerProviderPrepare } from './providers/provider-container-registry.js';
 import type { AgentGroup } from './types.js';
 
 /**
@@ -313,6 +315,42 @@ describe('resolveProviderName', () => {
     expect(() => resolveProviderName(null, 'opencode', undefined)).toThrow(
       /container\.json resolves to 'claude'.*agent_groups\.agent_provider is 'opencode'/,
     );
+  });
+});
+
+describe('provider preparation', () => {
+  it('awaits provider preparation before building the synchronous contribution', async () => {
+    const provider = 'test-prepare-order';
+    const order: string[] = [];
+    registerProviderPrepare(provider, async () => {
+      order.push('prepare');
+    });
+    registerProviderContainerConfig(provider, () => {
+      order.push('contribution');
+      return {};
+    });
+    const group: AgentGroup = {
+      id: 'ag-prepare',
+      name: 'Prepare',
+      folder: 'prepare',
+      agent_provider: null,
+      created_at: '2026-01-01T00:00:00.000Z',
+    };
+    const config: ContainerConfig = {
+      mcpServers: {},
+      packages: { apt: [], npm: [] },
+      additionalMounts: [],
+      skills: 'all',
+      provider,
+    };
+
+    await resolveProviderContribution(
+      { id: 'sess-prepare', agent_group_id: group.id, agent_provider: null } as never,
+      group,
+      config,
+    );
+
+    expect(order).toEqual(['prepare', 'contribution']);
   });
 });
 

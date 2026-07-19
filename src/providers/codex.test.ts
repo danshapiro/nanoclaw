@@ -1,12 +1,13 @@
 import crypto from 'crypto';
 import { spawn } from 'child_process';
 import fs from 'fs';
+import net from 'net';
 import os from 'os';
 import path from 'path';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { codexHostContainerFactory } from './codex.js';
+import { codexHostContainerFactory, prepareCodexHost } from './codex.js';
 
 const tempRoots: string[] = [];
 
@@ -67,12 +68,15 @@ async function startFakeBroker(store: unknown) {
   };
 }
 
-function writeNativeConfig(root: string, agentGroupId = 'ag-main') {
+function writeNativeConfig(
+  root: string,
+  agentGroupId = 'ag-main',
+  configPath = path.join(root, 'onecli-codex-container-config.json'),
+) {
   const tokenFile = path.join(root, 'codex-onecli-agent-token');
   const token = 'aoc_test_agent_token';
   const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
   fs.writeFileSync(tokenFile, token);
-  const configPath = path.join(root, 'onecli-codex-container-config.json');
   fs.writeFileSync(
     configPath,
     JSON.stringify({
@@ -105,10 +109,336 @@ function tempDir(prefix: string) {
   return dir;
 }
 
+async function startFakeProvisioner(
+  socketPath: string,
+  respond: (
+    request: Record<string, unknown>,
+  ) => Record<string, unknown> | null | Promise<Record<string, unknown> | null>,
+) {
+  const requests: Record<string, unknown>[] = [];
+  const server = net.createServer((socket) => {
+    let buffer = '';
+    socket.setEncoding('utf8');
+    let handled = false;
+    socket.on('data', async (chunk) => {
+      buffer += chunk;
+      const newline = buffer.indexOf('\n');
+      if (newline < 0 || handled) return;
+      handled = true;
+      const request = JSON.parse(buffer.slice(0, newline)) as Record<string, unknown>;
+      requests.push(request);
+      const response = await respond(request);
+      if (response) socket.end(`${JSON.stringify(response)}\n`);
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(socketPath, resolve);
+  });
+  return {
+    requests,
+    close: () => new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve()))),
+  };
+}
+
+async function startPassiveBroker(socketPath: string) {
+  fs.mkdirSync(path.dirname(socketPath), { recursive: true });
+  if (fs.existsSync(socketPath)) fs.unlinkSync(socketPath);
+  const server = net.createServer();
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(socketPath, resolve);
+  });
+  return {
+    close: () => new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve()))),
+  };
+}
+
 afterEach(() => {
   for (const root of tempRoots.splice(0)) {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+describe('codex host preparation', () => {
+  it('ensures the base OneCLI grants before requesting missing Codex artifacts', async () => {
+    const root = tempDir('yente-codex-prepare-');
+    const configPath = path.join(root, 'codex', 'onecli-codex-container-config.json');
+    const brokerSocket = path.join(root, 'runtime', 'ag-child.sock');
+    const provisionSocket = path.join(root, 'provision.sock');
+    const order: string[] = [];
+    let broker: Awaited<ReturnType<typeof startPassiveBroker>> | undefined;
+    const server = await startFakeProvisioner(provisionSocket, async (request) => {
+      order.push('provision');
+      fs.mkdirSync(path.dirname(configPath), { recursive: true });
+      writeNativeConfig(root, 'ag-child', configPath);
+      broker = await startPassiveBroker(brokerSocket);
+      return {
+        ok: true,
+        agentGroupId: request.agentGroupId,
+        status: 'created',
+        brokerSocket,
+        configPath,
+      };
+    });
+    const ensureOneCliIdentityAndGrants = vi.fn(async () => {
+      order.push('onecli');
+    });
+    try {
+      await prepareCodexHost({
+        sessionDir: path.join(root, 'session'),
+        agentGroupId: 'ag-child',
+        agentGroupFolder: 'child',
+        agentGroupName: 'Child',
+        hostEnv: { NANOCLAW_CODEX_PROVISION_SOCKET: provisionSocket },
+        containerConfig: {
+          mcpServers: {},
+          packages: { apt: [], npm: [] },
+          additionalMounts: [],
+          skills: 'all',
+          provider: 'codex',
+          codex: { onecliConfigPath: configPath, brokerSocket },
+        },
+        ensureOneCliIdentityAndGrants,
+      });
+
+      expect(order).toEqual(['onecli', 'provision']);
+      expect(server.requests).toEqual([
+        {
+          op: 'ensure-codex-target',
+          agentGroupId: 'ag-child',
+          agentGroupFolder: 'child',
+          agentGroupName: 'Child',
+        },
+      ]);
+    } finally {
+      await broker?.close();
+      await server.close();
+    }
+  });
+
+  it('is a no-op when the native config is valid and the broker is listening', async () => {
+    const root = tempDir('yente-codex-ready-');
+    const { configPath } = writeNativeConfig(root, 'ag-ready');
+    const broker = await startFakeBroker({});
+    const ensureOneCliIdentityAndGrants = vi.fn();
+    try {
+      await prepareCodexHost({
+        sessionDir: path.join(root, 'session'),
+        agentGroupId: 'ag-ready',
+        agentGroupFolder: 'ready',
+        agentGroupName: 'Ready',
+        hostEnv: { NANOCLAW_CODEX_PROVISION_SOCKET: path.join(root, 'missing-provision.sock') },
+        containerConfig: {
+          mcpServers: {},
+          packages: { apt: [], npm: [] },
+          additionalMounts: [],
+          skills: 'all',
+          provider: 'codex',
+          codex: { onecliConfigPath: configPath, brokerSocket: broker.sock },
+        },
+        ensureOneCliIdentityAndGrants,
+      });
+
+      expect(ensureOneCliIdentityAndGrants).not.toHaveBeenCalled();
+    } finally {
+      await broker.close();
+    }
+  });
+
+  it('repairs an invalid native config instead of treating path existence as ready', async () => {
+    const root = tempDir('yente-codex-invalid-config-');
+    const configPath = path.join(root, 'config.json');
+    const brokerSocket = path.join(root, 'runtime', 'ag-child.sock');
+    const provisionSocket = path.join(root, 'provision.sock');
+    fs.writeFileSync(configPath, '{}');
+    const broker = await startPassiveBroker(brokerSocket);
+    const provisioner = await startFakeProvisioner(provisionSocket, () => {
+      writeNativeConfig(root, 'ag-child', configPath);
+      return { ok: true, agentGroupId: 'ag-child', status: 'existing', brokerSocket, configPath };
+    });
+    const ensureOneCliIdentityAndGrants = vi.fn().mockResolvedValue(undefined);
+    try {
+      await prepareCodexHost({
+        sessionDir: path.join(root, 'session'),
+        agentGroupId: 'ag-child',
+        agentGroupFolder: 'child',
+        agentGroupName: 'Child',
+        hostEnv: { NANOCLAW_CODEX_PROVISION_SOCKET: provisionSocket },
+        containerConfig: {
+          mcpServers: {},
+          packages: { apt: [], npm: [] },
+          additionalMounts: [],
+          skills: 'all',
+          provider: 'codex',
+          codex: { onecliConfigPath: configPath, brokerSocket },
+        },
+        ensureOneCliIdentityAndGrants,
+      });
+      expect(provisioner.requests).toHaveLength(1);
+      expect(ensureOneCliIdentityAndGrants).toHaveBeenCalledOnce();
+    } finally {
+      await broker.close();
+      await provisioner.close();
+    }
+  });
+
+  it('repairs a stale broker socket instead of treating path existence as ready', async () => {
+    const root = tempDir('yente-codex-stale-socket-');
+    const { configPath } = writeNativeConfig(root, 'ag-child');
+    const brokerSocket = path.join(root, 'runtime', 'ag-child.sock');
+    const provisionSocket = path.join(root, 'provision.sock');
+    fs.mkdirSync(path.dirname(brokerSocket), { recursive: true });
+    fs.writeFileSync(brokerSocket, 'stale');
+    let broker: Awaited<ReturnType<typeof startPassiveBroker>> | undefined;
+    const provisioner = await startFakeProvisioner(provisionSocket, async () => {
+      broker = await startPassiveBroker(brokerSocket);
+      return { ok: true, agentGroupId: 'ag-child', status: 'existing', brokerSocket, configPath };
+    });
+    try {
+      await prepareCodexHost({
+        sessionDir: path.join(root, 'session'),
+        agentGroupId: 'ag-child',
+        agentGroupFolder: 'child',
+        agentGroupName: 'Child',
+        hostEnv: { NANOCLAW_CODEX_PROVISION_SOCKET: provisionSocket },
+        containerConfig: {
+          mcpServers: {},
+          packages: { apt: [], npm: [] },
+          additionalMounts: [],
+          skills: 'all',
+          provider: 'codex',
+          codex: { onecliConfigPath: configPath, brokerSocket },
+        },
+        ensureOneCliIdentityAndGrants: vi.fn().mockResolvedValue(undefined),
+      });
+      expect(provisioner.requests).toHaveLength(1);
+    } finally {
+      await broker?.close();
+      await provisioner.close();
+    }
+  });
+
+  it('accepts the canonical shared config path when the release path is a symlink alias', async () => {
+    const root = tempDir('yente-codex-release-alias-');
+    const sharedGroups = path.join(root, 'shared', 'groups');
+    const releaseDir = path.join(root, 'release');
+    const releaseGroups = path.join(releaseDir, 'groups');
+    fs.mkdirSync(sharedGroups, { recursive: true });
+    fs.mkdirSync(releaseDir, { recursive: true });
+    fs.symlinkSync(sharedGroups, releaseGroups, 'dir');
+
+    const canonicalConfigPath = path.join(sharedGroups, 'child', 'codex', 'onecli-codex-container-config.json');
+    const releaseConfigPath = path.join(releaseGroups, 'child', 'codex', 'onecli-codex-container-config.json');
+    const brokerSocket = path.join(root, 'runtime', 'ag-child.sock');
+    const provisionSocket = path.join(root, 'provision.sock');
+    let broker: Awaited<ReturnType<typeof startPassiveBroker>> | undefined;
+    const server = await startFakeProvisioner(provisionSocket, async () => {
+      fs.mkdirSync(path.dirname(canonicalConfigPath), { recursive: true });
+      writeNativeConfig(root, 'ag-child', canonicalConfigPath);
+      broker = await startPassiveBroker(brokerSocket);
+      return {
+        ok: true,
+        agentGroupId: 'ag-child',
+        status: 'created',
+        brokerSocket,
+        configPath: canonicalConfigPath,
+      };
+    });
+    try {
+      await expect(
+        prepareCodexHost({
+          sessionDir: path.join(root, 'session'),
+          agentGroupId: 'ag-child',
+          agentGroupFolder: 'child',
+          agentGroupName: 'Child',
+          hostEnv: { NANOCLAW_CODEX_PROVISION_SOCKET: provisionSocket },
+          containerConfig: {
+            mcpServers: {},
+            packages: { apt: [], npm: [] },
+            additionalMounts: [],
+            skills: 'all',
+            provider: 'codex',
+            codex: { onecliConfigPath: releaseConfigPath, brokerSocket },
+          },
+          ensureOneCliIdentityAndGrants: vi.fn().mockResolvedValue(undefined),
+        }),
+      ).resolves.toBeUndefined();
+    } finally {
+      await broker?.close();
+      await server.close();
+    }
+  });
+
+  it('fails closed when the provisioner returns paths for another group', async () => {
+    const root = tempDir('yente-codex-mismatch-');
+    const configPath = path.join(root, 'config.json');
+    const brokerSocket = path.join(root, 'broker.sock');
+    const provisionSocket = path.join(root, 'provision.sock');
+    const server = await startFakeProvisioner(provisionSocket, () => ({
+      ok: true,
+      agentGroupId: 'ag-other',
+      status: 'existing',
+      brokerSocket: path.join(root, 'other.sock'),
+      configPath: path.join(root, 'other.json'),
+    }));
+    try {
+      await expect(
+        prepareCodexHost({
+          sessionDir: path.join(root, 'session'),
+          agentGroupId: 'ag-child',
+          agentGroupFolder: 'child',
+          agentGroupName: 'Child',
+          hostEnv: { NANOCLAW_CODEX_PROVISION_SOCKET: provisionSocket },
+          containerConfig: {
+            mcpServers: {},
+            packages: { apt: [], npm: [] },
+            additionalMounts: [],
+            skills: 'all',
+            provider: 'codex',
+            codex: { onecliConfigPath: configPath, brokerSocket },
+          },
+          ensureOneCliIdentityAndGrants: vi.fn().mockResolvedValue(undefined),
+        }),
+      ).rejects.toThrow(/mismatched provisioning response/);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('times out without spawning when the host provisioner does not answer', async () => {
+    const root = tempDir('yente-codex-timeout-');
+    const provisionSocket = path.join(root, 'provision.sock');
+    const server = await startFakeProvisioner(provisionSocket, () => null);
+    try {
+      await expect(
+        prepareCodexHost({
+          sessionDir: path.join(root, 'session'),
+          agentGroupId: 'ag-child',
+          agentGroupFolder: 'child',
+          agentGroupName: 'Child',
+          hostEnv: {
+            NANOCLAW_CODEX_PROVISION_SOCKET: provisionSocket,
+            NANOCLAW_CODEX_PROVISION_TIMEOUT_MS: '20',
+          },
+          containerConfig: {
+            mcpServers: {},
+            packages: { apt: [], npm: [] },
+            additionalMounts: [],
+            skills: 'all',
+            provider: 'codex',
+            codex: {
+              onecliConfigPath: path.join(root, 'config.json'),
+              brokerSocket: path.join(root, 'broker.sock'),
+            },
+          },
+          ensureOneCliIdentityAndGrants: vi.fn().mockResolvedValue(undefined),
+        }),
+      ).rejects.toThrow(/timed out/);
+    } finally {
+      await server.close();
+    }
+  });
 });
 
 describe('codex host provider container config', () => {

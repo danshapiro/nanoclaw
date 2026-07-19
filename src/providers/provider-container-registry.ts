@@ -30,6 +30,8 @@ export interface ProviderContainerContext {
   agentGroupId: string;
   /** Agent group folder name, for per-group filesystem layout. */
   agentGroupFolder?: string;
+  /** Agent group display name, for host-side identity provisioning. */
+  agentGroupName?: string;
   /** Parsed group container.json read once by the container runner. */
   containerConfig?: ContainerConfig;
   /** `process.env` at spawn time — pull passthrough values from here. */
@@ -38,6 +40,15 @@ export interface ProviderContainerContext {
   groupModel?: string;
   /** Per-group OpenCode reasoning effort override from container.json. */
   groupReasoningEffort?: string;
+}
+
+export interface ProviderPrepareContext extends ProviderContainerContext {
+  /**
+   * Idempotently create the group's base OneCLI identity and required grants.
+   * Provider preparation must call this before asking a privileged host helper
+   * to derive a provider-specific identity from those grants.
+   */
+  ensureOneCliIdentityAndGrants: () => Promise<void>;
 }
 
 export interface ProviderContainerContribution {
@@ -50,8 +61,10 @@ export interface ProviderContainerContribution {
 }
 
 export type ProviderContainerConfigFn = (ctx: ProviderContainerContext) => ProviderContainerContribution;
+export type ProviderPrepareFn = (ctx: ProviderPrepareContext) => Promise<void>;
 
 const registry = new Map<string, ProviderContainerConfigFn>();
+const prepareRegistry = new Map<string, ProviderPrepareFn>();
 
 export function registerProviderContainerConfig(name: string, fn: ProviderContainerConfigFn): void {
   if (registry.has(name)) {
@@ -62,6 +75,17 @@ export function registerProviderContainerConfig(name: string, fn: ProviderContai
 
 export function getProviderContainerConfig(name: string): ProviderContainerConfigFn | undefined {
   return registry.get(name);
+}
+
+export function registerProviderPrepare(name: string, fn: ProviderPrepareFn): void {
+  if (prepareRegistry.has(name)) {
+    throw new Error(`Provider prepare hook already registered: ${name}`);
+  }
+  prepareRegistry.set(name, fn);
+}
+
+export function getProviderPrepare(name: string): ProviderPrepareFn | undefined {
+  return prepareRegistry.get(name);
 }
 
 export function listProviderContainerConfigNames(): string[] {
