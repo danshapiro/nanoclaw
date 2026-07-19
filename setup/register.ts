@@ -7,7 +7,7 @@
 import fs from 'fs';
 import path from 'path';
 
-import { DATA_DIR } from '../src/config.js';
+import { DATA_DIR, DEFAULT_AGENT_PROVIDER } from '../src/config.js';
 import { initDb } from '../src/db/connection.js';
 import { runMigrations } from '../src/db/migrations/index.js';
 import { createAgentGroup, getAgentGroupByFolder } from '../src/db/agent-groups.js';
@@ -128,6 +128,7 @@ export async function run(args: string[]): Promise<void> {
 
   // 1. Create or find agent group
   let agentGroup = getAgentGroupByFolder(parsed.folder);
+  let createdAgentGroup = false;
   if (!agentGroup) {
     const agId = generateId('ag');
     createAgentGroup({
@@ -138,9 +139,10 @@ export async function run(args: string[]): Promise<void> {
       created_at: new Date().toISOString(),
     });
     agentGroup = getAgentGroupByFolder(parsed.folder)!;
+    createdAgentGroup = true;
     log.info('Created agent group', { id: agId, folder: parsed.folder });
   }
-  initGroupFilesystem(agentGroup);
+  initGroupFilesystem(agentGroup, createdAgentGroup ? { provider: DEFAULT_AGENT_PROVIDER } : undefined);
 
   // 2. Create or find messaging group
   let messagingGroup = getMessagingGroupByPlatform(parsed.channel, parsed.platformId);

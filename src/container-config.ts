@@ -60,7 +60,7 @@ export interface ContainerConfig {
   additionalMounts: AdditionalMountConfig[];
   /** Which skills to enable — array of skill names or "all" (default). */
   skills: SkillSelection;
-  /** Agent provider name (e.g. "claude", "opencode"). Default: "claude". */
+  /** Agent provider name (e.g. "claude", "codex", "opencode"). */
   provider?: string;
   /** Agent group display name (used in transcript archiving). */
   groupName?: string;
@@ -78,12 +78,13 @@ export interface ContainerConfig {
   codex?: CodexContainerConfig;
 }
 
-function emptyConfig(): ContainerConfig {
+function emptyConfig(provider?: string): ContainerConfig {
   return {
     mcpServers: {},
     packages: { apt: [], npm: [] },
     additionalMounts: [],
     skills: 'all',
+    ...(provider ? { provider } : {}),
   };
 }
 
@@ -154,12 +155,14 @@ export function updateContainerConfig(folder: string, mutate: (config: Container
 }
 
 /**
- * Initialize an empty container.json for a group if one doesn't already
- * exist. Idempotent — used from `group-init.ts`.
+ * Initialize a baseline container.json for a group if one doesn't already
+ * exist, stamping its creation-time provider. Idempotent — used from
+ * `group-init.ts`; an existing file is never changed.
  */
-export function initContainerConfig(folder: string): boolean {
+export function initContainerConfig(folder: string, provider: string): boolean {
   const p = configPath(folder);
   if (fs.existsSync(p)) return false;
-  writeContainerConfig(folder, emptyConfig());
+  const normalizedProvider = provider.trim().toLowerCase() || 'claude';
+  writeContainerConfig(folder, emptyConfig(normalizedProvider));
   return true;
 }

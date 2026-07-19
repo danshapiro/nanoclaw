@@ -8,9 +8,10 @@
 import path from 'path';
 
 import { GROUPS_DIR } from '../../config.js';
+import { readContainerConfig } from '../../container-config.js';
 import { createAgentGroup, getAgentGroup, getAgentGroupByFolder } from '../../db/agent-groups.js';
 import { getSession } from '../../db/sessions.js';
-import { wakeContainer } from '../../container-runner.js';
+import { resolveProviderName, wakeContainer } from '../../container-runner.js';
 import { initGroupFilesystem } from '../../group-init.js';
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
@@ -71,6 +72,14 @@ export async function handleCreateAgent(content: Record<string, unknown>, sessio
     return;
   }
 
+  // A persistent companion inherits the creator's effective provider instead
+  // of falling through to the instance default. This keeps explicit Claude and
+  // OpenCode groups intact while Codex parents create Codex companions. Resolve
+  // this before creating anything so an invalid parent config cannot leave an
+  // orphan group row behind.
+  const sourceConfig = readContainerConfig(sourceGroup.folder);
+  const parentProvider = resolveProviderName(session.agent_provider, sourceGroup.agent_provider, sourceConfig.provider);
+
   const agentGroupId = `ag-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const now = new Date().toISOString();
 
@@ -82,7 +91,7 @@ export async function handleCreateAgent(content: Record<string, unknown>, sessio
     created_at: now,
   };
   createAgentGroup(newGroup);
-  initGroupFilesystem(newGroup, { instructions: instructions ?? undefined });
+  initGroupFilesystem(newGroup, { instructions: instructions ?? undefined, provider: parentProvider });
 
   // Insert bidirectional destination rows (= ACL grants).
   // Creator refers to child by the name it chose; child refers to creator as "parent".

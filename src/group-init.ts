@@ -34,8 +34,13 @@ const DEFAULT_SETTINGS_JSON =
  * spawn by `composeGroupClaudeMd()` (see `claude-md-compose.ts`). Initial
  * per-group instructions (if provided) seed `CLAUDE.local.md`.
  */
-export function initGroupFilesystem(group: AgentGroup, opts?: { instructions?: string }): void {
+export function initGroupFilesystem(group: AgentGroup, opts?: { instructions?: string; provider?: string }): void {
   const initialized: string[] = [];
+  // Callers that have just created a group pass the instance default (or an
+  // inherited provider) explicitly. A defensive/re-registration call with no
+  // provider opinion preserves the historical Claude behavior for a legacy
+  // group whose container.json is missing.
+  const providerHint = (opts?.provider ?? 'claude').trim().toLowerCase() || 'claude';
 
   // 1. groups/<folder>/ — group memory + working dir
   const groupDir = path.resolve(GROUPS_DIR, group.folder);
@@ -53,10 +58,10 @@ export function initGroupFilesystem(group: AgentGroup, opts?: { instructions?: s
     initialized.push('CLAUDE.local.md');
   }
 
-  // groups/<folder>/container.json — empty container config, replaces the
-  // former agent_groups.container_config DB column. Self-modification flows
-  // read and write this file directly.
-  if (initContainerConfig(group.folder)) {
+  // groups/<folder>/container.json — baseline container config with the
+  // creation-time provider, replacing the former agent_groups.container_config
+  // DB column. Self-modification flows read and write this file directly.
+  if (initContainerConfig(group.folder, providerHint)) {
     initialized.push('container.json');
   }
 

@@ -17,10 +17,16 @@ const envConfig = readEnvFile([
   'YENTE_SCHEDULER_ALERT_CHANNEL_TYPE',
   'YENTE_SCHEDULER_ALERT_PLATFORM_ID',
   'YENTE_SCHEDULER_ALERT_THREAD_ID',
+  'DEFAULT_AGENT_PROVIDER',
   'TZ',
 ]);
 
 export const ASSISTANT_NAME = process.env.ASSISTANT_NAME || envConfig.ASSISTANT_NAME || 'Andy';
+// Instance-wide default for newly created groups. This is stamped into each
+// new group's container.json; it is deliberately not consulted during runtime
+// provider resolution, so upgrading never flips an existing group.
+export const DEFAULT_AGENT_PROVIDER =
+  (process.env.DEFAULT_AGENT_PROVIDER || envConfig.DEFAULT_AGENT_PROVIDER || 'claude').trim().toLowerCase() || 'claude';
 export const ASSISTANT_HAS_OWN_NUMBER =
   (process.env.ASSISTANT_HAS_OWN_NUMBER || envConfig.ASSISTANT_HAS_OWN_NUMBER) === 'true';
 

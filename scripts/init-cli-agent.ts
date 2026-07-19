@@ -19,7 +19,7 @@
  */
 import path from 'path';
 
-import { DATA_DIR } from '../src/config.js';
+import { DATA_DIR, DEFAULT_AGENT_PROVIDER } from '../src/config.js';
 import { createAgentGroup, getAgentGroupByFolder } from '../src/db/agent-groups.js';
 import { initDb } from '../src/db/connection.js';
 import {
@@ -97,6 +97,7 @@ async function main(): Promise<void> {
   // 2. Agent group + filesystem.
   const folder = `cli-with-${normalizeName(args.displayName)}`;
   let ag: AgentGroup | undefined = getAgentGroupByFolder(folder);
+  let createdAgentGroup = false;
   if (!ag) {
     const agId = generateId('ag');
     createAgentGroup({
@@ -107,11 +108,13 @@ async function main(): Promise<void> {
       created_at: now,
     });
     ag = getAgentGroupByFolder(folder)!;
+    createdAgentGroup = true;
     console.log(`Created agent group: ${ag.id} (${folder})`);
   } else {
     console.log(`Reusing agent group: ${ag.id} (${folder})`);
   }
   initGroupFilesystem(ag, {
+    ...(createdAgentGroup ? { provider: DEFAULT_AGENT_PROVIDER } : {}),
     instructions:
       `# ${args.agentName}\n\n` +
       `You are ${args.agentName}, a personal NanoClaw agent for ${args.displayName}. ` +
