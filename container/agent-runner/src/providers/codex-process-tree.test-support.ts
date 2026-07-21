@@ -3,7 +3,7 @@ import { createInterface } from 'readline';
 
 import type { AppServer } from './codex-app-server.js';
 
-export type CodexTestProcessTreeMode = 'graceful' | 'stubborn' | 'sigkill';
+export type CodexTestProcessTreeMode = 'graceful' | 'graceful-unreaped' | 'stubborn' | 'sigkill';
 
 export function isProcessAlive(pid: number): boolean {
   try {
@@ -29,7 +29,10 @@ export async function spawnCodexTestProcessTree(mode: CodexTestProcessTreeMode):
   descendantPid: number;
   cleanup(): Promise<void>;
 }> {
-  const descendantSource = 'setInterval(() => {}, 1000);';
+  const descendantSource =
+    mode === 'graceful-unreaped'
+      ? "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);"
+      : 'setInterval(() => {}, 1000);';
   const shutdownSource =
     mode === 'graceful'
       ? [
@@ -42,7 +45,9 @@ export async function spawnCodexTestProcessTree(mode: CodexTestProcessTreeMode):
           "  descendant.kill('SIGTERM');",
           '});',
         ]
-      : mode === 'stubborn'
+      : mode === 'graceful-unreaped'
+        ? ['process.stdin.resume();', "process.stdin.on('end', () => process.exit(0));"]
+        : mode === 'stubborn'
         ? [
             'process.stdin.resume();',
             "process.stdin.on('end', () => {});",

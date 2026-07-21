@@ -4084,14 +4084,14 @@ describe('provider finalization barriers', () => {
     expect(getAckStatus('quiescence-failed-init')).toBe('recovery');
   });
 
-  it('retains correlation when direct-PID Codex teardown leaves a real descendant alive', async () => {
+  it('retains correlation when clean-EOF Codex teardown leaves a real descendant alive', async () => {
     insertMessage(
       'codex-descendant-quiescence-failed',
       'chat',
       { sender: 'User', text: 'run a tool in a descendant process' },
       { platformId: 'chan-codex-descendant', channelType: 'discord' },
     );
-    const tree = await spawnCodexTestProcessTree('stubborn');
+    const tree = await spawnCodexTestProcessTree('graceful-unreaped');
     const streamEnded = deferred();
     let releaseCalls = 0;
     const provider: AgentProvider = {
@@ -4104,7 +4104,7 @@ describe('provider finalization barriers', () => {
           abort() {
             streamEnded.resolve();
             return terminateCodexAppServer(tree.server, {
-              gracefulShutdownMs: 50,
+              gracefulShutdownMs: 250,
               termExitMs: 150,
               killExitMs: 250,
             });
@@ -4134,6 +4134,77 @@ describe('provider finalization barriers', () => {
       expect(isProcessAlive(tree.descendantPid)).toBe(true);
       expect(releaseCalls).toBe(0);
       expect(getAckStatus('codex-descendant-quiescence-failed')).toBe('recovery');
+    } finally {
+      controller.abort();
+      await loopPromise.catch(() => {});
+      await tree.cleanup();
+    }
+  });
+
+  it('persists a resolved Codex continuation but exits for host recycle when clean teardown lacks tree proof', async () => {
+    insertMessage(
+      'codex-normal-result-before-recycle',
+      'chat',
+      { sender: 'User', text: 'finish normally, then recycle safely' },
+      { platformId: 'chan-codex-recycle', channelType: 'discord', hostProviderName: 'codex' },
+    );
+    insertChannelDestination('discord-current', 'chan-codex-recycle');
+    const tree = await spawnCodexTestProcessTree('graceful-unreaped');
+    let releaseCalls = 0;
+    let termination: Promise<void> | undefined;
+    const terminate = (): Promise<void> => {
+      termination ??= terminateCodexAppServer(tree.server, {
+        gracefulShutdownMs: 250,
+        termExitMs: 100,
+        killExitMs: 250,
+      });
+      return termination;
+    };
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query(input) {
+        return {
+          push() {},
+          end() {},
+          abort: terminate,
+          events: (async function* () {
+            yield { type: 'init', continuation: 'codex-thread-after-recycle' };
+            yield { type: 'input-accepted', inputId: input.inputId, scope: 'initial' };
+            yield {
+              type: 'result',
+              text: '<message to="discord-current">Finished.</message>',
+              resolvedInputIds: [input.inputId!],
+            };
+            await terminate();
+          })(),
+        };
+      },
+    };
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({
+      provider,
+      providerName: 'codex',
+      cwd: '/tmp',
+      signal: controller.signal,
+      releaseGwsCorrelation: async () => {
+        releaseCalls++;
+      },
+    });
+
+    try {
+      await waitFor(
+        () =>
+          getAckStatus('codex-normal-result-before-recycle') === 'completed' &&
+          getContinuation('codex') === 'codex-thread-after-recycle',
+        1500,
+      );
+      controller.abort();
+      await expect(loopPromise).rejects.toBeInstanceOf(ProviderQuiescenceError);
+      expect(isProcessAlive(tree.descendantPid)).toBe(true);
+      expect(releaseCalls).toBe(0);
+      expect(getAckStatus('codex-normal-result-before-recycle')).toBe('completed');
+      expect(getContinuation('codex')).toBe('codex-thread-after-recycle');
     } finally {
       controller.abort();
       await loopPromise.catch(() => {});

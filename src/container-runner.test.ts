@@ -803,6 +803,32 @@ describe('session wake lifecycle', () => {
     }
   });
 
+  it('keeps the session active after a fatal runner exit and spawns one replacement on the next wake', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      harness.oneCliRelease.resolve();
+      await harness.containerRunner.wakeContainer(harness.session);
+      expect(harness.spawnedProcesses).toHaveLength(1);
+
+      harness.spawnedProcesses[0].emit('close', 1);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      expect(harness.spawnedProcesses).toHaveLength(1);
+      expect(harness.containerRunner.getActiveContainerCount()).toBe(0);
+      expect(harness.sessions.getSession(harness.session.id)).toMatchObject({
+        status: 'active',
+        container_status: 'stopped',
+      });
+
+      await harness.containerRunner.wakeContainer(harness.session);
+      expect(harness.spawnedProcesses).toHaveLength(2);
+      expect(harness.containerRunner.getActiveContainerCount()).toBe(1);
+      expect(harness.sessions.getSession(harness.session.id)?.container_status).toBe('running');
+    } finally {
+      harness.close();
+    }
+  });
+
   it('starts configured agent MCP bridges for non-main groups before spawn', async () => {
     const harness = await loadContainerRunnerHarness({
       mcpConfigForGroup: (folder) => {

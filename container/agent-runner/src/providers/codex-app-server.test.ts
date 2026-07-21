@@ -16,15 +16,39 @@ import { isProcessAlive, spawnCodexTestProcessTree, waitForProcessExit } from '.
 import { ProviderQuiescenceError } from './types.js';
 
 describe('Codex app-server termination', () => {
-  it('closes stdio normally and reports quiescence only after the app-server reaps its descendant', async () => {
+  it('rejects even a clean EOF exit after the app-server reaps its descendant', async () => {
     const tree = await spawnCodexTestProcessTree('graceful');
     try {
-      await terminateCodexAppServer(tree.server, {
-        gracefulShutdownMs: 750,
-        termExitMs: 100,
-        killExitMs: 250,
+      await expect(
+        terminateCodexAppServer(tree.server, {
+          gracefulShutdownMs: 750,
+          termExitMs: 100,
+          killExitMs: 250,
+        }),
+      ).rejects.toMatchObject({
+        name: 'ProviderQuiescenceError',
+        message: expect.stringContaining('whole process tree'),
       });
       expect(await waitForProcessExit(tree.descendantPid, 250)).toBe(true);
+    } finally {
+      await tree.cleanup();
+    }
+  });
+
+  it('rejects a clean EOF/zero direct exit while a ready TERM-ignoring descendant remains alive', async () => {
+    const tree = await spawnCodexTestProcessTree('graceful-unreaped');
+    try {
+      await expect(
+        terminateCodexAppServer(tree.server, {
+          gracefulShutdownMs: 250,
+          termExitMs: 100,
+          killExitMs: 250,
+        }),
+      ).rejects.toMatchObject({
+        name: 'ProviderQuiescenceError',
+        message: expect.stringContaining('whole process tree'),
+      });
+      expect(isProcessAlive(tree.descendantPid)).toBe(true);
     } finally {
       await tree.cleanup();
     }
