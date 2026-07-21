@@ -282,6 +282,8 @@ export interface CodexQueryDependencies {
   initializeServer?: typeof initializeCodexAppServer;
   startThread?: typeof startOrResumeCodexThread;
   terminateServer?: typeof terminateCodexAppServer;
+  abortGraceMs?: number;
+  setTimer?: (ms: number, callback: () => void) => ReturnType<typeof setTimeout>;
 }
 
 export class CodexProvider implements AgentProvider {
@@ -329,9 +331,16 @@ export class CodexProvider implements AgentProvider {
         };
       },
     };
+    const self = this;
     const kick = (): void => {
       waiting?.();
     };
+    let generatorStarted = false;
+    let server: AppServer | undefined;
+    let unsubscribeQueryAbort: (() => void) | undefined;
+    let queryTerminationTimer: ReturnType<typeof setTimeout> | undefined;
+    let terminationPromise: Promise<void> | undefined;
+    let quiescenceSettled = false;
     let resolveQuiescence!: () => void;
     let rejectQuiescence!: (reason: unknown) => void;
     const quiescence = new Promise<void>((resolve, reject) => {
@@ -342,6 +351,58 @@ export class CodexProvider implements AgentProvider {
     // parallel abort waiter from becoming an unhandled rejection when unused.
     void quiescence.catch(() => {});
 
+    const settleQuiescence = (): void => {
+      if (quiescenceSettled) return;
+      quiescenceSettled = true;
+      resolveQuiescence();
+    };
+    const failQuiescence = (err: unknown): ProviderQuiescenceError => {
+      const failure =
+        err instanceof ProviderQuiescenceError
+          ? err
+          : new ProviderQuiescenceError('Codex app-server query termination failed', {
+              cause: err instanceof Error ? err : new Error(String(err)),
+            });
+      if (!quiescenceSettled) {
+        quiescenceSettled = true;
+        rejectQuiescence(failure);
+      }
+      return failure;
+    };
+    const terminateQueryServer = (): Promise<void> => {
+      const activeServer = server;
+      if (!activeServer) return Promise.resolve();
+      if (!terminationPromise) {
+        if (queryTerminationTimer) {
+          clearTimeout(queryTerminationTimer);
+          queryTerminationTimer = undefined;
+        }
+        const terminate = self.queryDependencies.terminateServer ?? terminateCodexAppServer;
+        terminationPromise = Promise.resolve()
+          .then(() => terminate(activeServer))
+          .then(
+            () => {
+              settleQuiescence();
+            },
+            (err) => {
+              throw failQuiescence(err);
+            },
+          );
+      }
+      return terminationPromise;
+    };
+    const armQueryTermination = (): void => {
+      if (!server || terminationPromise || queryTerminationTimer) return;
+      const setTimer =
+        self.queryDependencies.setTimer ?? ((ms: number, callback: () => void) => setTimeout(callback, ms));
+      queryTerminationTimer = setTimer(self.queryDependencies.abortGraceMs ?? 2_000, () => {
+        queryTerminationTimer = undefined;
+        void terminateQueryServer().catch(() => {
+          // The typed failure is already owned by the quiescence promise.
+        });
+      });
+    };
+
     pending.push({
       prompt: input.prompt,
       inputId: input.inputId,
@@ -350,30 +411,38 @@ export class CodexProvider implements AgentProvider {
       visibleDestinationName: input.visibleDestinationName,
     });
 
-    const self = this;
-
     async function* gen(): AsyncGenerator<ProviderEvent> {
+      generatorStarted = true;
+      if (aborted) {
+        settleQuiescence();
+        return;
+      }
       // One app-server per query invocation. The poll-loop keeps a single
       // query active per batch of pending messages and ends it on idle, so
       // spawn-per-query matches that cadence naturally.
-      (self.queryDependencies.syncManagedSkillLinks ?? syncCodexManagedSkillLinks)();
-      (self.queryDependencies.writeMcpConfig ?? writeCodexMcpConfigToml)(self.mcpServers);
-      const server = (self.queryDependencies.spawnServer ?? spawnCodexAppServer)(
-        (self.queryDependencies.createConfigOverrides ?? createCodexConfigOverrides)(),
-      );
-      // Relay turns run read-only (codexThreadSandbox(relay)); auto-approval is
-      // made relay-aware so a relay can't bypass that boundary by side-effecting
-      // through an approval prompt.
-      const relay = input.relayMode === true;
-      (self.queryDependencies.attachAutoApproval ?? attachCodexAutoApproval)(server, { relay });
-
-      let threadId: string | undefined = input.continuation;
-      let initYielded = false;
-      let turnIndex = 0;
-      let visibleDestinationName: string | undefined = input.visibleDestinationName;
-
       try {
-        await (self.queryDependencies.initializeServer ?? initializeCodexAppServer)(server);
+        (self.queryDependencies.syncManagedSkillLinks ?? syncCodexManagedSkillLinks)();
+        (self.queryDependencies.writeMcpConfig ?? writeCodexMcpConfigToml)(self.mcpServers);
+        server = (self.queryDependencies.spawnServer ?? spawnCodexAppServer)(
+          (self.queryDependencies.createConfigOverrides ?? createCodexConfigOverrides)(),
+        );
+        // Register the query-level backstop immediately after spawn. Per-turn
+        // cancellation may request a graceful interrupt, but setup requests do
+        // not have a turn id and still need bounded process-exit proof.
+        unsubscribeQueryAbort = abortSignal.onAbort(armQueryTermination);
+
+        // Relay turns run read-only (codexThreadSandbox(relay)); auto-approval is
+        // made relay-aware so a relay can't bypass that boundary by side-effecting
+        // through an approval prompt.
+        const relay = input.relayMode === true;
+        (self.queryDependencies.attachAutoApproval ?? attachCodexAutoApproval)(server, { relay });
+
+        let threadId: string | undefined = input.continuation;
+        let initYielded = false;
+        let turnIndex = 0;
+        let visibleDestinationName: string | undefined = input.visibleDestinationName;
+
+        await (self.queryDependencies.initializeServer ?? initializeCodexAppServer)(server, abortSignal);
 
         const threadParams = {
           model: self.model,
@@ -390,6 +459,7 @@ export class CodexProvider implements AgentProvider {
           server,
           threadId,
           threadParams,
+          abortSignal,
         );
 
         // Emit the continuation as soon as we have a live thread. Compact turns
@@ -466,7 +536,13 @@ export class CodexProvider implements AgentProvider {
             () => {
               initYielded = true;
             },
-            { abortSignal, acceptanceScope: scope, acceptInput: turn.acceptInput },
+            {
+              abortSignal,
+              acceptanceScope: scope,
+              acceptInput: turn.acceptInput,
+              abortGraceMs: self.queryDependencies.abortGraceMs,
+              terminateServer: async () => await terminateQueryServer(),
+            },
           );
           // A terminal interruption (timeout / turn failure) ENDS the whole
           // query stream — mirrors opencode-container.ts:1238-1240. Without this
@@ -477,12 +553,22 @@ export class CodexProvider implements AgentProvider {
           if (terminal) return;
         }
       } finally {
+        unsubscribeQueryAbort?.();
+        unsubscribeQueryAbort = undefined;
+        if (queryTerminationTimer) {
+          clearTimeout(queryTerminationTimer);
+          queryTerminationTimer = undefined;
+        }
         try {
-          await (self.queryDependencies.terminateServer ?? terminateCodexAppServer)(server);
-          resolveQuiescence();
+          if (server) {
+            await terminateQueryServer();
+          } else {
+            // All fallible setup before spawn is inside this finally. With no
+            // handle created, there is no child process that could still work.
+            settleQuiescence();
+          }
         } catch (err) {
-          rejectQuiescence(err);
-          throw err;
+          throw failQuiescence(err);
         }
       }
     }
@@ -504,6 +590,7 @@ export class CodexProvider implements AgentProvider {
         aborted = true;
         for (const handler of [...abortHandlers]) handler();
         kick();
+        if (!generatorStarted) settleQuiescence();
         await quiescence;
       },
       events: gen(),

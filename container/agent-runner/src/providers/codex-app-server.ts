@@ -571,7 +571,7 @@ export function attachCodexAutoApproval(server: AppServer, { relay }: { relay: b
 
 export async function initializeCodexAppServer(
   server: AppServer,
-  _cancellation?: CodexRequestCancellation,
+  cancellation?: CodexRequestCancellation,
 ): Promise<void> {
   log('Sending initialize…');
   const resp = await sendCodexRequest(
@@ -582,6 +582,7 @@ export async function initializeCodexAppServer(
       capabilities: { experimentalApi: false },
     },
     INIT_TIMEOUT_MS,
+    cancellation,
   );
   if (resp.error) throw new Error(`Initialize failed: ${resp.error.message}`);
   log('Initialize successful');
@@ -606,14 +607,20 @@ export async function startOrResumeCodexThread(
   server: AppServer,
   threadId: string | undefined,
   params: ThreadParams,
-  _cancellation?: CodexRequestCancellation,
+  cancellation?: CodexRequestCancellation,
 ): Promise<string> {
   if (threadId) {
     log(`Resuming thread: ${threadId}`);
-    const resp = await sendCodexRequest(server, 'thread/resume', {
-      threadId,
-      ...(params as unknown as Record<string, unknown>),
-    });
+    const resp = await sendCodexRequest(
+      server,
+      'thread/resume',
+      {
+        threadId,
+        ...(params as unknown as Record<string, unknown>),
+      },
+      60_000,
+      cancellation,
+    );
     if (!resp.error) {
       log(`Thread resumed: ${threadId}`);
       return threadId;
@@ -628,9 +635,15 @@ export async function startOrResumeCodexThread(
   }
 
   log('Starting new thread…');
-  const resp = await sendCodexRequest(server, 'thread/start', {
-    ...(params as unknown as Record<string, unknown>),
-  });
+  const resp = await sendCodexRequest(
+    server,
+    'thread/start',
+    {
+      ...(params as unknown as Record<string, unknown>),
+    },
+    60_000,
+    cancellation,
+  );
   if (resp.error) throw new Error(`thread/start failed: ${resp.error.message}`);
 
   const result = resp.result as { thread?: { id?: string } } | undefined;
