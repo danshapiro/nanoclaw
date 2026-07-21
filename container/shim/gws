@@ -547,7 +547,7 @@ case "$http_code" in
           NC_RESPONSE_INPUT_ID="$response_input_id" NC_RESPONSE_ROUTE_KEY="$response_route_key" \
           NC_RESPONSE_SERVICE="$response_service" NC_RESPONSE_METHOD="$response_method" \
           NC_RESPONSE_OCCURRED_AT="$response_occurred_at" \
-          NC_ACCOUNT_MATCHES="$account_matches" \
+          NC_REQUEST_ACCOUNT="$account" \
           NANOCLAW_HOST_CORRELATION_FILE="$host_correlation_file" \
           node -e '
             const fs = require("fs");
@@ -604,25 +604,29 @@ case "$http_code" in
               responseMethod === invokedMethod &&
               signedService === invokedService &&
               signedMethod === invokedMethod;
-            // Ordinarily keep transport/invocation bindings independent so a
-            // valid signature for a different call is rejected. If the sole
-            // transport anomaly is its account label, retain the signed v2
-            // bindings so the host can authenticate the already-completed
-            // mutation while recording that bad label separately.
-            const useSignedBindings = process.env.NC_ACCOUNT_MATCHES !== "true" && signed && signed.schema_version === 2;
+            const requestAccount = process.env.NC_REQUEST_ACCOUNT || null;
+            const expectedAccountEmail = requestAccount === "personal"
+              ? "dan@danshapiro.com"
+              : requestAccount === "glowforge"
+                ? "dan@glowforge.com"
+                : null;
             const rec = {
               kind: exactDraft ? "gmail_draft_created" : "gws_mutation_completed",
               payload_schema_version: Number(process.env.NC_RESPONSE_SCHEMA) === 2 ? 2 : 1,
-              audit_id: useSignedBindings ? signed.audit_id : (process.env.NC_AUDIT_ID || null),
-              profile: useSignedBindings ? signed.profile : (process.env.NC_RESPONSE_PROFILE || null),
-              account_label: useSignedBindings ? signed.account_label : (process.env.NC_RESPONSE_ACCOUNT_LABEL || null),
+              // Every duplicated binding remains independently known: request
+              // account/operation, host correlation, and response headers. A
+              // signed payload never gets to manufacture its own verifier
+              // inputs, even when the transport account label is anomalous.
+              audit_id: process.env.NC_AUDIT_ID || null,
+              profile: process.env.NC_RESPONSE_PROFILE || null,
+              account_label: requestAccount,
               response_account_label: process.env.NC_RESPONSE_ACCOUNT_LABEL || null,
-              account_email: useSignedBindings ? signed.account_email : (process.env.NC_RESPONSE_ACCOUNT_EMAIL || null),
+              account_email: expectedAccountEmail,
               request_class: process.env.NC_REQUEST_CLASS || null,
-              occurred_at: useSignedBindings ? signed.occurred_at : (process.env.NC_RESPONSE_OCCURRED_AT || acceptedAt || null),
-              input_id: useSignedBindings ? signed.input_id : inputId,
-              route_key: useSignedBindings ? signed.route_key : routeKey,
-              operation: useSignedBindings && signedService && signedMethod ? `${signedService} ${signedMethod}` : (invokedService && invokedMethod ? `${invokedService} ${invokedMethod}` : null),
+              occurred_at: process.env.NC_RESPONSE_OCCURRED_AT || acceptedAt || null,
+              input_id: inputId,
+              route_key: routeKey,
+              operation: invokedService && invokedMethod ? `${invokedService} ${invokedMethod}` : null,
               response_input_id: process.env.NC_RESPONSE_INPUT_ID || null,
               response_route_key: process.env.NC_RESPONSE_ROUTE_KEY || null,
               response_service: responseService,

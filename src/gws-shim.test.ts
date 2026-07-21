@@ -1389,6 +1389,92 @@ describe('gws proxy shim — side-effect ledger', () => {
     });
   });
 
+  it('keeps a valid stale cross-request response non-authoritative while suppressing output and retry', async () => {
+    tmp = freshTmp();
+    const ledger = path.join(tmp, 'side-effects.jsonl');
+    const hostInputId = 'operator-current-input';
+    const hostRouteKey = 'operator|ag-main|operator-current';
+    const stale = {
+      schema_version: 2,
+      audit_id: 'aud-stale-cross-request',
+      profile: 'nanoclaw',
+      account_label: 'glowforge',
+      account_email: 'dan@glowforge.com',
+      input_id: 'different-input',
+      route_key: 'operator|ag-other|different-session',
+      service: 'drive',
+      method: 'files.create',
+      request_class: 'api',
+      api_effect: true,
+      operation_succeeded: true,
+      occurred_at: '2026-07-21T15:00:01.000Z',
+      result_digest: 'stale-result-digest',
+    };
+    const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+    const payload = canonicalSideEffectPayload(stale);
+    const signature = crypto.sign(null, Buffer.from(payload), privateKey).toString('base64');
+    const proxy = await withProxy((_req, res) => {
+      res.writeHead(200, {
+        'Content-Type': 'text/plain',
+        'X-Exit-Code': '0',
+        'X-GWS-Account': stale.account_label,
+        'X-GWS-Audit-Id': stale.audit_id,
+        'X-GWS-Request-Class': stale.request_class,
+        'X-GWS-Api-Effect': 'true',
+        'X-GWS-Operation-Succeeded': 'true',
+        'X-GWS-Side-Effect-Signature': signature,
+        'X-GWS-Side-Effect-Payload': payload,
+        'X-GWS-Side-Effect-Schema': '2',
+        'X-GWS-Profile': stale.profile,
+        'X-GWS-Account-Email': stale.account_email,
+        'X-GWS-Input-Id': stale.input_id,
+        'X-GWS-Route-Key': stale.route_key,
+        'X-GWS-Service': stale.service,
+        'X-GWS-Method': stale.method,
+        'X-GWS-Occurred-At': stale.occurred_at,
+      });
+      res.end('stale completed response must not be printed');
+    });
+    const correlation = path.join(tmp, 'operator-correlation.json');
+    fs.writeFileSync(
+      correlation,
+      JSON.stringify({
+        schemaVersion: 1,
+        inputId: hostInputId,
+        routeKey: hostRouteKey,
+        acceptedAt: freshUpdatedAt(),
+      }),
+    );
+
+    const result = await runShimRaw(['--account', 'personal', 'gmail', 'users', 'drafts', 'create'], {
+      GWS_PROXY_URL: proxy.url,
+      NANOCLAW_SIDE_EFFECT_LEDGER: ledger,
+      NANOCLAW_HOST_CORRELATION_FILE: correlation,
+    });
+
+    expect(result.status).toBe(75);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('Do not retry automatically');
+    expect(result.stderr).not.toContain('stale completed response');
+    const [row] = readLedger(ledger);
+    expect(row).toMatchObject({
+      audit_id: stale.audit_id,
+      account_label: 'personal',
+      input_id: hostInputId,
+      route_key: hostRouteKey,
+      operation: 'gmail users.drafts.create',
+      response_account_label: 'glowforge',
+    });
+    expect(
+      classifyAndSanitize(row, {
+        gwsPublicKey: publicKey.export({ format: 'pem', type: 'spki' }).toString(),
+      }),
+    ).toMatchObject({
+      validation: { authoritative: false, reason: 'gws_binding_invalid' },
+      replayPolicy: 'no_duplicate_operation',
+    });
+  });
+
   it('also sends inputId/routeKey in the POST body', async () => {
     tmp = freshTmp();
     const ledger = path.join(tmp, 'side-effects.jsonl');
