@@ -272,4 +272,55 @@ describe('runOneTurn Codex interrupt handling', () => {
       terminal: true,
     });
   });
+
+  it('terminates promptly after a successful interrupt with no terminal event and waits for process exit', async () => {
+    const { server, dispatchNotification } = makeFakeAppServer();
+    const abort = makeAbortControl();
+    const started = makeDeferred<void>();
+    const terminationStarted = makeDeferred<void>();
+    const processExited = makeDeferred<void>();
+    const gen = runOneTurn(
+      server,
+      'thread-abc',
+      'do long work',
+      'gpt-5.5',
+      '/workspace/agent',
+      'input-no-terminal',
+      () => true,
+      () => {},
+      {
+        acceptInput: async () => {},
+        abortSignal: abort.signal,
+        startTurn: async () => {
+          started.resolve();
+        },
+        interruptTurn: async () => {},
+        abortGraceMs: 20,
+        terminateServer: async () => {
+          terminationStarted.resolve();
+          await processExited.promise;
+        },
+      },
+    );
+    let settled = false;
+    const events = collectEvents(gen).then((value) => {
+      settled = true;
+      return value;
+    });
+
+    await started.promise;
+    dispatchNotification('turn/started', { threadId: 'thread-abc', turn: { id: 'turn-no-terminal' } });
+    abort.abort();
+    await withTimeout(terminationStarted.promise, 'bounded forced termination');
+    expect(settled).toBe(false);
+
+    processExited.resolve();
+    const collected = await withTimeout(events, 'forced-termination interrupted events');
+    expect(collected.find((event) => event.type === 'interruption')).toMatchObject({
+      type: 'interruption',
+      inputId: 'input-no-terminal',
+      classification: 'codex_turn_interrupted',
+      terminal: true,
+    });
+  });
 });

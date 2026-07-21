@@ -20,7 +20,7 @@ import {
 } from './opencode.js';
 import { classifyContinuation, isMissingOpenCodeSessionError, zombieDecision } from './opencode-errors.js';
 import type { OpenCodePumpClock } from './opencode-events.js';
-import type { ProviderEvent } from './types.js';
+import { ProviderQuiescenceError, type ProviderEvent } from './types.js';
 
 const tmpRoots: string[] = [];
 
@@ -1563,5 +1563,82 @@ describe('RealOpenCodeRuntimeController.destroy ordering', () => {
     } finally {
       (process as unknown as { kill: typeof realKill }).kill = realKill;
     }
+  });
+
+  it('normalizes stream.return rejection into a fatal quiescence fault', async () => {
+    const stream = {
+      next: async () => ({ done: true as const, value: undefined }),
+      return: async () => {
+        throw new Error('stream return rejected');
+      },
+    } as unknown as AsyncGenerator<{ type: string; properties: Record<string, unknown> }, void, void>;
+    const proc = {
+      pid: 4244,
+      exitCode: 0,
+      signalCode: null,
+      kill: () => true,
+    } as unknown as import('child_process').ChildProcess;
+    const client = { session: {}, async postSessionIdPermissionsPermissionId() {} } as never;
+    const controller = new RealOpenCodeRuntimeController(proc, client, stream);
+
+    await expect(controller.destroy('stream-return-rejected')).rejects.toBeInstanceOf(ProviderQuiescenceError);
+  });
+
+  it('normalizes a process error event into a fatal quiescence fault', async () => {
+    const stream = {
+      next: async () => ({ done: true as const, value: undefined }),
+      return: async () => ({ done: true as const, value: undefined }),
+    } as unknown as AsyncGenerator<{ type: string; properties: Record<string, unknown> }, void, void>;
+    const proc = new EventEmitter() as EventEmitter & {
+      pid: number;
+      exitCode: number | null;
+      signalCode: NodeJS.Signals | null;
+      kill(signal?: NodeJS.Signals): boolean;
+    };
+    proc.pid = 4245;
+    proc.exitCode = null;
+    proc.signalCode = null;
+    proc.kill = () => true;
+    const client = { session: {}, async postSessionIdPermissionsPermissionId() {} } as never;
+    const controller = new RealOpenCodeRuntimeController(
+      proc as unknown as import('child_process').ChildProcess,
+      client,
+      stream,
+    );
+
+    const destroying = controller.destroy('process-error');
+    proc.emit('error', new Error('child process error'));
+    await expect(destroying).rejects.toBeInstanceOf(ProviderQuiescenceError);
+  });
+
+  it('normalizes an exit deadline into a fatal quiescence fault', async () => {
+    const stream = {
+      next: async () => ({ done: true as const, value: undefined }),
+      return: async () => ({ done: true as const, value: undefined }),
+    } as unknown as AsyncGenerator<{ type: string; properties: Record<string, unknown> }, void, void>;
+    const proc = new EventEmitter() as EventEmitter & {
+      pid: number;
+      exitCode: number | null;
+      signalCode: NodeJS.Signals | null;
+      kill(signal?: NodeJS.Signals): boolean;
+    };
+    proc.pid = 4246;
+    proc.exitCode = null;
+    proc.signalCode = null;
+    proc.kill = () => true;
+    const client = { session: {}, async postSessionIdPermissionsPermissionId() {} } as never;
+    const Controller = RealOpenCodeRuntimeController as unknown as new (
+      proc: import('child_process').ChildProcess,
+      client: never,
+      stream: AsyncGenerator<{ type: string; properties: Record<string, unknown> }, void, void>,
+      timeoutMs: number,
+    ) => RealOpenCodeRuntimeController;
+    const controller = new Controller(proc as unknown as import('child_process').ChildProcess, client, stream, 20);
+
+    const result = Promise.race([
+      controller.destroy('exit-timeout'),
+      new Promise<void>((_resolve, reject) => setTimeout(() => reject(new Error('test deadline exceeded')), 500)),
+    ]);
+    await expect(result).rejects.toBeInstanceOf(ProviderQuiescenceError);
   });
 });

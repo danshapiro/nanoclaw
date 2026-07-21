@@ -100,6 +100,11 @@ async function loadContainerRunnerHarness(
       defaultResult: StartBridgeResult,
       credentialError: typeof AgentMcpCredentialUnavailableError,
     ) => Promise<StartBridgeResult>;
+    gwsRevocationHooks?: {
+      beforePointerInvalidation?: () => void;
+      beforeRowExpiry?: () => void;
+      beforeTransportClose?: () => void;
+    };
   } = {},
 ) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-container-runner-'));
@@ -196,6 +201,17 @@ async function loadContainerRunnerHarness(
       startAgentMcpBridge: startAgentMcpBridgeMock,
     };
   });
+  vi.doMock('./gws-correlation-ipc.js', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('./gws-correlation-ipc.js')>();
+    return {
+      ...actual,
+      registerGwsCorrelationLaunchLease: (opts: Parameters<typeof actual.registerGwsCorrelationLaunchLease>[0]) =>
+        actual.registerGwsCorrelationLaunchLease({
+          ...opts,
+          __revocationHooks: options.gwsRevocationHooks,
+        } as Parameters<typeof actual.registerGwsCorrelationLaunchLease>[0]),
+    };
+  });
   vi.doMock('./providers/index.js', () => ({}));
   vi.doMock('./yente/service-env.js', () => ({
     YENTE_LOCAL_PROXY_HOSTNAMES: [
@@ -266,6 +282,7 @@ async function loadContainerRunnerHarness(
       vi.doUnmock('./config.js');
       vi.doUnmock('./agent-mcp-config.js');
       vi.doUnmock('./agent-mcp-bridge.js');
+      vi.doUnmock('./gws-correlation-ipc.js');
       vi.doUnmock('./providers/index.js');
       vi.doUnmock('./yente/service-env.js');
       vi.resetModules();
@@ -1776,6 +1793,42 @@ describe('side-effect ledger container env', () => {
       harness.close();
     }
   });
+
+  for (const failurePoint of ['beforePointerInvalidation', 'beforeRowExpiry', 'beforeTransportClose'] as const) {
+    it(`retains the active owner and blocks successor wake when revocation fails at ${failurePoint}`, async () => {
+      let failRevocation = true;
+      const fault = vi.fn(() => {
+        if (failRevocation) throw new Error(`injected ${failurePoint} failure`);
+      });
+      const harness = await loadContainerRunnerHarness({
+        gwsRevocationHooks: { [failurePoint]: fault },
+      });
+      try {
+        harness.oneCliRelease.resolve();
+        await harness.containerRunner.wakeContainer(harness.session);
+        const hostDir = path.join(harness.dataDir, 'v2-host-correlation', 'ag-1', harness.session.id);
+        const markerPath = path.join(hostDir, 'active-lease.json');
+
+        await expect(
+          harness.containerRunner.stopContainerAndVerify(harness.session.id, `revocation-${failurePoint}`),
+        ).rejects.toThrow(/Failed to finalize stopped container/);
+        expect(harness.containerRunner.getActiveContainerCount()).toBe(1);
+
+        await harness.containerRunner.wakeContainer(harness.session);
+        expect(harness.spawnedProcesses).toHaveLength(1);
+
+        failRevocation = false;
+        await harness.containerRunner.stopContainerAndVerify(harness.session.id, `revocation-retry-${failurePoint}`);
+        expect(harness.containerRunner.getActiveContainerCount()).toBe(0);
+        expect(fs.existsSync(markerPath)).toBe(false);
+
+        await harness.containerRunner.wakeContainer(harness.session);
+        expect(harness.spawnedProcesses).toHaveLength(2);
+      } finally {
+        harness.close();
+      }
+    });
+  }
 
   it('re-overlays inbound correlation inputs read-only inside the writable workspace', async () => {
     const harness = await loadContainerRunnerHarness();

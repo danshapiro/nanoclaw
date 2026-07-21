@@ -28,6 +28,7 @@ import {
   listRecoveryEntries,
   markRecoveryInFlight,
   resolveRecoveryEntry,
+  scheduleProviderRetry,
   setContinuation,
   type ProviderRecoveryEntry,
   type ProviderRecoveryScope,
@@ -4143,6 +4144,59 @@ describe('provider finalization barriers', () => {
     ).toBe('trusted_acceptance_ambiguous');
   });
 
+  it('always awaits provider abort after a raw stream failure and never releases on failed quiescence', async () => {
+    insertMessage(
+      'stream-failure-quiescence-init',
+      'chat',
+      { sender: 'User', text: 'run once' },
+      { platformId: 'chan-stream-failure-quiescence', channelType: 'discord' },
+    );
+    let abortCalls = 0;
+    let releaseCalls = 0;
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query() {
+        return {
+          push() {},
+          end() {},
+          abort: async () => {
+            abortCalls++;
+            throw new ProviderQuiescenceError('OpenCode teardown remained uncertain');
+          },
+          events: (async function* () {
+            throw new Error('OpenCode SSE stream failed');
+          })(),
+        };
+      },
+    };
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({
+      provider,
+      providerName: 'test',
+      cwd: '/tmp',
+      signal: controller.signal,
+      releaseGwsCorrelation: async () => {
+        releaseCalls++;
+      },
+    });
+
+    const settled = await Promise.race([
+      loopPromise.then(
+        () => 'resolved',
+        () => 'rejected',
+      ),
+      new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 350)),
+    ]);
+    controller.abort();
+    await loopPromise.catch(() => {});
+
+    expect(settled).toBe('rejected');
+    expect(abortCalls).toBe(1);
+    expect(releaseCalls).toBe(0);
+    expect(getAckStatus('stream-failure-quiescence-init')).toBe('recovery');
+  });
+
   it('durably backs off a provider failure before input-accepted and emits one bounded user error', async () => {
     insertMessage(
       'preaccept-backoff-init',
@@ -4192,6 +4246,81 @@ describe('provider finalization barriers', () => {
 
     controller.abort();
     await loopPromise.catch(() => {});
+  });
+
+  it('exhausts the tenth pre-accept attempt into recovery and never makes an eleventh automatic call', async () => {
+    insertMessage(
+      'preaccept-cap-init',
+      'chat',
+      { sender: 'User', text: 'retry at most ten times' },
+      { platformId: 'chan-preaccept-cap', channelType: 'discord' },
+    );
+    const routeKey = normalizeRoute('test', {
+      platformId: 'chan-preaccept-cap',
+      channelType: 'discord',
+      threadId: null,
+      messagingGroupId: null,
+      isGroup: null,
+    }).routeKey;
+    const oldNow = Date.now() - 120_000;
+    for (let attempt = 0; attempt < 9; attempt++) {
+      scheduleProviderRetry('test', routeKey, oldNow);
+    }
+
+    let now = Date.now();
+    const dateNow = spyOn(Date, 'now').mockImplementation(() => now);
+    let attempts = 0;
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query() {
+        attempts++;
+        return {
+          push() {},
+          end() {},
+          abort: async () => {},
+          events: (async function* () {
+            throw new Error('pre-accept retry cap failure');
+          })(),
+        };
+      },
+    };
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+    try {
+      await waitFor(() => {
+        const row = getOutboundDb()
+          .prepare("SELECT value FROM session_state WHERE key LIKE 'provider_retry:%'")
+          .get() as { value?: string } | undefined;
+        return Boolean(row?.value && (JSON.parse(row.value) as { attempts?: number }).attempts === 10);
+      }, 1500);
+      now += 120_000;
+      await new Promise((resolve) => setTimeout(resolve, 750));
+
+      const retryRow = getOutboundDb()
+        .prepare("SELECT value FROM session_state WHERE key LIKE 'provider_retry:%'")
+        .get() as { value: string };
+      const retry = JSON.parse(retryRow.value) as {
+        attempts: number;
+        status?: string;
+        nextAttemptAt?: string;
+      };
+      const surfaced = getUndeliveredMessages().filter((message) =>
+        message.content.includes('pre-accept retry cap failure'),
+      );
+
+      expect(attempts).toBe(1);
+      expect(retry).toMatchObject({ attempts: 10, status: 'exhausted' });
+      expect(retry.nextAttemptAt).toBeUndefined();
+      expect(surfaced).toHaveLength(1);
+      expect(getAckStatus('preaccept-cap-init')).toBe('recovery');
+      expect(getPendingMessages().map((message) => message.id)).not.toContain('preaccept-cap-init');
+    } finally {
+      controller.abort();
+      await loopPromise.catch(() => {});
+      dateNow.mockRestore();
+    }
   });
 });
 
