@@ -398,10 +398,6 @@ export class CodexProvider implements AgentProvider {
           // If the call fails we gracefully fall through to a normal turn so the
           // user still gets *some* response rather than a silent drop.
           if (scope !== 'relay' && isCompactCommand(turn.messages)) {
-            // Bind outside the fallback catch. A rejected trusted bind cancels
-            // the turn; only a failure from Codex's compact operation may fall
-            // through to a normal model turn under the already-accepted gate.
-            await turn.acceptInput();
             let compactFulfilled = false;
             try {
               yield* compactCodexThread(
@@ -411,7 +407,8 @@ export class CodexProvider implements AgentProvider {
                 visibleDestinationName,
                 REAL_CLOCK,
                 scope,
-                async () => {},
+                turn.acceptInput,
+                abortSignal,
               );
               compactFulfilled = true;
             } catch (err) {
@@ -721,9 +718,15 @@ export async function* runOneTurn(
     if (turnInputId) {
       if (!deps.acceptInput) throw new Error('Codex turn has no trusted acceptance gate');
       await deps.acceptInput();
+      if (abortRequested || runDeps.abortSignal?.isAborted()) return true;
+      // Invoke turn/start synchronously after the cancellation check. The
+      // observational event is yielded only after submission has begun.
+      const startTurn = runDeps.startTurn(server, { threadId, inputText, model, cwd });
       yield { type: 'input-accepted', inputId: turnInputId, scope: deps.acceptanceScope ?? 'initial' };
+      await startTurn;
+    } else {
+      await runDeps.startTurn(server, { threadId, inputText, model, cwd });
     }
-    await runDeps.startTurn(server, { threadId, inputText, model, cwd });
 
     while (true) {
       while (buffer.length > 0) {
@@ -813,23 +816,32 @@ export async function* compactCodexThread(
   clock: CodexTimingClock,
   acceptanceScope: ProviderInputScope = 'initial',
   acceptInput?: () => Promise<void>,
+  abortSignal?: CodexAbortSignal,
 ): AsyncGenerator<ProviderEvent> {
   if (inputId) {
     if (!acceptInput) throw new Error('Codex compact turn has no trusted acceptance gate');
     await acceptInput();
+    if (abortSignal?.isAborted()) return;
+    const request = sendCodexRequest(server, 'thread/compact/start', { threadId }, COMPACT_REQUEST_TIMEOUT_MS);
     yield { type: 'input-accepted', inputId, scope: acceptanceScope };
+    yield { type: 'activity' };
+    const startedAt = clock.now();
+    const resp = await request;
+    if (resp.error) {
+      throw new Error(`thread/compact/start failed: ${resp.error.message}`);
+    }
+    const remainingNotificationMs = Math.max(0, COMPACT_NOTIFICATION_TIMEOUT_MS - (clock.now() - startedAt));
+    await waitForCodexCompactionComplete(server, threadId, remainingNotificationMs);
+  } else {
+    yield { type: 'activity' };
+    const startedAt = clock.now();
+    const resp = await sendCodexRequest(server, 'thread/compact/start', { threadId }, COMPACT_REQUEST_TIMEOUT_MS);
+    if (resp.error) {
+      throw new Error(`thread/compact/start failed: ${resp.error.message}`);
+    }
+    const remainingNotificationMs = Math.max(0, COMPACT_NOTIFICATION_TIMEOUT_MS - (clock.now() - startedAt));
+    await waitForCodexCompactionComplete(server, threadId, remainingNotificationMs);
   }
-  yield { type: 'activity' };
-  const startedAt = clock.now();
-  const resp = await sendCodexRequest(server, 'thread/compact/start', { threadId }, COMPACT_REQUEST_TIMEOUT_MS);
-  if (resp.error) {
-    throw new Error(`thread/compact/start failed: ${resp.error.message}`);
-  }
-  const remainingNotificationMs = Math.max(0, COMPACT_NOTIFICATION_TIMEOUT_MS - (clock.now() - startedAt));
-  // Wait for the canonical v2 compaction signal. If it never arrives we throw
-  // so the outer loop can fall back to a normal model turn instead of falsely
-  // claiming the context was compacted.
-  await waitForCodexCompactionComplete(server, threadId, remainingNotificationMs);
 
   const resultText = buildCompactResultText(destinationName);
   yield { type: 'progress', inputId, message: COMPACT_RESULT_TEXT };

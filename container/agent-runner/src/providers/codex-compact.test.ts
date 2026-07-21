@@ -26,6 +26,14 @@ function makeMessageRow(text: string): MessageInRow {
 
 type CapturedRequest = { id: number; method: string; params: Record<string, unknown> };
 
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
 function makeFakeAppServer(): {
   server: AppServer;
   requests: CapturedRequest[];
@@ -124,6 +132,50 @@ function contextCompactionItem(id = 'ctx-compact-1'): { type: 'contextCompaction
 }
 
 describe('compactCodexThread', () => {
+  it('does not send a compact RPC when cancellation lands during the trusted bind', async () => {
+    const { server, requests } = makeFakeAppServer();
+    const gate = deferred<void>();
+    let aborted = false;
+    const gen = compactCodexThread(
+      server,
+      'thread-cancelled-bind',
+      'input-cancelled-bind',
+      undefined,
+      { now: () => Date.now() },
+      'initial',
+      () => gate.promise,
+      { isAborted: () => aborted, onAbort: () => () => {} },
+    );
+    const collected = drainCompactGenerator(gen);
+
+    await Promise.resolve();
+    aborted = true;
+    gate.resolve();
+
+    await expect(collected).resolves.toEqual([]);
+    expect(requests).toHaveLength(0);
+  });
+
+  it('rechecks cancellation after the compact acceptance callback and before the RPC', async () => {
+    const { server, requests } = makeFakeAppServer();
+    let aborted = false;
+    const gen = compactCodexThread(
+      server,
+      'thread-cancelled-callback',
+      'input-cancelled-callback',
+      undefined,
+      { now: () => Date.now() },
+      'initial',
+      async () => {
+        aborted = true;
+      },
+      { isAborted: () => aborted, onAbort: () => () => {} },
+    );
+
+    await expect(drainCompactGenerator(gen)).resolves.toEqual([]);
+    expect(requests).toHaveLength(0);
+  });
+
   it('emits progress + result after item/completed with a contextCompaction item', async () => {
     const { server, requests, dispatchNotification, resolveAll } = makeFakeAppServer();
     const clock = { now: () => Date.now() };

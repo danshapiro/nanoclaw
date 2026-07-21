@@ -268,6 +268,125 @@ describe('provider input-accepted/result contract', () => {
     );
     expect(promptConsumed).toBe(false);
   });
+
+  it('claude cancels a deferred bind without consuming the prompt or admitting a tool', async () => {
+    let sdkOptions: any;
+    let promptConsumed = false;
+    let interrupted = false;
+    mock.module('@anthropic-ai/claude-agent-sdk', () => ({
+      query: ({ prompt, options }: { prompt: AsyncIterable<unknown>; options: unknown }) => {
+        sdkOptions = options;
+        const result = (async function* () {
+          for await (const _message of prompt) {
+            promptConsumed = true;
+            yield { type: 'result', result: 'must not run' };
+          }
+        })();
+        return Object.assign(result, {
+          interrupt: async () => {
+            interrupted = true;
+          },
+        });
+      },
+    }));
+    const gate = deferred<void>();
+    const { ClaudeProvider } = await import('./claude.js');
+    const query = new ClaudeProvider().query({
+      inputId: 'claude-cancel-during-bind',
+      acceptInput: () => gate.promise,
+      prompt: 'do not run',
+      cwd: '/tmp',
+    });
+    const iter = query.events[Symbol.asyncIterator]();
+    const first = iter.next();
+    await Promise.resolve();
+    const preTool = sdkOptions.hooks.PreToolUse[0].hooks[0];
+    const tool = preTool({ tool_name: 'Bash', tool_input: {}, tool_use_id: 'cancelled-tool' }, 'cancelled-tool', {
+      signal: new AbortController().signal,
+    });
+
+    query.abort();
+    gate.resolve();
+
+    await expect(first).resolves.toMatchObject({ done: true });
+    await expect(tool).resolves.toMatchObject({ decision: 'block' });
+    expect(promptConsumed).toBe(false);
+    expect(interrupted).toBe(true);
+  });
+
+  it('claude rechecks cancellation synchronously after the acceptance callback', async () => {
+    let promptConsumed = false;
+    mock.module('@anthropic-ai/claude-agent-sdk', () => ({
+      query: ({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+        const result = (async function* () {
+          for await (const _message of prompt) {
+            promptConsumed = true;
+            yield { type: 'result', result: 'must not run' };
+          }
+        })();
+        return Object.assign(result, { interrupt: async () => {} });
+      },
+    }));
+    const gate = deferred<void>();
+    const { ClaudeProvider } = await import('./claude.js');
+    let query!: ReturnType<ClaudeProvider['query']>;
+    query = new ClaudeProvider().query({
+      inputId: 'claude-cancel-in-acceptance-callback',
+      acceptInput: async () => {
+        await gate.promise;
+        query.abort();
+      },
+      prompt: 'do not run',
+      cwd: '/tmp',
+    });
+    const first = query.events[Symbol.asyncIterator]().next();
+    gate.resolve();
+
+    await expect(first).resolves.toMatchObject({ done: true });
+    expect(promptConsumed).toBe(false);
+  });
+
+  it('claude preserves acceptance when cancellation races after SDK prompt consumption', async () => {
+    const promptConsumed = deferred<void>();
+    const finishSdkTurn = deferred<void>();
+    let interrupted = false;
+    mock.module('@anthropic-ai/claude-agent-sdk', () => ({
+      query: ({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+        const result = (async function* () {
+          for await (const _message of prompt) {
+            promptConsumed.resolve();
+            await finishSdkTurn.promise;
+            yield { type: 'result', result: 'cancelled result' };
+          }
+        })();
+        return Object.assign(result, {
+          interrupt: async () => {
+            interrupted = true;
+          },
+        });
+      },
+    }));
+    const { ClaudeProvider } = await import('./claude.js');
+    const query = new ClaudeProvider().query({
+      inputId: 'claude-cancel-after-submit',
+      acceptInput: async () => {},
+      prompt: 'submit exactly once',
+      cwd: '/tmp',
+    });
+    const iter = query.events[Symbol.asyncIterator]();
+    const first = iter.next();
+
+    await promptConsumed.promise;
+    query.abort();
+    finishSdkTurn.resolve();
+
+    await expect(first).resolves.toMatchObject({
+      done: false,
+      value: { type: 'input-accepted', inputId: 'claude-cancel-after-submit' },
+    });
+    await expect(iter.next()).resolves.toMatchObject({ done: true });
+    expect(interrupted).toBe(true);
+  });
 });
 
 describe('provider push attachment compatibility', () => {

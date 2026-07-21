@@ -40,6 +40,7 @@ export class MockProvider implements AgentProvider {
         // Process initial prompt — accept synchronously, then resolve it.
         if (input.inputId) {
           await input.acceptInput();
+          if (ended || aborted) return;
           yield { type: 'input-accepted', inputId: input.inputId, scope: 'initial' };
         }
         yield { type: 'activity' };
@@ -56,6 +57,7 @@ export class MockProvider implements AgentProvider {
             const msg = pending.shift()!;
             if (msg.inputId) {
               await msg.acceptInput();
+              if (ended || aborted) return;
               yield { type: 'input-accepted', inputId: msg.inputId, scope: 'followup' };
             }
             yield {
@@ -78,6 +80,7 @@ export class MockProvider implements AgentProvider {
           const msg = pending.shift()!;
           if (msg.inputId) {
             await msg.acceptInput();
+            if (ended || aborted) return;
             yield { type: 'input-accepted', inputId: msg.inputId, scope: 'followup' };
           }
           yield {

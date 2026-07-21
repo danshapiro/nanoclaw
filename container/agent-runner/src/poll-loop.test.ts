@@ -1200,6 +1200,7 @@ describe('poll-loop conversational reply accounting', () => {
   });
 
   it('writes a visible error when the provider throws', async () => {
+    insertChannelDestination('discord-unrelated', 'chan-4');
     insertMessage(
       'throwing-chat',
       'chat',
@@ -1207,22 +1208,63 @@ describe('poll-loop conversational reply accounting', () => {
       { platformId: 'chan-3', channelType: 'discord', threadId: 'thread-3' },
     );
 
-    const provider = new ScriptedProvider(async function* () {
-      yield { type: 'init', continuation: 'throwing-session' };
-      throw new Error('provider exploded');
+    const scope: ProviderRecoveryScope = {
+      providerName: 'test',
+      routeKey: normalizeRoute('test', {
+        platformId: 'chan-3',
+        channelType: 'discord',
+        threadId: 'thread-3',
+        messagingGroupId: null,
+        isGroup: null,
+      }).routeKey,
+    };
+    const seenPrompts: string[] = [];
+    let providerTurn = 0;
+    const provider = new ScriptedProvider(async function* (input) {
+      seenPrompts.push(input.prompt);
+      providerTurn++;
+      if (providerTurn === 1) {
+        yield { type: 'init', continuation: 'throwing-session' };
+        throw new Error('provider exploded');
+      }
+      yield { type: 'result', text: '<message to="discord-unrelated">unrelated ok</message>' };
     });
     const controller = new AbortController();
     const loopPromise = runPollLoopWithTimeout(provider, controller.signal);
 
     await waitFor(() => getUndeliveredMessages().length === 1, 1500);
-    controller.abort();
 
     const out = getUndeliveredMessages();
     expect(out).toHaveLength(1);
     expect(out[0].in_reply_to).toBeNull();
     expect(JSON.parse(out[0].content).text).toBe('Error: provider exploded');
-    expect(getAckStatus('throwing-chat')).toBe('completed');
+    expect(getAckStatus('throwing-chat')).toBe('recovery');
+    expect(getPendingMessages().map((message) => message.id)).not.toContain('throwing-chat');
+    const recovery = listRecoveryEntries(scope);
+    expect(recovery).toHaveLength(1);
+    expect(recovery[0]).toMatchObject({
+      status: 'pending',
+      classification: 'terminal_interruption_accepted_unresolved',
+      acceptedUnresolvedInputs: [{ messageIds: ['throwing-chat'] }],
+    });
 
+    // A later message on a different route must not absorb the failed turn's
+    // recovery payload. Recovery remains route-owned and the new row receives
+    // its own independent terminal outcome.
+    insertMessage(
+      'unrelated-chat',
+      'chat',
+      { sender: 'User', text: 'a separate task' },
+      { platformId: 'chan-4', channelType: 'discord', threadId: 'thread-4' },
+    );
+    await waitFor(() => getAckStatus('unrelated-chat') === 'completed', 1500);
+    expect(seenPrompts).toHaveLength(2);
+    expect(seenPrompts[1]).toContain('a separate task');
+    expect(seenPrompts[1]).not.toContain('this will fail');
+    expect(getAckStatus('throwing-chat')).toBe('recovery');
+    expect(listRecoveryEntries(scope)).toHaveLength(1);
+
+    controller.abort();
     await loopPromise.catch(() => {});
   });
 
@@ -2206,6 +2248,78 @@ describe('poll-loop final host-backed input selection', () => {
       controller.abort();
       await loopPromise.catch(() => {});
     }
+  });
+
+  it('releases a host bind and returns the claim to pending when cancellation wins before provider submission', async () => {
+    const route = normalizeRoute('test', {
+      platformId: 'chan-cancel',
+      channelType: 'discord',
+      threadId: null,
+      messagingGroupId: 'mg-cancel',
+      isGroup: 0,
+    }).routeKey;
+    insertMessage(
+      'cancel-during-bind',
+      'chat',
+      { sender: 'User', text: 'do not submit after cancellation' },
+      {
+        platformId: 'chan-cancel',
+        channelType: 'discord',
+        messagingGroupId: 'mg-cancel',
+        isGroup: 0,
+      },
+    );
+    stampHostInput('cancel-during-bind', 'in-cancel-during-bind', route);
+
+    const bindStarted = deferred();
+    const finishBind = deferred();
+    let providerAborted = false;
+    let providerSubmissionCalls = 0;
+    const releases: string[] = [];
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query(input) {
+        return {
+          push() {},
+          end() {},
+          abort() {
+            providerAborted = true;
+          },
+          events: (async function* () {
+            await input.acceptInput();
+            if (providerAborted) return;
+            providerSubmissionCalls++;
+            yield { type: 'input-accepted', inputId: input.inputId, scope: 'initial' };
+          })(),
+        };
+      },
+    };
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({
+      provider,
+      providerName: 'test',
+      cwd: '/tmp',
+      signal: controller.signal,
+      bindGwsCorrelation: async () => {
+        bindStarted.resolve();
+        await finishBind.promise;
+      },
+      releaseGwsCorrelation: async (inputId) => {
+        releases.push(inputId);
+      },
+    });
+
+    await bindStarted.promise;
+    controller.abort();
+    finishBind.resolve();
+    await loopPromise;
+
+    expect(providerSubmissionCalls).toBe(0);
+    expect(releases).toEqual(['in-cancel-during-bind']);
+    expect(getAckStatus('cancel-during-bind')).toBeNull();
+    expect(getPendingMessages().map((message) => message.id)).toContain('cancel-during-bind');
+    expect(listRecoveryEntries({ providerName: 'test', routeKey: route })).toHaveLength(0);
   });
 
   it('keeps an accumulate-only active-turn follow-up under the existing accepted host input', async () => {

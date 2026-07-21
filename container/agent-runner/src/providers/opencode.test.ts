@@ -679,7 +679,7 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
 
     releaseGate();
     await expect(first).resolves.toMatchObject({ value: { type: 'input-accepted', inputId: 'in-gated' } });
-    expect(controller.promptCalls).toBe(0);
+    expect(controller.promptCalls).toBe(1);
     const second = iter.next();
     await Promise.resolve();
     await new Promise((resolve) => setTimeout(resolve, 5));
@@ -703,7 +703,53 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     expect(controller.promptCalls).toBe(0);
   });
 
-  it('emits input-accepted after prompt() returns, then result on session.idle', async () => {
+  it('does not submit when cancellation lands during the trusted bind', async () => {
+    const stream = new FakeStream();
+    const { provider, controller } = makeProvider({ stream });
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    const query = provider.query({
+      inputId: 'in-cancelled-during-bind',
+      acceptInput: () => gate,
+      prompt: 'do not submit',
+      cwd: '/workspace/agent',
+    });
+    const first = query.events[Symbol.asyncIterator]().next();
+    await Promise.resolve();
+    query.abort();
+    releaseGate();
+
+    await expect(first).resolves.toMatchObject({ done: true });
+    expect(controller.promptCalls).toBe(0);
+  });
+
+  it('rechecks cancellation after the acceptance callback and before promptAsync', async () => {
+    const stream = new FakeStream();
+    const { provider, controller } = makeProvider({ stream });
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    let query!: ReturnType<OpenCodeProvider['query']>;
+    query = provider.query({
+      inputId: 'in-cancelled-in-callback',
+      acceptInput: async () => {
+        await gate;
+        query.abort();
+      },
+      prompt: 'do not submit',
+      cwd: '/workspace/agent',
+    });
+    const first = query.events[Symbol.asyncIterator]().next();
+    releaseGate();
+
+    await expect(first).resolves.toMatchObject({ done: true });
+    expect(controller.promptCalls).toBe(0);
+  });
+
+  it('starts prompt submission before emitting input-accepted, then resolves on session.idle', async () => {
     const stream = new FakeStream();
     const { provider } = makeProvider({ stream });
     const query = provider.query({
@@ -720,7 +766,7 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
         if (e.type === 'result') break;
       }
     })();
-    // Let prompt() resolve and input-accepted emit, then drive the stream.
+    // Let prompt submission start and input-accepted emit, then drive the stream.
     await Promise.resolve();
     await new Promise((r) => setTimeout(r, 5));
     stream.push({

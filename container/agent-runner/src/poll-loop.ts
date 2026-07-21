@@ -630,9 +630,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         clearContinuation(config.providerName, continuationScope);
       }
 
-      // Provider throw is a sanitized recoverable interruption. Write a
-      // user-visible fallback so the user knows to retry, then settle the
-      // claimed rows (the provider never resolved their inputId).
+      // Provider throw is a sanitized recoverable interruption. processQuery's
+      // finally block has already chosen exactly one durable disposition:
+      // accepted/submitted rows are recovery-owned; unsubmitted rows are back
+      // to pending. Never overwrite either outcome with `completed` here.
       writeMessageOut({
         id: generateId(),
         kind: 'chat',
@@ -641,9 +642,6 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         thread_id: routing.threadId,
         content: JSON.stringify({ text: `Error: ${errMsg}` }),
       });
-      // The claimed rows have a written user-visible fallback; complete them so
-      // they don't loop forever (the existing provider-throw contract).
-      markCompleted(processingIds);
     }
     log(`Completed wake for route ${activeRouteKey} (${ids.length} active row(s))`);
   }
@@ -931,7 +929,7 @@ async function processQuery(
       if (inputId === ledgerCtx.topLevelInputId) topLevelResolved = true;
       const entry = ledger.get(inputId);
       if (!entry || entry.state === 'resolved') continue;
-      const acceptedClaims = entry.claims.filter((claim) => claim.state === 'accepted');
+      const acceptedClaims = entry.claims.filter((claim) => claim.state === 'accepted' && claim.acceptanceObserved);
       if (acceptedClaims.length === 0) continue;
       for (const claim of acceptedClaims) {
         claim.state = 'resolved';
@@ -1330,7 +1328,7 @@ async function processQuery(
     // discard/complete path; ordinary terminal interruptions keep the existing
     // retry/recovery split (Invariants 160/161/162).
     const acceptedUnresolved = [...ledger.values()].filter((entry) =>
-      entry.claims.some((claim) => claim.state === 'accepted'),
+      entry.claims.some((claim) => claim.state === 'accepted' && claim.acceptanceObserved),
     );
     if (userStopRequested) {
       const idsToComplete: string[] = [];
@@ -1369,7 +1367,7 @@ async function processQuery(
       const recoveryId = recoveryIdFor(scope.routeKey);
       const ownedIds: string[] = [];
       const acceptedUnresolvedInputs = acceptedUnresolved.map((e) => {
-        const acceptedClaims = e.claims.filter((claim) => claim.state === 'accepted');
+        const acceptedClaims = e.claims.filter((claim) => claim.state === 'accepted' && claim.acceptanceObserved);
         const acceptedMessageIds = acceptedClaims.flatMap((claim) => claim.messageIds);
         ownedIds.push(...acceptedMessageIds);
         return {
@@ -1414,7 +1412,7 @@ async function processQuery(
         } else {
           for (const e of acceptedUnresolved) {
             for (const claim of e.claims) {
-              if (claim.state === 'accepted') claim.state = 'recovery_owned';
+              if (claim.state === 'accepted' && claim.acceptanceObserved) claim.state = 'recovery_owned';
             }
             e.state = e.claims.some((claim) => claim.state === 'queued') ? 'queued' : 'recovery_owned';
           }
@@ -1435,7 +1433,9 @@ async function processQuery(
     }
 
     for (const entry of ledger.values()) {
-      const queuedClaims = entry.claims.filter((claim) => claim.state === 'queued');
+      const queuedClaims = entry.claims.filter(
+        (claim) => claim.state === 'queued' || (claim.state === 'accepted' && !claim.acceptanceObserved),
+      );
       if (queuedClaims.length > 0) {
         // Never accepted by the provider before the turn ended → return to
         // pending so a later wake retries them (route-matched and other-route

@@ -901,26 +901,45 @@ export class OpenCodeProvider implements AgentProvider {
           );
           const turnScope: ProviderInputScope = relayMode ? 'relay' : turnIndex === 0 ? 'initial' : 'followup';
           turnIndex += 1;
+          let sessionId: string;
           if (turnInputId) {
             if (!turn.acceptInput) throw new Error('OpenCode turn has no trusted acceptance gate');
             await turn.acceptInput();
-            // Yield while still before promptAsync: the consumer observes the
-            // host bind receipt before this generator can resume into model
-            // execution or any MCP/tool request.
+            if (aborted) return;
+            // No yield/await may separate this cancellation check from prompt
+            // submission. input-accepted is observational and follows the
+            // synchronous start of promptSession/promptAsync.
+            const prompt = promptSession(
+              client.session,
+              getActiveSession(),
+              buildOpenCodePromptParts(turn.prompt, staged),
+              modelForAttachments(staged),
+            );
             yield { type: 'input-accepted', inputId: turnInputId, scope: turnScope };
-          }
-          const prompted = await promptSession(
-            client.session,
-            getActiveSession(),
-            buildOpenCodePromptParts(turn.prompt, staged),
-            modelForAttachments(staged),
-          );
-          const sessionId = prompted.sessionId;
-          setActiveSession(sessionId);
+            const prompted = await prompt;
+            if (aborted) return;
+            sessionId = prompted.sessionId;
+            setActiveSession(sessionId);
 
-          if (!initYielded || prompted.recoveredFromStale) {
-            yield { type: 'init', continuation: sessionId };
-            initYielded = true;
+            if (!initYielded || prompted.recoveredFromStale) {
+              yield { type: 'init', continuation: sessionId };
+              initYielded = true;
+            }
+          } else {
+            const prompted = await promptSession(
+              client.session,
+              getActiveSession(),
+              buildOpenCodePromptParts(turn.prompt, staged),
+              modelForAttachments(staged),
+            );
+            if (aborted) return;
+            sessionId = prompted.sessionId;
+            setActiveSession(sessionId);
+
+            if (!initYielded || prompted.recoveredFromStale) {
+              yield { type: 'init', continuation: sessionId };
+              initYielded = true;
+            }
           }
 
           const partTextByMessageId = new Map<string, string>();

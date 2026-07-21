@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'bun:test';
 
 import { type AppServer, type JsonRpcNotification } from './codex-app-server.js';
-import { runOneTurn } from './codex.js';
+import { runOneTurn, type CodexAbortSignal } from './codex.js';
 import type { ProviderEvent } from './types.js';
 
 type CapturedRequest = { id: number; method: string; params: Record<string, unknown> };
@@ -15,6 +15,24 @@ function makeDeferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; 
     reject = rej;
   });
   return { promise, resolve, reject };
+}
+
+function makeAbortSignal(): CodexAbortSignal & { abort(): void } {
+  let aborted = false;
+  const handlers = new Set<() => void>();
+  return {
+    isAborted: () => aborted,
+    onAbort(handler) {
+      handlers.add(handler);
+      if (aborted) handler();
+      return () => handlers.delete(handler);
+    },
+    abort() {
+      if (aborted) return;
+      aborted = true;
+      for (const handler of [...handlers]) handler();
+    },
+  };
 }
 
 // Mirrors codex-interrupt.test.ts: a fake app-server whose notificationHandlers
@@ -128,6 +146,7 @@ describe('runOneTurn provider-error surfacing', () => {
   it('does not call turn/start before the exact acceptance gate resolves', async () => {
     const { server } = makeFakeAppServer();
     const gate = makeDeferred<void>();
+    const start = makeDeferred<void>();
     let startCalls = 0;
     const gen = runOneTurn(
       server,
@@ -140,9 +159,9 @@ describe('runOneTurn provider-error surfacing', () => {
       () => {},
       {
         acceptInput: () => gate.promise,
-        startTurn: async () => {
+        startTurn: () => {
           startCalls++;
-          throw new Error('stop after proof');
+          return start.promise;
         },
       },
     );
@@ -151,9 +170,74 @@ describe('runOneTurn provider-error surfacing', () => {
     expect(startCalls).toBe(0);
     gate.resolve();
     await expect(first).resolves.toMatchObject({ value: { type: 'input-accepted', inputId: 'input-gated' } });
+    expect(startCalls).toBe(1);
     const second = gen.next();
+    start.reject(new Error('stop after proof'));
     await expect(second).rejects.toThrow('stop after proof');
     expect(startCalls).toBe(1);
+  });
+
+  it('does not call turn/start when cancellation lands during the trusted bind', async () => {
+    const { server } = makeFakeAppServer();
+    const gate = makeDeferred<void>();
+    const abortSignal = makeAbortSignal();
+    let startCalls = 0;
+    const gen = runOneTurn(
+      server,
+      'thread-abc',
+      'do work',
+      'gpt-5.5',
+      '/workspace/agent',
+      'input-cancelled',
+      () => true,
+      () => {},
+      {
+        abortSignal,
+        acceptInput: () => gate.promise,
+        startTurn: async () => {
+          startCalls++;
+        },
+      },
+    );
+    const first = gen.next();
+    await Promise.resolve();
+    abortSignal.abort();
+    gate.resolve();
+
+    await expect(first).resolves.toMatchObject({ done: true, value: true });
+    expect(startCalls).toBe(0);
+  });
+
+  it('rechecks cancellation after the acceptance callback and before turn/start', async () => {
+    const { server } = makeFakeAppServer();
+    const gate = makeDeferred<void>();
+    const abortSignal = makeAbortSignal();
+    let startCalls = 0;
+    const gen = runOneTurn(
+      server,
+      'thread-abc',
+      'do work',
+      'gpt-5.5',
+      '/workspace/agent',
+      'input-callback-cancelled',
+      () => true,
+      () => {},
+      {
+        abortSignal,
+        acceptInput: async () => {
+          await gate.promise;
+          abortSignal.abort();
+        },
+        startTurn: async () => {
+          startCalls++;
+        },
+      },
+    );
+    const first = gen.next();
+    gate.resolve();
+
+    await expect(first).resolves.toMatchObject({ done: true, value: true });
+    expect(startCalls).toBe(0);
   });
 
   it('cancels the Codex turn when the trusted acceptance gate rejects', async () => {

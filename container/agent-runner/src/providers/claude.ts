@@ -96,6 +96,12 @@ class ClaudeExecutionBarrier {
   private toolsDrainedWaiters: Array<() => void> = [];
   private transitionTail: Promise<void> = Promise.resolve();
   private transitionPending: Promise<void> | null = null;
+  private cancelled = false;
+
+  cancel(): void {
+    this.cancelled = true;
+    for (const resolve of this.toolsDrainedWaiters.splice(0)) resolve();
+  }
 
   transition(acceptInput: () => Promise<void>): Promise<void> {
     let publishTransitionComplete!: () => void;
@@ -106,12 +112,15 @@ class ClaudeExecutionBarrier {
     // generation between prompt consumption and the serialized transition.
     this.transitionPending = transitionIntent;
     const transition = this.transitionTail.then(async () => {
+      if (this.cancelled) throw new Error('Claude execution cancelled before trusted input acceptance');
       if (this.activeTools.size > 0) {
         await new Promise<void>((resolve) => this.toolsDrainedWaiters.push(resolve));
       }
+      if (this.cancelled) throw new Error('Claude execution cancelled before trusted input acceptance');
       const acceptance = acceptInput();
       this.currentAcceptance = acceptance;
       await acceptance;
+      if (this.cancelled) throw new Error('Claude execution cancelled after trusted input acceptance');
     });
     this.transitionTail = transition.catch(() => {});
     return transition.finally(() => {
@@ -122,6 +131,7 @@ class ClaudeExecutionBarrier {
 
   async acquireTool(toolUseId: string): Promise<void> {
     for (;;) {
+      if (this.cancelled) throw new Error('Claude execution cancelled before tool admission');
       const pending = this.transitionPending;
       if (pending) {
         await pending;
@@ -130,6 +140,7 @@ class ClaudeExecutionBarrier {
       const acceptance = this.currentAcceptance;
       if (!acceptance) throw new Error('Claude attempted a tool before any trusted input acceptance');
       await acceptance;
+      if (this.cancelled) throw new Error('Claude execution cancelled before tool admission');
       if (acceptance !== this.currentAcceptance || this.transitionPending) continue;
       if (this.activeTools.has(toolUseId)) throw new Error(`duplicate Claude tool lease ${toolUseId}`);
       this.activeTools.add(toolUseId);
@@ -179,12 +190,27 @@ class MessageStream {
     this.waiting?.();
   }
 
+  cancel(): void {
+    this.done = true;
+    this.queue.length = 0;
+    this.executionBarrier.cancel();
+    this.waiting?.();
+  }
+
   async *[Symbol.asyncIterator](): AsyncGenerator<SDKUserMessage> {
     while (true) {
       while (this.queue.length > 0) {
         const queued = this.queue.shift()!;
         if (queued.inputId) {
-          await this.executionBarrier.transition(queued.acceptInput);
+          try {
+            await this.executionBarrier.transition(queued.acceptInput);
+          } catch (err) {
+            if (this.done) return;
+            throw err;
+          }
+          // There is intentionally no await/yield between this cancellation
+          // check and yielding the prompt to the SDK consumer.
+          if (this.done) return;
           this.onAccept?.(queued.inputId, queued.scope);
         }
         yield queued.message;
@@ -549,6 +575,19 @@ export class ClaudeProvider implements AgentProvider {
     });
 
     let aborted = false;
+    let sdkCancellation: Promise<void> | null = null;
+
+    const cancelExecution = (): void => {
+      if (aborted) return;
+      aborted = true;
+      stream.cancel();
+      const interrupt = (sdkResult as { interrupt?: () => Promise<void> }).interrupt;
+      sdkCancellation = interrupt
+        ? interrupt.call(sdkResult).catch((err) => {
+            log(`Claude SDK interrupt failed: ${err instanceof Error ? err.message : String(err)}`);
+          })
+        : Promise.resolve();
+    };
 
     // Track accepted-but-unresolved input ids in arrival order. A Claude
     // `result` ends the current turn; it resolves whichever accepted inputs
@@ -572,69 +611,81 @@ export class ClaudeProvider implements AgentProvider {
 
     async function* translateEvents(): AsyncGenerator<ProviderEvent> {
       let messageCount = 0;
-      for await (const message of sdkResult) {
-        if (aborted) return;
-        messageCount++;
+      try {
+        for await (const message of sdkResult) {
+          if (aborted) return;
+          messageCount++;
 
-        // Emit any input-accepted events queued since the last SDK event,
-        // before translating this one, so the poll loop sees acceptance first.
-        for (const ev of drainAccepted()) yield ev;
+          // Emit any input-accepted events queued since the last SDK event,
+          // before translating this one, so the poll loop sees acceptance first.
+          for (const ev of drainAccepted()) yield ev;
 
-        // Yield activity for every SDK event so the poll loop knows the agent is working
-        yield { type: 'activity' };
+          // Yield activity for every SDK event so the poll loop knows the agent is working
+          yield { type: 'activity' };
 
-        if (message.type === 'system' && message.subtype === 'init') {
-          yield { type: 'init', continuation: message.session_id };
-        } else if (message.type === 'result') {
-          const text = 'result' in message ? ((message as { result?: string }).result ?? null) : null;
-          const resolvedInputIds = takeResolvedIds();
-          yield {
-            type: 'result',
-            text,
-            inputId: resolvedInputIds[resolvedInputIds.length - 1],
-            resolvedInputIds,
-          };
-        } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
-          // API retry is a mid-turn, non-terminal signal: the turn continues.
-          // Reclassify as a non-terminal notice (warn, no relay) correlated to
-          // the active input — not a terminal interruption, not a throw.
-          yield {
-            type: 'notice',
-            inputId: acceptedUnresolved[acceptedUnresolved.length - 1] ?? initialInputId ?? '',
-            classification: 'api_retry',
-            severity: 'warn',
-            agentMessage: 'Retrying after a transient API error.',
-            fallbackUserMessage: 'A transient error happened; retrying automatically.',
-            relayRecommended: false,
-          };
-        } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'rate_limit_event') {
-          // The current code does NOT return on rate_limit_event — the turn
-          // provably continues — so classify as a continue-the-turn notice
-          // (warn, quota classification), not a terminal interruption.
-          yield {
-            type: 'notice',
-            inputId: acceptedUnresolved[acceptedUnresolved.length - 1] ?? initialInputId ?? '',
-            classification: 'quota',
-            severity: 'warn',
-            agentMessage: 'Rate limited; waiting before continuing.',
-            fallbackUserMessage: 'Rate limited; the turn will continue shortly.',
-            relayRecommended: false,
-          };
-        } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'compact_boundary') {
-          const meta = (message as { compact_metadata?: { pre_tokens?: number } }).compact_metadata;
-          const detail = meta?.pre_tokens ? ` (${meta.pre_tokens.toLocaleString()} tokens compacted)` : '';
-          yield {
-            type: 'progress',
-            inputId: acceptedUnresolved[acceptedUnresolved.length - 1] ?? initialInputId,
-            message: `Context compacted${detail}.`,
-          };
-        } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
-          const tn = message as { summary?: string };
-          yield { type: 'progress', message: tn.summary || 'Task notification' };
+          if (message.type === 'system' && message.subtype === 'init') {
+            yield { type: 'init', continuation: message.session_id };
+          } else if (message.type === 'result') {
+            const text = 'result' in message ? ((message as { result?: string }).result ?? null) : null;
+            const resolvedInputIds = takeResolvedIds();
+            yield {
+              type: 'result',
+              text,
+              inputId: resolvedInputIds[resolvedInputIds.length - 1],
+              resolvedInputIds,
+            };
+          } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
+            // API retry is a mid-turn, non-terminal signal: the turn continues.
+            // Reclassify as a non-terminal notice (warn, no relay) correlated to
+            // the active input — not a terminal interruption, not a throw.
+            yield {
+              type: 'notice',
+              inputId: acceptedUnresolved[acceptedUnresolved.length - 1] ?? initialInputId ?? '',
+              classification: 'api_retry',
+              severity: 'warn',
+              agentMessage: 'Retrying after a transient API error.',
+              fallbackUserMessage: 'A transient error happened; retrying automatically.',
+              relayRecommended: false,
+            };
+          } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'rate_limit_event') {
+            // The current code does NOT return on rate_limit_event — the turn
+            // provably continues — so classify as a continue-the-turn notice
+            // (warn, quota classification), not a terminal interruption.
+            yield {
+              type: 'notice',
+              inputId: acceptedUnresolved[acceptedUnresolved.length - 1] ?? initialInputId ?? '',
+              classification: 'quota',
+              severity: 'warn',
+              agentMessage: 'Rate limited; waiting before continuing.',
+              fallbackUserMessage: 'Rate limited; the turn will continue shortly.',
+              relayRecommended: false,
+            };
+          } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'compact_boundary') {
+            const meta = (message as { compact_metadata?: { pre_tokens?: number } }).compact_metadata;
+            const detail = meta?.pre_tokens ? ` (${meta.pre_tokens.toLocaleString()} tokens compacted)` : '';
+            yield {
+              type: 'progress',
+              inputId: acceptedUnresolved[acceptedUnresolved.length - 1] ?? initialInputId,
+              message: `Context compacted${detail}.`,
+            };
+          } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
+            const tn = message as { summary?: string };
+            yield { type: 'progress', message: tn.summary || 'Task notification' };
+          }
         }
+        // Flush any trailing acceptance events the SDK never interleaved.
+        if (!aborted) {
+          for (const ev of drainAccepted()) yield ev;
+        }
+      } finally {
+        // Prompt consumption is the provider-submission boundary. If abort
+        // races after the SDK has consumed a prompt but before it emits its
+        // next event, preserve that acceptance signal so the poll loop keeps
+        // recovery ownership of the submitted work. Cancellation before
+        // prompt consumption never queues an event here.
+        for (const ev of drainAccepted()) yield ev;
+        if (sdkCancellation) await sdkCancellation;
       }
-      // Flush any trailing acceptance events the SDK never interleaved.
-      for (const ev of drainAccepted()) yield ev;
       log(`Query completed after ${messageCount} SDK messages`);
     }
 
@@ -655,10 +706,7 @@ export class ClaudeProvider implements AgentProvider {
       },
       end: () => stream.end(),
       events: translateEvents(),
-      abort: () => {
-        aborted = true;
-        stream.end();
-      },
+      abort: cancelExecution,
     };
   }
 }
