@@ -14,9 +14,9 @@ import {
   hostGwsCorrelationIpcDir,
   processAuthenticatedGwsCorrelationRequest,
   registerGwsCorrelationLaunchLease,
-  unregisterGwsCorrelationLaunchLease,
   type AuthenticatedGwsCorrelationRequest,
   type GwsCorrelationLaunchControl,
+  type RegisteredGwsCorrelationLaunchControl,
 } from './gws-correlation-ipc.js';
 import { closeDb, createAgentGroup, createSession, initTestDb, runMigrations } from './db/index.js';
 import { INBOUND_SCHEMA, OUTBOUND_SCHEMA } from './db/schema.js';
@@ -110,14 +110,6 @@ async function readSocketFrame(socket: Socket): Promise<Record<string, unknown>>
     socket.once('error', onError);
     socket.once('close', onClose);
   });
-}
-
-async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (!predicate()) {
-    if (Date.now() >= deadline) throw new Error('condition did not become true before deadline');
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
 }
 
 describe('host-owned accepted GWS correlation', () => {
@@ -233,7 +225,7 @@ describe('authenticated GWS correlation acceptance lease', () => {
   const routeKey = 'opencode|discord|chan-1|dm:mg-1';
   const issuedAt = '2026-05-29T00:00:00.000Z';
   const acceptedAt = '2026-05-29T00:00:01.000Z';
-  let control: GwsCorrelationLaunchControl;
+  let control: RegisteredGwsCorrelationLaunchControl;
 
   beforeEach(() => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-correlation-auth-'));
@@ -269,7 +261,7 @@ describe('authenticated GWS correlation acceptance lease', () => {
   });
 
   afterEach(() => {
-    unregisterGwsCorrelationLaunchLease(groupId, sessionId);
+    control.revokeAfterConfirmedStop();
     fs.rmSync(root, { recursive: true, force: true });
   });
 
@@ -335,8 +327,18 @@ describe('authenticated GWS correlation acceptance lease', () => {
     db.close();
   });
 
-  it('invalidates the old lease on respawn', () => {
-    const oldRequest = request();
+  it('refuses to replace a lease before confirmed stop', () => {
+    expect(() =>
+      registerGwsCorrelationLaunchLease({
+        agentGroupId: groupId,
+        sessionId,
+        providerName: 'opencode',
+        issuedAt,
+        secret: Buffer.alloc(32, 8),
+        leaseId: 'lease-host-issued-2',
+      }),
+    ).toThrow(/still active|confirm container stop/i);
+    control.revokeAfterConfirmedStop();
     control = registerGwsCorrelationLaunchLease({
       agentGroupId: groupId,
       sessionId,
@@ -345,7 +347,6 @@ describe('authenticated GWS correlation acceptance lease', () => {
       secret: Buffer.alloc(32, 8),
       leaseId: 'lease-host-issued-2',
     });
-    expect(() => process(oldRequest)).toThrow(/lease|auth|mac/i);
   });
 
   it('accepts one legitimate queued batch exactly once and never rewrites original accepted_at on replay', () => {
@@ -396,20 +397,20 @@ describe('authenticated GWS correlation acceptance lease', () => {
 });
 
 describe('bounded GWS correlation socket transport', () => {
-  const controls: GwsCorrelationLaunchControl[] = [];
+  const controls: RegisteredGwsCorrelationLaunchControl[] = [];
   const sockets: Socket[] = [];
   const createdSessions: string[] = [];
 
   afterEach(() => {
     for (const socket of sockets.splice(0)) socket.destroy();
     for (const control of controls.splice(0)) {
-      unregisterGwsCorrelationLaunchLease(control.agentGroupId, control.sessionId, control.leaseId);
+      control.revokeAfterConfirmedStop();
     }
     closeDb();
     for (const dir of createdSessions.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  function register(group: string, session: string): GwsCorrelationLaunchControl {
+  function register(group: string, session: string): RegisteredGwsCorrelationLaunchControl {
     const control = registerGwsCorrelationLaunchLease({
       agentGroupId: group,
       sessionId: session,
@@ -549,13 +550,21 @@ describe('bounded GWS correlation socket transport', () => {
 
     socket.destroy();
     await new Promise<void>((resolve) => socket.once('close', resolve));
-    await waitFor(() => !fs.existsSync(hostCorrelationPath(groupId, sessionId)));
-    expect(fs.existsSync(hostCorrelationPath(groupId, sessionId))).toBe(false);
-    const ended = new Database(inboundDbPath(groupId, sessionId), { readonly: true });
-    expect(ended.prepare("SELECT host_acceptance_ended_at FROM messages_in WHERE id = 'm-socket-bind'").get()).toEqual({
-      host_acceptance_ended_at: expect.any(String),
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    // Losing the runner's control fd must stop future binds, but it cannot end
+    // the active execution interval while the owning container may still have
+    // a GWS tool in flight. Only confirmed container stop may revoke it.
+    expect(fs.existsSync(hostCorrelationPath(groupId, sessionId))).toBe(true);
+    const stillOpen = new Database(inboundDbPath(groupId, sessionId), { readonly: true });
+    expect(
+      stillOpen.prepare("SELECT host_acceptance_ended_at FROM messages_in WHERE id = 'm-socket-bind'").get(),
+    ).toEqual({
+      host_acceptance_ended_at: null,
     });
-    ended.close();
+    stillOpen.close();
+
+    expect(control.revokeAfterConfirmedStop()).toBe(true);
+    expect(fs.existsSync(hostCorrelationPath(groupId, sessionId))).toBe(false);
   });
 });
 
@@ -599,7 +608,7 @@ describe('GWS acceptance lifecycle barriers', () => {
     const pointerPath = hostCorrelationPath(groupId, sessionId);
     fs.writeFileSync(pointerPath, JSON.stringify({ schemaVersion: 1, inputId: 'in-life', leaseId }));
 
-    expect(unregisterGwsCorrelationLaunchLease(groupId, sessionId, control.leaseId)).toBe(true);
+    expect(control.revokeAfterConfirmedStop()).toBe(true);
     expect(fs.existsSync(pointerPath)).toBe(false);
     expect(fs.existsSync(path.join(path.dirname(pointerPath), 'active-lease.json'))).toBe(false);
     const db = new Database(dbPath, { readonly: true });

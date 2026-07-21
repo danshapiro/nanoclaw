@@ -29,6 +29,16 @@ export interface GwsCorrelationLaunchControl {
   socketName: string;
 }
 
+/**
+ * Host-only lifecycle capability. The revoker is deliberately non-enumerable,
+ * so the serialized launch control delivered to the container contains only
+ * data. Production code receives revocation authority only from registration
+ * and invokes it after confirmed container termination.
+ */
+export interface RegisteredGwsCorrelationLaunchControl extends GwsCorrelationLaunchControl {
+  revokeAfterConfirmedStop(): boolean;
+}
+
 interface ProviderAcceptanceProof {
   event: 'input-accepted';
   scope: 'initial' | 'followup';
@@ -352,10 +362,10 @@ function startLeaseSocket(control: GwsCorrelationLaunchControl, state: GwsCorrel
       clearTimeout(deadline);
       if (frameDeadline) clearTimeout(frameDeadline);
       if (state.socket === socket) {
-        // The persistent authenticated fd is the lifetime of this authority.
-        // Revoke synchronously on disconnect so no stale pointer survives
-        // while the later container-exit callback is still pending.
-        unregisterGwsCorrelationLaunchLease(control.agentGroupId, control.sessionId, control.leaseId);
+        // Losing the control fd prevents future binds, but is not proof that
+        // the container or an already-admitted tool stopped. Keep the active
+        // interval/pointer open until the container lifecycle confirms stop.
+        state.socket = undefined;
       }
     });
   });
@@ -379,7 +389,7 @@ export function registerGwsCorrelationLaunchLease(opts: {
   issuedAt?: string;
   secret?: Buffer;
   leaseId?: string;
-}): GwsCorrelationLaunchControl {
+}): RegisteredGwsCorrelationLaunchControl {
   const agentGroupId = canonicalCorrelation(opts.agentGroupId, 'agentGroupId');
   const sessionId = canonicalCorrelation(opts.sessionId, 'sessionId');
   const providerName = canonicalCorrelation(opts.providerName, 'providerName');
@@ -387,7 +397,12 @@ export function registerGwsCorrelationLaunchLease(opts: {
   const secret = Buffer.from(opts.secret ?? randomBytes(32));
   if (secret.length !== 32) throw new Error('GWS correlation launch secret must be 32 bytes');
   const leaseId = canonicalCorrelation(opts.leaseId ?? randomBytes(24).toString('base64url'), 'leaseId');
-  unregisterGwsCorrelationLaunchLease(agentGroupId, sessionId);
+  const key = launchLeaseKey(agentGroupId, sessionId);
+  if (launchLeases.has(key)) {
+    throw new Error(
+      `GWS correlation lease for ${agentGroupId}/${sessionId} is still active; confirm container stop first`,
+    );
+  }
   const socketName = `${createHash('sha256').update(leaseId).digest('hex').slice(0, 16)}.sock`;
   const state: GwsCorrelationLeaseState = {
     secret,
@@ -399,7 +414,7 @@ export function registerGwsCorrelationLaunchLease(opts: {
     acceptedInputs: new Map(),
     mutationTail: Promise.resolve(),
   };
-  const control: GwsCorrelationLaunchControl = {
+  const control = {
     schemaVersion: 1,
     agentGroupId,
     sessionId,
@@ -408,8 +423,12 @@ export function registerGwsCorrelationLaunchLease(opts: {
     issuedAt,
     secret: secret.toString('base64url'),
     socketName,
-  };
-  launchLeases.set(launchLeaseKey(agentGroupId, sessionId), state);
+  } as RegisteredGwsCorrelationLaunchControl;
+  Object.defineProperty(control, 'revokeAfterConfirmedStop', {
+    enumerable: false,
+    value: () => revokeGwsCorrelationLaunchLease(agentGroupId, sessionId, leaseId),
+  });
+  launchLeases.set(key, state);
   writeJsonAtomic(activeLeasePath(agentGroupId, sessionId), {
     schemaVersion: 1,
     agentGroupId,
@@ -421,11 +440,7 @@ export function registerGwsCorrelationLaunchLease(opts: {
   return control;
 }
 
-export function unregisterGwsCorrelationLaunchLease(
-  agentGroupId: string,
-  sessionId: string,
-  expectedLeaseId?: string,
-): boolean {
+function revokeGwsCorrelationLaunchLease(agentGroupId: string, sessionId: string, expectedLeaseId?: string): boolean {
   const key = launchLeaseKey(agentGroupId, sessionId);
   const prior = launchLeases.get(key);
   if (expectedLeaseId && prior?.leaseId !== expectedLeaseId) return false;
@@ -631,15 +646,6 @@ export function releaseAcceptedGwsCorrelation(opts: {
   if (opts.requestId) {
     writeRequestReceiptAtomic(opts.correlationPath, { requestId: opts.requestId, action: 'release', inputId });
   }
-}
-
-export function clearAcceptedGwsCorrelation(
-  agentGroupId: string,
-  sessionId: string,
-  endedAt = new Date().toISOString(),
-): void {
-  invalidateCorrelationPointers(agentGroupId, sessionId);
-  expireAcceptedRows(agentGroupId, sessionId, undefined, endedAt);
 }
 
 function authenticatedRequest(value: unknown): AuthenticatedGwsCorrelationRequest {
@@ -871,10 +877,11 @@ export function startGwsCorrelationIpcWatcher(): void {
 }
 
 export function stopGwsCorrelationIpcWatcher(): void {
-  for (const key of [...launchLeases.keys()]) {
-    const [agentGroupId, sessionId] = key.split('\0');
-    unregisterGwsCorrelationLaunchLease(agentGroupId, sessionId);
-  }
+  // Transport shutdown is not lease revocation. At normal shutdown all
+  // containers have already drained and their lifecycle capabilities revoked;
+  // if drain verification failed, pointers/intervals intentionally remain for
+  // startup's verified orphan-stop barrier to expire on the next process.
+  for (const state of launchLeases.values()) closeLeaseTransport(state);
 }
 
 /**

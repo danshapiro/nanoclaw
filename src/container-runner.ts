@@ -34,11 +34,7 @@ import {
 } from './container-runtime.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { resolveGwsSideEffectVerifyKey } from './gws-side-effect-key.js';
-import {
-  hostGwsCorrelationIpcDir,
-  registerGwsCorrelationLaunchLease,
-  unregisterGwsCorrelationLaunchLease,
-} from './gws-correlation-ipc.js';
+import { hostGwsCorrelationIpcDir, registerGwsCorrelationLaunchLease } from './gws-correlation-ipc.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable, isDbInitialized } from './db/connection.js';
 import { getSession } from './db/sessions.js';
@@ -94,7 +90,13 @@ const ONECLI_GATEWAY_PROXY_ENV_KEYS = [
 ] as const;
 
 /** Active containers tracked by session ID. */
-type ActiveContainer = { process: ChildProcess; containerName: string; leaseId: string; startedAtMs: number };
+type ActiveContainer = {
+  process: ChildProcess;
+  containerName: string;
+  leaseId: string;
+  revokeGwsAfterConfirmedStop: () => boolean;
+  startedAtMs: number;
+};
 const activeContainers = new Map<string, ActiveContainer>();
 const activeMcpBridges = new Map<string, AgentMcpBridge[]>();
 const containerExitWaiters = new Map<string, Set<() => void>>();
@@ -334,18 +336,37 @@ async function spawnContainer(session: Session): Promise<void> {
     providerName: provider,
     containerName,
   });
-  let container: ChildProcess;
+  let container: ChildProcess | undefined;
   try {
     container = spawn(CONTAINER_RUNTIME_BIN, args, { stdio: ['pipe', 'pipe', 'pipe'] });
     if (!container.stdin) throw new Error('container runtime did not expose the launch-control stdin pipe');
     container.stdin.end(`${JSON.stringify(launchControl)}\n`);
   } catch (err) {
-    unregisterGwsCorrelationLaunchLease(agentGroup.id, session.id, launchControl.leaseId);
+    // A synchronous spawn failure means no container exists. The only
+    // post-spawn synchronous failure is a missing/broken stdin pipe; stop and
+    // verify that runtime instance before closing its execution interval.
+    if (container) {
+      const spawnedContainer = container;
+      await stopContainerAsync(containerName).catch(() => {
+        spawnedContainer.kill('SIGKILL');
+      });
+      const [runningByName, runningByLabel] = await Promise.all([
+        isContainerRunningAsync(containerName),
+        isContainerWithLabelRunningAsync(`${SESSION_CONTAINER_LABEL_KEY}=${session.id}`),
+      ]);
+      if (runningByName || runningByLabel) {
+        throw new AggregateError([err], `Failed launch container remains live for session ${session.id}`, {
+          cause: err,
+        });
+      }
+    }
+    launchControl.revokeAfterConfirmedStop();
     removeContainerEnvFile(envFilePath);
     cleanupTempSkillRoot(managedSkillsRoot);
     await stopAgentMcpBridges(bridges);
     throw err;
   }
+  if (!container) throw new Error(`Container runtime returned no process for session ${session.id}`);
 
   // `docker run` reads --env-file client-side at create time. Delete the file
   // at the earliest signal that create has completed: any container output,
@@ -361,6 +382,7 @@ async function spawnContainer(session: Session): Promise<void> {
     process: container,
     containerName,
     leaseId: launchControl.leaseId,
+    revokeGwsAfterConfirmedStop: launchControl.revokeAfterConfirmedStop,
     startedAtMs: Date.now(),
   });
   if (bridges.length > 0) {
@@ -392,8 +414,9 @@ async function spawnContainer(session: Session): Promise<void> {
   });
 
   container.on('error', (err) => {
-    finalizeContainerProcess(session.id, containerName, launchControl.leaseId, null);
-    cleanupTempSkillRoot(managedSkillsRoot);
+    // An error event is not, by itself, proof that the runtime container has
+    // stopped (ChildProcess also uses it for failed kill/send operations).
+    // The close event or an explicit runtime name+label check owns finalization.
     log.error('Container spawn error', { sessionId: session.id, err });
   });
 }
@@ -424,13 +447,12 @@ function finalizeContainerProcess(
   }
   if (isDbInitialized()) {
     markContainerStopped(sessionId);
-    const session = getSession(sessionId);
-    if (session) {
-      unregisterGwsCorrelationLaunchLease(session.agent_group_id, session.id, leaseId);
-    }
   } else {
     log.warn('Container exited after DB shutdown; skipped session stopped marker', { sessionId, containerName });
   }
+  // Process close or a successful runtime name+label verification is the stop
+  // proof. Revoke only now, before notifying waiters that may wake a successor.
+  current.revokeGwsAfterConfirmedStop();
   stopTypingRefresh(sessionId);
   notifyContainerExit(sessionId);
   log.info('Container exited', { sessionId, code, containerName });

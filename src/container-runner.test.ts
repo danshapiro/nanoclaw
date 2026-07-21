@@ -7,6 +7,8 @@ import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
+import Database from 'better-sqlite3';
+
 import {
   applyOneCliGatewayForContainerArgs,
   assertNoReservedAgentCommandCollisionsShell,
@@ -1557,6 +1559,100 @@ describe('side-effect ledger container env', () => {
       expect(JSON.stringify(args)).not.toContain(control.secret);
       expect(harness.envFileSnapshots.map((snapshot) => snapshot.content).join('\n')).not.toContain(control.secret);
       expect(args.filter((arg) => arg.includes(':/workspace/')).join('\n')).not.toContain(control.secret);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('keeps the acceptance interval open while a marker-read tool waits for confirmed container stop', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      harness.oneCliRelease.resolve();
+      await harness.containerRunner.wakeContainer(harness.session);
+      const child = harness.spawnedProcesses[0];
+      const control = JSON.parse(String(child.stdin.end.mock.calls[0][0])) as { leaseId: string };
+      const hostDir = path.join(harness.dataDir, 'v2-host-correlation', 'ag-1', harness.session.id);
+      const markerPath = path.join(hostDir, 'active-lease.json');
+      const pointerPath = path.join(hostDir, 'current.json');
+      const inboundPath = path.join(harness.dataDir, 'v2-sessions', 'ag-1', harness.session.id, 'inbound.db');
+      const acceptedAt = new Date(Date.now() - 1_000).toISOString();
+      const db = new Database(inboundPath);
+      db.prepare(
+        `INSERT INTO messages_in
+           (id, seq, kind, timestamp, content, trigger, host_input_id, host_route_key, host_received_at,
+            host_accepted_input_id, host_accepted_route_key, host_accepted_at, host_acceptance_lease_id)
+         VALUES ('marker-paused', 1, 'chat', ?, '{}', 1, 'in-marker-paused', 'route-marker-paused', ?,
+                 'in-marker-paused', 'route-marker-paused', ?, ?)`,
+      ).run(acceptedAt, acceptedAt, acceptedAt, control.leaseId);
+      db.close();
+      fs.writeFileSync(
+        pointerPath,
+        JSON.stringify({
+          schemaVersion: 1,
+          inputId: 'in-marker-paused',
+          routeKey: 'route-marker-paused',
+          leaseId: control.leaseId,
+        }),
+      );
+
+      // Model the shim paused immediately after its stable marker/pointer read.
+      const resumePausedTool = deferred();
+      let containerCanExecute = true;
+      let upstreamCalls = 0;
+      const pausedTool = (async () => {
+        await resumePausedTool.promise;
+        if (containerCanExecute) upstreamCalls++;
+      })();
+
+      const stopStarted = deferred();
+      let confirmStop!: () => void;
+      let runtimeStopped = false;
+      harness.execFileMock.mockImplementation((_file, args: string[], _options, cb) => {
+        if (args[0] === 'stop') {
+          stopStarted.resolve();
+          confirmStop = () => {
+            // Confirmation represents Docker quiescing every process/tool in
+            // the container before reporting stop success.
+            containerCanExecute = false;
+            runtimeStopped = true;
+            cb(null, '', '');
+          };
+          return;
+        }
+        if (args[0] === 'ps') {
+          cb(null, runtimeStopped ? '' : 'nanoclaw-v2-agent-live\n', '');
+          return;
+        }
+        cb(null, '', '');
+      });
+
+      const stopping = harness.containerRunner.stopContainerAndVerify(harness.session.id, 'marker-read-race');
+      await stopStarted.promise;
+      expect(fs.existsSync(markerPath)).toBe(true);
+      expect(fs.existsSync(pointerPath)).toBe(true);
+      const beforeStop = new Database(inboundPath, { readonly: true });
+      expect(
+        beforeStop.prepare("SELECT host_acceptance_ended_at FROM messages_in WHERE id = 'marker-paused'").get(),
+      ).toEqual({ host_acceptance_ended_at: null });
+      beforeStop.close();
+
+      // A separate admitted operation can finish while shutdown is waiting;
+      // its completion must remain inside the final accepted interval.
+      const completedInFlightAt = new Date().toISOString();
+      confirmStop();
+      await stopping;
+      resumePausedTool.resolve();
+      await pausedTool;
+
+      expect(upstreamCalls).toBe(0);
+      expect(fs.existsSync(markerPath)).toBe(false);
+      expect(fs.existsSync(pointerPath)).toBe(false);
+      const afterStop = new Database(inboundPath, { readonly: true });
+      const ended = afterStop
+        .prepare("SELECT host_acceptance_ended_at FROM messages_in WHERE id = 'marker-paused'")
+        .get() as { host_acceptance_ended_at: string };
+      expect(Date.parse(ended.host_acceptance_ended_at)).toBeGreaterThanOrEqual(Date.parse(completedInFlightAt));
+      afterStop.close();
     } finally {
       harness.close();
     }

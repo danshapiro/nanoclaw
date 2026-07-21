@@ -27,7 +27,9 @@ vi.mock('./container-runtime.js', () => ({
 vi.mock('./gws-correlation-ipc.js', () => ({
   expireAllStaleGwsCorrelations: vi.fn(),
   startGwsCorrelationIpcWatcher: vi.fn(),
-  stopGwsCorrelationIpcWatcher: vi.fn(),
+  stopGwsCorrelationIpcWatcher: vi.fn(() => {
+    h.calls.push('stopGwsCorrelationIpcWatcher');
+  }),
 }));
 vi.mock('./delivery.js', () => ({
   startActiveDeliveryPoll: vi.fn(),
@@ -87,6 +89,7 @@ describe('runShutdown', () => {
       'stopHostSweep',
       'shutdownCallback',
       'drainAllContainers(30)',
+      'stopGwsCorrelationIpcWatcher',
       'teardownChannelAdapters',
     ]);
     expect(exit).toHaveBeenCalledTimes(1);

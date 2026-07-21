@@ -214,7 +214,6 @@ export async function runShutdown(signal: string, exit: (code: number) => void =
   // 1. Stop pollers first so nothing re-wakes containers during the drain.
   stopDeliveryPolls();
   stopHostSweep();
-  stopGwsCorrelationIpcWatcher();
 
   // 2. Module shutdown callbacks.
   for (const cb of getShutdownCallbacks()) {
@@ -227,6 +226,10 @@ export async function runShutdown(signal: string, exit: (code: number) => void =
 
   // 3. Drain active containers so no docker run clients outlive the process.
   await drainAllContainers(30);
+
+  // 3b. Stop accepting IPC only after drain. This closes transports but never
+  // revokes any interval whose container failed to confirm termination.
+  stopGwsCorrelationIpcWatcher();
 
   // 4. Channel adapter teardown.
   await teardownChannelAdapters();
