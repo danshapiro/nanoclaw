@@ -89,14 +89,14 @@ export function getPendingMessages(): MessageInRow[] {
 }
 
 /** Mark messages as processing — writes to processing_ack in outbound.db. */
-export function markProcessing(ids: string[]): void {
+export function markProcessing(ids: string[], claimToken?: string): void {
   if (ids.length === 0) return;
   const db = getOutboundDb();
   const stmt = db.prepare(
-    "INSERT OR REPLACE INTO processing_ack (message_id, status, status_changed) VALUES (?, 'processing', datetime('now'))",
+    "INSERT OR REPLACE INTO processing_ack (message_id, status, status_changed, claim_token) VALUES (?, 'processing', datetime('now'), ?)",
   );
   db.transaction(() => {
-    for (const id of ids) stmt.run(id);
+    for (const id of ids) stmt.run(id, claimToken ?? null);
   })();
 }
 

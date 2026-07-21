@@ -57,12 +57,22 @@ function insertMessage(
     threadId?: string;
     messagingGroupId?: string | null;
     isGroup?: 0 | 1 | null;
+    hostProviderName?: string;
   },
 ) {
+  const hostRoute = normalizeRoute(opts?.hostProviderName ?? 'test', {
+    platformId: opts?.platformId ?? null,
+    channelType: opts?.channelType ?? null,
+    threadId: opts?.threadId ?? null,
+    messagingGroupId: opts?.messagingGroupId ?? null,
+    isGroup: opts?.isGroup ?? null,
+  }).routeKey;
   getInboundDb()
     .prepare(
-      `INSERT INTO messages_in (id, kind, timestamp, status, process_after, trigger, platform_id, channel_type, thread_id, messaging_group_id, is_group, content)
-     VALUES (?, ?, datetime('now'), 'pending', ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO messages_in
+         (id, kind, timestamp, status, process_after, trigger, platform_id, channel_type, thread_id,
+          messaging_group_id, is_group, host_input_id, host_route_key, host_received_at, content)
+       VALUES (?, ?, datetime('now'), 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)`,
     )
     .run(
       id,
@@ -74,6 +84,8 @@ function insertMessage(
       opts?.threadId ?? null,
       opts?.messagingGroupId ?? null,
       opts?.isGroup ?? null,
+      `in-host-${id}`,
+      hostRoute,
       JSON.stringify(content),
     );
 }
@@ -85,6 +97,16 @@ function insertChannelDestination(name: string, platformId = 'chan-1', channelTy
        VALUES (?, ?, 'channel', ?, ?, NULL)`,
     )
     .run(name, name, channelType, platformId);
+}
+
+function stampHostInput(id: string, inputId: string, routeKey: string, receivedAt = new Date().toISOString()): void {
+  getInboundDb()
+    .prepare(
+      `UPDATE messages_in
+          SET host_input_id = ?, host_route_key = ?, host_received_at = ?
+        WHERE id = ?`,
+    )
+    .run(inputId, routeKey, receivedAt, id);
 }
 
 class ScriptedProvider implements AgentProvider {
@@ -495,6 +517,7 @@ describe('poll-loop conversational reply accounting', () => {
 
     const filePath = '/workspace/agent/tmp/vision-fixture.png';
     const queryStarted = deferred();
+    const pushAttempted = deferred();
     let releaseQuery!: () => void;
     const provider: AgentProvider = {
       supportsNativeSlashCommands: false,
@@ -503,6 +526,7 @@ describe('poll-loop conversational reply accounting', () => {
         queryStarted.resolve();
         return {
           push() {
+            pushAttempted.resolve();
             throw new Error('queue full');
           },
           end() {},
@@ -537,11 +561,12 @@ describe('poll-loop conversational reply accounting', () => {
 
     await queryStarted.promise;
     insertMessage('image-follow-up', 'chat', { sender: 'User', text: `Use ${filePath}` }, { platformId: 'chan-1' });
-    await waitFor(() => getAckStatus('image-follow-up') === 'processing', 1500);
+    await pushAttempted.promise;
+    await waitFor(() => getAckStatus('image-follow-up') === null, 1500);
     controller.abort();
     await loopPromise.catch(() => {});
 
-    expect(getAckStatus('image-follow-up')).toBe('processing');
+    expect(getAckStatus('image-follow-up')).toBeNull();
   });
 
   it('writes an explicit error when a conversational trigger completes without a user-visible response', async () => {
@@ -2056,6 +2081,149 @@ describe('poll-loop input ledger and recovery (route-scoped)', () => {
   });
 });
 
+describe('poll-loop final host-backed input selection', () => {
+  it('does not submit an accumulate-only remainder after pre-task filtering removes the only trigger', async () => {
+    const route = normalizeRoute('test', {
+      platformId: 'chan-final',
+      channelType: 'discord',
+      threadId: null,
+      messagingGroupId: 'mg-final',
+      isGroup: 0,
+    }).routeKey;
+    insertMessage(
+      'context-only',
+      'chat',
+      { sender: 'Observer', text: 'context only' },
+      {
+        trigger: 0,
+        platformId: 'chan-final',
+        channelType: 'discord',
+        messagingGroupId: 'mg-final',
+        isGroup: 0,
+      },
+    );
+    insertMessage(
+      'script-trigger',
+      'task',
+      { prompt: 'skip me' },
+      {
+        trigger: 1,
+        platformId: 'chan-final',
+        channelType: 'discord',
+        messagingGroupId: 'mg-final',
+        isGroup: 0,
+      },
+    );
+    stampHostInput('context-only', 'in-context-receipt', route);
+    stampHostInput('script-trigger', 'in-script-trigger', route);
+
+    let queryCalls = 0;
+    const provider = new ScriptedProvider(async function* () {
+      queryCalls++;
+      throw new Error('provider must not receive an input without a surviving host-backed trigger');
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({
+      provider,
+      providerName: 'test',
+      cwd: '/tmp',
+      signal: controller.signal,
+      runPreTaskScripts: async (messages) => ({
+        keep: messages.filter((message) => message.id === 'context-only'),
+        skipped: ['script-trigger'],
+      }),
+    });
+
+    try {
+      await waitFor(() => getAckStatus('script-trigger') === 'completed', 1500);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(queryCalls).toBe(0);
+      expect(getAckStatus('context-only')).toBeNull();
+      expect(getUndeliveredMessages().some((message) => JSON.parse(message.content).text?.startsWith('Error:'))).toBe(
+        false,
+      );
+    } finally {
+      controller.abort();
+      await loopPromise.catch(() => {});
+    }
+  });
+
+  it('keeps an accumulate-only active-turn follow-up under the existing accepted host input', async () => {
+    const route = normalizeRoute('test', {
+      platformId: 'chan-active',
+      channelType: 'discord',
+      threadId: null,
+      messagingGroupId: 'mg-active',
+      isGroup: 0,
+    }).routeKey;
+    insertMessage(
+      'active-trigger',
+      'task',
+      { prompt: 'start' },
+      {
+        platformId: 'chan-active',
+        channelType: 'discord',
+        messagingGroupId: 'mg-active',
+        isGroup: 0,
+      },
+    );
+    stampHostInput('active-trigger', 'in-host-active', route);
+
+    const initialAccepted = deferred();
+    const followupPushed = deferred();
+    let pushedInputId: string | undefined;
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query(input) {
+        return {
+          push(value) {
+            if (typeof value !== 'string') pushedInputId = value.inputId;
+            followupPushed.resolve();
+          },
+          end() {},
+          abort() {},
+          events: (async function* () {
+            yield { type: 'input-accepted', inputId: input.inputId, scope: 'initial' };
+            initialAccepted.resolve();
+            await followupPushed.promise;
+            yield { type: 'input-accepted', inputId: pushedInputId!, scope: 'followup' };
+            yield { type: 'result', text: null, inputId: input.inputId, resolvedInputIds: [input.inputId] };
+          })(),
+        };
+      },
+    };
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+    try {
+      await initialAccepted.promise;
+      insertMessage(
+        'accumulated-followup',
+        'chat',
+        { sender: 'Observer', text: 'background context' },
+        {
+          trigger: 0,
+          platformId: 'chan-active',
+          channelType: 'discord',
+          messagingGroupId: 'mg-active',
+          isGroup: 0,
+        },
+      );
+      stampHostInput('accumulated-followup', 'in-receipt-only', route);
+      await followupPushed.promise;
+      expect(pushedInputId).toBe('in-host-active');
+      await waitFor(() => getAckStatus('accumulated-followup') === 'completed', 1500);
+      expect(getUndeliveredMessages().some((message) => JSON.parse(message.content).text?.startsWith('Error:'))).toBe(
+        false,
+      );
+    } finally {
+      controller.abort();
+      await loopPromise.catch(() => {});
+    }
+  });
+});
+
 describe('poll-loop active-input stamping (follow-up correlation)', () => {
   // B4 (Step 1 line 473): a side effect produced during an accepted FOLLOW-UP
   // must be stamped with the follow-up's inputId, NOT the initial input id. The
@@ -3008,9 +3176,9 @@ describe('poll-loop pre-query failure recovery (Step 4 lines 557-559)', () => {
     }
   });
 
-  // B8: pre-task script handling failure AFTER claim follows the same recoverable
-  // lifecycle (returns rows to pending), without writing a raw error.
-  it('pre-task script handling failure after claim returns rows to pending without a raw error', async () => {
+  // Pre-task handling runs before the exact final batch is claimed. A handler
+  // crash therefore leaves the row naturally pending without provider input.
+  it('pre-task script handling failure leaves rows unclaimed without a raw error', async () => {
     insertMessage(
       'pretask-fail',
       'task',
@@ -3057,8 +3225,9 @@ describe('poll-loop pre-query failure recovery (Step 4 lines 557-559)', () => {
     });
 
     try {
-      await waitFor(() => returnedToPending.has('pretask-fail'), 3000);
-      expect(returnedToPending.has('pretask-fail')).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(getAckStatus('pretask-fail')).toBeNull();
+      expect(returnedToPending.has('pretask-fail')).toBe(false);
       expect(rawProviderErrorWritten()).toBe(false);
     } finally {
       console.error = origError;
@@ -3424,6 +3593,17 @@ describe('poll-loop inactivity status and terminal recovery', () => {
   it('does not resume an unscoped continuation when the provider supplies a runtime scope', async () => {
     setContinuation('opencode', 'ses_old_unscoped');
     dmMsg('scoped-cont-init', 'use the current model config');
+    stampHostInput(
+      'scoped-cont-init',
+      'in-host-scoped-cont-init',
+      normalizeRoute('opencode', {
+        platformId: 'chan-1',
+        channelType: 'discord',
+        threadId: null,
+        messagingGroupId: 'mg-relay',
+        isGroup: 0,
+      }).routeKey,
+    );
     let attemptedContinuation: string | undefined = 'not-called';
 
     const provider: AgentProvider = {
@@ -3464,6 +3644,17 @@ describe('poll-loop inactivity status and terminal recovery', () => {
   it('resumes a continuation stored under the same provider runtime scope', async () => {
     setContinuation('opencode', 'ses_matching_scope', 'openai-gpt-5.5-xhigh');
     dmMsg('scoped-cont-resume', 'continue the current model config');
+    stampHostInput(
+      'scoped-cont-resume',
+      'in-host-scoped-cont-resume',
+      normalizeRoute('opencode', {
+        platformId: 'chan-1',
+        channelType: 'discord',
+        threadId: null,
+        messagingGroupId: 'mg-relay',
+        isGroup: 0,
+      }).routeKey,
+    );
     let attemptedContinuation: string | undefined;
 
     const provider: AgentProvider = {
@@ -3670,7 +3861,10 @@ describe('routeless-trigger reply routing', () => {
     insertMessage(
       'a2a-err-1',
       'chat',
-      { sender: 'subagent', text: 'Error: agent completed without sending a user-visible response in this conversation.' },
+      {
+        sender: 'subagent',
+        text: 'Error: agent completed without sending a user-visible response in this conversation.',
+      },
       { channelType: 'agent', platformId: 'ag-test' },
     );
 
@@ -3739,7 +3933,10 @@ describe('routeless-trigger reply routing', () => {
     insertMessage(
       'a2a-err-2',
       'chat',
-      { sender: 'subagent', text: 'Error: agent completed without sending a user-visible response in this conversation.' },
+      {
+        sender: 'subagent',
+        text: 'Error: agent completed without sending a user-visible response in this conversation.',
+      },
       { channelType: 'agent', platformId: 'ag-test' },
     );
 

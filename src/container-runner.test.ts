@@ -58,17 +58,23 @@ function deferred(): Deferred {
   return { promise, resolve };
 }
 
-function fakeChildProcess(
-  pid = 12345,
-): NodeJS.EventEmitter & { pid: number; kill: ReturnType<typeof vi.fn>; stdout: EventEmitter; stderr: EventEmitter } {
+function fakeChildProcess(pid = 12345): NodeJS.EventEmitter & {
+  pid: number;
+  kill: ReturnType<typeof vi.fn>;
+  stdin: { end: ReturnType<typeof vi.fn> };
+  stdout: EventEmitter;
+  stderr: EventEmitter;
+} {
   const proc = new EventEmitter() as NodeJS.EventEmitter & {
     pid: number;
     kill: ReturnType<typeof vi.fn>;
+    stdin: { end: ReturnType<typeof vi.fn> };
     stdout: EventEmitter;
     stderr: EventEmitter;
   };
   proc.pid = pid;
   proc.kill = vi.fn();
+  proc.stdin = { end: vi.fn() };
   proc.stdout = new EventEmitter();
   proc.stderr = new EventEmitter();
   return proc;
@@ -1499,6 +1505,31 @@ describe('side-effect ledger container env', () => {
         '/workspace/.host-correlation/current.json',
       );
       expect(readSpawnEnvFile(args).env.get('NANOCLAW_SESSION_ID')).toBe(harness.session.id);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('delivers the GWS acceptance capability only over consumed stdin, never argv, env, or a mount', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      const args = await buildArgs(harness);
+      expect(args).toContain('-i');
+      expect(args).toContain('--cap-drop=ALL');
+      expect(args).toContain('--security-opt=no-new-privileges');
+      expect(args).toContain('--ulimit=core=0');
+      const spawnCall = harness.spawnMock.mock.calls[0];
+      expect(spawnCall[2]).toMatchObject({ stdio: ['pipe', 'pipe', 'pipe'] });
+      const child = harness.spawnedProcesses[0];
+      expect(child.stdin.end).toHaveBeenCalledTimes(1);
+      const frame = String(child.stdin.end.mock.calls[0][0]);
+      const control = JSON.parse(frame) as { secret: string; leaseId: string; providerName: string };
+      expect(control.secret).toMatch(/^[A-Za-z0-9_-]{43}$/);
+      expect(control.leaseId).toMatch(/^[A-Za-z0-9_-]+$/);
+      expect(control.providerName).toBe('claude');
+      expect(JSON.stringify(args)).not.toContain(control.secret);
+      expect(harness.envFileSnapshots.map((snapshot) => snapshot.content).join('\n')).not.toContain(control.secret);
+      expect(args.filter((arg) => arg.includes(':/workspace/')).join('\n')).not.toContain(control.secret);
     } finally {
       harness.close();
     }

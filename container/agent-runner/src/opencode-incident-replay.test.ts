@@ -354,21 +354,36 @@ function insertMessage(
 ): void {
   const platformId = opts.platformId ?? 'chan-x';
   const channelType = opts.channelType ?? 'discord';
+  const messagingGroupId = opts.messagingGroupId ?? null;
+  const isGroup = opts.isGroup ?? 0;
+  const routeKey = normalizeRoute('opencode', {
+    platformId,
+    channelType,
+    threadId: null,
+    messagingGroupId,
+    isGroup,
+  }).routeKey;
+  const receivedAt = new Date().toISOString();
   ensureReplayDestination(channelType, platformId);
 
   getInboundDb()
     .prepare(
-      `INSERT INTO messages_in (id, kind, timestamp, status, process_after, trigger, platform_id, channel_type, thread_id, messaging_group_id, is_group, content)
-       VALUES (?, 'chat', datetime('now'), 'pending', NULL, ?, ?, ?, NULL, ?, ?, ?)`,
+      `INSERT INTO messages_in
+         (id, kind, timestamp, status, process_after, trigger, platform_id, channel_type,
+          thread_id, messaging_group_id, is_group, content, host_input_id, host_route_key, host_received_at)
+       VALUES (?, 'chat', datetime('now'), 'pending', NULL, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)`,
     )
     .run(
       id,
       opts.trigger ?? 1,
       platformId,
       channelType,
-      opts.messagingGroupId ?? null,
-      opts.isGroup ?? 0,
+      messagingGroupId,
+      isGroup,
       JSON.stringify({ sender: 'User', text }),
+      `in-${id}`,
+      routeKey,
+      receivedAt,
     );
 }
 

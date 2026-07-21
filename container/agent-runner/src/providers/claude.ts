@@ -77,28 +77,36 @@ interface SDKUserMessage {
   session_id: string;
 }
 
+interface QueuedSDKUserMessage {
+  message: SDKUserMessage;
+  inputId?: string;
+  scope: ProviderInputScope;
+}
+
 /**
  * Push-based async iterable for streaming user messages to the Claude SDK.
  */
 class MessageStream {
-  private queue: SDKUserMessage[] = [];
+  private queue: QueuedSDKUserMessage[] = [];
   private waiting: (() => void) | null = null;
   private done = false;
 
   /**
-   * Fired when a prompt is accepted into the stream (push succeeds). Carries
-   * the prompt's inputId and scope so the provider can emit `input-accepted`.
+   * Fired only when the SDK consumes a queued prompt from the async iterator.
    */
   onAccept: ((inputId: string, scope: ProviderInputScope) => void) | null = null;
 
   push(text: string, inputId?: string, scope: ProviderInputScope = 'followup'): void {
     this.queue.push({
-      type: 'user',
-      message: { role: 'user', content: text },
-      parent_tool_use_id: null,
-      session_id: '',
+      message: {
+        type: 'user',
+        message: { role: 'user', content: text },
+        parent_tool_use_id: null,
+        session_id: '',
+      },
+      inputId,
+      scope,
     });
-    if (inputId) this.onAccept?.(inputId, scope);
     this.waiting?.();
   }
 
@@ -110,7 +118,9 @@ class MessageStream {
   async *[Symbol.asyncIterator](): AsyncGenerator<SDKUserMessage> {
     while (true) {
       while (this.queue.length > 0) {
-        yield this.queue.shift()!;
+        const queued = this.queue.shift()!;
+        if (queued.inputId) this.onAccept?.(queued.inputId, queued.scope);
+        yield queued.message;
       }
       if (this.done) return;
       await new Promise<void>((r) => {

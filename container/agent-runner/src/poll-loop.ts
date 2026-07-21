@@ -1,4 +1,5 @@
 import fs from 'fs';
+import { randomUUID } from 'crypto';
 
 import {
   findByName,
@@ -75,12 +76,6 @@ function logAttachmentEvent(event: unknown): void {
 
 function generateId(): string {
   return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-let inputCounter = 0;
-function generateInputId(scope: string): string {
-  inputCounter += 1;
-  return `in-${scope}-${Date.now()}-${inputCounter}-${Math.random().toString(36).slice(2, 6)}`;
 }
 
 /** Normalized route key for a message row, using host-stamped metadata. */
@@ -394,9 +389,6 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     }
 
     const ids = activeMessages.map((m) => m.id);
-    const originalTasks: ProviderRecoveryEntry['originalTasks'] = activeMessages
-      .filter((m) => m.trigger === 1)
-      .map((m) => ({ messageId: m.id, text: textOfMessage(m), timestamp: m.timestamp }));
     // Pending/in_flight recovery entries for THIS route are resumed on this
     // top-level turn: their XML-escaped context is prepended to the prompt so the
     // next Yente turn picks up interrupted work (original task + prior progress +
@@ -406,21 +398,6 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const resumableRecovery = listRecoveryEntries(activeRouteScope).filter(
       (e) => e.status === 'pending' || e.status === 'in_flight',
     );
-    // Generate a top-level inputId for this wake's prompt. Acceptance is tracked
-    // when the provider emits input-accepted for this id.
-    const acceptedTriggerRows = activeMessages.filter((message) => message.trigger === 1);
-    const hostTrigger = acceptedTriggerRows[acceptedTriggerRows.length - 1];
-    const topLevelInputId =
-      hostTrigger.host_input_id &&
-      hostTrigger.host_route_key === activeRouteKey &&
-      typeof hostTrigger.host_received_at === 'string' &&
-      Number.isFinite(Date.parse(hostTrigger.host_received_at))
-        ? hostTrigger.host_input_id
-        : generateInputId('initial');
-    markProcessing(ids);
-
-    const routing = extractRouting(activeMessages);
-
     // Pre-query failures after rows are claimed are recoverable (Invariant 170):
     // a throw in pre-task script HANDLING, formatting, attachment inspection,
     // provider startup, session creation, or prompt acceptance must return the
@@ -433,6 +410,11 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     let prompt: string;
     let attachments: Awaited<ReturnType<typeof collectQueryAttachments>>;
     let query: AgentQuery;
+    let processingIds: string[] = [];
+    let claimToken = '';
+    let topLevelInputId = '';
+    let routing: RoutingContext = extractRouting(activeMessages);
+    let originalTasks: ProviderRecoveryEntry['originalTasks'] = [];
     try {
       // Pre-task scripts: for any task rows with a `script`, run it before the
       // provider call. Scripts returning wakeAgent=false (or erroring) gate
@@ -454,6 +436,38 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         log(`All ${activeMessages.length} message(s) gated by script, skipping query`);
         continue;
       }
+
+      // Derive provider identity only from the FINAL pre-task-filtered batch.
+      // A context-only survivor cannot invent an input id or reach a provider.
+      const finalTriggerRows = keep.filter((message) => message.trigger === 1);
+      const hostTrigger = finalTriggerRows.at(-1);
+      if (
+        !hostTrigger?.host_input_id ||
+        hostTrigger.host_route_key !== activeRouteKey ||
+        typeof hostTrigger.host_received_at !== 'string' ||
+        !Number.isFinite(Date.parse(hostTrigger.host_received_at))
+      ) {
+        log(
+          JSON.stringify({
+            severity: 'info',
+            event: 'no_host_backed_trigger_after_pre_task',
+            route_key: activeRouteKey,
+            remaining_message_ids: keep.map((message) => message.id),
+          }),
+        );
+        await sleep(POLL_INTERVAL_MS, config.signal);
+        continue;
+      }
+      topLevelInputId = hostTrigger.host_input_id;
+      processingIds = keep.map((message) => message.id);
+      claimToken = randomUUID();
+      markProcessing(processingIds, claimToken);
+      routing = extractRouting(keep);
+      originalTasks = finalTriggerRows.map((message) => ({
+        messageId: message.id,
+        text: textOfMessage(message),
+        timestamp: message.timestamp,
+      }));
 
       // Format messages: passthrough commands get raw text (only if the
       // provider natively handles slash commands), others get XML.
@@ -496,7 +510,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           severity: 'warn',
           event: 'pre_query_failure_returned_to_pending',
           route_key: activeRouteKey,
-          message_ids: ids,
+          message_ids: processingIds,
           error: preMsg,
         }),
       );
@@ -521,14 +535,12 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         createdAt: now,
         updatedAt: now,
       });
-      returnProcessingToPending(ids, 'pre_query_failure');
+      returnProcessingToPending(processingIds, 'pre_query_failure');
       await sleep(POLL_INTERVAL_MS, config.signal);
       continue;
     }
 
     // Process the query while concurrently polling for new messages
-    const skippedSet = new Set(skipped);
-    const processingIds = ids.filter((id) => !skippedSet.has(id));
     const replyAccounting = {
       initialRequiresUserVisibleReply: requiresUserVisibleReply(keep),
       initialUserTriggered: isUserTriggered(keep),
@@ -546,6 +558,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         replyAccounting,
         {
           topLevelInputId,
+          initialClaimToken: claimToken,
           activeRouteKey,
           activeRouteScope,
           originalTasks,
@@ -658,6 +671,14 @@ interface InputLedgerEntry {
   prompt: string;
   requiresUserVisibleReply: boolean;
   outboundVisibleReplyCountBefore: number;
+  claims: InputClaimBatch[];
+}
+
+interface InputClaimBatch {
+  claimToken: string;
+  messageIds: string[];
+  prompt: string;
+  state: 'queued' | 'accepted' | 'resolved' | 'returned' | 'recovery_owned';
 }
 
 type ProviderStatusState = {
@@ -689,6 +710,7 @@ async function processQuery(
   replyAccounting: ReplyAccounting,
   ledgerCtx: {
     topLevelInputId: string;
+    initialClaimToken: string;
     activeRouteKey: string;
     activeRouteScope: ProviderRecoveryScope;
     originalTasks: ProviderRecoveryEntry['originalTasks'];
@@ -740,6 +762,14 @@ async function processQuery(
     prompt: ledgerCtx.originalTasks.map((t) => t.text).join('\n') || '(initial turn)',
     requiresUserVisibleReply: replyAccounting.initialRequiresUserVisibleReply,
     outboundVisibleReplyCountBefore: replyAccounting.outboundVisibleReplyCountBefore,
+    claims: [
+      {
+        claimToken: ledgerCtx.initialClaimToken,
+        messageIds: [...initialBatchIds],
+        prompt: ledgerCtx.originalTasks.map((t) => t.text).join('\n') || '(initial turn)',
+        state: 'queued',
+      },
+    ],
   });
 
   if (signal?.aborted) {
@@ -748,15 +778,18 @@ async function processQuery(
     signal?.addEventListener('abort', abortQuery, { once: true });
   }
 
-  function onInputAccepted(inputId: string): void {
+  function onInputAccepted(inputId: string, scope: 'initial' | 'followup'): void {
     const entry = ledger.get(inputId);
     if (!entry) return;
+    const claim = entry.claims.find((candidate) => candidate.state === 'queued');
+    if (!claim) return;
     // This synchronous host handshake blocks the event loop before any later
     // tool event can run. The host validates the exact inbound batch and only
     // then atomically publishes a read-only pointer visible to the GWS shim.
-    if (bindHostGwsCorrelation(inputId, ledgerCtx.activeRouteKey, entry.messageIds)) {
+    if (bindHostGwsCorrelation(inputId, ledgerCtx.activeRouteKey, claim.messageIds, claim.claimToken, scope)) {
       boundGwsInputs.add(inputId);
     }
+    claim.state = 'accepted';
     entry.state = 'accepted';
     // Legacy agent-writable correlation remains for non-GWS tools only.
     writeActiveInput(inputId, ledgerCtx.activeRouteKey);
@@ -801,9 +834,19 @@ async function processQuery(
       if (inputId === ledgerCtx.topLevelInputId) topLevelResolved = true;
       const entry = ledger.get(inputId);
       if (!entry || entry.state === 'resolved') continue;
-      entry.state = 'resolved';
-      idsToComplete.push(...entry.messageIds);
-      if (boundGwsInputs.delete(inputId)) releaseHostGwsCorrelation(inputId);
+      const acceptedClaims = entry.claims.filter((claim) => claim.state === 'accepted');
+      if (acceptedClaims.length === 0) continue;
+      for (const claim of acceptedClaims) {
+        claim.state = 'resolved';
+        idsToComplete.push(...claim.messageIds);
+      }
+      entry.state = entry.claims.every((claim) => claim.state === 'resolved') ? 'resolved' : 'queued';
+      if (
+        !entry.claims.some((claim) => claim.state === 'queued' || claim.state === 'accepted') &&
+        boundGwsInputs.delete(inputId)
+      ) {
+        releaseHostGwsCorrelation(inputId);
+      }
     }
     // A successful result that resolves the top-level input also resolves the
     // recovery entries this turn resumed (and completes their owned recovery rows).
@@ -890,12 +933,51 @@ async function processQuery(
 
     const newIds = newMessages.map((m) => m.id);
     const followupTrigger = newMessages.filter((message) => message.trigger === 1).at(-1);
-    const followupInputId =
-      followupTrigger?.host_input_id && followupTrigger.host_route_key === ledgerCtx.activeRouteKey
-        ? followupTrigger.host_input_id
-        : generateInputId('followup');
+    let followupInputId: string;
+    let entry: InputLedgerEntry;
+    if (followupTrigger) {
+      if (
+        !followupTrigger.host_input_id ||
+        followupTrigger.host_route_key !== ledgerCtx.activeRouteKey ||
+        typeof followupTrigger.host_received_at !== 'string' ||
+        !Number.isFinite(Date.parse(followupTrigger.host_received_at))
+      ) {
+        log(
+          JSON.stringify({
+            severity: 'warn',
+            event: 'followup_missing_host_backed_trigger',
+            route_key: ledgerCtx.activeRouteKey,
+            message_ids: newIds,
+          }),
+        );
+        return;
+      }
+      followupInputId = followupTrigger.host_input_id;
+      if (ledger.has(followupInputId)) {
+        log(JSON.stringify({ severity: 'warn', event: 'duplicate_host_input_id', input_id: followupInputId }));
+        return;
+      }
+      entry = {
+        inputId: followupInputId,
+        messageIds: [],
+        state: 'queued',
+        scope: 'followup',
+        prompt: '',
+        requiresUserVisibleReply: requiresUserVisibleReply(newMessages),
+        outboundVisibleReplyCountBefore: countOutboundVisibleReplyMessages(routing),
+        claims: [],
+      };
+    } else {
+      // Accumulated context can only extend an input the provider already
+      // accepted; it never receives a synthetic/random correlation id.
+      const acceptedEntries = [...ledger.values()].filter((candidate) =>
+        candidate.claims.some((claim) => claim.state === 'accepted'),
+      );
+      entry = acceptedEntries.at(-1)!;
+      if (!entry) return;
+      followupInputId = entry.inputId;
+    }
     const outboundVisibleReplyCountBefore = countOutboundVisibleReplyMessages(routing);
-    markProcessing(newIds);
 
     const prompt = formatMessages(newMessages);
     const attachments = await collectQueryAttachments({
@@ -905,6 +987,13 @@ async function processQuery(
       log: logAttachmentEvent,
     });
     const followupDestination = findByRouting(routing.channelType, routing.platformId);
+    const claimToken = randomUUID();
+    const claim: InputClaimBatch = { claimToken, messageIds: newIds, prompt, state: 'queued' };
+    markProcessing(newIds, claimToken);
+    entry.claims.push(claim);
+    entry.messageIds.push(...newIds);
+    entry.prompt = [entry.prompt, newMessages.map(textOfMessage).join('\n')].filter(Boolean).join('\n');
+    if (!ledger.has(followupInputId)) ledger.set(followupInputId, entry);
 
     log(`Pushing ${newMessages.length} follow-up message(s) into active query (input ${followupInputId})`);
     try {
@@ -926,23 +1015,17 @@ async function processQuery(
           error: err instanceof Error ? err.message : String(err),
         }),
       );
-      // Enqueue failed — do NOT register a ledger entry (so terminal handling
-      // never returns it to pending) and leave the rows in 'processing'. The
-      // throwing-push contract keeps them retryable via host sweep / next wake.
+      entry.claims = entry.claims.filter((candidate) => candidate !== claim);
+      entry.messageIds = entry.messageIds.filter((id) => !newIds.includes(id));
+      if (entry.claims.length === 0) ledger.delete(followupInputId);
+      returnProcessingToPending(newIds, 'followup_enqueue_failed');
       return;
     }
-    // Registered only on a SUCCESSFUL push. The row is completed only when the
-    // provider resolves followupInputId via a result; if never accepted by the
-    // turn's end it is returned to pending.
-    ledger.set(followupInputId, {
-      inputId: followupInputId,
-      messageIds: newIds,
-      state: 'queued',
-      scope: 'followup',
-      prompt: newMessages.map(textOfMessage).join('\n'),
-      requiresUserVisibleReply: requiresUserVisibleReply(newMessages),
+    entry.requiresUserVisibleReply ||= requiresUserVisibleReply(newMessages);
+    entry.outboundVisibleReplyCountBefore = Math.min(
+      entry.outboundVisibleReplyCountBefore,
       outboundVisibleReplyCountBefore,
-    });
+    );
     if (isUserTriggered(newMessages)) turnUserTriggered = true;
   }
 
@@ -958,7 +1041,7 @@ async function processQuery(
         // next wake resume the conversation.
         setContinuation(providerName, event.continuation, config?.provider.continuationScope);
       } else if (event.type === 'input-accepted') {
-        onInputAccepted(event.inputId);
+        if (event.scope === 'initial' || event.scope === 'followup') onInputAccepted(event.inputId, event.scope);
       } else if (event.type === 'notice') {
         if (userStopRequested) {
           log(
@@ -1140,12 +1223,17 @@ async function processQuery(
     // Terminal handling for un-resolved ledger entries. User-requested stop is a
     // discard/complete path; ordinary terminal interruptions keep the existing
     // retry/recovery split (Invariants 160/161/162).
-    const acceptedUnresolved = [...ledger.values()].filter((e) => e.state === 'accepted');
+    const acceptedUnresolved = [...ledger.values()].filter((entry) =>
+      entry.claims.some((claim) => claim.state === 'accepted'),
+    );
     if (userStopRequested) {
       const idsToComplete: string[] = [];
       for (const entry of ledger.values()) {
-        if (entry.state !== 'queued' && entry.state !== 'accepted') continue;
-        idsToComplete.push(...entry.messageIds);
+        for (const claim of entry.claims) {
+          if (claim.state !== 'queued' && claim.state !== 'accepted') continue;
+          idsToComplete.push(...claim.messageIds);
+          claim.state = 'resolved';
+        }
         entry.state = 'resolved';
       }
       markCompleted(idsToComplete);
@@ -1175,8 +1263,14 @@ async function processQuery(
       const recoveryId = recoveryIdFor(scope.routeKey);
       const ownedIds: string[] = [];
       const acceptedUnresolvedInputs = acceptedUnresolved.map((e) => {
-        ownedIds.push(...e.messageIds);
-        return { inputId: e.inputId, messageIds: [...e.messageIds], prompt: e.prompt };
+        const acceptedClaims = e.claims.filter((claim) => claim.state === 'accepted');
+        const acceptedMessageIds = acceptedClaims.flatMap((claim) => claim.messageIds);
+        ownedIds.push(...acceptedMessageIds);
+        return {
+          inputId: e.inputId,
+          messageIds: acceptedMessageIds,
+          prompt: acceptedClaims.map((claim) => claim.prompt).join('\n'),
+        };
       });
       const entry: ProviderRecoveryEntry = {
         id: recoveryId,
@@ -1212,7 +1306,12 @@ async function processQuery(
           // alerted; host sweep is the backstop).
           writeMissingVisibleReplyError(routing, null, turnUserTriggered);
         } else {
-          for (const e of acceptedUnresolved) e.state = 'recovery_owned';
+          for (const e of acceptedUnresolved) {
+            for (const claim of e.claims) {
+              if (claim.state === 'accepted') claim.state = 'recovery_owned';
+            }
+            e.state = e.claims.some((claim) => claim.state === 'queued') ? 'queued' : 'recovery_owned';
+          }
         }
       } catch (recErr) {
         // Atomic transaction rolled back (no partial state). Surface a structured
@@ -1230,13 +1329,17 @@ async function processQuery(
     }
 
     for (const entry of ledger.values()) {
-      if (entry.state === 'queued') {
+      const queuedClaims = entry.claims.filter((claim) => claim.state === 'queued');
+      if (queuedClaims.length > 0) {
         // Never accepted by the provider before the turn ended → return to
         // pending so a later wake retries them (route-matched and other-route
         // rows alike are returned to pending; other-route rows were never
         // claimed here).
-        returnProcessingToPending(entry.messageIds, 'unaccepted_at_terminal');
-        entry.state = 'returned';
+        for (const claim of queuedClaims) {
+          returnProcessingToPending(claim.messageIds, 'unaccepted_at_terminal');
+          claim.state = 'returned';
+        }
+        if (entry.claims.every((claim) => claim.state === 'returned')) entry.state = 'returned';
       }
     }
     for (const inputId of boundGwsInputs) {

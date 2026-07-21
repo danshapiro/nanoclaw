@@ -3,6 +3,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './db/connection.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { getPendingMessages } from './db/messages-in.js';
+import { normalizeRoute } from './formatter.js';
 import { MockProvider } from './providers/mock.js';
 import { runPollLoop } from './poll-loop.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, QueryInput, QueryTurnInput } from './providers/types.js';
@@ -27,12 +28,25 @@ function insertMessage(
   content: object,
   opts?: { platformId?: string; channelType?: string; threadId?: string },
 ) {
+  const platformId = opts?.platformId ?? 'chan-1';
+  const channelType = opts?.channelType ?? 'discord';
+  const threadId = opts?.threadId ?? null;
+  const routeKey = normalizeRoute('mock', {
+    platformId,
+    channelType,
+    threadId,
+    messagingGroupId: null,
+    isGroup: null,
+  }).routeKey;
+  const receivedAt = new Date().toISOString();
   getInboundDb()
     .prepare(
-      `INSERT INTO messages_in (id, kind, timestamp, status, platform_id, channel_type, thread_id, content)
-       VALUES (?, 'chat', datetime('now'), 'pending', ?, ?, ?, ?)`,
+      `INSERT INTO messages_in
+         (id, kind, timestamp, status, platform_id, channel_type, thread_id, content,
+          host_input_id, host_route_key, host_received_at)
+       VALUES (?, 'chat', datetime('now'), 'pending', ?, ?, ?, ?, ?, ?, ?)`,
     )
-    .run(id, opts?.platformId ?? 'chan-1', opts?.channelType ?? 'discord', opts?.threadId ?? null, JSON.stringify(content));
+    .run(id, platformId, channelType, threadId, JSON.stringify(content), `in-${id}`, routeKey, receivedAt);
 }
 
 describe('poll loop integration', () => {

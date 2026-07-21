@@ -34,7 +34,12 @@ import {
 } from './container-runtime.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { resolveGwsSideEffectVerifyKey } from './gws-side-effect-key.js';
-import { clearAcceptedGwsCorrelation, hostGwsCorrelationIpcDir } from './gws-correlation-ipc.js';
+import {
+  clearAcceptedGwsCorrelation,
+  hostGwsCorrelationIpcDir,
+  registerGwsCorrelationLaunchLease,
+  unregisterGwsCorrelationLaunchLease,
+} from './gws-correlation-ipc.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable, isDbInitialized } from './db/connection.js';
 import { getSession } from './db/sessions.js';
@@ -324,7 +329,24 @@ async function spawnContainer(session: Session): Promise<void> {
   // immediate kill before the new container touches the file itself.
   fs.rmSync(heartbeatPath(agentGroup.id, session.id), { force: true });
 
-  const container = spawn(CONTAINER_RUNTIME_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  const launchControl = registerGwsCorrelationLaunchLease({
+    agentGroupId: agentGroup.id,
+    sessionId: session.id,
+    providerName: provider,
+    containerName,
+  });
+  let container: ChildProcess;
+  try {
+    container = spawn(CONTAINER_RUNTIME_BIN, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    if (!container.stdin) throw new Error('container runtime did not expose the launch-control stdin pipe');
+    container.stdin.end(`${JSON.stringify(launchControl)}\n`);
+  } catch (err) {
+    unregisterGwsCorrelationLaunchLease(agentGroup.id, session.id);
+    removeContainerEnvFile(envFilePath);
+    cleanupTempSkillRoot(managedSkillsRoot);
+    await stopAgentMcpBridges(bridges);
+    throw err;
+  }
 
   // `docker run` reads --env-file client-side at create time. Delete the file
   // at the earliest signal that create has completed: any container output,
@@ -361,11 +383,13 @@ async function spawnContainer(session: Session): Promise<void> {
   // on a wall-clock timer.
 
   container.on('close', (code) => {
+    unregisterGwsCorrelationLaunchLease(agentGroup.id, session.id);
     finalizeContainerProcess(session.id, containerName, code);
     cleanupTempSkillRoot(managedSkillsRoot);
   });
 
   container.on('error', (err) => {
+    unregisterGwsCorrelationLaunchLease(agentGroup.id, session.id);
     finalizeContainerProcess(session.id, containerName, null);
     cleanupTempSkillRoot(managedSkillsRoot);
     log.error('Container spawn error', { sessionId: session.id, err });
@@ -398,6 +422,7 @@ function finalizeContainerProcess(sessionId: string, containerName: string, code
       } catch (err) {
         log.error('Failed to clear host GWS correlation after container exit', { sessionId, err });
       }
+      unregisterGwsCorrelationLaunchLease(session.agent_group_id, session.id);
     }
   } else {
     log.warn('Container exited after DB shutdown; skipped session stopped marker', { sessionId, containerName });
@@ -1285,6 +1310,10 @@ async function buildContainerArgs(
     CONTAINER_INSTALL_LABEL,
     '--label',
     `${SESSION_CONTAINER_LABEL_KEY}=${sessionId}`,
+    '-i',
+    '--cap-drop=ALL',
+    '--security-opt=no-new-privileges',
+    '--ulimit=core=0',
   ];
 
   // Environment — only vars read by code we don't own.
@@ -1355,7 +1384,7 @@ async function buildContainerArgs(
     }
   }
 
-  // Override entrypoint: run v2 entry point directly via Bun (no tsc, no stdin).
+  // Override entrypoint: run v2 entry point directly via Bun (no tsc).
   args.push('--entrypoint', 'bash');
 
   const image = await resolveAgentImageForRun({

@@ -1,14 +1,6 @@
 import { describe, it, expect } from 'bun:test';
-import {
-  type AppServer,
-  type JsonRpcNotification,
-} from './codex-app-server.js';
-import {
-  buildCompactResultText,
-  COMPACT_RESULT_TEXT,
-  compactCodexThread,
-  isCompactCommand,
-} from './codex.js';
+import { type AppServer, type JsonRpcNotification } from './codex-app-server.js';
+import { buildCompactResultText, COMPACT_RESULT_TEXT, compactCodexThread, isCompactCommand } from './codex.js';
 import type { MessageInRow } from '../db/messages-in.js';
 
 function makeMessageRow(text: string): MessageInRow {
@@ -154,6 +146,7 @@ describe('compactCodexThread', () => {
     const events = await collectPromise;
     expect(events).toEqual([
       { type: 'activity' },
+      { type: 'input-accepted', inputId: 'input-xyz', scope: 'initial' },
       { type: 'progress', inputId: 'input-xyz', message: COMPACT_RESULT_TEXT },
       {
         type: 'result',
@@ -184,6 +177,7 @@ describe('compactCodexThread', () => {
     const events = await collectPromise;
     expect(events).toEqual([
       { type: 'activity' },
+      { type: 'input-accepted', inputId: 'input-xyz', scope: 'initial' },
       { type: 'progress', inputId: 'input-xyz', message: COMPACT_RESULT_TEXT },
       {
         type: 'result',
@@ -208,6 +202,7 @@ describe('compactCodexThread', () => {
     const events = await collectPromise;
     expect(events).toEqual([
       { type: 'activity' },
+      { type: 'input-accepted', inputId: 'input-uvw', scope: 'initial' },
       { type: 'progress', inputId: 'input-uvw', message: COMPACT_RESULT_TEXT },
       {
         type: 'result',

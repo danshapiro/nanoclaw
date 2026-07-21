@@ -27,6 +27,7 @@ import {
   effectiveCeilingMs,
   gwsDiscoveryScope,
   parseSqliteUtc,
+  recoverGwsClaimPartitions,
   recoverInterruptedTurn,
   resetStuckProcessingRows,
   writeHostInterruptedRecovery,
@@ -1047,6 +1048,106 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
       }).discovered,
     ).toBe(0);
     expect((outDb.prepare('SELECT COUNT(*) AS n FROM side_effect_ledger').get() as { n: number }).n).toBe(0);
+    inDb.close();
+    outDb.close();
+  });
+
+  it('recovers each exact accepted partition and returns coexisting unaccepted claims without aborting recovery', () => {
+    const { sessionPath, inPath, outPath } = setupSession();
+    const routeKey = 'opencode|discord|chan-1|dm:mg-1';
+    const key = generateKeyPairSync('ed25519');
+    const gwsPublicKey = key.publicKey.export({ format: 'pem', type: 'spki' }).toString();
+    const auditStore = path.join(tmpRoot, 'partitioned-gws-audit.jsonl');
+    writeAuditStore(auditStore, [
+      signedAuditEntry(key, {
+        auditId: 'partition-a-draft',
+        inputId: 'in-partition-a',
+        routeKey,
+        occurredAt: '2026-05-29T12:00:02.000Z',
+      }),
+    ]);
+
+    const inDb = new Database(inPath);
+    const insert = inDb.prepare(
+      `INSERT INTO messages_in
+         (id, timestamp, content, host_input_id, host_route_key, host_received_at,
+          host_accepted_input_id, host_accepted_route_key, host_accepted_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    insert.run(
+      'accepted-a',
+      '2026-05-29T12:00:00.000Z',
+      '{"text":"draft A"}',
+      'in-partition-a',
+      routeKey,
+      '2026-05-29T12:00:00.000Z',
+      'in-partition-a',
+      routeKey,
+      '2026-05-29T12:00:01.000Z',
+    );
+    insert.run(
+      'accepted-b',
+      '2026-05-29T12:01:00.000Z',
+      '{"text":"work B"}',
+      'in-partition-b',
+      routeKey,
+      '2026-05-29T12:01:00.000Z',
+      'in-partition-b',
+      routeKey,
+      '2026-05-29T12:01:01.000Z',
+    );
+    insert.run(
+      'queued-unaccepted',
+      '2026-05-29T12:02:00.000Z',
+      '{"text":"not accepted yet"}',
+      'in-queued',
+      routeKey,
+      '2026-05-29T12:02:00.000Z',
+      null,
+      null,
+      null,
+    );
+    const outDb = new Database(outPath);
+    const claim = outDb.prepare('INSERT INTO processing_ack (message_id, status, status_changed) VALUES (?, ?, ?)');
+    claim.run('accepted-a', 'processing', '2026-05-29 12:00:01');
+    claim.run('accepted-b', 'processing', '2026-05-29 12:01:01');
+    claim.run('queued-unaccepted', 'processing', '2026-05-29 12:02:01');
+
+    const result = recoverGwsClaimPartitions({
+      sessionDir: sessionPath,
+      inDb,
+      outDb,
+      reason: 'claim-stuck',
+      containerStopped: true,
+      stoppedAt: '2026-05-29T12:03:00.000Z',
+      auditStorePath: auditStore,
+      gwsPublicKey,
+    });
+
+    expect(result.recoveryIds).toHaveLength(2);
+    expect(result.returnedUnacceptedClaimIds).toEqual(['queued-unaccepted']);
+    expect(
+      outDb.prepare("SELECT message_id FROM processing_ack WHERE status = 'processing' ORDER BY message_id").all(),
+    ).toEqual([{ message_id: 'accepted-a' }, { message_id: 'accepted-b' }]);
+    const state = outDb
+      .prepare('SELECT value FROM session_state WHERE key = ?')
+      .get(`recovery:opencode:${routeKey}`) as {
+      value: string;
+    };
+    const recoveries = JSON.parse(state.value) as Array<{
+      acceptedUnresolvedInputs: Array<{ inputId: string }>;
+      sideEffects: Array<{ inputId: string }>;
+    }>;
+    expect(recoveries.map((entry) => entry.acceptedUnresolvedInputs[0].inputId).sort()).toEqual([
+      'in-partition-a',
+      'in-partition-b',
+    ]);
+    expect(
+      recoveries.find((entry) => entry.acceptedUnresolvedInputs[0].inputId === 'in-partition-a')?.sideEffects,
+    ).toHaveLength(1);
+    expect(
+      recoveries.find((entry) => entry.acceptedUnresolvedInputs[0].inputId === 'in-partition-b')?.sideEffects,
+    ).toHaveLength(0);
     inDb.close();
     outDb.close();
   });

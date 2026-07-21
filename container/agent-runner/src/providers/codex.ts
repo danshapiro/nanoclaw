@@ -137,10 +137,7 @@ export function isCompactCommand(messages: MessageInRow[] | undefined): boolean 
   const [msg] = messages;
   if (msg.kind !== 'chat' && msg.kind !== 'chat-sdk') return false;
   const info = categorizeMessage(msg);
-  return (
-    info.command === COMPACT_COMMAND_TEXT &&
-    info.text.trim().toLowerCase() === COMPACT_COMMAND_TEXT
-  );
+  return info.command === COMPACT_COMMAND_TEXT && info.text.trim().toLowerCase() === COMPACT_COMMAND_TEXT;
 }
 
 /** @internal exported for unit tests */
@@ -258,11 +255,7 @@ export function syncCodexManagedSkillLinks(
 export function buildNanoclawSkillInventoryInstructions(skillsRoot = NANOCLAW_SKILLS_ROOT): string | undefined {
   const names = listNanoclawSkillNames(skillsRoot);
   if (names.length === 0) return undefined;
-  return [
-    '## NanoClaw deployed skill inventory',
-    '',
-    `Available NanoClaw skills: ${names.join(', ')}`,
-  ].join('\n');
+  return ['## NanoClaw deployed skill inventory', '', `Available NanoClaw skills: ${names.join(', ')}`].join('\n');
 }
 
 function composeBaseInstructions(promptAddendum: string | undefined): string | undefined {
@@ -393,16 +386,10 @@ export class CodexProvider implements AgentProvider {
             visibleDestinationName = turn.visibleDestinationName;
           }
 
-          // The turn is now committed — emit input-accepted once so the poll-loop
-          // can correlate this input (mirrors opencode-container.ts:877-881). Scope
-          // mirrors OpenCode: relay turns are 'relay'; the first normal turn is
-          // 'initial'; subsequent normal turns are 'followup'.
+          // Acceptance is emitted inside the provider operation, only after
+          // turn/start (or thread/compact/start) succeeds.
           const scope: ProviderInputScope = relay ? 'relay' : turnIndex === 0 ? 'initial' : 'followup';
           turnIndex += 1;
-
-          if (turnInputId) {
-            yield { type: 'input-accepted', inputId: turnInputId, scope };
-          }
 
           // Intercept the admin slash command `/compact` for non-Claude providers.
           // Codex exposes native context compaction via `thread/compact/start`, so we
@@ -412,7 +399,7 @@ export class CodexProvider implements AgentProvider {
           if (scope !== 'relay' && isCompactCommand(turn.messages)) {
             let compactFulfilled = false;
             try {
-              yield* compactCodexThread(server, threadId!, turnInputId, visibleDestinationName, REAL_CLOCK);
+              yield* compactCodexThread(server, threadId!, turnInputId, visibleDestinationName, REAL_CLOCK, scope);
               compactFulfilled = true;
             } catch (err) {
               warnStructured('codex_compact_failed', {
@@ -439,7 +426,7 @@ export class CodexProvider implements AgentProvider {
             () => {
               initYielded = true;
             },
-            { abortSignal },
+            { abortSignal, acceptanceScope: scope },
           );
           // A terminal interruption (timeout / turn failure) ENDS the whole
           // query stream — mirrors opencode-container.ts:1238-1240. Without this
@@ -497,6 +484,7 @@ export async function* runOneTurn(
     startTurn?: typeof startCodexTurn;
     interruptTurn?: typeof interruptCodexTurn;
     abortSignal?: CodexAbortSignal;
+    acceptanceScope?: ProviderInputScope;
   } = {},
 ): AsyncGenerator<ProviderEvent, boolean> {
   const runDeps = {
@@ -577,10 +565,10 @@ export async function* runOneTurn(
       turnState.error = new Error(`Turn ${terminalTimeout}-timeout after ${d.liveness.elapsedMs}ms`);
       turnDone = true;
       kick();
-      return;   // terminal: do NOT re-arm (armWake would no-op anyway, but be explicit)
+      return; // terminal: do NOT re-arm (armWake would no-op anyway, but be explicit)
     }
     if (d.kind === 'inactivity-notice') {
-      buffer.push(buildInactivityNotice(inputId ?? '', d.liveness));   // Behavior 1 (Task B4 enables consumption)
+      buffer.push(buildInactivityNotice(inputId ?? '', d.liveness)); // Behavior 1 (Task B4 enables consumption)
     }
     armWake();
     kick();
@@ -595,7 +583,8 @@ export async function* runOneTurn(
     // idle timer — yield before any event-specific translation so even
     // long tool executions keep the loop awake.
     buffer.push({ type: 'activity' });
-    const meaningful = method === 'item/agentMessage/delta' || method === 'item/completed' || method === 'turn/completed';
+    const meaningful =
+      method === 'item/agentMessage/delta' || method === 'item/completed' || method === 'turn/completed';
     timers.onActivity(method ?? 'activity', meaningful);
     armWake();
 
@@ -640,10 +629,15 @@ export async function* runOneTurn(
         if (foreignThread) break;
         const item = params.item as { type?: string; text?: string } | undefined;
         if (item?.type === 'agentMessage' && item.text) resultText = item.text;
-        const se = dedupeCodexSideEffect(item as { id?: string; type?: string }, inputId ?? '', Date.now(), emittedSideEffectIds);
+        const se = dedupeCodexSideEffect(
+          item as { id?: string; type?: string },
+          inputId ?? '',
+          Date.now(),
+          emittedSideEffectIds,
+        );
         if (se) {
           collectedSideEffects.push(se);
-          buffer.push({ type: 'side-effect', sideEffect: se });   // emitted to the poll loop
+          buffer.push({ type: 'side-effect', sideEffect: se }); // emitted to the poll loop
         }
         break;
       }
@@ -711,6 +705,9 @@ export async function* runOneTurn(
     }
 
     await runDeps.startTurn(server, { threadId, inputText, model, cwd });
+    if (turnInputId) {
+      yield { type: 'input-accepted', inputId: turnInputId, scope: deps.acceptanceScope ?? 'initial' };
+    }
 
     while (true) {
       while (buffer.length > 0) {
@@ -742,9 +739,12 @@ export async function* runOneTurn(
     }
 
     if (turnState.error) {
-      const classification = terminalTimeout === 'transport' ? 'codex_transport_timeout'
-        : terminalTimeout === 'absolute' ? 'codex_absolute_timeout'
-        : 'codex_turn_failed';
+      const classification =
+        terminalTimeout === 'transport'
+          ? 'codex_transport_timeout'
+          : terminalTimeout === 'absolute'
+            ? 'codex_absolute_timeout'
+            : 'codex_turn_failed';
       yield {
         type: 'interruption',
         inputId: inputId ?? '',
@@ -752,7 +752,7 @@ export async function* runOneTurn(
         severity: 'error',
         terminal: true,
         agentMessage: terminalTimeout
-          ? "I ran out of time on this turn before finishing."
+          ? 'I ran out of time on this turn before finishing.'
           : 'The Codex turn failed before completing.',
         fallbackUserMessage: terminalTimeout
           ? "That took longer than I'm allowed for one turn. Please ask me to continue."
@@ -795,23 +795,17 @@ export async function* compactCodexThread(
   inputId: string | undefined,
   destinationName: string | undefined,
   clock: CodexTimingClock,
+  acceptanceScope: ProviderInputScope = 'initial',
 ): AsyncGenerator<ProviderEvent> {
   yield { type: 'activity' };
   const startedAt = clock.now();
-  const resp = await sendCodexRequest(
-    server,
-    'thread/compact/start',
-    { threadId },
-    COMPACT_REQUEST_TIMEOUT_MS,
-  );
+  const resp = await sendCodexRequest(server, 'thread/compact/start', { threadId }, COMPACT_REQUEST_TIMEOUT_MS);
   if (resp.error) {
     throw new Error(`thread/compact/start failed: ${resp.error.message}`);
   }
+  if (inputId) yield { type: 'input-accepted', inputId, scope: acceptanceScope };
 
-  const remainingNotificationMs = Math.max(
-    0,
-    COMPACT_NOTIFICATION_TIMEOUT_MS - (clock.now() - startedAt),
-  );
+  const remainingNotificationMs = Math.max(0, COMPACT_NOTIFICATION_TIMEOUT_MS - (clock.now() - startedAt));
   // Wait for the canonical v2 compaction signal. If it never arrives we throw
   // so the outer loop can fall back to a normal model turn instead of falsely
   // claiming the context was compacted.

@@ -48,6 +48,7 @@ import {
   retryWithBackoff,
   syncProcessingAcks,
   type ContainerState,
+  type ProcessingClaim,
 } from './db/session-db.js';
 import { log } from './log.js';
 import { resolveGwsSideEffectVerifyKey } from './gws-side-effect-key.js';
@@ -636,54 +637,84 @@ export function gwsDiscoveryScope(
   outDb: Database.Database,
   stoppedAt = new Date().toISOString(),
 ): { inputId?: string; routeKey?: string; notBefore?: string; notAfter?: string } {
-  const scope: { inputId?: string; routeKey?: string; notBefore?: string; notAfter?: string } = {};
-  try {
-    const stoppedMs = Date.parse(stoppedAt);
-    if (!Number.isFinite(stoppedMs)) return {};
-    const claims = getProcessingClaims(outDb);
-    if (claims.length === 0) return scope;
-    const lookup = inDb.prepare(
-      `SELECT host_accepted_input_id, host_accepted_route_key, host_accepted_at, host_acceptance_ended_at
-         FROM messages_in WHERE id = ?`,
-    );
-    let acceptedMs: number | undefined;
-    let inputId: string | undefined;
-    let routeKey: string | undefined;
-    let upperMs = stoppedMs;
-    for (const claim of claims) {
-      const row = lookup.get(claim.message_id) as
-        | {
-            host_accepted_input_id: string | null;
-            host_accepted_route_key: string | null;
-            host_accepted_at: string | null;
-            host_acceptance_ended_at: string | null;
-          }
-        | undefined;
-      if (!row?.host_accepted_input_id || !row.host_accepted_route_key || !row.host_accepted_at) return {};
-      const rowAcceptedMs = Date.parse(row.host_accepted_at);
-      if (!Number.isFinite(rowAcceptedMs)) return {};
-      if (inputId && row.host_accepted_input_id !== inputId) return {};
-      if (routeKey && row.host_accepted_route_key !== routeKey) return {};
-      if (acceptedMs !== undefined && rowAcceptedMs !== acceptedMs) return {};
-      inputId = row.host_accepted_input_id;
-      routeKey = row.host_accepted_route_key;
-      acceptedMs = rowAcceptedMs;
-      if (row.host_acceptance_ended_at) {
-        const endedMs = Date.parse(row.host_acceptance_ended_at);
-        if (!Number.isFinite(endedMs)) return {};
-        upperMs = Math.min(upperMs, endedMs);
-      }
-    }
-    if (!inputId || !routeKey || acceptedMs === undefined || upperMs < acceptedMs) return {};
-    scope.inputId = inputId;
-    scope.routeKey = routeKey;
-    scope.notBefore = new Date(acceptedMs).toISOString();
-    scope.notAfter = new Date(upperMs).toISOString();
-  } catch {
-    return {};
-  }
+  const plan = partitionGwsClaims(inDb, outDb, stoppedAt);
+  if (plan.unacceptedClaimIds.length > 0 || plan.partitions.length !== 1) return {};
+  return plan.partitions[0].scope;
+}
 
-  return scope;
+interface ExactGwsClaimPartition {
+  scope: { inputId: string; routeKey: string; notBefore: string; notAfter: string };
+  claims: ProcessingClaim[];
+}
+
+function partitionGwsClaims(
+  inDb: Database.Database,
+  outDb: Database.Database,
+  stoppedAt: string,
+): { partitions: ExactGwsClaimPartition[]; unacceptedClaimIds: string[] } {
+  const stoppedMs = Date.parse(stoppedAt);
+  if (!Number.isFinite(stoppedMs))
+    return { partitions: [], unacceptedClaimIds: getProcessingClaims(outDb).map((c) => c.message_id) };
+  const lookup = inDb.prepare(
+    `SELECT host_accepted_input_id, host_accepted_route_key, host_accepted_at, host_acceptance_ended_at
+       FROM messages_in WHERE id = ?`,
+  );
+  const grouped = new Map<
+    string,
+    { inputId: string; routeKey: string; acceptedAt: string; upperMs: number; claims: ProcessingClaim[] }
+  >();
+  const unacceptedClaimIds: string[] = [];
+  for (const claim of getProcessingClaims(outDb)) {
+    const row = lookup.get(claim.message_id) as
+      | {
+          host_accepted_input_id: string | null;
+          host_accepted_route_key: string | null;
+          host_accepted_at: string | null;
+          host_acceptance_ended_at: string | null;
+        }
+      | undefined;
+    const acceptedMs = row?.host_accepted_at ? Date.parse(row.host_accepted_at) : NaN;
+    if (!row?.host_accepted_input_id || !row.host_accepted_route_key || !Number.isFinite(acceptedMs)) {
+      unacceptedClaimIds.push(claim.message_id);
+      continue;
+    }
+    let upperMs = stoppedMs;
+    if (row.host_acceptance_ended_at) {
+      const endedMs = Date.parse(row.host_acceptance_ended_at);
+      if (!Number.isFinite(endedMs)) {
+        unacceptedClaimIds.push(claim.message_id);
+        continue;
+      }
+      upperMs = Math.min(upperMs, endedMs);
+    }
+    if (upperMs < acceptedMs) {
+      unacceptedClaimIds.push(claim.message_id);
+      continue;
+    }
+    const key = `${row.host_accepted_input_id}\0${row.host_accepted_route_key}\0${row.host_accepted_at}`;
+    const partition = grouped.get(key) ?? {
+      inputId: row.host_accepted_input_id,
+      routeKey: row.host_accepted_route_key,
+      acceptedAt: row.host_accepted_at!,
+      upperMs,
+      claims: [],
+    };
+    partition.upperMs = Math.min(partition.upperMs, upperMs);
+    partition.claims.push(claim);
+    grouped.set(key, partition);
+  }
+  return {
+    partitions: [...grouped.values()].map((partition) => ({
+      scope: {
+        inputId: partition.inputId,
+        routeKey: partition.routeKey,
+        notBefore: new Date(Date.parse(partition.acceptedAt)).toISOString(),
+        notAfter: new Date(partition.upperMs).toISOString(),
+      },
+      claims: partition.claims,
+    })),
+    unacceptedClaimIds: unacceptedClaimIds.sort(),
+  };
 }
 
 /**
@@ -702,8 +733,9 @@ export function discoverGwsCrashWindowDraftsScoped(opts: {
   auditStorePath: string | undefined;
   gwsPublicKey?: string;
   stoppedAt?: string;
+  scope?: { inputId: string; routeKey: string; notBefore: string; notAfter: string };
 }): ReturnType<typeof discoverGwsCrashWindowDrafts> {
-  const scope = gwsDiscoveryScope(opts.inDb, opts.outDb, opts.stoppedAt);
+  const scope = opts.scope ?? gwsDiscoveryScope(opts.inDb, opts.outDb, opts.stoppedAt);
   return discoverGwsCrashWindowDrafts({
     sessionDir: opts.sessionDir,
     containerStopped: opts.containerStopped,
@@ -733,10 +765,12 @@ export function writeHostInterruptedRecovery(opts: {
   outDb: Database.Database;
   reason: string;
   gwsPublicKey?: string;
+  scope?: { inputId: string; routeKey: string; notBefore: string; notAfter: string };
+  claims?: ProcessingClaim[];
 }): string | null {
-  const scope = gwsDiscoveryScope(opts.inDb, opts.outDb);
+  const scope = opts.scope ?? gwsDiscoveryScope(opts.inDb, opts.outDb);
   if (!scope.inputId || !scope.routeKey || !scope.notBefore || !scope.notAfter) return null;
-  const claims = getProcessingClaims(opts.outDb);
+  const claims = opts.claims ?? getProcessingClaims(opts.outDb);
   if (claims.length === 0) return null;
 
   const ids = claims.map((claim) => claim.message_id).sort();
@@ -804,6 +838,61 @@ export function writeHostInterruptedRecovery(opts: {
 }
 
 /**
+ * Recover every independently authenticated accepted claim partition. Claims
+ * that never crossed provider acceptance are returned to normal pending flow;
+ * one missing audit match never suppresses recovery for another partition.
+ */
+export function recoverGwsClaimPartitions(opts: {
+  sessionDir: string;
+  inDb: Database.Database;
+  outDb: Database.Database;
+  reason: string;
+  containerStopped: boolean;
+  stoppedAt?: string;
+  auditStorePath: string | undefined;
+  gwsPublicKey?: string;
+}): { recoveryIds: string[]; returnedUnacceptedClaimIds: string[] } {
+  const plan = partitionGwsClaims(opts.inDb, opts.outDb, opts.stoppedAt ?? new Date().toISOString());
+  if (plan.unacceptedClaimIds.length > 0) {
+    const remove = opts.outDb.prepare("DELETE FROM processing_ack WHERE message_id = ? AND status = 'processing'");
+    opts.outDb.transaction(() => {
+      for (const id of plan.unacceptedClaimIds) remove.run(id);
+    })();
+  }
+
+  const recoveryIds: string[] = [];
+  for (const partition of plan.partitions) {
+    try {
+      discoverGwsCrashWindowDraftsScoped({
+        sessionDir: opts.sessionDir,
+        inDb: opts.inDb,
+        outDb: opts.outDb,
+        containerStopped: opts.containerStopped,
+        auditStorePath: opts.auditStorePath,
+        gwsPublicKey: opts.gwsPublicKey,
+        scope: partition.scope,
+      });
+    } catch (err) {
+      log.warn('GWS partition crash-window discovery failed; preserving partition recovery', {
+        inputId: partition.scope.inputId,
+        routeKey: partition.scope.routeKey,
+        err,
+      });
+    }
+    const recoveryId = writeHostInterruptedRecovery({
+      inDb: opts.inDb,
+      outDb: opts.outDb,
+      reason: opts.reason,
+      gwsPublicKey: opts.gwsPublicKey,
+      scope: partition.scope,
+      claims: partition.claims,
+    });
+    if (recoveryId) recoveryIds.push(recoveryId);
+  }
+  return { recoveryIds, returnedUnacceptedClaimIds: plan.unacceptedClaimIds };
+}
+
+/**
  * Production wiring for recoverInterruptedTurn from the sweep loop. Reopens the
  * outbound DB writable only after a verified container stop, imports the host
  * session path for /workspace/side-effects.jsonl, writes recovery, then resets.
@@ -833,40 +922,22 @@ export async function recoverAfterKill(inDb: Database.Database, session: Session
         } catch (err) {
           log.warn('Side-effect import failed during recovery', { sessionId: session.id, err });
         }
-        // HOST-ONLY GWS audit-store crash-window discovery: detect a completed
-        // drafts.create whose JSONL append was lost to a kill-in-the-window so
-        // recovery does not duplicate the draft. Gated on GWS_AUDIT_STORE; unset
-        // ⇒ inactive (degrades to no-duplication-when-tool-survives).
-        //
-        // SCOPE the discovery to THIS turn — the audit store is a SHARED GLOBAL
-        // file across every session/route, so an unscoped read would import
-        // other conversations' drafts into this session's ledger. We pass the
-        // active turn's route (and inputId when known) plus a notBefore
-        // turn-start bound, computed while the interrupted processing claims are
-        // still present (recoverInterruptedTurn resets them only after this).
-        try {
-          discoverGwsCrashWindowDraftsScoped({
-            sessionDir: dir,
-            inDb,
-            outDb: writableOutDb,
-            containerStopped,
-            auditStorePath: process.env.GWS_AUDIT_STORE,
-            gwsPublicKey,
-          });
-        } catch (err) {
-          log.warn('GWS crash-window discovery failed during recovery', { sessionId: session.id, err });
-        }
       },
       writeRecovery: () => {
-        const recoveryId = writeHostInterruptedRecovery({
+        const recovered = recoverGwsClaimPartitions({
+          sessionDir: dir,
           inDb,
           outDb: writableOutDb,
           reason,
+          containerStopped: true,
+          auditStorePath: process.env.GWS_AUDIT_STORE,
           gwsPublicKey,
         });
-        if (!recoveryId) {
-          throw new Error(`recoverAfterKill: missing host-authenticated recovery scope for session ${session.id}`);
-        }
+        log.info('Partitioned interrupted claims before reset', {
+          sessionId: session.id,
+          recoveryCount: recovered.recoveryIds.length,
+          returnedUnacceptedCount: recovered.returnedUnacceptedClaimIds.length,
+        });
       },
       wakeContainer: async () => {
         shouldWake = true;

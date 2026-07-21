@@ -97,6 +97,32 @@ function findResult(events: ProviderEvent[]): ResultEvent | undefined {
 }
 
 describe('runOneTurn provider-error surfacing', () => {
+  it('does not emit input acceptance when turn/start rejects', async () => {
+    const { server } = makeFakeAppServer();
+    const seen: ProviderEvent[] = [];
+    const gen = runOneTurn(
+      server,
+      'thread-abc',
+      'do work',
+      'gpt-5.5',
+      '/workspace/agent',
+      'input-rejected',
+      () => true,
+      () => {},
+      {
+        startTurn: async () => {
+          throw new Error('turn/start rejected');
+        },
+      },
+    );
+    await expect(
+      (async () => {
+        for await (const event of gen) seen.push(event);
+      })(),
+    ).rejects.toThrow('turn/start rejected');
+    expect(seen.some((event) => event.type === 'input-accepted')).toBe(false);
+  });
+
   it('carries a top-level error notification verbatim on an empty turn', async () => {
     const { server, dispatchNotification } = makeFakeAppServer();
     const { started, events } = startFakeTurn(server);
@@ -176,7 +202,10 @@ describe('runOneTurn provider-error surfacing', () => {
     const { started, events } = startFakeTurn(server);
     await started;
     dispatchNotification('error', { error: { message: 'transient quota blip' } });
-    dispatchNotification('item/completed', { threadId: 'thread-abc', item: { type: 'agentMessage', text: 'recovered answer' } });
+    dispatchNotification('item/completed', {
+      threadId: 'thread-abc',
+      item: { type: 'agentMessage', text: 'recovered answer' },
+    });
     dispatchNotification('turn/completed', { threadId: 'thread-abc', turn: { status: 'completed' } });
     const result = findResult(await withTimeout(events, 'error-then-text turn'));
     expect(result?.text).toBe('recovered answer');

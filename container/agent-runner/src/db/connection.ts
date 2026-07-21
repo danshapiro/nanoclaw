@@ -100,7 +100,8 @@ export function ensureOutboundSchema(db: Database): void {
       message_id     TEXT PRIMARY KEY,
       status         TEXT NOT NULL,
       status_changed TEXT NOT NULL,
-      notice_message_out_id TEXT
+      notice_message_out_id TEXT,
+      claim_token TEXT
     );
   `);
   // Lightweight forward-compat: session_state was added after the initial
@@ -198,6 +199,9 @@ function ensureOutboundRouteColumns(db: Database): void {
   );
   if (!ackCols.has('notice_message_out_id')) {
     db.exec('ALTER TABLE processing_ack ADD COLUMN notice_message_out_id TEXT');
+  }
+  if (!ackCols.has('claim_token')) {
+    db.exec('ALTER TABLE processing_ack ADD COLUMN claim_token TEXT');
   }
 }
 
@@ -318,6 +322,16 @@ export function initTestSessionDb(): { inbound: Database; outbound: Database } {
       thread_id      TEXT,
       messaging_group_id TEXT,
       is_group       INTEGER,
+      host_input_id  TEXT,
+      host_route_key TEXT,
+      host_received_at TEXT,
+      host_accepted_input_id TEXT,
+      host_accepted_route_key TEXT,
+      host_accepted_at TEXT,
+      host_acceptance_ended_at TEXT,
+      host_acceptance_claim_token TEXT,
+      host_acceptance_lease_id TEXT,
+      host_acceptance_sequence INTEGER,
       content        TEXT NOT NULL
     );
     CREATE TABLE delivered (
@@ -360,7 +374,8 @@ export function initTestSessionDb(): { inbound: Database; outbound: Database } {
       message_id     TEXT PRIMARY KEY,
       status         TEXT NOT NULL,
       status_changed TEXT NOT NULL,
-      notice_message_out_id TEXT
+      notice_message_out_id TEXT,
+      claim_token TEXT
     );
     CREATE TABLE session_state (
       key        TEXT PRIMARY KEY,

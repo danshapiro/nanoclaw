@@ -67,6 +67,9 @@ export function migrateOutboundRouteColumns(db: Database.Database): void {
   if (!ackCols.has('notice_message_out_id')) {
     db.prepare('ALTER TABLE processing_ack ADD COLUMN notice_message_out_id TEXT').run();
   }
+  if (!ackCols.has('claim_token')) {
+    db.prepare('ALTER TABLE processing_ack ADD COLUMN claim_token TEXT').run();
+  }
   db.exec(`
     CREATE TABLE IF NOT EXISTS side_effect_ledger (
       id              TEXT PRIMARY KEY,
@@ -978,5 +981,14 @@ export function migrateMessagesInTable(db: Database.Database): void {
   }
   if (!cols.has('host_acceptance_ended_at')) {
     db.prepare('ALTER TABLE messages_in ADD COLUMN host_acceptance_ended_at TEXT').run();
+  }
+  if (!cols.has('host_acceptance_claim_token')) {
+    db.prepare('ALTER TABLE messages_in ADD COLUMN host_acceptance_claim_token TEXT').run();
+  }
+  if (!cols.has('host_acceptance_lease_id')) {
+    db.prepare('ALTER TABLE messages_in ADD COLUMN host_acceptance_lease_id TEXT').run();
+  }
+  if (!cols.has('host_acceptance_sequence')) {
+    db.prepare('ALTER TABLE messages_in ADD COLUMN host_acceptance_sequence INTEGER').run();
   }
 }

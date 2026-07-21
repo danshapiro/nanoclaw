@@ -12,10 +12,7 @@ import type { ProviderEvent } from './types.js';
  * works, which is why Task 1 asserts the event contract on Mock and Claude
  * only.
  */
-async function nextEvent(
-  iter: AsyncIterator<ProviderEvent>,
-  type: ProviderEvent['type'],
-): Promise<ProviderEvent> {
+async function nextEvent(iter: AsyncIterator<ProviderEvent>, type: ProviderEvent['type']): Promise<ProviderEvent> {
   for (;;) {
     const { value, done } = await iter.next();
     if (done) throw new Error(`stream ended before a '${type}' event`);
@@ -80,6 +77,20 @@ describe('provider input-accepted/result contract', () => {
     const accepted = await nextEvent(iter, 'input-accepted');
     expect(accepted).toMatchObject({ type: 'input-accepted', inputId: 'claude-initial', scope: 'initial' });
     query.end();
+  });
+
+  it('claude does not emit input acceptance when the SDK never consumes the queued prompt', async () => {
+    mock.module('@anthropic-ai/claude-agent-sdk', () => ({
+      query: () =>
+        (async function* () {
+          return;
+        })(),
+    }));
+    const { ClaudeProvider } = await import('./claude.js');
+    const query = new ClaudeProvider().query({ inputId: 'claude-unconsumed', prompt: 'hello', cwd: '/tmp' });
+    const events: ProviderEvent[] = [];
+    for await (const event of query.events) events.push(event);
+    expect(events.some((event) => event.type === 'input-accepted')).toBe(false);
   });
 
   it('claude provider translates compact boundaries as progress without resolving input', async () => {

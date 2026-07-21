@@ -2,7 +2,8 @@
  * NanoClaw Agent Runner v2
  *
  * Runs inside a container. All IO goes through the session DB.
- * No stdin, no stdout markers, no IPC files.
+ * Host launch control is consumed once from stdin before provider code loads;
+ * all normal IO then goes through the session DB and authenticated host IPC.
  *
  * Config is read from /workspace/agent/container.json (mounted RO).
  * Only TZ and OneCLI networking vars come from env.
@@ -28,11 +29,10 @@ import { fileURLToPath } from 'url';
 import { loadConfig } from './config.js';
 import { clearStaleContainerToolState } from './db/connection.js';
 import { buildSystemPromptAddendum } from './destinations.js';
-// Providers barrel — each enabled provider self-registers on import.
-// Provider skills append imports to providers/index.ts.
-import './providers/index.js';
 import { createProvider, type ProviderName } from './providers/factory.js';
+import { consumeGwsCorrelationLaunchControlFromStdin } from './gws-correlation.js';
 import { runPollLoop } from './poll-loop.js';
+import { makeRunnerProcessNonDumpable } from './process-isolation.js';
 import { ensureAgentRunnerPath, suppressUndiciProxyWarning } from './runtime-path.js';
 
 function log(msg: string): void {
@@ -42,6 +42,11 @@ function log(msg: string): void {
 const CWD = '/workspace/agent';
 
 async function main(): Promise<void> {
+  // Fail closed before consuming the one-shot secret or loading provider code.
+  makeRunnerProcessNonDumpable();
+  consumeGwsCorrelationLaunchControlFromStdin();
+  // Providers barrel — each enabled provider self-registers on import.
+  await import('./providers/index.js');
   ensureAgentRunnerPath();
   // Node CLIs spawned below inherit process.env (see createProvider's env
   // spread); suppress the per-spawn UNDICI-EHPA experimental-warning noise.

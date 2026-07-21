@@ -316,6 +316,9 @@ CREATE TABLE IF NOT EXISTS messages_in (
   host_accepted_route_key TEXT,
   host_accepted_at TEXT,
   host_acceptance_ended_at TEXT,
+  host_acceptance_claim_token TEXT,
+  host_acceptance_lease_id TEXT,
+  host_acceptance_sequence INTEGER,
   content        TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_in_series ON messages_in(series_id);
@@ -391,7 +394,8 @@ CREATE TABLE IF NOT EXISTS processing_ack (
   message_id     TEXT PRIMARY KEY,
   status         TEXT NOT NULL,
   status_changed TEXT NOT NULL,
-  notice_message_out_id TEXT
+  notice_message_out_id TEXT,
+  claim_token TEXT
 );
 
 -- Validated, imported side effects (idempotency key = id = the proxy audit_id
