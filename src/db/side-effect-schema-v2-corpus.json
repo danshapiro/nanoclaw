@@ -1,0 +1,48 @@
+{
+  "payload": {
+    "schema_version": 2,
+    "audit_id": "audit-golden-1",
+    "profile": "nanoclaw",
+    "account_label": "personal",
+    "account_email": "dan@danshapiro.com",
+    "input_id": "input-golden-1",
+    "route_key": "opencode|discord|chan-1|dm:mg-1",
+    "service": "gmail",
+    "method": "users.drafts.create",
+    "request_class": "api",
+    "api_effect": true,
+    "operation_succeeded": true,
+    "occurred_at": "2026-07-20T12:34:56.789Z",
+    "result_digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  },
+  "canonical": "{\"schema_version\":2,\"audit_id\":\"audit-golden-1\",\"profile\":\"nanoclaw\",\"account_label\":\"personal\",\"account_email\":\"dan@danshapiro.com\",\"input_id\":\"input-golden-1\",\"route_key\":\"opencode|discord|chan-1|dm:mg-1\",\"service\":\"gmail\",\"method\":\"users.drafts.create\",\"request_class\":\"api\",\"api_effect\":true,\"operation_succeeded\":true,\"occurred_at\":\"2026-07-20T12:34:56.789Z\",\"result_digest\":\"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\"}",
+  "seed_base64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+  "adversarial": [
+    { "field": "audit_id", "value": "audit-substituted" },
+    { "field": "account_label", "value": "glowforge" },
+    { "field": "account_email", "value": "dan@glowforge.com" },
+    { "field": "service", "value": "drive" },
+    { "field": "method", "value": "files.create" },
+    { "field": "request_class", "value": "help" },
+    { "field": "api_effect", "value": false },
+    { "field": "operation_succeeded", "value": false },
+    { "field": "occurred_at", "value": "2026-07-20T12:34:57.789Z" },
+    { "field": "result_digest", "value": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" }
+  ],
+  "non_gmail_payload": {
+    "schema_version": 2,
+    "audit_id": "audit-drive-1",
+    "profile": "nanoclaw",
+    "account_label": "glowforge",
+    "account_email": "dan@glowforge.com",
+    "input_id": "input-drive-1",
+    "route_key": "opencode|discord|chan-2|dm:mg-2",
+    "service": "drive",
+    "method": "files.create",
+    "request_class": "api",
+    "api_effect": true,
+    "operation_succeeded": true,
+    "occurred_at": "2026-07-20T12:35:56.789Z",
+    "result_digest": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+  }
+}

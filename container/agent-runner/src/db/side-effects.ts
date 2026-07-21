@@ -79,8 +79,10 @@ export function importSideEffectLedger(opts: ImportLedgerOptions = {}): ImportLe
   const existsStmt = db.prepare('SELECT 1 AS ok FROM side_effect_ledger WHERE id = $id');
   const insertStmt = db.prepare(
     `INSERT INTO side_effect_ledger
-       (id, source, kind, operation, input_id, route_key, evidence_json, validation_json, replay_policy, occurred_at, imported_at)
-     VALUES ($id, $source, $kind, $operation, $input_id, $route_key, $evidence_json, $validation_json, $replay_policy, $occurred_at, $imported_at)`,
+       (id, source, kind, operation, payload_schema_version, account_label, account_email, input_id, route_key,
+        signed_payload, signature, evidence_json, validation_json, replay_policy, occurred_at, imported_at)
+     VALUES ($id, $source, $kind, $operation, $payload_schema_version, $account_label, $account_email, $input_id, $route_key,
+        $signed_payload, $signature, $evidence_json, $validation_json, $replay_policy, $occurred_at, $imported_at)`,
   );
   const now = new Date().toISOString();
   db.transaction(() => {
@@ -103,8 +105,13 @@ export function importSideEffectLedger(opts: ImportLedgerOptions = {}): ImportLe
         $source: validated.source,
         $kind: validated.kind,
         $operation: validated.operation,
+        $payload_schema_version: validated.payloadSchemaVersion,
+        $account_label: validated.accountLabel,
+        $account_email: validated.accountEmail,
         $input_id: validated.inputId,
         $route_key: validated.routeKey,
+        $signed_payload: validated.signedPayload,
+        $signature: validated.signature,
         $evidence_json: JSON.stringify(validated.evidence),
         $validation_json: JSON.stringify(validated.validation),
         $replay_policy: validated.replayPolicy,
@@ -123,8 +130,13 @@ interface LedgerRow {
   source: string;
   kind: string;
   operation: string | null;
+  payload_schema_version: number;
+  account_label: string | null;
+  account_email: string | null;
   input_id: string | null;
   route_key: string | null;
+  signed_payload: string | null;
+  signature: string | null;
   evidence_json: string;
   validation_json: string;
   occurred_at: string | null;
@@ -138,7 +150,7 @@ function rowToProviderSideEffect(row: LedgerRow): ProviderSideEffect {
     evidence = {};
   }
   const kind = (
-    ['gmail_draft_created', 'summarize_dnd_recording_cached', 'summarize_dnd_summary_artifact', 'tool_completed'].includes(
+    ['gmail_draft_created', 'gws_mutation_completed', 'summarize_dnd_recording_cached', 'summarize_dnd_summary_artifact', 'tool_completed'].includes(
       row.kind,
     )
       ? row.kind
@@ -148,7 +160,13 @@ function rowToProviderSideEffect(row: LedgerRow): ProviderSideEffect {
     id: row.id,
     inputId: row.input_id ?? '',
     kind,
-    label: row.operation ?? row.kind,
+    label:
+      row.source === 'gws' && row.payload_schema_version !== 2
+        ? 'legacy account unknown; do not recreate automatically; reconcile'
+        : row.operation ?? row.kind,
+    payloadSchemaVersion: row.payload_schema_version,
+    accountLabel: row.payload_schema_version === 2 ? row.account_label : null,
+    accountEmail: row.payload_schema_version === 2 ? row.account_email : null,
     evidence,
     occurredAt: row.occurred_at ?? '',
   };
@@ -170,6 +188,7 @@ function queryLedger(opts: { authoritativeOnly: boolean; routeKey?: string; inpu
     } catch {
       authoritative = false;
     }
+    if (row.source === 'gws' && row.payload_schema_version !== 2) authoritative = false;
     if (opts.authoritativeOnly && !authoritative) continue;
     if (!opts.authoritativeOnly && authoritative) continue; // hints = non-authoritative only
     out.push(rowToProviderSideEffect(row));

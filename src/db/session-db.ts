@@ -68,8 +68,13 @@ export function migrateOutboundRouteColumns(db: Database.Database): void {
       source          TEXT NOT NULL,
       kind            TEXT NOT NULL,
       operation       TEXT,
+      payload_schema_version INTEGER NOT NULL DEFAULT 1,
+      account_label   TEXT,
+      account_email   TEXT,
       input_id        TEXT,
       route_key       TEXT,
+      signed_payload  TEXT,
+      signature       TEXT,
       evidence_json   TEXT NOT NULL,
       validation_json TEXT NOT NULL,
       replay_policy   TEXT,
@@ -77,6 +82,20 @@ export function migrateOutboundRouteColumns(db: Database.Database): void {
       imported_at     TEXT NOT NULL
     );
   `);
+  const ledgerCols = new Set(
+    (db.prepare("PRAGMA table_info('side_effect_ledger')").all() as Array<{ name: string }>).map((c) => c.name),
+  );
+  if (!ledgerCols.has('payload_schema_version'))
+    db.prepare('ALTER TABLE side_effect_ledger ADD COLUMN payload_schema_version INTEGER NOT NULL DEFAULT 1').run();
+  if (!ledgerCols.has('account_label'))
+    db.prepare('ALTER TABLE side_effect_ledger ADD COLUMN account_label TEXT').run();
+  if (!ledgerCols.has('account_email'))
+    db.prepare('ALTER TABLE side_effect_ledger ADD COLUMN account_email TEXT').run();
+  if (!ledgerCols.has('input_id')) db.prepare('ALTER TABLE side_effect_ledger ADD COLUMN input_id TEXT').run();
+  if (!ledgerCols.has('route_key')) db.prepare('ALTER TABLE side_effect_ledger ADD COLUMN route_key TEXT').run();
+  if (!ledgerCols.has('signed_payload'))
+    db.prepare('ALTER TABLE side_effect_ledger ADD COLUMN signed_payload TEXT').run();
+  if (!ledgerCols.has('signature')) db.prepare('ALTER TABLE side_effect_ledger ADD COLUMN signature TEXT').run();
 }
 
 /**
@@ -399,8 +418,10 @@ export function importHostSideEffects(opts: {
     const existsStmt = db.prepare('SELECT 1 AS ok FROM side_effect_ledger WHERE id = ?');
     const insertStmt = db.prepare(
       `INSERT INTO side_effect_ledger
-         (id, source, kind, operation, input_id, route_key, evidence_json, validation_json, replay_policy, occurred_at, imported_at)
-       VALUES (@id, @source, @kind, @operation, @input_id, @route_key, @evidence_json, @validation_json, @replay_policy, @occurred_at, @imported_at)`,
+         (id, source, kind, operation, payload_schema_version, account_label, account_email, input_id, route_key,
+          signed_payload, signature, evidence_json, validation_json, replay_policy, occurred_at, imported_at)
+       VALUES (@id, @source, @kind, @operation, @payload_schema_version, @account_label, @account_email, @input_id, @route_key,
+          @signed_payload, @signature, @evidence_json, @validation_json, @replay_policy, @occurred_at, @imported_at)`,
     );
     const now = new Date().toISOString();
     db.transaction(() => {
@@ -423,8 +444,13 @@ export function importHostSideEffects(opts: {
           source: validated.source,
           kind: validated.kind,
           operation: validated.operation,
+          payload_schema_version: validated.payloadSchemaVersion,
+          account_label: validated.accountLabel,
+          account_email: validated.accountEmail,
           input_id: validated.inputId,
           route_key: validated.routeKey,
+          signed_payload: validated.signedPayload,
+          signature: validated.signature,
           evidence_json: JSON.stringify(validated.evidence),
           validation_json: JSON.stringify(validated.validation),
           replay_policy: validated.replayPolicy,
@@ -443,12 +469,18 @@ export function importHostSideEffects(opts: {
 
 /** One append-only entry the gws-proxy writes to GWS_AUDIT_STORE per call. */
 interface GwsAuditStoreEntry {
+  schema_version?: number;
   audit_id?: string;
+  profile?: string;
+  account_label?: string;
+  account_email?: string;
   input_id?: string;
   route_key?: string;
   service?: string;
   method?: string;
   occurred_at?: string;
+  payload?: string;
+  signature?: string;
 }
 
 export interface DiscoverCrashWindowResult {
@@ -469,7 +501,7 @@ export interface DiscoverCrashWindowResult {
  * correlated by `input_id`/`route_key`/time-window. This finds such an orphan
  * (a completed `drafts.create` whose `audit_id` is not already in the session's
  * `side_effect_ledger`) and records exactly one non-duplicate row so recovery
- * knows the draft already exists and does NOT re-create it.
+ * knows the exact signed mutation already completed and does NOT repeat it.
  *
  * Gating: `auditStorePath` unset ⇒ discovery is inactive and the no-duplication
  * guarantee degrades to "no duplication when the tool process survives to
@@ -484,6 +516,7 @@ export function discoverGwsCrashWindowDrafts(opts: {
   routeKey?: string;
   notBefore?: string;
   notAfter?: string;
+  gwsPublicKey?: string;
 }): DiscoverCrashWindowResult {
   if (opts.containerStopped !== true) {
     throw new Error(
@@ -499,7 +532,8 @@ export function discoverGwsCrashWindowDrafts(opts: {
   // Read the proxy's append-only audit store directly (read-only host access),
   // tolerant of malformed lines.
   const raw = fs.readFileSync(opts.auditStorePath, 'utf8');
-  const matches: GwsAuditStoreEntry[] = [];
+  const matches: Array<{ entry: GwsAuditStoreEntry; validated: NonNullable<ReturnType<typeof classifyAndSanitize>> }> =
+    [];
   for (const line of raw.split('\n')) {
     const trimmed = line.trim();
     if (!trimmed) continue;
@@ -509,14 +543,30 @@ export function discoverGwsCrashWindowDrafts(opts: {
     } catch {
       continue;
     }
-    if (e.service !== 'gmail') continue;
-    if (e.method !== 'users.drafts.create' && e.method !== 'drafts.create') continue;
-    if (opts.inputId && e.input_id !== opts.inputId) continue;
-    if (opts.routeKey && e.route_key !== opts.routeKey) continue;
-    if (opts.notBefore && e.occurred_at && e.occurred_at < opts.notBefore) continue;
-    if (opts.notAfter && e.occurred_at && e.occurred_at > opts.notAfter) continue;
     if (!e.audit_id) continue;
-    matches.push(e);
+    const validated = classifyAndSanitize(
+      {
+        kind: 'gws_mutation_completed',
+        payload_schema_version: e.schema_version,
+        audit_id: e.audit_id,
+        profile: e.profile,
+        account_label: e.account_label,
+        account_email: e.account_email,
+        input_id: e.input_id,
+        route_key: e.route_key,
+        operation: e.service && e.method ? `${e.service} ${e.method}` : undefined,
+        occurred_at: e.occurred_at,
+        payload: e.payload,
+        signature: e.signature,
+      },
+      { gwsPublicKey: opts.gwsPublicKey },
+    );
+    if (!validated?.validation.authoritative) continue;
+    if (opts.inputId && validated.inputId !== opts.inputId) continue;
+    if (opts.routeKey && validated.routeKey !== opts.routeKey) continue;
+    if (opts.notBefore && validated.occurredAt && validated.occurredAt < opts.notBefore) continue;
+    if (opts.notAfter && validated.occurredAt && validated.occurredAt > opts.notAfter) continue;
+    matches.push({ entry: e, validated });
   }
   if (matches.length === 0) return result;
 
@@ -526,29 +576,36 @@ export function discoverGwsCrashWindowDrafts(opts: {
     const existsStmt = db.prepare('SELECT 1 AS ok FROM side_effect_ledger WHERE id = ?');
     const insertStmt = db.prepare(
       `INSERT INTO side_effect_ledger
-         (id, source, kind, operation, input_id, route_key, evidence_json, validation_json, replay_policy, occurred_at, imported_at)
-       VALUES (@id, @source, @kind, @operation, @input_id, @route_key, @evidence_json, @validation_json, @replay_policy, @occurred_at, @imported_at)`,
+         (id, source, kind, operation, payload_schema_version, account_label, account_email, input_id, route_key,
+          signed_payload, signature, evidence_json, validation_json, replay_policy, occurred_at, imported_at)
+       VALUES (@id, @source, @kind, @operation, @payload_schema_version, @account_label, @account_email, @input_id, @route_key,
+          @signed_payload, @signature, @evidence_json, @validation_json, @replay_policy, @occurred_at, @imported_at)`,
     );
     const now = new Date().toISOString();
     db.transaction(() => {
-      for (const e of matches) {
+      for (const { entry: e, validated } of matches) {
         // Idempotent by audit_id: if the JSONL importer already created this row
         // (the tool survived to append), discovery adds nothing — no duplicate.
         if (existsStmt.get(e.audit_id!)) continue;
         insertStmt.run({
           id: e.audit_id!,
           source: 'gws',
-          kind: 'gmail_draft_created',
-          operation: e.method ?? null,
-          input_id: e.input_id ?? null,
-          route_key: e.route_key ?? null,
+          kind: validated.kind,
+          operation: validated.operation,
+          payload_schema_version: validated.payloadSchemaVersion,
+          account_label: validated.accountLabel,
+          account_email: validated.accountEmail,
+          input_id: validated.inputId,
+          route_key: validated.routeKey,
+          signed_payload: validated.signedPayload,
+          signature: validated.signature,
           evidence_json: JSON.stringify({ discovered_via: 'gws_audit_store' }),
-          // Discovered from the audit store, not from a signed JSONL entry: this
-          // is durable "a draft was created" evidence for no-duplication, but it
-          // is NOT a signature-validated authoritative entry.
-          validation_json: JSON.stringify({ authoritative: false, reason: 'discovered_audit_store_crash_window' }),
-          replay_policy: 'no_duplicate_draft',
-          occurred_at: e.occurred_at ?? null,
+          // The root audit stores the same canonical bytes/signature as the shim
+          // row, so a kill-window discovery is authoritative only after the full
+          // schema-v2 binding and Ed25519 verification above succeeds.
+          validation_json: JSON.stringify(validated.validation),
+          replay_policy: validated.replayPolicy,
+          occurred_at: validated.occurredAt,
           imported_at: now,
         });
         result.discovered++;

@@ -1,4 +1,4 @@
-import { generateKeyPairSync, sign as edSign } from 'crypto';
+import { createPrivateKey, createPublicKey, generateKeyPairSync, sign as edSign } from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -8,6 +8,7 @@ import { beforeEach, describe, expect, test } from 'bun:test';
 import { getOutboundDb, initTestSessionDb } from './connection.js';
 import {
   canonicalSideEffectPayload,
+  classifyAndSanitize,
   getAuthoritativeSideEffects,
   getSideEffectHints,
   importSideEffectLedger,
@@ -414,10 +415,18 @@ describe('side_effect_ledger import', () => {
 function signedGmailLine(
   auditId: string,
   key: ReturnType<typeof generateKeyPairSync>,
-  overrides: { tamper?: boolean; recordAuditId?: string } = {},
+  overrides: { tamper?: boolean; recordAuditId?: string; accountLabel?: 'personal' | 'glowforge' } = {},
 ): string {
+  const accountLabel = overrides.accountLabel ?? 'personal';
+  const accountEmail = accountLabel === 'personal' ? 'dan@danshapiro.com' : 'dan@glowforge.com';
   const payload = canonicalSideEffectPayload({
+    schema_version: 2,
     audit_id: auditId,
+    profile: 'nanoclaw',
+    account_label: accountLabel,
+    account_email: accountEmail,
+    input_id: 'in-1',
+    route_key: 'opencode|discord|chan-1|dm:mg-1',
     service: 'gmail',
     method: 'users.drafts.create',
     request_class: 'api',
@@ -430,7 +439,13 @@ function signedGmailLine(
   // Tampered: present a DIFFERENT payload than what was signed.
   const forwardedPayload = overrides.tamper
     ? canonicalSideEffectPayload({
+        schema_version: 2,
         audit_id: auditId,
+        profile: 'nanoclaw',
+        account_label: accountLabel,
+        account_email: accountEmail,
+        input_id: 'in-1',
+        route_key: 'opencode|discord|chan-1|dm:mg-1',
         service: 'gmail',
         method: 'users.drafts.create',
         request_class: 'api',
@@ -442,9 +457,14 @@ function signedGmailLine(
     : payload;
   return JSON.stringify({
     kind: 'gmail_draft_created',
+    payload_schema_version: 2,
     // Rebinding vector: the RECORD's audit_id (idempotency key) may differ from
     // the audit_id embedded in the validly-signed payload.
     audit_id: overrides.recordAuditId ?? auditId,
+    profile: 'nanoclaw',
+    account_label: accountLabel,
+    account_email: accountEmail,
+    operation: 'gmail users.drafts.create',
     occurred_at: '2026-05-29T00:00:00.000Z',
     input_id: 'in-1',
     route_key: 'opencode|discord|chan-1|dm:mg-1',
@@ -462,6 +482,61 @@ describe('side_effect_ledger signed gmail import (Task 4B)', () => {
     expect(r.imported).toBe(1);
     expect(r.validated).toBe(1);
     expect(getAuthoritativeSideEffects().some((s) => s.id === 'signed-1')).toBe(true);
+    const row = getOutboundDb()
+      .prepare(
+        `SELECT payload_schema_version, account_label, account_email, input_id, route_key, operation,
+                signed_payload, signature FROM side_effect_ledger WHERE id = 'signed-1'`,
+      )
+      .get() as Record<string, unknown>;
+    expect(row.payload_schema_version).toBe(2);
+    expect(row.account_label).toBe('personal');
+    expect(row.account_email).toBe('dan@danshapiro.com');
+    expect(row.input_id).toBe('in-1');
+    expect(row.route_key).toBe('opencode|discord|chan-1|dm:mg-1');
+    expect(row.operation).toBe('gmail users.drafts.create');
+    expect(row.signed_payload).toBeTruthy();
+    expect(row.signature).toBeTruthy();
+  });
+
+  test('personal and Glowforge incident replays retain their exact signed Gmail account', () => {
+    const key = generateKeyPairSync('ed25519');
+    const pem = key.publicKey.export({ format: 'pem', type: 'spki' }).toString();
+    const result = importSideEffectLedger({
+      jsonl: [
+        signedGmailLine('personal-replay', key, { accountLabel: 'personal' }),
+        signedGmailLine('glowforge-replay', key, { accountLabel: 'glowforge' }),
+      ].join('\n'),
+      gwsPublicKey: pem,
+    });
+    expect(result.validated).toBe(2);
+    const recovered = getAuthoritativeSideEffects();
+    expect(recovered.find((effect) => effect.id === 'personal-replay')).toMatchObject({
+      accountLabel: 'personal',
+      accountEmail: 'dan@danshapiro.com',
+      kind: 'gmail_draft_created',
+    });
+    expect(recovered.find((effect) => effect.id === 'glowforge-replay')).toMatchObject({
+      accountLabel: 'glowforge',
+      accountEmail: 'dan@glowforge.com',
+      kind: 'gmail_draft_created',
+    });
+  });
+
+  test('an existing schema-v1 SQL row claiming authoritative is downgraded and rendered account-unknown', () => {
+    getOutboundDb()
+      .prepare(
+        `INSERT INTO side_effect_ledger
+          (id, source, kind, operation, evidence_json, validation_json, replay_policy, occurred_at, imported_at)
+         VALUES (?, 'gws', 'gmail_draft_created', 'gmail users.drafts.create', '{}', ?, 'no_duplicate_draft', ?, ?)`,
+      )
+      .run('legacy-authoritative', JSON.stringify({ authoritative: true }), '2026-05-29T00:00:00Z', new Date().toISOString());
+
+    expect(getAuthoritativeSideEffects().some((s) => s.id === 'legacy-authoritative')).toBe(false);
+    const legacy = getSideEffectHints().find((s) => s.id === 'legacy-authoritative');
+    expect(legacy?.label).toBe('legacy account unknown; do not recreate automatically; reconcile');
+    expect(legacy?.payloadSchemaVersion).toBe(1);
+    expect(legacy?.accountLabel).toBeNull();
+    expect(legacy?.accountEmail).toBeNull();
   });
 
   test('idempotency key = audit_id: replaying a genuine signed entry imports one row', () => {
@@ -531,6 +606,59 @@ describe('side_effect_ledger signed gmail import (Task 4B)', () => {
 // side-effects-verify.ts files are byte-identical, so identical vectors must
 // yield identical verify/reject results.
 describe('side-effects-verify cross-check (container copy)', () => {
+  test('uses the shared schema-v2 golden bytes and rejects every adversarial substitution', () => {
+    type CorpusPayload = Parameters<typeof canonicalSideEffectPayload>[0];
+    const corpus = JSON.parse(
+      fs.readFileSync(new URL('./side-effect-schema-v2-corpus.json', import.meta.url), 'utf8'),
+    ) as {
+      payload: CorpusPayload;
+      canonical: string;
+      seed_base64: string;
+      adversarial: Array<{ field: keyof CorpusPayload; value: string | boolean }>;
+      non_gmail_payload: CorpusPayload;
+    };
+    const seed = Buffer.from(corpus.seed_base64, 'base64');
+    const privateKey = createPrivateKey({
+      key: Buffer.concat([Buffer.from('302e020100300506032b657004220420', 'hex'), seed]),
+      format: 'der',
+      type: 'pkcs8',
+    });
+    const publicKey = createPublicKey(privateKey).export({ format: 'pem', type: 'spki' }).toString();
+    const canonical = canonicalSideEffectPayload(corpus.payload);
+    const signature = edSign(null, Buffer.from(canonical), privateKey).toString('base64');
+
+    expect(canonical).toBe(corpus.canonical);
+    expect(verifyGwsSideEffectSignature(canonical, signature, publicKey)).toBe('valid');
+    for (const substitution of corpus.adversarial) {
+      const mutated = canonicalSideEffectPayload({ ...corpus.payload, [substitution.field]: substitution.value });
+      expect(verifyGwsSideEffectSignature(mutated, signature, publicKey), substitution.field).toBe('invalid');
+    }
+
+    const drivePayload = canonicalSideEffectPayload(corpus.non_gmail_payload);
+    const driveSignature = edSign(null, Buffer.from(drivePayload), privateKey).toString('base64');
+    const drive = classifyAndSanitize(
+      {
+        kind: 'gmail_draft_created',
+        payload_schema_version: 2,
+        audit_id: corpus.non_gmail_payload.audit_id,
+        profile: corpus.non_gmail_payload.profile,
+        account_label: corpus.non_gmail_payload.account_label,
+        account_email: corpus.non_gmail_payload.account_email,
+        input_id: corpus.non_gmail_payload.input_id,
+        route_key: corpus.non_gmail_payload.route_key,
+        operation: `${corpus.non_gmail_payload.service} ${corpus.non_gmail_payload.method}`,
+        occurred_at: corpus.non_gmail_payload.occurred_at,
+        payload: drivePayload,
+        signature: driveSignature,
+      },
+      { gwsPublicKey: publicKey },
+    );
+    expect(drive?.validation.authoritative).toBe(true);
+    expect(drive?.kind).toBe('gws_mutation_completed');
+    expect(drive?.accountLabel).toBe('glowforge');
+    expect(drive?.accountEmail).toBe('dan@glowforge.com');
+  });
+
   test('verifies/rejects each shared vector exactly', () => {
     const key = generateKeyPairSync('ed25519');
     const other = generateKeyPairSync('ed25519');
@@ -540,7 +668,13 @@ describe('side-effects-verify cross-check (container copy)', () => {
     const otherPem = other.publicKey.export({ format: 'pem', type: 'spki' }).toString();
 
     const canonical = canonicalSideEffectPayload({
+      schema_version: 2,
       audit_id: 'abc123',
+      profile: 'nanoclaw',
+      account_label: 'personal',
+      account_email: 'dan@danshapiro.com',
+      input_id: 'in-1',
+      route_key: 'route-1',
       service: 'gmail',
       method: 'users.drafts.create',
       request_class: 'api',
@@ -550,7 +684,13 @@ describe('side-effects-verify cross-check (container copy)', () => {
       result_digest: 'deadbeef',
     });
     const tampered = canonicalSideEffectPayload({
+      schema_version: 2,
       audit_id: 'abc123',
+      profile: 'nanoclaw',
+      account_label: 'personal',
+      account_email: 'dan@danshapiro.com',
+      input_id: 'in-1',
+      route_key: 'route-1',
       service: 'gmail',
       method: 'users.drafts.create',
       request_class: 'api',
@@ -575,7 +715,13 @@ describe('side-effects-verify cross-check (container copy)', () => {
   test('canonical payload bytes match the cross-language contract', () => {
     expect(
       canonicalSideEffectPayload({
+        schema_version: 2,
         audit_id: 'abc123',
+        profile: 'nanoclaw',
+        account_label: 'personal',
+        account_email: 'dan@danshapiro.com',
+        input_id: 'in-1',
+        route_key: 'route-1',
         service: 'gmail',
         method: 'users.drafts.create',
         request_class: 'api',
@@ -585,7 +731,7 @@ describe('side-effects-verify cross-check (container copy)', () => {
         result_digest: 'deadbeef',
       }),
     ).toBe(
-      '{"audit_id":"abc123","service":"gmail","method":"users.drafts.create","request_class":"api","api_effect":true,"operation_succeeded":true,"occurred_at":"2026-05-29T00:00:00.000Z","result_digest":"deadbeef"}',
+      '{"schema_version":2,"audit_id":"abc123","profile":"nanoclaw","account_label":"personal","account_email":"dan@danshapiro.com","input_id":"in-1","route_key":"route-1","service":"gmail","method":"users.drafts.create","request_class":"api","api_effect":true,"operation_succeeded":true,"occurred_at":"2026-05-29T00:00:00.000Z","result_digest":"deadbeef"}',
     );
   });
 });

@@ -33,6 +33,7 @@ import {
   stopContainerAsync,
 } from './container-runtime.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
+import { resolveGwsSideEffectVerifyKey } from './gws-side-effect-key.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable, isDbInitialized } from './db/connection.js';
 import { getSession } from './db/sessions.js';
@@ -1274,7 +1275,7 @@ async function buildContainerArgs(
   // the gws-proxy container and is NEVER injected here. When unset (dev /
   // pre-deploy) Gmail side-effect recovery is simply inactive (staged entries
   // stay unvalidated hints).
-  const sideEffectVerifyKey = process.env.GWS_SIDE_EFFECT_VERIFY_KEY?.trim();
+  const sideEffectVerifyKey = resolveGwsSideEffectVerifyKey(process.env);
   if (sideEffectVerifyKey) {
     args.push('-e', `GWS_SIDE_EFFECT_VERIFY_KEY=${sideEffectVerifyKey}`);
   }

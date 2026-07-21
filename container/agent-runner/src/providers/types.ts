@@ -150,11 +150,15 @@ export interface ProviderSideEffect {
   inputId: string;
   kind:
     | 'gmail_draft_created'
+    | 'gws_mutation_completed'
     | 'summarize_dnd_recording_cached'
     | 'summarize_dnd_summary_artifact'
     | 'tool_completed'
     | 'other';
   label: string;
+  payloadSchemaVersion?: number;
+  accountLabel?: string | null;
+  accountEmail?: string | null;
   evidence: Record<string, string | number | boolean | null>;
   occurredAt: string;
 }

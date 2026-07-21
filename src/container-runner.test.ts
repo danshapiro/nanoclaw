@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { spawnSync } from 'child_process';
+import { generateKeyPairSync } from 'crypto';
 import { EventEmitter } from 'events';
 import fs from 'fs';
 import os from 'os';
@@ -22,6 +23,7 @@ import { AgentMcpCredentialUnavailableError, type AgentMcpBridgeOptions } from '
 import { log } from './log.js';
 import type { AgentMcpConfigForGroup } from './agent-mcp-config.js';
 import type { ContainerConfig } from './container-config.js';
+import { resolveGwsSideEffectVerifyKey } from './gws-side-effect-key.js';
 import { registerProviderContainerConfig, registerProviderPrepare } from './providers/provider-container-registry.js';
 import type { AgentGroup } from './types.js';
 
@@ -1513,25 +1515,109 @@ describe('side-effect ledger container env', () => {
   it('injects the Ed25519 public verify key when the host env var is set', async () => {
     const harness = await loadContainerRunnerHarness();
     const saved = process.env.GWS_SIDE_EFFECT_VERIFY_KEY;
+    const savedFile = process.env.GWS_SIDE_EFFECT_VERIFY_KEY_FILE;
     try {
-      process.env.GWS_SIDE_EFFECT_VERIFY_KEY = 'test-pub-key-base64';
+      delete process.env.GWS_SIDE_EFFECT_VERIFY_KEY_FILE;
+      process.env.GWS_SIDE_EFFECT_VERIFY_KEY = generateKeyPairSync('ed25519')
+        .publicKey.export({ format: 'der', type: 'spki' })
+        .subarray(12)
+        .toString('base64');
       const args = await buildArgs(harness);
-      expect(readSpawnEnvFile(args).env.get('GWS_SIDE_EFFECT_VERIFY_KEY')).toBe('test-pub-key-base64');
+      expect(readSpawnEnvFile(args).env.get('GWS_SIDE_EFFECT_VERIFY_KEY')).toBe(process.env.GWS_SIDE_EFFECT_VERIFY_KEY);
     } finally {
       if (saved === undefined) {
         delete process.env.GWS_SIDE_EFFECT_VERIFY_KEY;
       } else {
         process.env.GWS_SIDE_EFFECT_VERIFY_KEY = saved;
       }
+      if (savedFile === undefined) delete process.env.GWS_SIDE_EFFECT_VERIFY_KEY_FILE;
+      else process.env.GWS_SIDE_EFFECT_VERIFY_KEY_FILE = savedFile;
       harness.close();
+    }
+  });
+
+  it('reads a root-controlled public-key file on the host and passes only its public value into the container', async () => {
+    const harness = await loadContainerRunnerHarness();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-verify-key-'));
+    const keyPath = path.join(dir, 'verify.pub');
+    const publicValue = generateKeyPairSync('ed25519')
+      .publicKey.export({ format: 'der', type: 'spki' })
+      .subarray(12)
+      .toString('base64');
+    const savedFile = process.env.GWS_SIDE_EFFECT_VERIFY_KEY_FILE;
+    const savedDirect = process.env.GWS_SIDE_EFFECT_VERIFY_KEY;
+    try {
+      fs.writeFileSync(keyPath, `${publicValue}\n`, { mode: 0o644 });
+      delete process.env.GWS_SIDE_EFFECT_VERIFY_KEY;
+      process.env.GWS_SIDE_EFFECT_VERIFY_KEY_FILE = keyPath;
+      const args = await buildArgs(harness);
+      const envFile = readSpawnEnvFile(args);
+      expect(envFile.env.get('GWS_SIDE_EFFECT_VERIFY_KEY')).toBe(publicValue);
+      expect(envFile.raw).not.toContain('GWS_SIDE_EFFECT_VERIFY_KEY_FILE');
+      expect(envFile.raw).not.toContain(keyPath);
+    } finally {
+      if (savedFile === undefined) delete process.env.GWS_SIDE_EFFECT_VERIFY_KEY_FILE;
+      else process.env.GWS_SIDE_EFFECT_VERIFY_KEY_FILE = savedFile;
+      if (savedDirect === undefined) delete process.env.GWS_SIDE_EFFECT_VERIFY_KEY;
+      else process.env.GWS_SIDE_EFFECT_VERIFY_KEY = savedDirect;
+      fs.rmSync(dir, { recursive: true, force: true });
+      harness.close();
+    }
+  });
+
+  it('rejects configuring both public-key value and public-key file', async () => {
+    const harness = await loadContainerRunnerHarness();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-verify-key-'));
+    const keyPath = path.join(dir, 'verify.pub');
+    const publicValue = generateKeyPairSync('ed25519')
+      .publicKey.export({ format: 'der', type: 'spki' })
+      .subarray(12)
+      .toString('base64');
+    const savedDirect = process.env.GWS_SIDE_EFFECT_VERIFY_KEY;
+    const savedFile = process.env.GWS_SIDE_EFFECT_VERIFY_KEY_FILE;
+    try {
+      fs.writeFileSync(keyPath, `${publicValue}\n`, { mode: 0o644 });
+      process.env.GWS_SIDE_EFFECT_VERIFY_KEY = publicValue;
+      process.env.GWS_SIDE_EFFECT_VERIFY_KEY_FILE = keyPath;
+      await expect(harness.containerRunner.wakeContainer(harness.session)).rejects.toThrow(/only one/i);
+    } finally {
+      if (savedDirect === undefined) delete process.env.GWS_SIDE_EFFECT_VERIFY_KEY;
+      else process.env.GWS_SIDE_EFFECT_VERIFY_KEY = savedDirect;
+      if (savedFile === undefined) delete process.env.GWS_SIDE_EFFECT_VERIFY_KEY_FILE;
+      else process.env.GWS_SIDE_EFFECT_VERIFY_KEY_FILE = savedFile;
+      fs.rmSync(dir, { recursive: true, force: true });
+      harness.close();
+    }
+  });
+
+  it('rejects symlinked and group-writable public-key files before container assembly', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-verify-key-'));
+    const keyPath = path.join(dir, 'verify.pub');
+    const linkPath = path.join(dir, 'verify-link.pub');
+    const publicValue = generateKeyPairSync('ed25519')
+      .publicKey.export({ format: 'der', type: 'spki' })
+      .subarray(12)
+      .toString('base64');
+    try {
+      fs.writeFileSync(keyPath, `${publicValue}\n`, { mode: 0o644 });
+      fs.symlinkSync(keyPath, linkPath);
+      expect(() => resolveGwsSideEffectVerifyKey({ GWS_SIDE_EFFECT_VERIFY_KEY_FILE: linkPath })).toThrow();
+      fs.chmodSync(keyPath, 0o664);
+      expect(() => resolveGwsSideEffectVerifyKey({ GWS_SIDE_EFFECT_VERIFY_KEY_FILE: keyPath })).toThrow(
+        /non-writable/i,
+      );
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 
   it('omits the Ed25519 public verify key when the host env var is absent', async () => {
     const harness = await loadContainerRunnerHarness();
     const saved = process.env.GWS_SIDE_EFFECT_VERIFY_KEY;
+    const savedFile = process.env.GWS_SIDE_EFFECT_VERIFY_KEY_FILE;
     try {
       delete process.env.GWS_SIDE_EFFECT_VERIFY_KEY;
+      delete process.env.GWS_SIDE_EFFECT_VERIFY_KEY_FILE;
       const args = await buildArgs(harness);
       // The key must be absent so the in-container default applies.
       expect(args.some((a) => a.startsWith('GWS_SIDE_EFFECT_VERIFY_KEY='))).toBe(false);
@@ -1540,6 +1626,7 @@ describe('side-effect ledger container env', () => {
       if (saved !== undefined) {
         process.env.GWS_SIDE_EFFECT_VERIFY_KEY = saved;
       }
+      if (savedFile !== undefined) process.env.GWS_SIDE_EFFECT_VERIFY_KEY_FILE = savedFile;
       harness.close();
     }
   });

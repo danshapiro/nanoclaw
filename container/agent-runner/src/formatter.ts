@@ -362,7 +362,13 @@ export interface RecoveryContextInput {
   acceptedUnresolvedInputs: Array<{ prompt: string }>;
   priorProgress: Array<{ text: string }>;
   observations: string[];
-  sideEffects: Array<{ kind: string; label: string }>;
+  sideEffects: Array<{
+    kind: string;
+    label: string;
+    payloadSchemaVersion?: number;
+    accountLabel?: string | null;
+    accountEmail?: string | null;
+  }>;
   continuationPolicy: string;
 }
 
@@ -390,10 +396,15 @@ export function formatRecoveryContext(entries: RecoveryContextInput[]): string {
       lines.push(`    <unresolved_input>${escapeXml(a.prompt)}</unresolved_input>`);
     for (const p of e.priorProgress) lines.push(`    <prior_progress>${escapeXml(p.text)}</prior_progress>`);
     for (const o of e.observations) lines.push(`    <observation>${escapeXml(o)}</observation>`);
-    for (const s of e.sideEffects)
+    for (const s of e.sideEffects) {
+      const accountAttrs =
+        s.payloadSchemaVersion === 2 && s.accountLabel && s.accountEmail
+          ? ` account_label="${escapeXml(s.accountLabel)}" account_email="${escapeXml(s.accountEmail)}"`
+          : '';
       lines.push(
-        `    <completed_side_effect kind="${escapeXml(s.kind)}">${escapeXml(s.label)}</completed_side_effect>`,
+        `    <completed_side_effect kind="${escapeXml(s.kind)}"${accountAttrs}>${escapeXml(s.label)}</completed_side_effect>`,
       );
+    }
     lines.push('  </interrupted>');
   }
   lines.push('</recovery>');

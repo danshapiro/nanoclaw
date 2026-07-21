@@ -17,7 +17,7 @@ import path from 'path';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb } from './db/connection.js';
 import { getPendingMessages } from './db/messages-in.js';
-import { formatMessages, sanitizeDeliveredText, stripInternalTags } from './formatter.js';
+import { formatMessages, formatRecoveryContext, sanitizeDeliveredText, stripInternalTags } from './formatter.js';
 import { TIMEZONE } from './timezone.js';
 
 let originalLocalSkillsWorkspace: string | undefined;
@@ -196,6 +196,80 @@ describe('stripInternalTags', () => {
 
   it('preserves content that surrounds internal tags', () => {
     expect(stripInternalTags('<internal>thinking</internal>The answer is 42')).toBe('The answer is 42');
+  });
+});
+
+describe('schema-v2 GWS recovery formatting', () => {
+  it('names the exact signed account and operation for personal, Glowforge, and non-Gmail effects', () => {
+    const common = {
+      classification: 'terminal_interruption',
+      agentMessage: 'Interrupted',
+      originalTasks: [],
+      acceptedUnresolvedInputs: [],
+      priorProgress: [],
+      observations: [],
+      continuationPolicy: 'preserve',
+    };
+    const formatted = formatRecoveryContext([
+      {
+        ...common,
+        sideEffects: [
+          {
+            kind: 'gmail_draft_created',
+            label: 'gmail users.drafts.create',
+            accountLabel: 'personal',
+            accountEmail: 'dan@danshapiro.com',
+            payloadSchemaVersion: 2,
+          },
+          {
+            kind: 'gmail_draft_created',
+            label: 'gmail users.drafts.create',
+            accountLabel: 'glowforge',
+            accountEmail: 'dan@glowforge.com',
+            payloadSchemaVersion: 2,
+          },
+          {
+            kind: 'gws_mutation_completed',
+            label: 'drive files.create',
+            accountLabel: 'glowforge',
+            accountEmail: 'dan@glowforge.com',
+            payloadSchemaVersion: 2,
+          },
+        ],
+      },
+    ]);
+    expect(formatted).toContain('account_label="personal"');
+    expect(formatted).toContain('account_email="dan@danshapiro.com"');
+    expect(formatted).toContain('account_label="glowforge"');
+    expect(formatted).toContain('gmail users.drafts.create');
+    expect(formatted).toContain('drive files.create');
+    expect(formatted).not.toContain('gmail_draft_created">drive files.create');
+  });
+
+  it('renders schema-v1 diagnostics with the mandatory no-recreation warning and no account attribution', () => {
+    const formatted = formatRecoveryContext([
+      {
+        classification: 'legacy',
+        agentMessage: '',
+        originalTasks: [],
+        acceptedUnresolvedInputs: [],
+        priorProgress: [],
+        observations: [],
+        sideEffects: [
+          {
+            kind: 'gmail_draft_created',
+            label: 'legacy account unknown; do not recreate automatically; reconcile',
+            payloadSchemaVersion: 1,
+            accountLabel: null,
+            accountEmail: null,
+          },
+        ],
+        continuationPolicy: 'preserve',
+      },
+    ]);
+    expect(formatted).toContain('legacy account unknown; do not recreate automatically; reconcile');
+    expect(formatted).not.toContain('account_label=');
+    expect(formatted).not.toContain('account_email=');
   });
 });
 

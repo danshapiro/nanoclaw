@@ -739,7 +739,7 @@ describe('gws proxy shim — side-effect ledger', () => {
     }
   });
 
-  it('appends one sanitized gmail_draft_created record (sig+payload verbatim) before stdout on success+api-effect', async () => {
+  it('keeps schema-v1 evidence generic while preserving sig+payload verbatim before stdout', async () => {
     tmp = freshTmp();
     const ledger = path.join(tmp, 'side-effects.jsonl');
     const active = path.join(tmp, 'active-input.json');
@@ -763,7 +763,8 @@ describe('gws proxy shim — side-effect ledger', () => {
     const rows = readLedger(ledger);
     expect(rows.length).toBe(1);
     const rec = rows[0];
-    expect(rec.kind).toBe('gmail_draft_created');
+    expect(rec.kind).toBe('gws_mutation_completed');
+    expect(rec.payload_schema_version).toBe(1);
     expect(rec.audit_id).toBe('aud-1');
     expect(rec.input_id).toBe('in-9');
     expect(rec.route_key).toBe('discord:7');
@@ -774,6 +775,95 @@ describe('gws proxy shim — side-effect ledger', () => {
     const blob = JSON.stringify(rec);
     expect(blob).not.toContain('Authorization');
     expect(blob).not.toContain('Bearer');
+  });
+
+  it('derives the kind and exact account/operation/correlation exclusively from the signed schema-v2 payload', async () => {
+    tmp = freshTmp();
+    const ledger = path.join(tmp, 'side-effects.jsonl');
+    const signed = {
+      schema_version: 2,
+      audit_id: 'aud-drive',
+      profile: 'nanoclaw',
+      account_label: 'glowforge',
+      account_email: 'dan@glowforge.com',
+      input_id: 'input-drive',
+      route_key: 'opencode|discord|chan-2|dm:mg-2',
+      service: 'drive',
+      method: 'files.create',
+      request_class: 'api',
+      api_effect: true,
+      operation_succeeded: true,
+      occurred_at: '2026-07-20T12:35:56.789Z',
+      result_digest: 'abcdef',
+    };
+    const payload = JSON.stringify(signed);
+    const proxy = await withProxy(apiEffectSuccessProxy('{"id":"file-1"}', 'SIG', payload, 'aud-drive'));
+    const result = await runShim(['drive', 'files', 'create', '--json', '{"name":"x"}'], {
+      GWS_PROXY_URL: proxy.url,
+      NANOCLAW_SIDE_EFFECT_LEDGER: ledger,
+    });
+
+    expect(result.status).toBe(0);
+    const [row] = readLedger(ledger);
+    expect(row.kind).toBe('gws_mutation_completed');
+    expect(row.payload_schema_version).toBe(2);
+    expect(row.account_label).toBe('glowforge');
+    expect(row.account_email).toBe('dan@glowforge.com');
+    expect(row.input_id).toBe('input-drive');
+    expect(row.route_key).toBe('opencode|discord|chan-2|dm:mg-2');
+    expect(row.operation).toBe('drive files.create');
+    expect(row.occurred_at).toBe('2026-07-20T12:35:56.789Z');
+    expect(row.payload).toBe(payload);
+  });
+
+  it('durably stages signed evidence and exits 75 when the proxy says Google completed but global audit failed', async () => {
+    tmp = freshTmp();
+    const ledger = path.join(tmp, 'side-effects.jsonl');
+    const signed = {
+      schema_version: 2,
+      audit_id: 'aud-audit-failed',
+      profile: 'nanoclaw',
+      account_label: 'personal',
+      account_email: 'dan@danshapiro.com',
+      input_id: 'input-1',
+      route_key: 'opencode|discord|chan-1|dm:mg-1',
+      service: 'gmail',
+      method: 'users.drafts.create',
+      request_class: 'api',
+      api_effect: true,
+      operation_succeeded: true,
+      occurred_at: '2026-07-20T12:35:56.789Z',
+      result_digest: 'abcdef',
+    };
+    const payload = JSON.stringify(signed);
+    const proxy = await withProxy((_req, res) => {
+      res.writeHead(200, {
+        'Content-Type': 'text/plain',
+        'X-Exit-Code': '75',
+        'X-GWS-Outcome': 'completed_audit_failed',
+        'X-GWS-Audit-Id': signed.audit_id,
+        'X-GWS-Request-Class': 'api',
+        'X-GWS-Api-Effect': 'true',
+        'X-GWS-Operation-Succeeded': 'true',
+        'X-GWS-Side-Effect-Signature': 'SIG',
+        'X-GWS-Side-Effect-Payload': payload,
+      });
+      res.end('sensitive ordinary result must not be printed');
+    });
+
+    const result = await runShim(['gmail', 'users', 'drafts', 'create'], {
+      GWS_PROXY_URL: proxy.url,
+      NANOCLAW_SIDE_EFFECT_LEDGER: ledger,
+    });
+    expect(result.status).toBe(75);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('operation completed');
+    expect(result.stderr).toContain('global audit failed');
+    expect(result.stderr).not.toContain('sensitive ordinary result');
+    const [row] = readLedger(ledger);
+    expect(row.kind).toBe('gmail_draft_created');
+    expect(row.account_label).toBe('personal');
+    expect(row.account_email).toBe('dan@danshapiro.com');
   });
 
   it('also sends inputId/routeKey in the POST body', async () => {
@@ -821,7 +911,8 @@ describe('gws proxy shim — side-effect ledger', () => {
     expect(rows.length).toBe(1);
     // Absent active-input ⇒ no input correlation (uncorrelated diagnostic record).
     expect(rows[0].input_id ?? null).toBeNull();
-    expect(rows[0].kind).toBe('gmail_draft_created');
+    expect(rows[0].kind).toBe('gws_mutation_completed');
+    expect(rows[0].payload_schema_version).toBe(1);
   });
 
   it('appends NO record for a non-api-effect (help/schema) response', async () => {

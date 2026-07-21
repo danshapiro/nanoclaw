@@ -29,6 +29,7 @@ export type SideEffectSource = 'gws' | 'summarize_dnd' | 'tool' | 'unknown';
 
 export type SideEffectKind =
   | 'gmail_draft_created'
+  | 'gws_mutation_completed'
   | 'summarize_dnd_recording_cached'
   | 'summarize_dnd_summary_artifact'
   | 'tool_completed'
@@ -36,7 +37,11 @@ export type SideEffectKind =
 
 export interface RawSideEffectRecord {
   kind?: string;
+  payload_schema_version?: number;
   audit_id?: string;
+  profile?: string;
+  account_label?: string;
+  account_email?: string;
   operation?: string;
   input_id?: string;
   route_key?: string;
@@ -45,9 +50,9 @@ export interface RawSideEffectRecord {
   /**
    * The proxy's canonical signed payload, forwarded VERBATIM by the shim as the
    * exact JSON string the proxy signed (X-GWS-Side-Effect-Payload). The verifier
-   * checks the Ed25519 signature over these exact bytes — it never re-serializes,
-   * so float/ordering differences cannot break cross-language verification. A
-   * legacy object form is tolerated by canonicalizing it.
+   * checks the Ed25519 signature over these exact bytes and requires the string
+   * itself to equal the schema-v2 canonical serialization. Legacy object forms
+   * remain schema-v1 diagnostics and can never become authoritative.
    */
   payload?: string | Record<string, unknown>;
   evidence?: Record<string, unknown>;
@@ -59,9 +64,14 @@ export interface ValidatedSideEffect {
   source: SideEffectSource;
   kind: SideEffectKind;
   operation: string | null;
+  payloadSchemaVersion: number;
+  accountLabel: string | null;
+  accountEmail: string | null;
   inputId: string | null;
   routeKey: string | null;
   occurredAt: string | null;
+  signedPayload: string | null;
+  signature: string | null;
   /** Sanitized, bounded evidence safe to persist and surface to recovery. */
   evidence: Record<string, string | number | boolean | null>;
   /** Validation outcome metadata (why this is/ isn't authoritative). */
@@ -78,7 +88,13 @@ export interface ValidatedSideEffect {
  * makes the cross-language Ed25519 verify work.
  */
 export function canonicalSideEffectPayload(payload: {
+  schema_version: number;
   audit_id: string;
+  profile: string;
+  account_label: string;
+  account_email: string;
+  input_id: string;
+  route_key: string;
   service: string;
   method: string;
   request_class: string;
@@ -88,7 +104,13 @@ export function canonicalSideEffectPayload(payload: {
   result_digest: string;
 }): string {
   return JSON.stringify({
+    schema_version: payload.schema_version,
     audit_id: payload.audit_id,
+    profile: payload.profile,
+    account_label: payload.account_label,
+    account_email: payload.account_email,
+    input_id: payload.input_id,
+    route_key: payload.route_key,
     service: payload.service,
     method: payload.method,
     request_class: payload.request_class,
@@ -242,6 +264,82 @@ export interface ClassifyOptions {
   statSize?: (path: string) => number | null;
 }
 
+export interface SchemaV2SideEffectPayload {
+  schema_version: number;
+  audit_id: string;
+  profile: string;
+  account_label: string;
+  account_email: string;
+  input_id: string;
+  route_key: string;
+  service: string;
+  method: string;
+  request_class: string;
+  api_effect: boolean;
+  operation_succeeded: boolean;
+  occurred_at: string;
+  result_digest: string;
+}
+
+const CANONICAL_ACCOUNT_EMAILS: Record<string, string> = {
+  personal: 'dan@danshapiro.com',
+  glowforge: 'dan@glowforge.com',
+};
+
+function parseCanonicalSchemaV2(payload: RawSideEffectRecord['payload']): {
+  canonical: string;
+  value: SchemaV2SideEffectPayload;
+} | null {
+  if (typeof payload !== 'string' || payload === '') return null;
+  let value: Record<string, unknown>;
+  try {
+    value = JSON.parse(payload) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  const stringKeys = [
+    'audit_id',
+    'profile',
+    'account_label',
+    'account_email',
+    'input_id',
+    'route_key',
+    'service',
+    'method',
+    'request_class',
+    'occurred_at',
+    'result_digest',
+  ] as const;
+  if (value.schema_version !== 2 || value.api_effect !== true || value.operation_succeeded !== true) return null;
+  if (stringKeys.some((key) => typeof value[key] !== 'string')) return null;
+  const typed = value as unknown as SchemaV2SideEffectPayload;
+  const canonical = canonicalSideEffectPayload(typed);
+  // Verbatim canonical bytes are part of the schema. This also rejects extra,
+  // missing, reordered, duplicated, or type-coerced fields.
+  if (payload !== canonical) return null;
+  return { canonical, value: typed };
+}
+
+function exactSignedOperation(payload: SchemaV2SideEffectPayload): string | null {
+  if (!/^[a-z][a-z0-9-]*$/.test(payload.service) || !/^[+a-zA-Z0-9][+a-zA-Z0-9_.-]*$/.test(payload.method)) {
+    return null;
+  }
+  return `${payload.service} ${payload.method}`;
+}
+
+function baseValidatedFields(raw: RawSideEffectRecord) {
+  return {
+    payloadSchemaVersion:
+      typeof raw.payload_schema_version === 'number' && Number.isInteger(raw.payload_schema_version)
+        ? raw.payload_schema_version
+        : 1,
+    accountLabel: null,
+    accountEmail: null,
+    signedPayload: typeof raw.payload === 'string' ? raw.payload : null,
+    signature: typeof raw.signature === 'string' ? raw.signature : null,
+  };
+}
+
 /**
  * Classify, validate, and sanitize a single raw ledger record into a
  * persistable ValidatedSideEffect. Unknown kinds collapse to a sanitized
@@ -258,30 +356,80 @@ export function classifyAndSanitize(raw: RawSideEffectRecord, opts: ClassifyOpti
   const occurredAt = typeof raw.occurred_at === 'string' ? raw.occurred_at : null;
   const kind = raw.kind;
 
-  if (kind === 'gmail_draft_created') {
-    // Authoritative ONLY when the proxy's Ed25519 signature verifies over the
-    // forwarded canonical payload AND that payload's audit_id binds to this
-    // record's idempotency key (so a genuine signature cannot be replayed under
-    // a different audit_id). Unsigned/forged/tampered/missing-key stays a hint.
-    const canonical = payloadCanonicalString(raw.payload);
-    let verify = verifyGwsSideEffectSignature(canonical, raw.signature, opts.gwsPublicKey);
-    if (verify === 'valid' && payloadAuditId(raw.payload) !== id) {
-      verify = 'invalid';
+  const isGwsRecord =
+    kind === 'gmail_draft_created' ||
+    kind === 'gws_mutation_completed' ||
+    raw.payload !== undefined ||
+    raw.signature !== undefined;
+
+  if (isGwsRecord) {
+    const parsed = parseCanonicalSchemaV2(raw.payload);
+    const payloadSchemaVersion = parsed?.value.schema_version ?? baseValidatedFields(raw).payloadSchemaVersion;
+    const verify = parsed
+      ? verifyGwsSideEffectSignature(parsed.canonical, raw.signature, opts.gwsPublicKey)
+      : raw.payload_schema_version === 2
+        ? 'invalid'
+        : 'unvalidated';
+    const signedOperation = parsed ? exactSignedOperation(parsed.value) : null;
+    const accountPairValid = Boolean(
+      parsed &&
+      parsed.value.account_label &&
+      CANONICAL_ACCOUNT_EMAILS[parsed.value.account_label] === parsed.value.account_email,
+    );
+    const bindingsValid = Boolean(
+      parsed &&
+      raw.payload_schema_version === 2 &&
+      raw.audit_id === parsed.value.audit_id &&
+      raw.profile === parsed.value.profile &&
+      raw.account_label === parsed.value.account_label &&
+      raw.account_email === parsed.value.account_email &&
+      raw.input_id === parsed.value.input_id &&
+      raw.route_key === parsed.value.route_key &&
+      raw.operation === signedOperation &&
+      raw.occurred_at === parsed.value.occurred_at &&
+      parsed.value.profile !== '' &&
+      parsed.value.input_id !== '' &&
+      parsed.value.route_key !== '' &&
+      parsed.value.request_class === 'api' &&
+      parsed.value.api_effect === true &&
+      parsed.value.operation_succeeded === true &&
+      parsed.value.result_digest !== '' &&
+      Number.isFinite(Date.parse(parsed.value.occurred_at)) &&
+      accountPairValid &&
+      signedOperation !== null,
+    );
+    const authoritative = payloadSchemaVersion === 2 && verify === 'valid' && bindingsValid;
+    const authoritativeKind: SideEffectKind =
+      parsed?.value.service === 'gmail' && parsed.value.method === 'users.drafts.create'
+        ? 'gmail_draft_created'
+        : 'gws_mutation_completed';
+    let reason = 'legacy_schema_v1_account_unknown';
+    if (payloadSchemaVersion === 2) {
+      if (!parsed) reason = 'schema_v2_payload_noncanonical';
+      else if (verify !== 'valid') reason = `gws_${verify}`;
+      else if (!bindingsValid) reason = 'gws_binding_invalid';
+      else reason = 'ed25519_schema_v2_authoritative';
     }
     return {
       id,
       source: 'gws',
-      kind: 'gmail_draft_created',
-      operation,
+      kind: authoritative
+        ? authoritativeKind
+        : kind === 'gmail_draft_created'
+          ? 'gmail_draft_created'
+          : 'gws_mutation_completed',
+      operation: authoritative ? signedOperation : operation,
+      payloadSchemaVersion,
+      accountLabel: authoritative ? parsed!.value.account_label : null,
+      accountEmail: authoritative ? parsed!.value.account_email : null,
       inputId,
       routeKey,
-      occurredAt,
+      occurredAt: authoritative ? parsed!.value.occurred_at : null,
+      signedPayload: typeof raw.payload === 'string' ? raw.payload : null,
+      signature: typeof raw.signature === 'string' ? raw.signature : null,
       evidence: sanitizeEvidence(raw.evidence, { allowPathKeys: [] }),
-      validation: {
-        authoritative: verify === 'valid',
-        reason: verify === 'valid' ? 'ed25519_signature_valid' : `gmail_${verify}`,
-      },
-      replayPolicy: 'no_duplicate_draft',
+      validation: { authoritative, reason },
+      replayPolicy: authoritativeKind === 'gmail_draft_created' ? 'no_duplicate_draft' : 'no_duplicate_operation',
     };
   }
 
@@ -312,6 +460,7 @@ export function classifyAndSanitize(raw: RawSideEffectRecord, opts: ClassifyOpti
       source: 'summarize_dnd',
       kind: 'summarize_dnd_summary_artifact',
       operation,
+      ...baseValidatedFields(raw),
       inputId,
       routeKey,
       occurredAt,
@@ -332,6 +481,7 @@ export function classifyAndSanitize(raw: RawSideEffectRecord, opts: ClassifyOpti
       source: 'summarize_dnd',
       kind: 'summarize_dnd_recording_cached',
       operation,
+      ...baseValidatedFields(raw),
       inputId,
       routeKey,
       occurredAt,
@@ -347,6 +497,7 @@ export function classifyAndSanitize(raw: RawSideEffectRecord, opts: ClassifyOpti
     source: 'tool',
     kind: 'tool_completed',
     operation,
+    ...baseValidatedFields(raw),
     inputId,
     routeKey,
     occurredAt,
@@ -354,59 +505,4 @@ export function classifyAndSanitize(raw: RawSideEffectRecord, opts: ClassifyOpti
     validation: { authoritative: false, reason: 'unknown_kind_sanitized' },
     replayPolicy: 'none',
   };
-}
-
-/**
- * Return the exact canonical payload string to verify the signature over. The
- * PRIMARY path: the shim forwards the proxy's signed payload verbatim as a
- * string, and we verify over those exact bytes — so cross-language byte parity
- * is guaranteed regardless of any character (U+2028/U+2029 included), because we
- * never re-serialize.
- *
- * The object form below is a LEGACY FALLBACK only (a payload that arrived
- * already parsed instead of as the forwarded string). It re-serializes with
- * `JSON.stringify`, which emits U+2028/U+2029 (LINE/PARAGRAPH SEPARATOR) RAW,
- * whereas the Go signer's `SetEscapeHTML(false)` encoder still escapes those two
- * code points — so a re-serialized payload whose `method`/`service`/etc.
- * contained U+2028/U+2029 would NOT byte-match the Go-signed bytes and would
- * (safely) fail to verify. This fallback must therefore only be relied on for
- * content free of U+2028/U+2029; the verbatim-string primary path is the
- * authoritative one and is unaffected. (No production payload field carries
- * those separators today.)
- */
-function payloadCanonicalString(payload: string | Record<string, unknown> | undefined): string {
-  if (typeof payload === 'string') return payload;
-  if (payload && typeof payload === 'object') {
-    try {
-      return canonicalSideEffectPayload({
-        audit_id: String(payload.audit_id ?? ''),
-        service: String(payload.service ?? ''),
-        method: String(payload.method ?? ''),
-        request_class: String(payload.request_class ?? ''),
-        api_effect: Boolean(payload.api_effect),
-        operation_succeeded: Boolean(payload.operation_succeeded),
-        occurred_at: String(payload.occurred_at ?? ''),
-        result_digest: String(payload.result_digest ?? ''),
-      });
-    } catch {
-      return '';
-    }
-  }
-  return '';
-}
-
-/** Extract the audit_id embedded in the signed payload (string or object). */
-function payloadAuditId(payload: string | Record<string, unknown> | undefined): string | null {
-  if (typeof payload === 'string') {
-    try {
-      const obj = JSON.parse(payload) as { audit_id?: unknown };
-      return typeof obj.audit_id === 'string' ? obj.audit_id : null;
-    } catch {
-      return null;
-    }
-  }
-  if (payload && typeof payload === 'object') {
-    return typeof payload.audit_id === 'string' ? payload.audit_id : null;
-  }
-  return null;
 }

@@ -49,6 +49,7 @@ import {
   type ContainerState,
 } from './db/session-db.js';
 import { log } from './log.js';
+import { resolveGwsSideEffectVerifyKey } from './gws-side-effect-key.js';
 import {
   openInboundDb,
   openOutboundDb,
@@ -692,6 +693,7 @@ export function discoverGwsCrashWindowDraftsScoped(opts: {
   outDb: Database.Database;
   containerStopped: boolean;
   auditStorePath: string | undefined;
+  gwsPublicKey?: string;
 }): ReturnType<typeof discoverGwsCrashWindowDrafts> {
   const scope = gwsDiscoveryScope(opts.sessionDir, opts.outDb);
   return discoverGwsCrashWindowDrafts({
@@ -701,6 +703,7 @@ export function discoverGwsCrashWindowDraftsScoped(opts: {
     inputId: scope.inputId,
     routeKey: scope.routeKey,
     notBefore: scope.notBefore,
+    gwsPublicKey: opts.gwsPublicKey,
   });
 }
 
@@ -711,6 +714,7 @@ export function discoverGwsCrashWindowDraftsScoped(opts: {
  */
 export async function recoverAfterKill(inDb: Database.Database, session: Session, reason: string): Promise<void> {
   const dir = sessionDir(session.agent_group_id, session.id);
+  const gwsPublicKey = resolveGwsSideEffectVerifyKey(process.env);
   // Verify stop BEFORE opening the outbound DB writable (single-writer invariant).
   if (isContainerRunning(session.id)) {
     throw new Error(`recoverAfterKill: container for session ${session.id} is still running; refusing recovery writes`);
@@ -725,7 +729,6 @@ export async function recoverAfterKill(inDb: Database.Database, session: Session
       writableOutDb,
       verifyContainerStopped: async () => !isContainerRunning(session.id),
       importSideEffects: ({ containerStopped }) => {
-        const gwsPublicKey = process.env.GWS_SIDE_EFFECT_VERIFY_KEY;
         const allowedArtifactRoots = process.env.NANOCLAW_ARTIFACT_ROOTS
           ? process.env.NANOCLAW_ARTIFACT_ROOTS.split(':').filter(Boolean)
           : undefined;
@@ -751,6 +754,7 @@ export async function recoverAfterKill(inDb: Database.Database, session: Session
             outDb: writableOutDb,
             containerStopped,
             auditStorePath: process.env.GWS_AUDIT_STORE,
+            gwsPublicKey,
           });
         } catch (err) {
           log.warn('GWS crash-window discovery failed during recovery', { sessionId: session.id, err });

@@ -438,8 +438,10 @@ case "$http_code" in
     fi
     api_effect="$(header_value 'X-GWS-Api-Effect')"
     op_succeeded="$(header_value 'X-GWS-Operation-Succeeded')"
-    # Stage a sanitized gmail_draft_created ledger record ONLY for a successful
-    # API-effect mutation, AFTER the response and BEFORE printing success. The
+    # Stage a sanitized GWS mutation ledger record ONLY for a successful
+    # API-effect mutation, AFTER the response and BEFORE printing success. Only
+    # the exact signed gmail/users.drafts.create operation is classified as a
+    # draft; legacy or non-Gmail evidence remains a generic GWS diagnostic. The
     # shim does NOT verify the signature (it cannot in POSIX sh and staged JSONL
     # is untrusted anyway) — it forwards sig+payload verbatim for the importer.
     if [ "$api_effect" = "true" ] && [ "$op_succeeded" = "true" ]; then
@@ -500,13 +502,32 @@ case "$http_code" in
             let m = body.match(/\br-[0-9a-zA-Z_-]{4,}\b/);
             if (!m) m = body.match(/"(?:id|draft_id|draftId)"\s*:\s*"([^"]+)"/);
             if (m) draftId = m[1] || m[0];
+            let signed = null;
+            try {
+              const parsed = JSON.parse(process.env.NC_PAYLOAD || "");
+              if (parsed && parsed.schema_version === 2) signed = parsed;
+            } catch (e) { /* schema-v1 diagnostic fallback */ }
+            const signedService = signed && typeof signed.service === "string" ? signed.service : null;
+            const signedMethod = signed && typeof signed.method === "string" ? signed.method : null;
             const rec = {
-              kind: "gmail_draft_created",
-              audit_id: process.env.NC_AUDIT_ID || null,
-              request_class: process.env.NC_REQUEST_CLASS || null,
-              occurred_at: new Date().toISOString(),
-              input_id: inputId,
-              route_key: routeKey,
+              kind:
+                signedService === "gmail" && signedMethod === "users.drafts.create"
+                  ? "gmail_draft_created"
+                  : "gws_mutation_completed",
+              payload_schema_version: signed ? 2 : 1,
+              audit_id: signed && typeof signed.audit_id === "string" ? signed.audit_id : process.env.NC_AUDIT_ID || null,
+              profile: signed && typeof signed.profile === "string" ? signed.profile : null,
+              account_label: signed && typeof signed.account_label === "string" ? signed.account_label : null,
+              account_email: signed && typeof signed.account_email === "string" ? signed.account_email : null,
+              request_class:
+                signed && typeof signed.request_class === "string"
+                  ? signed.request_class
+                  : process.env.NC_REQUEST_CLASS || null,
+              occurred_at:
+                signed && typeof signed.occurred_at === "string" ? signed.occurred_at : new Date().toISOString(),
+              input_id: signed && typeof signed.input_id === "string" ? signed.input_id : inputId,
+              route_key: signed && typeof signed.route_key === "string" ? signed.route_key : routeKey,
+              operation: signedService && signedMethod ? `${signedService} ${signedMethod}` : null,
               args: sanitized,
               signature: process.env.NC_SIG || undefined,
               payload: process.env.NC_PAYLOAD || undefined,
@@ -519,18 +540,45 @@ case "$http_code" in
         # success, NOT a generic failure: the draft exists but we could not stage
         # its ledger line. Route through the exit-75 message (audit id, no body).
         if [ "$record_build_status" -ne 0 ] || [ -z "$record_line" ]; then
-          printf 'Error: GWS draft was created (audit_id=%s) but the side-effect ledger record could not be built. The draft exists; do not recreate it.\n' "$audit_id" >&2
+          printf 'Error: GWS operation completed (audit_id=%s) but the side-effect ledger record could not be built. Do not recreate it automatically.\n' "$audit_id" >&2
           exit 75
         fi
         # TRUE atomic append: a single >> write of the whole line. Never
         # temp+rename (which would clobber a concurrent appender). If the append
         # fails AFTER the API mutation already succeeded, emit a structured
         # partial-success error (audit id only, no raw body) instead of success.
-        if ! printf '%s\n' "$record_line" >> "$ledger_path" 2>/dev/null; then
-          printf 'Error: GWS draft was created (audit_id=%s) but the side-effect ledger append failed. The draft exists; do not recreate it.\n' "$audit_id" >&2
+        append_status=0
+        NC_LEDGER_PATH="$ledger_path" NC_RECORD_LINE="$record_line" NODE_NO_WARNINGS=1 node -e '
+          const fs = require("fs");
+          const path = require("path");
+          let fd;
+          let parentFd;
+          try {
+            fd = fs.openSync(
+              process.env.NC_LEDGER_PATH,
+              fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW,
+              0o600,
+            );
+            const line = Buffer.from(`${process.env.NC_RECORD_LINE}\n`);
+            if (fs.writeSync(fd, line) !== line.length) throw new Error("short side-effect ledger append");
+            fs.fsyncSync(fd);
+            parentFd = fs.openSync(path.dirname(process.env.NC_LEDGER_PATH), fs.constants.O_RDONLY);
+            fs.fsyncSync(parentFd);
+          } finally {
+            if (parentFd !== undefined) fs.closeSync(parentFd);
+            if (fd !== undefined) fs.closeSync(fd);
+          }
+        ' 2>/dev/null || append_status=$?
+        if [ "$append_status" -ne 0 ]; then
+          printf 'Error: GWS operation completed (audit_id=%s) but the durable side-effect ledger append failed. Do not recreate it automatically.\n' "$audit_id" >&2
           exit 75
         fi
       fi
+    fi
+    outcome="$(header_value 'X-GWS-Outcome')"
+    if [ "$outcome" = "completed_audit_failed" ]; then
+      printf 'Error: GWS operation completed (audit_id=%s) but global audit failed. Reconcile it; do not retry automatically.\n' "$(header_value 'X-GWS-Audit-Id')" >&2
+      exit 75
     fi
     printf '%s' "$body"
     exit "$exit_code"

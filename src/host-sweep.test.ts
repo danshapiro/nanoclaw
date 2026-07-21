@@ -4,6 +4,7 @@
  * don't have to mock the filesystem or the container runner.
  */
 import fs from 'fs';
+import { generateKeyPairSync, sign as edSign } from 'crypto';
 import os from 'os';
 import path from 'path';
 
@@ -12,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { countDueMessagesExcludingRecovery, getProcessingClaims } from './db/session-db.js';
 import { OUTBOUND_SCHEMA } from './db/schema.js';
+import { canonicalSideEffectPayload } from './db/side-effects-verify.js';
 import {
   ABSOLUTE_CEILING_MS,
   CLAIM_STUCK_MS,
@@ -737,6 +739,34 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
     fs.writeFileSync(p, entries.map((e) => JSON.stringify(e)).join('\n') + '\n');
   }
 
+  function signedAuditEntry(
+    key: ReturnType<typeof generateKeyPairSync>,
+    values: { auditId: string; inputId: string; routeKey: string; occurredAt: string },
+  ) {
+    const payloadValue = {
+      schema_version: 2,
+      audit_id: values.auditId,
+      profile: 'nanoclaw',
+      account_label: 'personal',
+      account_email: 'dan@danshapiro.com',
+      input_id: values.inputId,
+      route_key: values.routeKey,
+      service: 'gmail',
+      method: 'users.drafts.create',
+      request_class: 'api',
+      api_effect: true,
+      operation_succeeded: true,
+      occurred_at: values.occurredAt,
+      result_digest: '0123456789abcdef',
+    };
+    const payload = canonicalSideEffectPayload(payloadValue);
+    return {
+      ...payloadValue,
+      payload,
+      signature: edSign(null, Buffer.from(payload), key.privateKey).toString('base64'),
+    };
+  }
+
   it('imports ONLY this turn’s route/window draft, excluding other-session/route entries from the shared global store', () => {
     const { sessionPath, outPath } = setupSession();
     const auditStore = path.join(tmpRoot, 'gws-audit.jsonl');
@@ -744,6 +774,8 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
     const thisRoute = 'opencode|discord|chan-1|dm:mg-1';
     const otherRoute = 'opencode|discord|chan-9|dm:mg-9';
     const turnStart = '2026-05-29T12:00:00.000Z';
+    const key = generateKeyPairSync('ed25519');
+    const gwsPublicKey = key.publicKey.export({ format: 'pem', type: 'spki' }).toString();
 
     // The poll loop's active-input correlation file: this turn's route/input.
     fs.writeFileSync(
@@ -760,33 +792,27 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
 
     writeAuditStore(auditStore, [
       // MATCHING: this route, this input, after turn-start.
-      {
-        audit_id: 'draft-this',
-        input_id: 'in-this',
-        route_key: thisRoute,
-        service: 'gmail',
-        method: 'users.drafts.create',
-        occurred_at: '2026-05-29T12:00:05.000Z',
-      },
+      signedAuditEntry(key, {
+        auditId: 'draft-this',
+        inputId: 'in-this',
+        routeKey: thisRoute,
+        occurredAt: '2026-05-29T12:00:05.000Z',
+      }),
       // NON-MATCHING (other session/route): must be excluded.
-      {
-        audit_id: 'draft-other-route',
-        input_id: 'in-other',
-        route_key: otherRoute,
-        service: 'gmail',
-        method: 'users.drafts.create',
-        occurred_at: '2026-05-29T12:00:06.000Z',
-      },
+      signedAuditEntry(key, {
+        auditId: 'draft-other-route',
+        inputId: 'in-other',
+        routeKey: otherRoute,
+        occurredAt: '2026-05-29T12:00:06.000Z',
+      }),
       // NON-MATCHING (this route but BEFORE turn-start — an older, already-
       // recovered turn): excluded by notBefore.
-      {
-        audit_id: 'draft-stale',
-        input_id: 'in-old',
-        route_key: thisRoute,
-        service: 'gmail',
-        method: 'users.drafts.create',
-        occurred_at: '2026-05-29T11:00:00.000Z',
-      },
+      signedAuditEntry(key, {
+        auditId: 'draft-stale',
+        inputId: 'in-old',
+        routeKey: thisRoute,
+        occurredAt: '2026-05-29T11:00:00.000Z',
+      }),
     ]);
 
     const writableOutDb = new Database(outPath);
@@ -796,6 +822,7 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
         outDb: writableOutDb,
         containerStopped: true,
         auditStorePath: auditStore,
+        gwsPublicKey,
       });
       expect(r.discovered).toBe(1);
     } finally {
@@ -818,6 +845,8 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
 
     const thisRoute = 'opencode|discord|chan-1|dm:mg-1';
     const otherRoute = 'opencode|discord|chan-9|dm:mg-9';
+    const key = generateKeyPairSync('ed25519');
+    const gwsPublicKey = key.publicKey.export({ format: 'pem', type: 'spki' }).toString();
 
     // The kill landed before a single accepted input id was recorded: route is
     // known (host-authoritative) but inputId is absent.
@@ -833,22 +862,18 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
     out.close();
 
     writeAuditStore(auditStore, [
-      {
-        audit_id: 'draft-this',
-        input_id: 'in-a',
-        route_key: thisRoute,
-        service: 'gmail',
-        method: 'users.drafts.create',
-        occurred_at: '2026-05-29T12:00:05.000Z',
-      },
-      {
-        audit_id: 'draft-other-route',
-        input_id: 'in-b',
-        route_key: otherRoute,
-        service: 'gmail',
-        method: 'users.drafts.create',
-        occurred_at: '2026-05-29T12:00:06.000Z',
-      },
+      signedAuditEntry(key, {
+        auditId: 'draft-this',
+        inputId: 'in-a',
+        routeKey: thisRoute,
+        occurredAt: '2026-05-29T12:00:05.000Z',
+      }),
+      signedAuditEntry(key, {
+        auditId: 'draft-other-route',
+        inputId: 'in-b',
+        routeKey: otherRoute,
+        occurredAt: '2026-05-29T12:00:06.000Z',
+      }),
     ]);
 
     const writableOutDb = new Database(outPath);
@@ -858,6 +883,7 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
         outDb: writableOutDb,
         containerStopped: true,
         auditStorePath: auditStore,
+        gwsPublicKey,
       });
       expect(r.discovered).toBe(1);
     } finally {

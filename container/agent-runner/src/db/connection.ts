@@ -143,8 +143,13 @@ export function ensureOutboundSchema(db: Database): void {
       source          TEXT NOT NULL,
       kind            TEXT NOT NULL,
       operation       TEXT,
+      payload_schema_version INTEGER NOT NULL DEFAULT 1,
+      account_label   TEXT,
+      account_email   TEXT,
       input_id        TEXT,
       route_key       TEXT,
+      signed_payload  TEXT,
+      signature       TEXT,
       evidence_json   TEXT NOT NULL,
       validation_json TEXT NOT NULL,
       replay_policy   TEXT,
@@ -153,6 +158,21 @@ export function ensureOutboundSchema(db: Database): void {
     );
   `);
   ensureOutboundRouteColumns(db);
+  ensureSideEffectLedgerColumns(db);
+}
+
+function ensureSideEffectLedgerColumns(db: Database): void {
+  const cols = new Set(
+    (db.prepare("PRAGMA table_info('side_effect_ledger')").all() as Array<{ name: string }>).map((c) => c.name),
+  );
+  if (!cols.has('payload_schema_version'))
+    db.exec('ALTER TABLE side_effect_ledger ADD COLUMN payload_schema_version INTEGER NOT NULL DEFAULT 1');
+  if (!cols.has('account_label')) db.exec('ALTER TABLE side_effect_ledger ADD COLUMN account_label TEXT');
+  if (!cols.has('account_email')) db.exec('ALTER TABLE side_effect_ledger ADD COLUMN account_email TEXT');
+  if (!cols.has('input_id')) db.exec('ALTER TABLE side_effect_ledger ADD COLUMN input_id TEXT');
+  if (!cols.has('route_key')) db.exec('ALTER TABLE side_effect_ledger ADD COLUMN route_key TEXT');
+  if (!cols.has('signed_payload')) db.exec('ALTER TABLE side_effect_ledger ADD COLUMN signed_payload TEXT');
+  if (!cols.has('signature')) db.exec('ALTER TABLE side_effect_ledger ADD COLUMN signature TEXT');
 }
 
 /**
@@ -357,8 +377,13 @@ export function initTestSessionDb(): { inbound: Database; outbound: Database } {
       source          TEXT NOT NULL,
       kind            TEXT NOT NULL,
       operation       TEXT,
+      payload_schema_version INTEGER NOT NULL DEFAULT 1,
+      account_label   TEXT,
+      account_email   TEXT,
       input_id        TEXT,
       route_key       TEXT,
+      signed_payload  TEXT,
+      signature       TEXT,
       evidence_json   TEXT NOT NULL,
       validation_json TEXT NOT NULL,
       replay_policy   TEXT,

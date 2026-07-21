@@ -547,7 +547,13 @@ function classifyInvocation(args: string[]): { cls: string; apiEffect: boolean }
 
 /** Canonical signed payload — byte-identical to canonicalSideEffectPayload (TS + Go). */
 function canonicalPayload(p: {
+  schema_version: 2;
   audit_id: string;
+  profile: string;
+  account_label: string;
+  account_email: string;
+  input_id: string;
+  route_key: string;
   service: string;
   method: string;
   request_class: string;
@@ -557,7 +563,13 @@ function canonicalPayload(p: {
   result_digest: string;
 }): string {
   return JSON.stringify({
+    schema_version: p.schema_version,
     audit_id: p.audit_id,
+    profile: p.profile,
+    account_label: p.account_label,
+    account_email: p.account_email,
+    input_id: p.input_id,
+    route_key: p.route_key,
     service: p.service,
     method: p.method,
     request_class: p.request_class,
@@ -601,7 +613,8 @@ function startGwsBoundary(signWith: 'ephemeral' | 'forged' | 'unsigned' = 'ephem
       const body = (await req.json()) as { args: string[]; input_id?: string; route_key?: string };
       const args = body.args ?? [];
       const service = args[0] ?? '';
-      const method = args.find((a, i) => i > 0 && !a.startsWith('-')) ?? '';
+      const flagIndex = args.findIndex((arg, index) => index > 0 && arg.startsWith('-'));
+      const method = args.slice(1, flagIndex < 0 ? args.length : flagIndex).join('.');
       const { cls, apiEffect } = classifyInvocation(args);
       audits.push({ args, inputId: body.input_id, routeKey: body.route_key, requestClass: cls, apiEffect });
       const auditId = crypto.randomUUID().replace(/-/g, '');
@@ -618,7 +631,13 @@ function startGwsBoundary(signWith: 'ephemeral' | 'forged' | 'unsigned' = 'ephem
         const occurredAt = new Date().toISOString();
         const digest = crypto.createHash('sha256').update(out).digest('hex');
         const payload = canonicalPayload({
+          schema_version: 2,
           audit_id: auditId,
+          profile: 'nanoclaw',
+          account_label: 'personal',
+          account_email: 'dan@danshapiro.com',
+          input_id: body.input_id ?? '',
+          route_key: body.route_key ?? '',
           service,
           method,
           request_class: cls,
@@ -633,6 +652,14 @@ function startGwsBoundary(signWith: 'ephemeral' | 'forged' | 'unsigned' = 'ephem
             .sign(null, Buffer.from(payload, 'utf8'), key)
             .toString('base64');
           headers['X-GWS-Side-Effect-Payload'] = payload;
+          headers['X-GWS-Side-Effect-Schema'] = '2';
+          headers['X-GWS-Profile'] = 'nanoclaw';
+          headers['X-GWS-Account'] = 'personal';
+          headers['X-GWS-Account-Email'] = 'dan@danshapiro.com';
+          headers['X-GWS-Input-Id'] = body.input_id ?? '';
+          headers['X-GWS-Route-Key'] = body.route_key ?? '';
+          headers['X-GWS-Service'] = service;
+          headers['X-GWS-Method'] = method;
         }
       }
       return new Response(out, { headers });
