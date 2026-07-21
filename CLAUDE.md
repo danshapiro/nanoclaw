@@ -105,6 +105,13 @@ Yente's agent-facing `gws` command is a shim at `/usr/local/bin/gws`, not the
 real Google Workspace CLI. The shim forwards argv to `GWS_PROXY_URL` through
 the configured OneCLI proxy environment; OneCLI injects the proxy authorization
 header for the configured proxy hostname.
+Remote calls must start with exactly `gws --account personal ...` or
+`gws --account glowforge ...`. The selector belongs to that one request: there
+is no `primary` alias or `both` selector, and work spanning both accounts uses
+two separately labeled calls. `auth status` uses the same leading selector and
+the authenticated `/whoami` route. The shim removes the selector from upstream
+argv and requires every proxy response to identify the same account before it
+prints a body or publishes downloaded bytes.
 Agent containers must not receive `GWS_PROXY_KEY`, `/srv/nanoclaw/shared/gws-config`,
 Google OAuth files, or a direct-auth Google Workspace CLI binary. The real
 GWS CLI and OAuth state belong only behind the `gws-proxy` policy boundary.
@@ -156,6 +163,13 @@ Four types of skills. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full taxono
 - **Utility skills** — ship code files alongside `SKILL.md` (e.g. `/claw`).
 - **Operational skills** — instruction-only workflows (`/setup`, `/debug`, `/customize`, `/init-first-agent`, `/manage-channels`, `/init-onecli`, `/update-nanoclaw`).
 - **Container skills** — loaded inside agent containers at runtime (`container/skills/`: `welcome`, `self-customize`, `agent-browser`, `slack-formatting`).
+
+The host resolves `container.json`'s skill selection once for each spawn. `all`
+means the complete merged managed inventory; an explicit list is validated,
+de-duplicated, and unioned with every available `gws-*` skill so Google Workspace
+remains a baseline capability. That exact filtered root is shared by Claude,
+Codex, OpenCode, threaded sessions, and operator forks, so no provider can
+independently discover a broader skill set.
 
 | Skill | When to Use |
 |-------|-------------|

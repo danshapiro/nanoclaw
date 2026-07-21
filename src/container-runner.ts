@@ -994,11 +994,20 @@ function buildMounts(
   // the catch block ensures the temp dir is cleaned up.
   const tempRoot = createManagedSkillTempRoot(DATA_DIR);
   try {
-    const managedSkills = resolveManagedSkillRoot({ projectRoot, dataDir: DATA_DIR, env: process.env, root: tempRoot });
+    const managedSkills = resolveManagedSkillRoot({
+      projectRoot,
+      dataDir: DATA_DIR,
+      env: process.env,
+      root: tempRoot,
+      selection: containerConfig.skills,
+    });
 
     // Sync skill symlinks based on container.json selection before mounting.
     const claudeDir = path.join(DATA_DIR, 'v2-sessions', agentGroup.id, '.claude-shared');
-    syncManagedSkillSymlinks({ claudeDir, skillRoot: managedSkills.root, selection: containerConfig.skills });
+    syncManagedSkillSymlinks({
+      claudeDir,
+      skillNames: managedSkills.skills.map((skill) => skill.name),
+    });
 
     // Compose CLAUDE.md fresh every spawn from the shared base, enabled skill
     // fragments, and MCP server instructions. See `claude-md-compose.ts`.

@@ -7,7 +7,7 @@ set -eu
 
 case "${1:-}" in
   --version)
-    echo "gws-proxy-shim 2.0.0"
+    echo "gws-proxy-shim 3.0.0"
     exit 0
     ;;
   --help|-h)
@@ -15,15 +15,51 @@ case "${1:-}" in
 gws - Google Workspace CLI (proxied)
 
 Usage:
-  gws auth status
-  gws <service> <resource-or-shortcut> [method] [flags]
+  gws --account personal auth status
+  gws --account glowforge auth status
+  gws --account personal <service> <resource-or-shortcut> [method] [flags]
+  gws --account glowforge <service> <resource-or-shortcut> [method] [flags]
 
 All non-local commands are forwarded to GWS_PROXY_URL/exec. OneCLI injects
-proxy authorization at the network gateway.
+proxy authorization at the network gateway. Each request targets exactly one
+account; use two explicit commands when a task needs both accounts.
 HELP
     exit 0
     ;;
 esac
+
+if [ "${1:-}" != "--account" ]; then
+  echo "Error: remote GWS commands require --account personal|glowforge as the first two arguments." >&2
+  exit 2
+fi
+
+account="${2:-}"
+case "$account" in
+  personal|glowforge) ;;
+  *)
+    echo "Error: --account must be exactly personal or glowforge." >&2
+    exit 2
+    ;;
+esac
+shift 2
+
+if [ "$#" -eq 0 ]; then
+  echo "Error: a GWS command is required after --account $account." >&2
+  exit 2
+fi
+for arg in "$@"; do
+  case "$arg" in
+    --account|--account=*)
+      echo "Error: --account is accepted exactly once, as the first two arguments." >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [ "${1:-}" = "auth" ] && { [ "${2:-}" != "status" ] || [ "$#" -ne 2 ]; }; then
+  echo "Error: the only supported auth operation is exactly 'auth status'." >&2
+  exit 2
+fi
 
 if [ -z "${GWS_PROXY_URL:-}" ]; then
   echo "Error: GWS_PROXY_URL is not set; GWS access is unavailable without the mediated proxy." >&2
@@ -40,31 +76,6 @@ curl_with_configured_proxy() {
   fi
 }
 
-json_string() {
-  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
-}
-
-case "${1:-}" in
-  auth)
-    if [ "${2:-}" = "status" ]; then
-      http_code="$(curl_with_configured_proxy -fsS -o /dev/null -w "%{http_code}" "$GWS_PROXY_URL/health" 2>/dev/null || true)"
-      proxy_url_json="$(json_string "$GWS_PROXY_URL")"
-      if [ "$http_code" = "200" ]; then
-        printf '{"auth_method":"proxy","proxy_url":"%s","status":"connected"}\n' "$proxy_url_json"
-        exit 0
-      fi
-      printf '{"auth_method":"proxy","proxy_url":"%s","status":"unreachable"}\n' "$proxy_url_json"
-      exit 1
-    fi
-    ;;
-esac
-
-# Correlation is host-authenticated and mounted read-only over the otherwise
-# agent-writable workspace. Never fall back to .active-input.json: the agent can
-# edit that file and must not be able to forge recovery scope.
-host_correlation_file="${NANOCLAW_HOST_CORRELATION_FILE:-/workspace/.host-correlation/current.json}"
-host_lease_file="${NANOCLAW_HOST_LEASE_FILE:-/workspace/.host-correlation/active-lease.json}"
-
 tmp_headers="$(mktemp)"
 tmp_body="$(mktemp)"
 tmp_arg_plan="$(mktemp)"
@@ -76,6 +87,52 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+
+# Extract a response header case-insensitively and strip CR.
+header_value() {
+  awk -v h="$1" 'BEGIN{IGNORECASE=1} {
+    if (tolower($0) ~ "^" tolower(h) ":") {
+      sub(/^[^:]*:[ \t]*/, "", $0); gsub("\r", "", $0); print; exit
+    }
+  }' "$tmp_headers"
+}
+
+case "${1:-}" in
+  auth)
+    if [ "${2:-}" = "status" ] && [ "$#" -eq 2 ]; then
+      whoami_status=0
+      http_code="$(
+        curl_with_configured_proxy -sS -o "$tmp_body" -D "$tmp_headers" -w "%{http_code}" \
+          -X POST \
+          -H "Content-Type: application/json" \
+          -d "{\"account\":\"$account\"}" \
+          "$GWS_PROXY_URL/whoami" 2>/dev/null
+      )" || whoami_status=$?
+      if [ "$whoami_status" -ne 0 ] || [ -z "$http_code" ] || [ "$http_code" = "000" ]; then
+        echo "Error: unable to reach GWS proxy at $GWS_PROXY_URL" >&2
+        exit 1
+      fi
+      if [ "$http_code" != "200" ]; then
+        printf 'Error: GWS proxy identity check returned HTTP %s\n' "$http_code" >&2
+        cat "$tmp_body" >&2
+        exit 1
+      fi
+      response_account="$(header_value 'X-GWS-Account')"
+      if [ "$response_account" != "$account" ]; then
+        printf 'Error: GWS proxy response account did not match requested account %s.\n' "$account" >&2
+        exit 1
+      fi
+      cat "$tmp_body"
+      exit 0
+    fi
+    ;;
+esac
+
+# Correlation is host-authenticated and mounted read-only over the otherwise
+# agent-writable workspace. Never fall back to .active-input.json: the agent can
+# edit that file and must not be able to forge recovery scope.
+host_correlation_file="${NANOCLAW_HOST_CORRELATION_FILE:-/workspace/.host-correlation/current.json}"
+host_lease_file="${NANOCLAW_HOST_LEASE_FILE:-/workspace/.host-correlation/active-lease.json}"
 
 parse_status=0
 readonly_output_roots="/workspace/agent:/workspace/outbox"
@@ -225,12 +282,12 @@ fi
 # kill happens before the JSONL append. The shim NEVER adds an Authorization
 # header (OneCLI injects it at the gateway).
 request_body="$(
-  NODE_NO_WARNINGS=1 NANOCLAW_HOST_CORRELATION_FILE="$host_correlation_file" \
+  NODE_NO_WARNINGS=1 GWS_ACCOUNT="$account" NANOCLAW_HOST_CORRELATION_FILE="$host_correlation_file" \
   NANOCLAW_HOST_LEASE_FILE="$host_lease_file" \
   GWS_ARG_PLAN_FILE="$tmp_arg_plan" node -e '
     const fs = require("fs");
     const plan = JSON.parse(fs.readFileSync(process.env.GWS_ARG_PLAN_FILE, "utf8"));
-    const body = { args: plan.proxyArgs };
+    const body = { account: process.env.GWS_ACCOUNT, args: plan.proxyArgs };
     if (plan.output) body.output = { mode: "return_file" };
     try {
       const markerBefore = JSON.parse(fs.readFileSync(process.env.NANOCLAW_HOST_LEASE_FILE, "utf8"));
@@ -301,17 +358,16 @@ if [ -z "$http_code" ] || [ "$http_code" = "000" ]; then
   exit 1
 fi
 
+response_account="$(header_value 'X-GWS-Account')"
+if [ "$response_account" != "$account" ]; then
+  rm -f "$tmp_output_body"
+  tmp_output_body=""
+  printf 'Error: GWS proxy response account did not match requested account %s.\n' "$account" >&2
+  exit 1
+fi
+
 exit_code="$(awk 'BEGIN{IGNORECASE=1} /^X-Exit-Code:/ {gsub("\r","",$2); print $2; exit}' "$tmp_headers")"
 exit_code="${exit_code:-0}"
-
-# Extract the audit-classification headers (case-insensitive; strip CR).
-header_value() {
-  awk -v h="$1" 'BEGIN{IGNORECASE=1} {
-    if (tolower($0) ~ "^" tolower(h) ":") {
-      sub(/^[^:]*:[ \t]*/, "", $0); gsub("\r", "", $0); print; exit
-    }
-  }' "$tmp_headers"
-}
 
 file_size_bytes() {
   NODE_NO_WARNINGS=1 node -e '
@@ -615,7 +671,12 @@ case "$http_code" in
       printf 'Error: GWS operation completed (audit_id=%s) but global audit failed. Reconcile it; do not retry automatically.\n' "$(header_value 'X-GWS-Audit-Id')" >&2
       exit 75
     fi
-    printf '%s' "$body"
+    if [ -z "$output_resolved_path" ]; then
+      cat "$curl_body_target"
+    else
+      # Output-mode CLI failures were moved out of the binary temp file above.
+      printf '%s' "$body"
+    fi
     exit "$exit_code"
     ;;
   401|403)

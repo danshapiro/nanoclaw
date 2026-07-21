@@ -89,6 +89,7 @@ export function resolveManagedSkillRoot(args: {
   dataDir: string;
   env?: NodeJS.ProcessEnv;
   root?: string;
+  selection?: SkillSelection;
 }): ManagedSkillRoot {
   const env = args.env ?? process.env;
   const sources = collectSkillRootSources(args.projectRoot, env);
@@ -125,7 +126,8 @@ export function resolveManagedSkillRoot(args: {
     }
   }
 
-  const skills = [...skillsByName.values()].sort((a, b) => a.name.localeCompare(b.name));
+  const availableSkills = [...skillsByName.values()].sort((a, b) => a.name.localeCompare(b.name));
+  const skills = resolveEffectiveSkillInventory(availableSkills, args.selection ?? 'all');
 
   // Each spawn gets a fresh, isolated merged root. If the caller provides
   // a root path (created externally with its own lifecycle), use it.
@@ -135,7 +137,7 @@ export function resolveManagedSkillRoot(args: {
     skill.mergedPath = path.join(root, skill.name);
     fs.cpSync(skill.sourcePath, skill.mergedPath, { recursive: true, dereference: true });
   }
-  copyRuntimeManifests(sources, root);
+  copyRuntimeManifests(sources, root, new Set(skills.map((skill) => skill.name)));
   synthesizeSkillBinLinks(root, skills);
 
   const generation = computeManagedSkillGeneration(managedSkillRootsFromEnv(env));
@@ -146,22 +148,42 @@ export function clearManagedSkillRootCache(): void {
   _cleanupRan = false;
 }
 
-export function syncManagedSkillSymlinks(args: {
-  claudeDir: string;
-  skillRoot: string;
-  selection: SkillSelection;
-}): void {
+/**
+ * Resolve the one effective inventory mounted into a runtime. Explicit
+ * selections are set unions with every available `gws-*` skill: duplicates are
+ * removed, names are sorted for a stable mount, and every requested name must
+ * exist before anything is copied. GWS is a baseline capability, not a
+ * provider- or group-specific privilege tier.
+ * Because `/app/skills` itself contains only this result, Claude symlinks,
+ * Codex discovery, OpenCode compatibility discovery, threaded sessions, and
+ * operator forks cannot accidentally see different inventories.
+ */
+export function resolveEffectiveSkillInventory(
+  availableSkills: readonly ManagedSkill[],
+  selection: SkillSelection,
+): ManagedSkill[] {
+  const availableByName = new Map(availableSkills.map((skill) => [skill.name, skill]));
+  const desiredNames =
+    selection === 'all'
+      ? [...availableByName.keys()].sort((a, b) => a.localeCompare(b))
+      : [...new Set([...selection, ...[...availableByName.keys()].filter((name) => name.startsWith('gws-'))])].sort(
+          (a, b) => a.localeCompare(b),
+        );
+
+  for (const name of desiredNames) {
+    if (!availableByName.has(name)) {
+      throw new Error(`Configured skill "${name}" is not available in the managed skill inventory`);
+    }
+  }
+
+  return desiredNames.map((name) => availableByName.get(name)!);
+}
+
+export function syncManagedSkillSymlinks(args: { claudeDir: string; skillNames: readonly string[] }): void {
   const skillsDir = path.join(args.claudeDir, 'skills');
   fs.mkdirSync(skillsDir, { recursive: true });
 
-  const available = new Set(listSkillNames(args.skillRoot));
-  const desired = args.selection === 'all' ? [...available].sort() : args.selection;
-
-  for (const skill of desired) {
-    if (!available.has(skill)) {
-      throw new Error(`Configured skill "${skill}" is not available in managed skill root: ${args.skillRoot}`);
-    }
-  }
+  const desired = [...args.skillNames];
 
   const desiredSet = new Set(desired);
   for (const entry of fs.readdirSync(skillsDir)) {
@@ -236,15 +258,6 @@ function listSkillSourceDirs(root: string): Array<{ name: string; sourcePath: st
     .filter((skill) => isDirectory(skill.sourcePath));
 }
 
-function listSkillNames(root: string): string[] {
-  if (!fs.existsSync(root)) return [];
-  return fs
-    .readdirSync(root)
-    .filter((name) => !name.startsWith('.'))
-    .filter((name) => isDirectory(path.join(root, name)))
-    .sort();
-}
-
 function collectManifestSkillLocalBins(root: string, binsBySkill: Map<string, Set<string>>): void {
   const manifestPath = path.join(root, SKILL_RUNTIME_MANIFEST);
   if (!fs.existsSync(manifestPath)) return;
@@ -268,7 +281,11 @@ function readRuntimeManifest(manifestPath: string): RuntimeManifest {
   return parsed;
 }
 
-function copyRuntimeManifests(sources: SkillRootSource[], mergedRoot: string): void {
+function copyRuntimeManifests(
+  sources: SkillRootSource[],
+  mergedRoot: string,
+  selectedNames: ReadonlySet<string>,
+): void {
   const manifests = sources
     .map((source) => path.join(source.root, SKILL_RUNTIME_MANIFEST))
     .filter((file) => fs.existsSync(file));
@@ -276,7 +293,12 @@ function copyRuntimeManifests(sources: SkillRootSource[], mergedRoot: string): v
   if (manifests.length > 1) {
     throw new Error(`Multiple ${SKILL_RUNTIME_MANIFEST} files are not supported in one merged skill root`);
   }
-  fs.copyFileSync(manifests[0], path.join(mergedRoot, SKILL_RUNTIME_MANIFEST));
+  const manifest = readRuntimeManifest(manifests[0]);
+  const filtered = {
+    ...manifest,
+    ...(manifest.skills ? { skills: manifest.skills.filter((skill) => selectedNames.has(skill.name)) } : {}),
+  };
+  fs.writeFileSync(path.join(mergedRoot, SKILL_RUNTIME_MANIFEST), `${JSON.stringify(filtered, null, 2)}\n`);
 }
 
 function synthesizeSkillBinLinks(root: string, skills: ManagedSkill[]): void {

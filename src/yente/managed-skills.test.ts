@@ -44,6 +44,76 @@ afterEach(() => {
 });
 
 describe('resolveManagedSkillRoot', () => {
+  it('uses one validated, de-duplicated effective inventory for all and explicit selections', () => {
+    const projectRoot = makeTempDir();
+    const dataDir = makeTempDir();
+    const bundledRoot = path.join(projectRoot, 'container', 'skills');
+    makeSkill(bundledRoot, 'status');
+    makeSkill(bundledRoot, 'gws-calendar');
+    makeSkill(bundledRoot, 'gws-drive');
+    makeSkill(bundledRoot, 'gws-gmail');
+
+    const all = resolveManagedSkillRoot({ projectRoot, dataDir, selection: 'all' });
+    const restricted = resolveManagedSkillRoot({
+      projectRoot,
+      dataDir,
+      selection: ['status', 'gws-drive', 'status'],
+    });
+
+    expect(all.skills.map((skill) => skill.name)).toEqual(['gws-calendar', 'gws-drive', 'gws-gmail', 'status']);
+    expect(restricted.skills.map((skill) => skill.name)).toEqual(['gws-calendar', 'gws-drive', 'gws-gmail', 'status']);
+    expect(fs.existsSync(path.join(restricted.root, 'status'))).toBe(true);
+    expect(fs.existsSync(path.join(restricted.root, 'gws-drive', 'SKILL.md'))).toBe(true);
+    expect(fs.existsSync(path.join(restricted.root, 'gws-gmail', 'SKILL.md'))).toBe(true);
+  });
+
+  it('fails closed when an explicit effective inventory names an unavailable skill', () => {
+    const projectRoot = makeTempDir();
+    const dataDir = makeTempDir();
+    makeSkill(path.join(projectRoot, 'container', 'skills'), 'gws-drive');
+
+    expect(() => resolveManagedSkillRoot({ projectRoot, dataDir, selection: ['gws-drive', 'gws-missing'] })).toThrow(
+      'Configured skill "gws-missing" is not available',
+    );
+  });
+
+  it('assembles the same selected GWS inventory for every provider and threaded runtime row', () => {
+    const projectRoot = makeTempDir();
+    const dataDir = makeTempDir();
+    const bundledRoot = path.join(projectRoot, 'container', 'skills');
+    for (const skill of ['gws-drive', 'gws-gmail', 'gws-calendar', 'status']) makeSkill(bundledRoot, skill);
+
+    const rows = [
+      ['claude/all', 'all'],
+      ['codex/all', 'all'],
+      ['opencode/all', 'all'],
+      ['claude/restricted', ['status', 'gws-drive', 'status']],
+      ['codex/restricted', ['status', 'gws-drive', 'status']],
+      ['opencode/restricted', ['status', 'gws-drive', 'status']],
+      ['threaded/restricted', ['status', 'gws-drive', 'status']],
+    ] as const;
+
+    const inventories = new Map<string, string[]>();
+    for (const [runtime, selection] of rows) {
+      const resolved = resolveManagedSkillRoot({
+        projectRoot,
+        dataDir,
+        selection: selection === 'all' ? 'all' : [...selection],
+      });
+      inventories.set(
+        runtime,
+        resolved.skills.map((skill) => skill.name).filter((name) => name.startsWith('gws-')),
+      );
+    }
+
+    for (const runtime of ['claude/all', 'codex/all', 'opencode/all']) {
+      expect(inventories.get(runtime)).toEqual(['gws-calendar', 'gws-drive', 'gws-gmail']);
+    }
+    for (const runtime of ['claude/restricted', 'codex/restricted', 'opencode/restricted', 'threaded/restricted']) {
+      expect(inventories.get(runtime)).toEqual(['gws-calendar', 'gws-drive', 'gws-gmail']);
+    }
+  });
+
   it('ships the validation skills required by the live proof harness', () => {
     const bundledRoot = path.join(process.cwd(), 'container', 'skills');
 
@@ -372,7 +442,7 @@ describe('syncManagedSkillSymlinks', () => {
     makeSkill(skillRoot, 'alpha');
     makeSkill(skillRoot, 'beta');
 
-    syncManagedSkillSymlinks({ claudeDir, skillRoot, selection: 'all' });
+    syncManagedSkillSymlinks({ claudeDir, skillNames: ['alpha', 'beta'] });
 
     expect(fs.lstatSync(path.join(claudeDir, 'skills', 'alpha')).isSymbolicLink()).toBe(true);
     expect(fs.readlinkSync(path.join(claudeDir, 'skills', 'alpha'))).toBe('/app/skills/alpha');

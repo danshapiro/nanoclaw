@@ -2071,6 +2071,129 @@ describe('side-effect ledger container env', () => {
   });
 });
 
+describe('assembled managed-skill runtime matrix', () => {
+  it('gives Claude, Codex, OpenCode, and threaded sessions the same effective GWS mount and gateway wiring', async () => {
+    const managedRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-gws-runtime-matrix-'));
+    for (const skill of ['gws-calendar', 'gws-drive', 'gws-gmail']) {
+      const skillDir = path.join(managedRoot, skill);
+      fs.mkdirSync(skillDir, { recursive: true });
+      fs.writeFileSync(path.join(skillDir, 'SKILL.md'), `# ${skill}\n`);
+    }
+    const savedManagedRoots = process.env.NANOCLAW_MANAGED_SKILLS_DIRS;
+    const savedRawKey = process.env.GWS_PROXY_KEY;
+    process.env.NANOCLAW_MANAGED_SKILLS_DIRS = managedRoot;
+    process.env.GWS_PROXY_KEY = 'must-not-cross-container-boundary';
+
+    const rows: Array<{
+      name: string;
+      provider: 'claude' | 'codex' | 'opencode';
+      skills: 'all' | string[];
+      threaded?: boolean;
+      expectedGws: string[];
+    }> = [
+      {
+        name: 'claude/all',
+        provider: 'claude',
+        skills: 'all',
+        expectedGws: ['gws-calendar', 'gws-drive', 'gws-gmail'],
+      },
+      { name: 'codex/all', provider: 'codex', skills: 'all', expectedGws: ['gws-calendar', 'gws-drive', 'gws-gmail'] },
+      {
+        name: 'opencode/all',
+        provider: 'opencode',
+        skills: 'all',
+        expectedGws: ['gws-calendar', 'gws-drive', 'gws-gmail'],
+      },
+      {
+        name: 'claude/restricted',
+        provider: 'claude',
+        skills: ['status', 'gws-drive', 'status'],
+        expectedGws: ['gws-calendar', 'gws-drive', 'gws-gmail'],
+      },
+      {
+        name: 'codex/restricted',
+        provider: 'codex',
+        skills: ['status', 'gws-drive', 'status'],
+        expectedGws: ['gws-calendar', 'gws-drive', 'gws-gmail'],
+      },
+      {
+        name: 'opencode/restricted',
+        provider: 'opencode',
+        skills: ['status', 'gws-drive', 'status'],
+        expectedGws: ['gws-calendar', 'gws-drive', 'gws-gmail'],
+      },
+      {
+        name: 'threaded/restricted',
+        provider: 'claude',
+        skills: ['status', 'gws-drive', 'status'],
+        threaded: true,
+        expectedGws: ['gws-calendar', 'gws-drive', 'gws-gmail'],
+      },
+    ];
+
+    const harness = await loadContainerRunnerHarness();
+    try {
+      expect(fs.statSync(path.join(process.cwd(), 'container', 'shim', 'gws')).mode & 0o111).not.toBe(0);
+      fs.mkdirSync(path.join(harness.groupsDir, 'agent'), { recursive: true });
+      harness.applyContainerConfigMock.mockImplementation(async (args: string[]) => {
+        harness.oneCliStarted.resolve();
+        args.push('-e', 'HTTP_PROXY=http://fake-yente-bearer@generic-onecli.local:10255');
+        args.push('-e', 'HTTPS_PROXY=http://fake-yente-bearer@generic-onecli.local:10255');
+        return true;
+      });
+      harness.oneCliRelease.resolve();
+
+      for (const [rowIndex, row] of rows.entries()) {
+        fs.writeFileSync(
+          path.join(harness.groupsDir, 'agent', 'container.json'),
+          JSON.stringify({
+            mcpServers: {},
+            packages: { apt: [], npm: [] },
+            additionalMounts: [],
+            skills: row.skills,
+            provider: row.provider,
+          }),
+        );
+        harness.session.thread_id = row.threaded ? 'thread-42' : null;
+
+        await harness.containerRunner.wakeContainer(harness.session);
+
+        const args = harness.spawnMock.mock.calls[rowIndex][1] as string[];
+        const skillMount = args.find((entry) => entry.endsWith(':/app/skills:ro'));
+        expect(skillMount, row.name).toBeTruthy();
+        const mountedRoot = skillMount!.slice(0, -':/app/skills:ro'.length);
+        const mountedGws = fs
+          .readdirSync(mountedRoot)
+          .filter((name) => name.startsWith('gws-'))
+          .sort();
+        expect(mountedGws, row.name).toEqual(row.expectedGws);
+        for (const skill of mountedGws) {
+          expect(fs.existsSync(path.join(mountedRoot, skill, 'SKILL.md')), `${row.name}:${skill}`).toBe(true);
+        }
+
+        const { env } = readSpawnEnvFile(args);
+        expect(env.get('GWS_PROXY_URL'), row.name).toBe('http://yente-gws-proxy.local:8083');
+        expect(env.get('YENTE_ONECLI_GATEWAY_PROXY_URL'), row.name).toBe(
+          'http://fake-yente-bearer@generic-onecli.local:10255',
+        );
+        expect(env.has('GWS_PROXY_KEY'), row.name).toBe(false);
+        expect(args, row.name).toContain('--add-host=yente-gws-proxy.local:host-gateway');
+
+        harness.spawnedProcesses[rowIndex].emit('close', 0);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(harness.containerRunner.getActiveContainerCount(), row.name).toBe(0);
+      }
+    } finally {
+      harness.close();
+      if (savedManagedRoots === undefined) delete process.env.NANOCLAW_MANAGED_SKILLS_DIRS;
+      else process.env.NANOCLAW_MANAGED_SKILLS_DIRS = savedManagedRoots;
+      if (savedRawKey === undefined) delete process.env.GWS_PROXY_KEY;
+      else process.env.GWS_PROXY_KEY = savedRawKey;
+      fs.rmSync(managedRoot, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('container env file (secrets off the command line)', () => {
   async function wakeAndGetArgs(harness: Awaited<ReturnType<typeof loadContainerRunnerHarness>>): Promise<string[]> {
     const wake = harness.containerRunner.wakeContainer(harness.session);

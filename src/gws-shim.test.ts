@@ -36,7 +36,18 @@ async function withProxy(
     req.on('data', (chunk) => {
       body += chunk;
     });
-    req.on('end', () => handler(req, res, body));
+    req.on('end', () => {
+      try {
+        const parsed = JSON.parse(body) as { account?: unknown };
+        if (parsed.account === 'personal' || parsed.account === 'glowforge') {
+          res.setHeader('X-GWS-Account', parsed.account);
+        }
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
+        // Tests that exercise malformed or bodyless requests set headers explicitly.
+      }
+      handler(req, res, body);
+    });
   });
   servers.push(server);
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -48,7 +59,13 @@ async function withProxy(
   };
 }
 
-async function runShim(args: string[], env: NodeJS.ProcessEnv = {}, cwd = process.cwd(), shim = shimPath) {
+async function runShim(
+  args: string[],
+  env: NodeJS.ProcessEnv = {},
+  cwd = process.cwd(),
+  shim = shimPath,
+  addDefaultAccount = true,
+) {
   const cleanProxyEnv: NodeJS.ProcessEnv = {
     HTTP_PROXY: undefined,
     http_proxy: undefined,
@@ -59,9 +76,16 @@ async function runShim(args: string[], env: NodeJS.ProcessEnv = {}, cwd = proces
     NO_PROXY: undefined,
     no_proxy: undefined,
   };
+  const effectiveArgs =
+    addDefaultAccount && !['--version', '--help', '-h', '--account'].includes(args[0] ?? '')
+      ? ['--account', 'personal', ...args]
+      : args;
   const effectiveEnv = { ...env };
   const localOnly =
-    args[0] === '--version' || args[0] === '--help' || args[0] === '-h' || (args[0] === 'auth' && args[1] === 'status');
+    effectiveArgs[0] === '--version' ||
+    effectiveArgs[0] === '--help' ||
+    effectiveArgs[0] === '-h' ||
+    (effectiveArgs[0] === '--account' && effectiveArgs[2] === 'auth' && effectiveArgs[3] === 'status');
   const explicitCorrelation = Object.prototype.hasOwnProperty.call(env, 'NANOCLAW_HOST_CORRELATION_FILE');
   const requestedCorrelation = effectiveEnv.NANOCLAW_HOST_CORRELATION_FILE;
   if (!localOnly && (!explicitCorrelation || (requestedCorrelation && fs.existsSync(requestedCorrelation)))) {
@@ -84,7 +108,7 @@ async function runShim(args: string[], env: NodeJS.ProcessEnv = {}, cwd = proces
     effectiveEnv.NANOCLAW_HOST_LEASE_FILE = markerPath;
   }
   return await new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve, reject) => {
-    const child = spawn('sh', [shim, ...args], {
+    const child = spawn('sh', [shim, ...effectiveArgs], {
       cwd,
       env: {
         ...process.env,
@@ -107,6 +131,10 @@ async function runShim(args: string[], env: NodeJS.ProcessEnv = {}, cwd = proces
     child.on('error', reject);
     child.on('close', (status) => resolve({ status, stdout, stderr }));
   });
+}
+
+async function runShimRaw(args: string[], env: NodeJS.ProcessEnv = {}, cwd = process.cwd(), shim = shimPath) {
+  return runShim(args, env, cwd, shim, false);
 }
 
 function shimWithOutputRootsForTest(roots: string[]): string {
@@ -161,34 +189,167 @@ describe('gws proxy shim', () => {
     expect(result.stderr).not.toContain('GWS_PROXY_KEY');
   });
 
-  it('reports proxy auth status through the unauthenticated health endpoint', async () => {
+  it('requires an exact fixed-position account selector before every remote operation', async () => {
     const records: RequestRecord[] = [];
     const proxy = await withProxy((req, res, body) => {
-      records.push({
+      records.push({ method: req.method, url: req.url, body });
+      res.writeHead(200, { 'Content-Type': 'application/json', 'X-Exit-Code': '0' });
+      res.end('{"ok":true}');
+    });
+
+    const personal = await runShimRaw(['--account', 'personal', 'gmail', 'users', 'getProfile'], {
+      GWS_PROXY_URL: proxy.url,
+    });
+    const glowforge = await runShimRaw(['--account', 'glowforge', 'admin-reports:directory_v1', 'users', 'list'], {
+      GWS_PROXY_URL: proxy.url,
+    });
+
+    expect(personal.status).toBe(0);
+    expect(glowforge.status).toBe(0);
+    expect(records.map((record) => JSON.parse(record.body))).toEqual([
+      {
+        account: 'personal',
+        args: ['gmail', 'users', 'getProfile'],
+        input_id: DEFAULT_TEST_INPUT,
+        route_key: DEFAULT_TEST_ROUTE,
+      },
+      {
+        account: 'glowforge',
+        args: ['admin-reports:directory_v1', 'users', 'list'],
+        input_id: DEFAULT_TEST_INPUT,
+        route_key: DEFAULT_TEST_ROUTE,
+      },
+    ]);
+  });
+
+  it.each([
+    ['missing selector', ['gmail', 'users', 'getProfile']],
+    ['missing label', ['--account']],
+    ['empty label', ['--account', '', 'gmail', 'users', 'getProfile']],
+    ['primary alias', ['--account', 'primary', 'gmail', 'users', 'getProfile']],
+    ['both selector', ['--account', 'both', 'gmail', 'users', 'getProfile']],
+    ['case variant', ['--account', 'Personal', 'gmail', 'users', 'getProfile']],
+    ['whitespace variant', ['--account', ' personal', 'gmail', 'users', 'getProfile']],
+    ['equals syntax', ['--account=personal', 'gmail', 'users', 'getProfile']],
+    ['misplaced selector', ['gmail', '--account', 'personal', 'users', 'getProfile']],
+    ['unsupported auth operation', ['--account', 'personal', 'auth', 'login']],
+    ['extra auth status argument', ['--account', 'personal', 'auth', 'status', 'extra']],
+    ['duplicate selector', ['--account', 'personal', 'gmail', 'users', 'getProfile', '--account', 'glowforge']],
+    ['duplicate equals selector', ['--account', 'personal', 'gmail', '--account=glowforge', 'users', 'getProfile']],
+  ])('rejects %s with exit 2 before making a network request', async (_name, args) => {
+    const records: RequestRecord[] = [];
+    const proxy = await withProxy((req, res, body) => {
+      records.push({ method: req.method, url: req.url, body });
+      res.writeHead(500);
+      res.end('must not be reached');
+    });
+
+    const result = await runShimRaw(args, { GWS_PROXY_URL: proxy.url });
+
+    expect(result.status).toBe(2);
+    expect(result.stdout).toBe('');
+    expect(records).toHaveLength(0);
+  });
+
+  it('keeps the authoritative selector outside upstream args even when an argument body names another account', async () => {
+    const records: RequestRecord[] = [];
+    const proxy = await withProxy((req, res, body) => {
+      records.push({ method: req.method, url: req.url, body });
+      res.writeHead(200, { 'Content-Type': 'application/json', 'X-Exit-Code': '0' });
+      res.end('{"ok":true}');
+    });
+
+    const result = await runShimRaw(
+      ['--account', 'personal', 'drive', 'files', 'create', '--json', '{"account":"glowforge","name":"x"}'],
+      { GWS_PROXY_URL: proxy.url },
+    );
+
+    expect(result.status).toBe(0);
+    expect(JSON.parse(records[0].body)).toEqual({
+      account: 'personal',
+      args: ['drive', 'files', 'create', '--json', '{"account":"glowforge","name":"x"}'],
+      input_id: DEFAULT_TEST_INPUT,
+      route_key: DEFAULT_TEST_ROUTE,
+    });
+  });
+
+  it('reports account-aware auth status through authenticated POST /whoami without sending a bearer itself', async () => {
+    const gatewayRecords: RequestRecord[] = [];
+    const serviceRecords: Array<{ account: string; authorization?: string }> = [];
+    const service = await withProxy((req, res, body) => {
+      const account = (JSON.parse(body) as { account: string }).account;
+      serviceRecords.push({ account, authorization: req.headers.authorization });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ account, email: account === 'personal' ? 'dan@danshapiro.com' : 'dan@glowforge.com' }));
+    });
+    const gateway = await withProxy((req, res, body) => {
+      gatewayRecords.push({
         method: req.method,
         url: req.url,
         authorization: req.headers.authorization,
         contentType: headerValue(req.headers['content-type']),
         body,
       });
-      res.writeHead(200, { 'Content-Type': 'text/plain' });
-      res.end('ok');
+      const forwarded = http.request(
+        `${service.url}/whoami`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: 'Bearer fake-yente-gws-proxy',
+          },
+        },
+        (serviceResponse) => {
+          const chunks: Buffer[] = [];
+          serviceResponse.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+          serviceResponse.on('end', () => {
+            res.writeHead(serviceResponse.statusCode ?? 500, serviceResponse.headers);
+            res.end(Buffer.concat(chunks));
+          });
+        },
+      );
+      forwarded.on('error', (error) => {
+        res.writeHead(502);
+        res.end(error.message);
+      });
+      forwarded.end(body);
     });
 
-    const result = await runShim(['auth', 'status'], { GWS_PROXY_URL: proxy.url });
-    expect(result.status).toBe(0);
-    expect(result.stderr).toBe('');
-    expect(JSON.parse(result.stdout)).toMatchObject({
-      auth_method: 'proxy',
-      status: 'connected',
-      proxy_url: proxy.url,
+    const env = {
+      GWS_PROXY_URL: 'http://yente-gws-proxy.local:8083',
+      YENTE_ONECLI_GATEWAY_PROXY_URL: gateway.url,
+    };
+    const personal = await runShimRaw(['--account', 'personal', 'auth', 'status'], env);
+    const glowforge = await runShimRaw(['--account', 'glowforge', 'auth', 'status'], env);
+    expect(personal).toMatchObject({
+      status: 0,
+      stdout: '{"account":"personal","email":"dan@danshapiro.com"}',
+      stderr: '',
     });
-    expect(records).toEqual([
-      expect.objectContaining({
-        method: 'GET',
-        url: '/health',
+    expect(glowforge).toMatchObject({
+      status: 0,
+      stdout: '{"account":"glowforge","email":"dan@glowforge.com"}',
+      stderr: '',
+    });
+    expect(gatewayRecords).toEqual([
+      {
+        method: 'POST',
+        url: 'http://yente-gws-proxy.local:8083/whoami',
         authorization: undefined,
-      }),
+        contentType: 'application/json',
+        body: '{"account":"personal"}',
+      },
+      {
+        method: 'POST',
+        url: 'http://yente-gws-proxy.local:8083/whoami',
+        authorization: undefined,
+        contentType: 'application/json',
+        body: '{"account":"glowforge"}',
+      },
+    ]);
+    expect(serviceRecords).toEqual([
+      { account: 'personal', authorization: 'Bearer fake-yente-gws-proxy' },
+      { account: 'glowforge', authorization: 'Bearer fake-yente-gws-proxy' },
     ]);
   });
 
@@ -216,12 +377,124 @@ describe('gws proxy shim', () => {
         authorization: undefined,
         contentType: 'application/json',
         body: JSON.stringify({
+          account: 'personal',
           args: ['gmail', '+triage', '--max', '5'],
           input_id: DEFAULT_TEST_INPUT,
           route_key: DEFAULT_TEST_ROUTE,
         }),
       },
     ]);
+  });
+
+  it('preserves successful upstream stdout bytes including trailing newlines', async () => {
+    const proxy = await withProxy((_req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/plain', 'X-Exit-Code': '0' });
+      res.end('line one\nline two\n\n');
+    });
+
+    const result = await runShim(['gmail', 'users', 'getProfile'], { GWS_PROXY_URL: proxy.url });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe('line one\nline two\n\n');
+  });
+
+  it.each([
+    ['missing', undefined],
+    ['mismatched', 'glowforge'],
+  ])('rejects a %s response account before printing any body', async (_name, responseAccount) => {
+    const proxy = await withProxy((_req, res) => {
+      if (responseAccount) res.setHeader('X-GWS-Account', responseAccount);
+      else res.removeHeader('X-GWS-Account');
+      res.writeHead(200, { 'Content-Type': 'application/json', 'X-Exit-Code': '0' });
+      res.end('{"secret":"must-not-print"}');
+    });
+
+    const result = await runShimRaw(['--account', 'personal', 'gmail', 'users', 'getProfile'], {
+      GWS_PROXY_URL: proxy.url,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('response account');
+    expect(result.stderr).not.toContain('must-not-print');
+  });
+
+  it('does not publish downloaded bytes when the response account mismatches', async () => {
+    const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-shim-account-output-'));
+    const shim = shimWithOutputRootsForTest([workspace]);
+    const output = path.join(workspace, 'private.bin');
+    const proxy = await withProxy((_req, res) => {
+      res.setHeader('X-GWS-Account', 'glowforge');
+      writeOutputProxyResponse(res, Buffer.from('private-output'));
+    });
+
+    const result = await runShimRaw(
+      ['--account', 'personal', 'drive', 'files', 'download', '--params', '{"fileId":"x"}', '-o', output],
+      { GWS_PROXY_URL: proxy.url },
+      workspace,
+      shim,
+    );
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe('');
+    expect(fs.existsSync(output)).toBe(false);
+  });
+
+  it('handles a request for both accounts as exactly two separately labeled calls through one generic gateway', async () => {
+    const gatewayRecords: Array<{ account: string; shimAuthorization?: string }> = [];
+    const serviceRecords: Array<{ account: string; authorization?: string }> = [];
+    const service = await withProxy((req, res, body) => {
+      const account = (JSON.parse(body) as { account: string }).account;
+      serviceRecords.push({ account, authorization: req.headers.authorization });
+      res.writeHead(200, { 'Content-Type': 'application/json', 'X-Exit-Code': '0' });
+      res.end(JSON.stringify({ account, items: [] }));
+    });
+    const gateway = await withProxy((req, res, body) => {
+      const account = (JSON.parse(body) as { account: string }).account;
+      gatewayRecords.push({ account, shimAuthorization: req.headers.authorization });
+      const forwarded = http.request(
+        `${service.url}/exec`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: 'Bearer fake-yente-gws-proxy',
+          },
+        },
+        (serviceResponse) => {
+          const chunks: Buffer[] = [];
+          serviceResponse.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+          serviceResponse.on('end', () => {
+            res.writeHead(serviceResponse.statusCode ?? 500, serviceResponse.headers);
+            res.end(Buffer.concat(chunks));
+          });
+        },
+      );
+      forwarded.on('error', (error) => {
+        res.writeHead(502);
+        res.end(error.message);
+      });
+      forwarded.end(body);
+    });
+
+    const results = await Promise.all(
+      ['personal', 'glowforge'].map((account) =>
+        runShimRaw(['--account', account, 'calendar', 'events', 'list'], {
+          GWS_PROXY_URL: 'http://yente-gws-proxy.local:8083',
+          YENTE_ONECLI_GATEWAY_PROXY_URL: gateway.url,
+        }),
+      ),
+    );
+
+    expect(results.map((result) => JSON.parse(result.stdout).account).sort()).toEqual(['glowforge', 'personal']);
+    expect(gatewayRecords).toHaveLength(2);
+    expect(gatewayRecords.map((record) => record.account).sort()).toEqual(['glowforge', 'personal']);
+    expect(gatewayRecords.every((record) => record.shimAuthorization === undefined)).toBe(true);
+    expect(serviceRecords).toHaveLength(2);
+    expect(serviceRecords.map((record) => record.account).sort()).toEqual(['glowforge', 'personal']);
+    expect(new Set(serviceRecords.map((record) => record.authorization))).toEqual(
+      new Set(['Bearer fake-yente-gws-proxy']),
+    );
   });
 
   it('does not treat -o-prefixed values for known flags as output syntax', async () => {
@@ -247,6 +520,7 @@ describe('gws proxy shim', () => {
     expect(records).toEqual([
       expect.objectContaining({
         body: JSON.stringify({
+          account: 'personal',
           args: ['gmail', 'messages', 'list', '--query', '-older_than:7d'],
           input_id: DEFAULT_TEST_INPUT,
           route_key: DEFAULT_TEST_ROUTE,
@@ -283,6 +557,7 @@ describe('gws proxy shim', () => {
         authorization: undefined,
         contentType: 'application/json',
         body: JSON.stringify({
+          account: 'personal',
           args: ['gmail', '+triage'],
           input_id: DEFAULT_TEST_INPUT,
           route_key: DEFAULT_TEST_ROUTE,
@@ -321,6 +596,7 @@ describe('gws proxy shim', () => {
         authorization: undefined,
         contentType: 'application/json',
         body: JSON.stringify({
+          account: 'personal',
           args: ['gmail', '+triage'],
           input_id: DEFAULT_TEST_INPUT,
           route_key: DEFAULT_TEST_ROUTE,
@@ -359,6 +635,7 @@ describe('gws proxy shim', () => {
         authorization: undefined,
         contentType: 'application/json',
         body: JSON.stringify({
+          account: 'personal',
           args: ['gmail', '+triage'],
           input_id: DEFAULT_TEST_INPUT,
           route_key: DEFAULT_TEST_ROUTE,
@@ -435,7 +712,8 @@ describe('gws proxy shim', () => {
       sha256: crypto.createHash('sha256').update('drive file text\n').digest('hex'),
     });
     expect(records).toHaveLength(1);
-    const posted = JSON.parse(records[0].body) as { args: string[]; output?: { mode: string } };
+    const posted = JSON.parse(records[0].body) as { account: string; args: string[]; output?: { mode: string } };
+    expect(posted.account).toBe('personal');
     expect(posted.output).toEqual({ mode: 'return_file' });
     expect(posted.args).toEqual([
       'drive',
@@ -878,7 +1156,7 @@ describe('gws proxy shim — side-effect ledger', () => {
         acceptedAt: freshUpdatedAt(),
       }),
     );
-    const result = await runShim(['drive', 'files', 'create', '--json', '{"name":"x"}'], {
+    const result = await runShimRaw(['--account', 'glowforge', 'drive', 'files', 'create', '--json', '{"name":"x"}'], {
       GWS_PROXY_URL: proxy.url,
       NANOCLAW_SIDE_EFFECT_LEDGER: ledger,
       NANOCLAW_HOST_CORRELATION_FILE: correlation,
