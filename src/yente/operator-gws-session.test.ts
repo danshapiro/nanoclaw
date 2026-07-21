@@ -39,6 +39,8 @@ describe('operator-owned GWS session lifecycle', () => {
       acceptedAt: '2026-07-21T15:00:00.000Z',
       leaseId: 'operator-lease-1',
     });
+    const auditStorePath = path.join(base, 'gws-audit.jsonl');
+    fs.writeFileSync(auditStorePath, '');
 
     // Releasing the source turn cannot invalidate or rewrite the independent
     // operator interval.
@@ -100,15 +102,21 @@ describe('operator-owned GWS session lifecycle', () => {
       })}\n`,
     );
 
-    expect(() => finalizeOperatorGwsSession({ operator, containerStopped: false, gwsPublicKey: undefined })).toThrow(
-      'confirmed stopped',
-    );
+    expect(() =>
+      finalizeOperatorGwsSession({
+        operator,
+        containerStopped: false,
+        auditStorePath,
+        gwsPublicKey: undefined,
+      }),
+    ).toThrow('confirmed stopped');
     expect(fs.existsSync(operator.correlationPath)).toBe(true);
     expect(fs.existsSync(operator.ledgerPath)).toBe(true);
 
     const result = finalizeOperatorGwsSession({
       operator,
       containerStopped: true,
+      auditStorePath,
       gwsPublicKey: publicKey.export({ format: 'pem', type: 'spki' }).toString(),
       stoppedAt: '2026-07-21T15:02:00.000Z',
     });
@@ -135,6 +143,214 @@ describe('operator-owned GWS session lifecycle', () => {
           route_key: operator.routeKey,
         },
       ]);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('discovers an audit-only completed write from the exact operator kill window before releasing authority', () => {
+    const base = tempRoot('nanoclaw-operator-audit-only');
+    const operator = startOperatorGwsSession({
+      root: path.join(base, 'operator-session'),
+      agentGroupId: 'ag-main',
+      groupFolder: 'main',
+      operatorId: 'operator-audit-only',
+      containerUid: process.getuid?.() ?? 0,
+      containerGid: process.getgid?.() ?? 0,
+      acceptedAt: '2026-07-21T16:00:00.000Z',
+      leaseId: 'operator-lease-audit-only',
+    });
+    const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+    const signed = {
+      schema_version: 2,
+      audit_id: 'operator-audit-only-write',
+      profile: 'nanoclaw',
+      account_label: 'personal',
+      account_email: 'dan@danshapiro.com',
+      input_id: operator.inputId,
+      route_key: operator.routeKey,
+      service: 'gmail',
+      method: 'users.drafts.create',
+      request_class: 'api',
+      api_effect: true,
+      operation_succeeded: true,
+      occurred_at: '2026-07-21T16:00:05.000Z',
+      result_digest: 'operator-audit-only-result',
+    };
+    const payload = canonicalSideEffectPayload(signed);
+    const auditStorePath = path.join(base, 'gws-audit.jsonl');
+    fs.writeFileSync(
+      auditStorePath,
+      `${JSON.stringify({
+        ...signed,
+        payload,
+        signature: crypto.sign(null, Buffer.from(payload), privateKey).toString('base64'),
+      })}\n`,
+    );
+
+    const result = finalizeOperatorGwsSession({
+      operator,
+      containerStopped: true,
+      auditStorePath,
+      gwsPublicKey: publicKey.export({ format: 'pem', type: 'spki' }).toString(),
+      stoppedAt: '2026-07-21T16:00:10.000Z',
+    });
+
+    expect(result).toEqual({ imported: 0, skipped: 0, validated: 0 });
+    expect(fs.existsSync(operator.correlationPath)).toBe(false);
+    expect(fs.existsSync(operator.activeLeasePath)).toBe(false);
+    const db = new Database(operator.outboundDbPath, { readonly: true });
+    try {
+      const row = db
+        .prepare('SELECT id, account_label, input_id, route_key, validation_json FROM side_effect_ledger')
+        .get() as Record<string, unknown>;
+      expect(row).toMatchObject({
+        id: signed.audit_id,
+        account_label: 'personal',
+        input_id: operator.inputId,
+        route_key: operator.routeKey,
+      });
+      expect(JSON.parse(String(row.validation_json))).toMatchObject({ authoritative: true });
+    } finally {
+      db.close();
+    }
+  });
+
+  it('retains authority across missing/truncated audit and unresolved evidence, then retries atomically', () => {
+    const base = tempRoot('nanoclaw-operator-audit-retry');
+    const operator = startOperatorGwsSession({
+      root: path.join(base, 'operator-session'),
+      agentGroupId: 'ag-main',
+      groupFolder: 'main',
+      operatorId: 'operator-audit-retry',
+      containerUid: process.getuid?.() ?? 0,
+      containerGid: process.getgid?.() ?? 0,
+      acceptedAt: '2026-07-21T17:00:00.000Z',
+      leaseId: 'operator-lease-audit-retry',
+    });
+    const auditStorePath = path.join(base, 'gws-audit.jsonl');
+    const publicKeyPair = crypto.generateKeyPairSync('ed25519');
+    const publicKey = publicKeyPair.publicKey.export({ format: 'pem', type: 'spki' }).toString();
+    const assertRetained = () => {
+      expect(fs.existsSync(operator.correlationPath)).toBe(true);
+      expect(fs.existsSync(operator.activeLeasePath)).toBe(true);
+      expect(fs.existsSync(operator.reconciliationReceiptPath)).toBe(false);
+    };
+
+    expect(() =>
+      finalizeOperatorGwsSession({
+        operator,
+        containerStopped: true,
+        auditStorePath,
+        gwsPublicKey: publicKey,
+        stoppedAt: '2026-07-21T17:00:10.000Z',
+      }),
+    ).toThrow(/audit/i);
+    assertRetained();
+
+    fs.writeFileSync(auditStorePath, '');
+    fs.writeFileSync(operator.ledgerPath, '{"truncated":true');
+    expect(() =>
+      finalizeOperatorGwsSession({
+        operator,
+        containerStopped: true,
+        auditStorePath,
+        gwsPublicKey: publicKey,
+        stoppedAt: '2026-07-21T17:00:10.000Z',
+      }),
+    ).toThrow(/truncated|complete/i);
+    assertRetained();
+
+    fs.writeFileSync(operator.ledgerPath, '');
+    fs.writeFileSync(auditStorePath, '{"truncated":true');
+    expect(() =>
+      finalizeOperatorGwsSession({
+        operator,
+        containerStopped: true,
+        auditStorePath,
+        gwsPublicKey: publicKey,
+        stoppedAt: '2026-07-21T17:00:10.000Z',
+      }),
+    ).toThrow(/truncated|complete/i);
+    assertRetained();
+
+    const signed = {
+      schema_version: 2,
+      audit_id: 'operator-retry-write',
+      profile: 'nanoclaw',
+      account_label: 'glowforge',
+      account_email: 'dan@glowforge.com',
+      input_id: operator.inputId,
+      route_key: operator.routeKey,
+      service: 'drive',
+      method: 'files.create',
+      request_class: 'api',
+      api_effect: true,
+      operation_succeeded: true,
+      occurred_at: '2026-07-21T17:00:05.000Z',
+      result_digest: 'operator-retry-result',
+    };
+    const payload = canonicalSideEffectPayload(signed);
+    fs.writeFileSync(
+      operator.ledgerPath,
+      `${JSON.stringify({
+        kind: 'gws_mutation_completed',
+        payload_schema_version: 2,
+        audit_id: signed.audit_id,
+        profile: signed.profile,
+        account_label: signed.account_label,
+        account_email: signed.account_email,
+        input_id: signed.input_id,
+        route_key: signed.route_key,
+        operation: `${signed.service} ${signed.method}`,
+        occurred_at: signed.occurred_at,
+        response_input_id: signed.input_id,
+        response_route_key: signed.route_key,
+        response_service: signed.service,
+        response_method: signed.method,
+        signature: 'forged-signature',
+        payload,
+        evidence: {},
+      })}\n`,
+    );
+    fs.writeFileSync(auditStorePath, '');
+    expect(() =>
+      finalizeOperatorGwsSession({
+        operator,
+        containerStopped: true,
+        auditStorePath,
+        gwsPublicKey: publicKey,
+        stoppedAt: '2026-07-21T17:00:10.000Z',
+      }),
+    ).toThrow(/unresolved/i);
+    assertRetained();
+
+    fs.writeFileSync(
+      auditStorePath,
+      `${JSON.stringify({
+        ...signed,
+        payload,
+        signature: crypto.sign(null, Buffer.from(payload), publicKeyPair.privateKey).toString('base64'),
+      })}\n`,
+    );
+    expect(() =>
+      finalizeOperatorGwsSession({
+        operator,
+        containerStopped: true,
+        auditStorePath,
+        gwsPublicKey: publicKey,
+        stoppedAt: '2026-07-21T17:00:10.000Z',
+      }),
+    ).not.toThrow();
+    expect(fs.existsSync(operator.correlationPath)).toBe(false);
+    expect(fs.existsSync(operator.activeLeasePath)).toBe(false);
+    expect(fs.existsSync(operator.reconciliationReceiptPath)).toBe(true);
+    const db = new Database(operator.outboundDbPath, { readonly: true });
+    try {
+      const row = db.prepare('SELECT validation_json FROM side_effect_ledger WHERE id = ?').get(signed.audit_id) as {
+        validation_json: string;
+      };
+      expect(JSON.parse(row.validation_json)).toMatchObject({ authoritative: true });
     } finally {
       db.close();
     }

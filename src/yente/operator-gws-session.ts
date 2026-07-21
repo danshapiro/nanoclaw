@@ -3,10 +3,12 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import {
+  discoverGwsCrashWindowDrafts,
   ensureSchema,
   importHostSideEffects,
   insertMessage,
   openInboundDb,
+  openOutboundDb,
   type ImportSideEffectsResult,
 } from '../db/session-db.js';
 import { bindAcceptedGwsCorrelation, releaseAcceptedGwsCorrelation } from '../gws-correlation-ipc.js';
@@ -184,6 +186,7 @@ export function startOperatorGwsSession(opts: StartOperatorGwsSessionOptions): O
 export function finalizeOperatorGwsSession(opts: {
   operator: OperatorGwsSession;
   containerStopped: boolean;
+  auditStorePath: string | undefined;
   gwsPublicKey?: string;
   stoppedAt?: string;
 }): ImportSideEffectsResult {
@@ -195,10 +198,44 @@ export function finalizeOperatorGwsSession(opts: {
     sessionDir: opts.operator.root,
     containerStopped: true,
     gwsPublicKey: opts.gwsPublicKey,
+    requireCompleteLedger: true,
+  });
+  const auditResult = discoverGwsCrashWindowDrafts({
+    sessionDir: opts.operator.root,
+    containerStopped: true,
+    auditStorePath: opts.auditStorePath,
+    inputId: opts.operator.inputId,
+    routeKey: opts.operator.routeKey,
+    notBefore: opts.operator.acceptedAt,
+    notAfter: stoppedAt,
+    gwsPublicKey: opts.gwsPublicKey,
+    requireAuditAccess: true,
+    requireCompleteAudit: true,
+    failOnUnresolved: true,
   });
 
-  // Import first. If verification or persistence fails, the durable evidence
-  // and active correlation remain intact for a later reconciliation attempt.
+  // Both the container ledger and root audit have now flowed through Task 3's
+  // single verifier/import path. Any GWS row still non-authoritative is
+  // unresolved evidence, so retain the lease and exact correlation for retry.
+  const outDb = openOutboundDb(opts.operator.outboundDbPath);
+  try {
+    const rows = outDb
+      .prepare(
+        `SELECT id, validation_json FROM side_effect_ledger
+          WHERE source = 'gws' AND input_id = ? AND route_key = ?`,
+      )
+      .all(opts.operator.inputId, opts.operator.routeKey) as Array<{ id: string; validation_json: string }>;
+    for (const row of rows) {
+      const authoritative = (JSON.parse(row.validation_json) as { authoritative?: unknown }).authoritative === true;
+      if (!authoritative) throw new Error(`operator GWS evidence remains unresolved (${row.id})`);
+    }
+  } finally {
+    outDb.close();
+  }
+
+  // Import and exact audit discovery first. If access, parsing, verification,
+  // or persistence fails, the durable evidence and active correlation remain
+  // intact for a later reconciliation attempt.
   releaseAcceptedGwsCorrelation({
     dbPath: opts.operator.inboundDbPath,
     correlationPath: opts.operator.correlationPath,
@@ -212,6 +249,7 @@ export function finalizeOperatorGwsSession(opts: {
     leaseId: opts.operator.leaseId,
     stoppedAt,
     importResult: result,
+    auditDiscoveryResult: auditResult,
   });
   return result;
 }

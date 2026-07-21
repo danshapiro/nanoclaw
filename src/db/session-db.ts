@@ -525,6 +525,8 @@ export function importHostSideEffects(opts: {
   containerStopped: boolean;
   allowedArtifactRoots?: string[];
   gwsPublicKey?: string;
+  /** Operator finalization requires a complete JSONL tail before releasing authority. */
+  requireCompleteLedger?: boolean;
 }): ImportSideEffectsResult {
   if (opts.containerStopped !== true) {
     throw new Error(
@@ -539,6 +541,19 @@ export function importHostSideEffects(opts: {
   if (!fs.existsSync(ledgerPath) || !fs.existsSync(outPath)) return result;
 
   const text = fs.readFileSync(ledgerPath, 'utf8');
+  if (opts.requireCompleteLedger) {
+    if (text.length > 0 && !text.endsWith('\n')) {
+      throw new Error('side-effect ledger has a truncated, incomplete tail');
+    }
+    for (const line of text.split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        JSON.parse(line);
+      } catch (error) {
+        throw new Error('side-effect ledger contains an invalid complete JSONL record', { cause: error });
+      }
+    }
+  }
   const raws = parseLedgerLines(text);
   if (raws.length === 0) return result;
 
@@ -668,6 +683,12 @@ export function discoverGwsCrashWindowDrafts(opts: {
   notBefore?: string;
   notAfter?: string;
   gwsPublicKey?: string;
+  /** Fail instead of silently disabling discovery when the root audit is unavailable. */
+  requireAuditAccess?: boolean;
+  /** Require the append-only audit to end at a complete JSONL boundary. */
+  requireCompleteAudit?: boolean;
+  /** Fail if an exact-scope audit row exists but cannot authenticate. */
+  failOnUnresolved?: boolean;
 }): DiscoverCrashWindowResult {
   if (opts.containerStopped !== true) {
     throw new Error(
@@ -679,22 +700,33 @@ export function discoverGwsCrashWindowDrafts(opts: {
   // input, route, and closed time interval for this interrupted turn.
   const notBeforeMs = opts.notBefore ? Date.parse(opts.notBefore) : NaN;
   const notAfterMs = opts.notAfter ? Date.parse(opts.notAfter) : NaN;
-  if (
+  const invalidScope =
     !opts.inputId ||
     !opts.routeKey ||
     !Number.isFinite(notBeforeMs) ||
     !Number.isFinite(notAfterMs) ||
-    notAfterMs < notBeforeMs
-  )
+    notAfterMs < notBeforeMs;
+  if (invalidScope) {
+    if (opts.requireAuditAccess) throw new Error('GWS audit discovery requires an exact input, route, and time window');
     return result;
+  }
   // Gating: no audit store configured ⇒ discovery inactive.
-  if (!opts.auditStorePath || !fs.existsSync(opts.auditStorePath)) return result;
+  if (!opts.auditStorePath || !fs.existsSync(opts.auditStorePath)) {
+    if (opts.requireAuditAccess) throw new Error('GWS audit store is missing or inaccessible');
+    return result;
+  }
   const outPath = path.join(opts.sessionDir, 'outbound.db');
-  if (!fs.existsSync(outPath)) return result;
+  if (!fs.existsSync(outPath)) {
+    if (opts.requireAuditAccess) throw new Error('GWS audit discovery outbound database is missing');
+    return result;
+  }
 
   // Read the proxy's append-only audit store directly (read-only host access),
   // tolerant of malformed lines.
   const raw = fs.readFileSync(opts.auditStorePath, 'utf8');
+  if (opts.requireCompleteAudit && raw.length > 0 && !raw.endsWith('\n')) {
+    throw new Error('GWS audit store has a truncated, incomplete tail');
+  }
   const matches: Array<{ entry: GwsAuditStoreEntry; validated: NonNullable<ReturnType<typeof classifyAndSanitize>> }> =
     [];
   for (const line of raw.split('\n')) {
@@ -703,10 +735,12 @@ export function discoverGwsCrashWindowDrafts(opts: {
     let e: GwsAuditStoreEntry;
     try {
       e = JSON.parse(trimmed) as GwsAuditStoreEntry;
-    } catch {
+    } catch (error) {
+      if (opts.requireCompleteAudit) {
+        throw new Error('GWS audit store contains an invalid complete JSONL record', { cause: error });
+      }
       continue;
     }
-    if (!e.audit_id) continue;
     const validated = classifyAndSanitize(
       {
         kind: 'gws_mutation_completed',
@@ -728,7 +762,21 @@ export function discoverGwsCrashWindowDrafts(opts: {
       },
       { gwsPublicKey: opts.gwsPublicKey },
     );
-    if (!validated?.validation.authoritative) continue;
+    if (!validated?.validation.authoritative) {
+      const occurredMs = e.occurred_at ? Date.parse(e.occurred_at) : NaN;
+      const exactOuterScope =
+        e.input_id === opts.inputId &&
+        e.route_key === opts.routeKey &&
+        Number.isFinite(occurredMs) &&
+        occurredMs >= notBeforeMs &&
+        occurredMs <= notAfterMs;
+      if (opts.failOnUnresolved && exactOuterScope) {
+        throw new Error(
+          `GWS audit store contains unresolved evidence for exact operator scope (${e.audit_id ?? 'missing-audit-id'})`,
+        );
+      }
+      continue;
+    }
     if (validated.inputId !== opts.inputId) continue;
     if (validated.routeKey !== opts.routeKey) continue;
     const occurredMs = validated.occurredAt ? Date.parse(validated.occurredAt) : NaN;
