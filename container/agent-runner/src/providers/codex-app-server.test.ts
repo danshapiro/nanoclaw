@@ -2,7 +2,6 @@ import { describe, it, expect } from 'bun:test';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { EventEmitter } from 'events';
 
 import {
   attachCodexAutoApproval,
@@ -13,41 +12,21 @@ import {
   writeCodexMcpConfigToml,
   type AppServer,
 } from './codex-app-server.js';
+import { spawnCodexTestProcessTree, waitForProcessExit } from './codex-process-tree.test-support.js';
 
 describe('Codex app-server termination', () => {
-  it('does not report quiescence until the child process exits', async () => {
-    const proc = new EventEmitter() as EventEmitter & {
-      exitCode: number | null;
-      signalCode: NodeJS.Signals | null;
-      kill(signal?: NodeJS.Signals): boolean;
-    };
-    proc.exitCode = null;
-    proc.signalCode = null;
-    const signals: Array<NodeJS.Signals | undefined> = [];
-    proc.kill = (signal) => {
-      signals.push(signal);
-      return true;
-    };
-    const server = {
-      process: proc,
-      readline: { close() {} },
-      pending: new Map(),
-      notificationHandlers: [],
-      serverRequestHandlers: [],
-    } as unknown as AppServer;
-
-    let settled = false;
-    const termination = terminateCodexAppServer(server).then(() => {
-      settled = true;
-    });
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(signals).toEqual(['SIGTERM']);
-    expect(settled).toBe(false);
-
-    proc.exitCode = 0;
-    proc.emit('exit', 0, null);
-    await termination;
-    expect(settled).toBe(true);
+  it('closes stdio normally and reports quiescence only after the app-server reaps its descendant', async () => {
+    const tree = await spawnCodexTestProcessTree('graceful');
+    try {
+      await terminateCodexAppServer(tree.server, {
+        gracefulShutdownMs: 750,
+        termExitMs: 100,
+        killExitMs: 250,
+      });
+      expect(await waitForProcessExit(tree.descendantPid, 250)).toBe(true);
+    } finally {
+      await tree.cleanup();
+    }
   });
 });
 

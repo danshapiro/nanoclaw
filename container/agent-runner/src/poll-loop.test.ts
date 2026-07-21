@@ -37,6 +37,8 @@ import { formatMessages, extractRouting, normalizeRoute } from './formatter.js';
 import { GwsCorrelationLifecycleFault } from './gws-correlation.js';
 import { decideProviderStatusAction, runPollLoop as runProductionPollLoop, type PollLoopConfig } from './poll-loop.js';
 import { MockProvider } from './providers/mock.js';
+import { terminateCodexAppServer } from './providers/codex-app-server.js';
+import { isProcessAlive, spawnCodexTestProcessTree } from './providers/codex-process-tree.test-support.js';
 import {
   ProviderQuiescenceError,
   type AgentProvider,
@@ -4080,6 +4082,63 @@ describe('provider finalization barriers', () => {
     await expect(loopPromise).rejects.toBeInstanceOf(ProviderQuiescenceError);
     expect(releaseCalls).toBe(0);
     expect(getAckStatus('quiescence-failed-init')).toBe('recovery');
+  });
+
+  it('retains correlation when direct-PID Codex teardown leaves a real descendant alive', async () => {
+    insertMessage(
+      'codex-descendant-quiescence-failed',
+      'chat',
+      { sender: 'User', text: 'run a tool in a descendant process' },
+      { platformId: 'chan-codex-descendant', channelType: 'discord' },
+    );
+    const tree = await spawnCodexTestProcessTree('stubborn');
+    const streamEnded = deferred();
+    let releaseCalls = 0;
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query(input) {
+        return {
+          push() {},
+          end() {},
+          abort() {
+            streamEnded.resolve();
+            return terminateCodexAppServer(tree.server, {
+              gracefulShutdownMs: 50,
+              termExitMs: 150,
+              killExitMs: 250,
+            });
+          },
+          events: (async function* () {
+            yield { type: 'input-accepted', inputId: input.inputId, scope: 'initial' };
+            await streamEnded.promise;
+          })(),
+        };
+      },
+    };
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({
+      provider,
+      providerName: 'test',
+      cwd: '/tmp',
+      signal: controller.signal,
+      releaseGwsCorrelation: async () => {
+        releaseCalls++;
+      },
+    });
+
+    try {
+      await waitFor(() => getAckStatus('codex-descendant-quiescence-failed') === 'processing', 1500);
+      controller.abort();
+      await expect(loopPromise).rejects.toBeInstanceOf(ProviderQuiescenceError);
+      expect(isProcessAlive(tree.descendantPid)).toBe(true);
+      expect(releaseCalls).toBe(0);
+      expect(getAckStatus('codex-descendant-quiescence-failed')).toBe('recovery');
+    } finally {
+      controller.abort();
+      await loopPromise.catch(() => {});
+      await tree.cleanup();
+    }
   });
 
   it('makes response loss after host acceptance a fatal recovery-owned lifecycle fault', async () => {
