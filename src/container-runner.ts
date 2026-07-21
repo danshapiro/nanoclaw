@@ -97,6 +97,7 @@ type ActiveContainer = {
   startedAtMs: number;
   managedSkillsRoot: string;
   finalization?: Promise<boolean>;
+  finalizationFailure?: 'revocation';
 };
 const activeContainers = new Map<string, ActiveContainer>();
 const activeMcpBridges = new Map<string, AgentMcpBridge[]>();
@@ -450,6 +451,7 @@ async function finalizeContainerProcess(
     if (current.finalization === inFlight) current.finalization = undefined;
     return await finalizeContainerProcess(sessionId, containerName, leaseId, code, reason);
   }
+  current.finalizationFailure = undefined;
   const operation = finalizeVerifiedContainerStop(sessionId, current, code, reason);
   current.finalization = operation;
   try {
@@ -477,6 +479,26 @@ async function finalizeVerifiedContainerStop(
   }
   if (activeContainers.get(sessionId) !== current) return false;
   await stopAgentMcpBridges(activeMcpBridges.get(sessionId) ?? []);
+  // Revocation is part of finalization, not best-effort cleanup. Retain the
+  // active owner (and therefore block successor wakes) until pointer, row, and
+  // transport revocation all succeed. The revoker is idempotent and retryable.
+  let revoked = false;
+  try {
+    revoked = current.revokeGwsAfterConfirmedStop();
+  } catch (err) {
+    log.error('GWS correlation revocation threw during stopped-container finalization', {
+      sessionId,
+      containerName: current.containerName,
+      leaseId: current.leaseId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+  if (!revoked) {
+    current.finalizationFailure = 'revocation';
+    return false;
+  }
+  if (activeContainers.get(sessionId) !== current) return false;
+
   activeMcpBridges.delete(sessionId);
   const wasActive = activeContainers.delete(sessionId);
   if (!wasActive) {
@@ -491,9 +513,6 @@ async function finalizeVerifiedContainerStop(
       containerName: current.containerName,
     });
   }
-  // Process close or a successful runtime name+label verification is the stop
-  // proof. Revoke only now, before notifying waiters that may wake a successor.
-  current.revokeGwsAfterConfirmedStop();
   cleanupTempSkillRoot(current.managedSkillsRoot);
   stopTypingRefresh(sessionId);
   notifyContainerExit(sessionId);
@@ -607,7 +626,10 @@ async function verifyContainerProcessExited(sessionId: string, entry: ActiveCont
       reason,
       containerName: entry.containerName,
     });
-    await finalizeContainerProcess(sessionId, entry.containerName, entry.leaseId, null, reason);
+    const finalized = await finalizeContainerProcess(sessionId, entry.containerName, entry.leaseId, null, reason);
+    if (!finalized && activeContainers.get(sessionId) === entry && entry.finalizationFailure === 'revocation') {
+      throw new Error(`Failed to finalize stopped container for session ${sessionId}`);
+    }
     return;
   }
 
@@ -619,7 +641,10 @@ async function verifyContainerProcessExited(sessionId: string, entry: ActiveCont
       reason,
       containerName: entry.containerName,
     });
-    await finalizeContainerProcess(sessionId, entry.containerName, entry.leaseId, null, reason);
+    const finalized = await finalizeContainerProcess(sessionId, entry.containerName, entry.leaseId, null, reason);
+    if (!finalized && activeContainers.get(sessionId) === entry && entry.finalizationFailure === 'revocation') {
+      throw new Error(`Failed to finalize stopped container for session ${sessionId}`);
+    }
     return;
   }
 

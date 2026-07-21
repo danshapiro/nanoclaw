@@ -106,6 +106,11 @@ interface GwsCorrelationLeaseState {
   socket?: Socket;
   socketPath?: string;
   mutationTail: Promise<void>;
+  revocationHooks?: {
+    beforePointerInvalidation?: () => void;
+    beforeRowExpiry?: () => void;
+    beforeTransportClose?: () => void;
+  };
 }
 
 const launchLeases = new Map<string, GwsCorrelationLeaseState>();
@@ -389,6 +394,8 @@ export function registerGwsCorrelationLaunchLease(opts: {
   issuedAt?: string;
   secret?: Buffer;
   leaseId?: string;
+  /** Test-only failure seams for proving retryable, fail-closed revocation. */
+  __revocationHooks?: GwsCorrelationLeaseState['revocationHooks'];
 }): RegisteredGwsCorrelationLaunchControl {
   const agentGroupId = canonicalCorrelation(opts.agentGroupId, 'agentGroupId');
   const sessionId = canonicalCorrelation(opts.sessionId, 'sessionId');
@@ -413,6 +420,7 @@ export function registerGwsCorrelationLaunchLease(opts: {
     nextSequence: 1,
     acceptedInputs: new Map(),
     mutationTail: Promise.resolve(),
+    revocationHooks: opts.__revocationHooks,
   };
   const control = {
     schemaVersion: 1,
@@ -444,12 +452,28 @@ function revokeGwsCorrelationLaunchLease(agentGroupId: string, sessionId: string
   const key = launchLeaseKey(agentGroupId, sessionId);
   const prior = launchLeases.get(key);
   if (expectedLeaseId && prior?.leaseId !== expectedLeaseId) return false;
-  // Fail closed before ending rows: no old pointer or transport remains usable.
+  if (!prior) return expectedLeaseId === undefined;
+  try {
+    // Cleanup may partially succeed, but the in-memory owner and secret remain
+    // authoritative until every step succeeds. Each operation is idempotent,
+    // so a verified-stop caller can safely retry without admitting a successor.
+    prior.revocationHooks?.beforePointerInvalidation?.();
+    invalidateCorrelationPointers(agentGroupId, sessionId);
+    prior.revocationHooks?.beforeRowExpiry?.();
+    expireAcceptedRows(agentGroupId, sessionId, prior.leaseId);
+    prior.revocationHooks?.beforeTransportClose?.();
+    closeLeaseTransport(prior);
+  } catch (err) {
+    log.error('GWS correlation lease revocation failed; retaining active lease owner for retry', {
+      agentGroupId,
+      sessionId,
+      leaseId: prior.leaseId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return false;
+  }
   launchLeases.delete(key);
-  invalidateCorrelationPointers(agentGroupId, sessionId);
-  if (prior) expireAcceptedRows(agentGroupId, sessionId, prior.leaseId);
-  if (prior) closeLeaseTransport(prior);
-  prior?.secret.fill(0);
+  prior.secret.fill(0);
   return true;
 }
 

@@ -95,9 +95,12 @@ export function clearContinuation(providerName: string, continuationScope?: stri
 
 export interface ProviderRetrySchedule {
   attempts: number;
-  nextAttemptAt: string;
+  status: 'scheduled' | 'exhausted';
+  nextAttemptAt?: string;
   lastErrorAt: string;
   userErrorEmittedAt?: string;
+  /** Host input whose automatic retry series owns this schedule. */
+  triggerInputId?: string;
 }
 
 function providerRetryKey(providerName: string, routeKey: string): string {
@@ -109,19 +112,33 @@ export function readProviderRetrySchedule(providerName: string, routeKey: string
   if (!raw) return undefined;
   try {
     const value = JSON.parse(raw) as Partial<ProviderRetrySchedule>;
+    // Old rows had no status. An old attempts=10 row was the former infinite
+    // clamp and must migrate fail-closed to exhausted, not schedule call 11.
+    const legacyExhausted = value.status === undefined && value.attempts === 10;
+    const status = value.status ?? (legacyExhausted ? 'exhausted' : 'scheduled');
     if (
       !Number.isSafeInteger(value.attempts) ||
       (value.attempts as number) < 1 ||
-      typeof value.nextAttemptAt !== 'string' ||
-      !Number.isFinite(Date.parse(value.nextAttemptAt)) ||
+      (value.attempts as number) > 10 ||
+      (status !== 'scheduled' && status !== 'exhausted') ||
+      (status === 'scheduled' && value.attempts === 10) ||
+      (status === 'exhausted' && value.attempts !== 10) ||
+      (status === 'scheduled' &&
+        (typeof value.nextAttemptAt !== 'string' || !Number.isFinite(Date.parse(value.nextAttemptAt)))) ||
+      (status === 'exhausted' && !legacyExhausted && value.nextAttemptAt !== undefined) ||
       typeof value.lastErrorAt !== 'string' ||
       !Number.isFinite(Date.parse(value.lastErrorAt)) ||
       (value.userErrorEmittedAt !== undefined &&
-        (typeof value.userErrorEmittedAt !== 'string' || !Number.isFinite(Date.parse(value.userErrorEmittedAt))))
+        (typeof value.userErrorEmittedAt !== 'string' || !Number.isFinite(Date.parse(value.userErrorEmittedAt)))) ||
+      (value.triggerInputId !== undefined && typeof value.triggerInputId !== 'string')
     ) {
       return undefined;
     }
-    return value as ProviderRetrySchedule;
+    if (status === 'exhausted') {
+      const { nextAttemptAt: _legacyNextAttemptAt, ...exhausted } = value;
+      return { ...exhausted, status } as ProviderRetrySchedule;
+    }
+    return { ...value, status } as ProviderRetrySchedule;
   } catch {
     return undefined;
   }
@@ -131,15 +148,19 @@ export function scheduleProviderRetry(
   providerName: string,
   routeKey: string,
   nowMs = Date.now(),
+  triggerInputId?: string,
 ): ProviderRetrySchedule {
   const prior = readProviderRetrySchedule(providerName, routeKey);
   const attempts = Math.min(10, (prior?.attempts ?? 0) + 1);
-  const delayMs = Math.min(30_000, 1_000 * 2 ** (attempts - 1));
+  const exhausted = attempts >= 10;
+  const delayMs = exhausted ? undefined : Math.min(30_000, 1_000 * 2 ** (attempts - 1));
   const schedule: ProviderRetrySchedule = {
     attempts,
-    nextAttemptAt: new Date(nowMs + delayMs).toISOString(),
+    status: exhausted ? 'exhausted' : 'scheduled',
+    ...(delayMs === undefined ? {} : { nextAttemptAt: new Date(nowMs + delayMs).toISOString() }),
     lastErrorAt: new Date(nowMs).toISOString(),
     userErrorEmittedAt: prior?.userErrorEmittedAt,
+    triggerInputId: triggerInputId ?? prior?.triggerInputId,
   };
   setValue(providerRetryKey(providerName, routeKey), JSON.stringify(schedule));
   return schedule;

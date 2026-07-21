@@ -261,56 +261,70 @@ export function sendCodexResponse(server: AppServer, id: number, result: unknown
   }
 }
 
-export async function terminateCodexAppServer(server: AppServer): Promise<void> {
-  try {
-    server.readline.close();
-  } catch {
-    // Process exit remains the authoritative proof.
-  }
-  if (server.process.exitCode !== null || server.process.signalCode !== null) return;
+const codexTerminationPromises = new WeakMap<AppServer, Promise<void>>();
 
-  let hardKill: ReturnType<typeof setTimeout> | undefined;
-  let deadline: ReturnType<typeof setTimeout> | undefined;
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const onExit = (): void => {
-        cleanup();
-        resolve();
-      };
-      const onError = (err: Error): void => {
-        cleanup();
-        reject(new ProviderQuiescenceError('Codex app-server termination failed', { cause: err }));
-      };
-      const cleanup = (): void => {
-        server.process.off('exit', onExit);
-        server.process.off('error', onError);
-        if (hardKill) clearTimeout(hardKill);
-        if (deadline) clearTimeout(deadline);
-      };
-      server.process.once('exit', onExit);
-      server.process.once('error', onError);
-      try {
-        server.process.kill('SIGTERM');
-      } catch (err) {
-        onError(err instanceof Error ? err : new Error(String(err)));
-        return;
-      }
-      hardKill = setTimeout(() => {
+export function terminateCodexAppServer(server: AppServer): Promise<void> {
+  const existing = codexTerminationPromises.get(server);
+  if (existing) return existing;
+
+  const termination = (async () => {
+    try {
+      server.readline.close();
+    } catch {
+      // Process exit remains the authoritative proof.
+    }
+    if (server.process.exitCode !== null || server.process.signalCode !== null) return;
+
+    let hardKill: ReturnType<typeof setTimeout> | undefined;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const onExit = (): void => {
+          cleanup();
+          resolve();
+        };
+        const onError = (err: Error): void => {
+          cleanup();
+          reject(new ProviderQuiescenceError('Codex app-server termination failed', { cause: err }));
+        };
+        const cleanup = (): void => {
+          server.process.off('exit', onExit);
+          server.process.off('error', onError);
+          if (hardKill) clearTimeout(hardKill);
+          if (deadline) clearTimeout(deadline);
+        };
+        server.process.once('exit', onExit);
+        server.process.once('error', onError);
         try {
-          server.process.kill('SIGKILL');
-        } catch {
-          // The deadline below owns the fail-closed result.
+          server.process.kill('SIGTERM');
+        } catch (err) {
+          onError(err instanceof Error ? err : new Error(String(err)));
+          return;
         }
-      }, 5_000);
-      deadline = setTimeout(() => {
-        cleanup();
-        reject(new ProviderQuiescenceError('Codex app-server did not exit after termination signals'));
-      }, 10_000);
+        hardKill = setTimeout(() => {
+          try {
+            server.process.kill('SIGKILL');
+          } catch {
+            // The deadline below owns the fail-closed result.
+          }
+        }, 1_000);
+        deadline = setTimeout(() => {
+          cleanup();
+          reject(new ProviderQuiescenceError('Codex app-server did not exit after termination signals'));
+        }, 5_000);
+      });
+    } finally {
+      if (hardKill) clearTimeout(hardKill);
+      if (deadline) clearTimeout(deadline);
+    }
+  })().catch((err) => {
+    if (err instanceof ProviderQuiescenceError) throw err;
+    throw new ProviderQuiescenceError('Codex app-server termination failed', {
+      cause: err instanceof Error ? err : new Error(String(err)),
     });
-  } finally {
-    if (hardKill) clearTimeout(hardKill);
-    if (deadline) clearTimeout(deadline);
-  }
+  });
+  codexTerminationPromises.set(server, termination);
+  return termination;
 }
 
 /**

@@ -122,6 +122,37 @@ function recoveryIdFor(routeKey: string): string {
   return `rec-${routeKey}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 }
 
+function ownExhaustedPreacceptRetry(
+  scope: ProviderRecoveryScope,
+  messageIds: string[],
+  originalTasks: ProviderRecoveryEntry['originalTasks'],
+  errorMessage: string,
+): void {
+  const now = new Date().toISOString();
+  const recoveryId = recoveryIdFor(scope.routeKey);
+  appendRecoveryEntryAndOwnRows(
+    scope,
+    {
+      id: recoveryId,
+      status: 'pending',
+      classification: 'pre_accept_retry_exhausted',
+      agentMessage: 'Automatic startup retries were exhausted before this request was accepted.',
+      fallbackUserMessage: 'I could not start this request after several retries. It is saved for recovery.',
+      originalTasks,
+      acceptedUnresolvedInputs: [],
+      pendingFollowups: [],
+      priorProgress: [],
+      observations: [`pre_accept_retry_exhausted: ${errorMessage}`],
+      sideEffects: [],
+      continuationPolicy: 'preserve',
+      createdAt: now,
+      updatedAt: now,
+    },
+    messageIds,
+    { recoveryId },
+  );
+}
+
 /**
  * Write a user-visible outbound chat row stamped with the active route metadata
  * from `routing` (`route_key`/`messaging_group_id`/`is_group`). All poll-loop
@@ -397,7 +428,32 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     }
 
     const retrySchedule = readProviderRetrySchedule(config.providerName, activeRouteKey);
-    const retryRemainingMs = retrySchedule ? Date.parse(retrySchedule.nextAttemptAt) - Date.now() : 0;
+    const activeTriggerInputId = activeMessages.filter((message) => message.trigger === 1).at(-1)?.host_input_id;
+    if (retrySchedule?.status === 'exhausted') {
+      // Exhaustion is durable and never ages back into an automatic eleventh
+      // call. Only a distinct host-backed trigger explicitly opens a new retry
+      // series; the exhausted request itself is recovery-owned below.
+      if (!retrySchedule.triggerInputId || retrySchedule.triggerInputId === activeTriggerInputId) {
+        // Close the crash window between persisting attempt 10 and the atomic
+        // recovery-ownership transaction. Re-entry never calls the provider;
+        // it only completes the durable exhausted disposition.
+        ownExhaustedPreacceptRetry(
+          activeRouteScope,
+          activeMessages.map((message) => message.id),
+          activeMessages
+            .filter((message) => message.trigger === 1)
+            .map((message) => ({
+              messageId: message.id,
+              text: textOfMessage(message),
+              timestamp: message.timestamp,
+            })),
+          'automatic retry schedule was already exhausted',
+        );
+        continue;
+      }
+      clearProviderRetrySchedule(config.providerName, activeRouteKey);
+    }
+    const retryRemainingMs = retrySchedule?.nextAttemptAt ? Date.parse(retrySchedule.nextAttemptAt) - Date.now() : 0;
     if (retryRemainingMs > 0) {
       await sleep(Math.min(retryRemainingMs, 500), config.signal);
       continue;
@@ -437,7 +493,13 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     };
     let initialClaim: InputClaimBatch | undefined;
     let routing: RoutingContext = extractRouting(activeMessages);
-    let originalTasks: ProviderRecoveryEntry['originalTasks'] = [];
+    let originalTasks: ProviderRecoveryEntry['originalTasks'] = activeMessages
+      .filter((message) => message.trigger === 1)
+      .map((message) => ({
+        messageId: message.id,
+        text: textOfMessage(message),
+        timestamp: message.timestamp,
+      }));
     try {
       // Pre-task scripts: for any task rows with a `script`, run it before the
       // provider call. Scripts returning wakeAgent=false (or erroring) gate
@@ -540,16 +602,24 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       });
     } catch (preErr) {
       const preMsg = preErr instanceof Error ? preErr.message : String(preErr);
-      const retry = scheduleProviderRetry(config.providerName, activeRouteKey);
+      const retry = scheduleProviderRetry(
+        config.providerName,
+        activeRouteKey,
+        Date.now(),
+        topLevelInputId || activeTriggerInputId || undefined,
+      );
       log(
         JSON.stringify({
           severity: 'warn',
-          event: 'pre_query_failure_returned_to_pending',
+          event:
+            retry.status === 'exhausted'
+              ? 'pre_query_failure_retry_exhausted_recovery_owned'
+              : 'pre_query_failure_returned_to_pending',
           route_key: activeRouteKey,
           message_ids: processingIds,
           error: preMsg,
           retry_attempt: retry.attempts,
-          next_attempt_at: retry.nextAttemptAt,
+          next_attempt_at: retry.nextAttemptAt ?? null,
         }),
       );
       // Store a route-scoped recovery entry so the next Yente turn has the
@@ -557,23 +627,32 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // are unaccepted (no provider input-accepted), so returning them to pending
       // is the correct lifecycle; recovery preserves the original-task context.
       const now = new Date().toISOString();
-      appendRecoveryEntry(activeRouteScope, {
-        id: recoveryIdFor(activeRouteScope.routeKey),
-        status: 'pending',
-        classification: 'pre_query_failure',
-        agentMessage: 'A setup step failed before I started working; I will retry.',
-        fallbackUserMessage: 'I hit a problem before starting your request and will retry it automatically.',
-        originalTasks,
-        acceptedUnresolvedInputs: [],
-        pendingFollowups: [],
-        priorProgress: [],
-        observations: [`pre_query_failure: ${preMsg}`],
-        sideEffects: [],
-        continuationPolicy: 'preserve',
-        createdAt: now,
-        updatedAt: now,
-      });
-      returnProcessingToPending(processingIds, 'pre_query_failure');
+      if (retry.status === 'exhausted') {
+        ownExhaustedPreacceptRetry(
+          activeRouteScope,
+          processingIds.length > 0 ? processingIds : activeMessages.map((message) => message.id),
+          originalTasks,
+          preMsg,
+        );
+      } else {
+        appendRecoveryEntry(activeRouteScope, {
+          id: recoveryIdFor(activeRouteScope.routeKey),
+          status: 'pending',
+          classification: 'pre_query_failure',
+          agentMessage: 'A setup step failed before I started working; I will retry.',
+          fallbackUserMessage: 'I hit a problem before starting your request and will retry it automatically.',
+          originalTasks,
+          acceptedUnresolvedInputs: [],
+          pendingFollowups: [],
+          priorProgress: [],
+          observations: [`pre_query_failure: ${preMsg}`],
+          sideEffects: [],
+          continuationPolicy: 'preserve',
+          createdAt: now,
+          updatedAt: now,
+        });
+        returnProcessingToPending(processingIds, 'pre_query_failure');
+      }
       continue;
     }
 
@@ -645,20 +724,26 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
       const failedBeforeAcceptance = initialClaim?.state === 'returned' && initialClaim.acceptanceObserved === false;
       if (failedBeforeAcceptance) {
-        const retry = scheduleProviderRetry(config.providerName, activeRouteKey);
+        const retry = scheduleProviderRetry(config.providerName, activeRouteKey, Date.now(), topLevelInputId);
         log(
           JSON.stringify({
             severity: 'warn',
-            event: 'provider_preaccept_failure_scheduled',
+            event:
+              retry.status === 'exhausted'
+                ? 'provider_preaccept_failure_retry_exhausted_recovery_owned'
+                : 'provider_preaccept_failure_scheduled',
             route_key: activeRouteKey,
             retry_attempt: retry.attempts,
-            next_attempt_at: retry.nextAttemptAt,
+            next_attempt_at: retry.nextAttemptAt ?? null,
             error: errMsg,
           }),
         );
         if (!retry.userErrorEmittedAt) {
           writeRoutedMessage(routing, `Error: ${sanitizeProviderErrorText(errMsg)}`);
           markProviderRetryUserErrorEmitted(config.providerName, activeRouteKey);
+        }
+        if (retry.status === 'exhausted') {
+          ownExhaustedPreacceptRetry(activeRouteScope, processingIds, originalTasks, errMsg);
         }
         continue;
       }
@@ -1390,6 +1475,10 @@ async function processQuery(
     settleInitialBatch(topLevelResolvedAtLeastOnce, null);
   } catch (err) {
     providerStreamFailure = err;
+    // A stream throw is itself a terminal provider boundary. Always drive the
+    // provider's abort/quiescence path and await it below before releasing any
+    // trusted correlation, even when the original stream error was untyped.
+    abortQuery();
     throw err;
   } finally {
     done = true;
@@ -1550,6 +1639,45 @@ async function processQuery(
       throw ledgerCtx.acceptanceContext.lifecycleFault;
     }
     if (quiescenceFailure) {
+      const uncertainEntries = [...ledger.values()].filter((entry) =>
+        entry.claims.some((claim) => claim.state === 'returned' || claim.state === 'queued'),
+      );
+      const uncertainMessageIds = uncertainEntries.flatMap((entry) =>
+        entry.claims
+          .filter((claim) => claim.state === 'returned' || claim.state === 'queued')
+          .flatMap((claim) => claim.messageIds),
+      );
+      if (uncertainMessageIds.length > 0) {
+        const now = new Date().toISOString();
+        const recoveryId = recoveryIdFor(ledgerCtx.activeRouteScope.routeKey);
+        appendRecoveryEntryAndOwnRows(
+          ledgerCtx.activeRouteScope,
+          {
+            id: recoveryId,
+            status: 'pending',
+            classification: 'provider_quiescence_unproven',
+            agentMessage: 'The provider stream failed and shutdown could not be proven; resume only through recovery.',
+            fallbackUserMessage:
+              'I lost contact with the provider while stopping safely. Your request is saved for recovery.',
+            originalTasks: ledgerCtx.originalTasks,
+            acceptedUnresolvedInputs: [],
+            pendingFollowups: [],
+            priorProgress: [],
+            observations: [
+              `provider_quiescence_unproven: ${
+                quiescenceFailure instanceof Error ? quiescenceFailure.message : String(quiescenceFailure)
+              }`,
+            ],
+            sideEffects: [],
+            continuationPolicy: 'preserve',
+            attemptedContinuation: queryContinuation,
+            createdAt: now,
+            updatedAt: now,
+          },
+          uncertainMessageIds,
+          { recoveryId },
+        );
+      }
       if (quiescenceFailure instanceof ProviderQuiescenceError) throw quiescenceFailure;
       throw new ProviderQuiescenceError('provider did not prove quiescence before correlation release', {
         cause: quiescenceFailure,

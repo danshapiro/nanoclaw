@@ -17,16 +17,17 @@ import fs from 'fs';
 import path from 'path';
 
 import { registerProvider } from './provider-registry.js';
-import type {
-  AgentProvider,
-  AgentQuery,
-  ProviderEvent,
-  ProviderInputScope,
-  ProviderOptions,
-  QueryInput,
-  QueryTurnInput,
+import {
+  normalizeQueryTurnInput,
+  ProviderQuiescenceError,
+  type AgentProvider,
+  type AgentQuery,
+  type ProviderEvent,
+  type ProviderInputScope,
+  type ProviderOptions,
+  type QueryInput,
+  type QueryTurnInput,
 } from './types.js';
-import { normalizeQueryTurnInput } from './types.js';
 import {
   type AppServer,
   type JsonRpcNotification,
@@ -512,6 +513,8 @@ export async function* runOneTurn(
     abortSignal?: CodexAbortSignal;
     acceptanceScope?: ProviderInputScope;
     acceptInput?: () => Promise<void>;
+    abortGraceMs?: number;
+    terminateServer?: typeof terminateCodexAppServer;
   } = {},
 ): AsyncGenerator<ProviderEvent, boolean> {
   const runDeps = {
@@ -520,6 +523,8 @@ export async function* runOneTurn(
     startTurn: deps.startTurn ?? startCodexTurn,
     interruptTurn: deps.interruptTurn ?? interruptCodexTurn,
     abortSignal: deps.abortSignal,
+    abortGraceMs: deps.abortGraceMs ?? 2_000,
+    terminateServer: deps.terminateServer ?? terminateCodexAppServer,
   };
   // Mutable refs via object properties — TS can't track closure assignments
   // for narrowing, but property access keeps the declared type visible.
@@ -531,6 +536,7 @@ export async function* runOneTurn(
   let activeTurnId: string | undefined;
   let abortRequested = runDeps.abortSignal?.isAborted() ?? false;
   let interruptRequested = false;
+  let forcedTerminationHandle: ReturnType<typeof setTimeout> | null = null;
 
   // Buffered event queue so we can `yield` across the async notification
   // callback. Each notification pushes zero or more ProviderEvents; the
@@ -556,10 +562,37 @@ export async function* runOneTurn(
   // correlation id (F1). Undefined only when the caller has no inputId; ?? '' is
   // safe for the message builders.
   const inputId: string | undefined = turnInputId;
+  const armForcedTermination = (): void => {
+    if (forcedTerminationHandle || turnDone) return;
+    forcedTerminationHandle = runDeps.setTimer(runDeps.abortGraceMs, () => {
+      forcedTerminationHandle = null;
+      void runDeps.terminateServer(server).then(
+        () => {
+          turnInterrupted = true;
+          turnDone = true;
+          kick();
+        },
+        (err) => {
+          turnState.error =
+            err instanceof ProviderQuiescenceError
+              ? err
+              : new ProviderQuiescenceError('Codex app-server abort termination failed', {
+                  cause: err instanceof Error ? err : new Error(String(err)),
+                });
+          turnDone = true;
+          kick();
+        },
+      );
+    });
+  };
   const requestInterrupt = (): void => {
     if (!abortRequested || interruptRequested || !activeTurnId || turnDone) return;
     const turnId = activeTurnId;
     interruptRequested = true;
+    // A successful JSON-RPC interrupt is only a request, not terminal proof.
+    // Bound the wait for turn/completed, then terminate the app-server directly
+    // and await process exit before the turn can report interruption.
+    armForcedTermination();
     void runDeps.interruptTurn(server, { threadId, turnId }).catch((err) => {
       warnStructured('codex_turn_interrupt_failed', {
         threadId,
@@ -574,6 +607,10 @@ export async function* runOneTurn(
   };
   const unsubscribeAbort = runDeps.abortSignal?.onAbort(() => {
     abortRequested = true;
+    // turn/started itself can be lost on a wedged app-server. Bound abort even
+    // before a turn id is available; requestInterrupt will still send the
+    // graceful JSON-RPC request if/when that id arrives during the grace window.
+    armForcedTermination();
     requestInterrupt();
   });
   const armWake = (): void => {
@@ -817,6 +854,7 @@ export async function* runOneTurn(
     return false;
   } finally {
     if (wakeHandle) clearTimeout(wakeHandle);
+    if (forcedTerminationHandle) clearTimeout(forcedTerminationHandle);
     unsubscribeAbort?.();
     const idx = server.notificationHandlers.indexOf(handler);
     if (idx >= 0) server.notificationHandlers.splice(idx, 1);

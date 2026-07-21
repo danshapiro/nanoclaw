@@ -109,6 +109,13 @@ function errorText(err: unknown): string {
   }
 }
 
+function asProviderQuiescenceError(err: unknown, message: string): ProviderQuiescenceError {
+  if (err instanceof ProviderQuiescenceError) return err;
+  return new ProviderQuiescenceError(message, {
+    cause: err instanceof Error ? err : new Error(errorText(err)),
+  });
+}
+
 export function isStaleSessionError(err: unknown): boolean {
   return STALE_SESSION_RE.test(errorText(err));
 }
@@ -370,6 +377,7 @@ export class RealOpenCodeRuntimeController implements OpenCodeRuntimeController 
     readonly proc: ChildProcess,
     readonly client: OpencodeClient,
     readonly stream: AsyncGenerator<OpenCodeSseEvent, void, void>,
+    private readonly quiescenceTimeoutMs = 10_000,
   ) {}
 
   async denyPermission(sessionId: string, permissionId: string, _reason: string): Promise<void> {
@@ -399,7 +407,9 @@ export class RealOpenCodeRuntimeController implements OpenCodeRuntimeController 
       // retiring runtime's outstanding pump read cannot steal a new query's
       // first event. Do not await it before signalling: a blocked SSE read must
       // not prevent the process-group termination that unblocks that read.
-      const streamStopped = Promise.resolve(this.stream.return?.(undefined)).then(() => undefined);
+      const streamStopped = (async () => {
+        await this.stream.return?.(undefined);
+      })();
       let removeExitListeners = (): void => {};
       const processExited =
         typeof this.proc.exitCode === 'number' || this.proc.signalCode != null
@@ -411,7 +421,7 @@ export class RealOpenCodeRuntimeController implements OpenCodeRuntimeController 
               };
               const onError = (err: Error): void => {
                 removeExitListeners();
-                reject(err);
+                reject(asProviderQuiescenceError(err, 'OpenCode runtime process failed during teardown'));
               };
               removeExitListeners = (): void => {
                 this.proc.off('exit', onExit);
@@ -428,7 +438,7 @@ export class RealOpenCodeRuntimeController implements OpenCodeRuntimeController 
           new Promise<never>((_, reject) => {
             timer = setTimeout(
               () => reject(new ProviderQuiescenceError('OpenCode runtime did not exit after SIGKILL')),
-              10_000,
+              this.quiescenceTimeoutMs,
             );
           }),
         ]);
@@ -436,7 +446,9 @@ export class RealOpenCodeRuntimeController implements OpenCodeRuntimeController 
         if (timer) clearTimeout(timer);
         removeExitListeners();
       }
-    })();
+    })().catch((err) => {
+      throw asProviderQuiescenceError(err, 'OpenCode runtime teardown failed before quiescence was proven');
+    });
     return this.destroyPromise;
   }
 }
@@ -840,12 +852,16 @@ export class OpenCodeProvider implements AgentProvider {
       else self.activeSessionId = id;
     };
     const teardownRuntime = async (reason: string): Promise<void> => {
-      if (relayMode) {
-        const controller = relayController;
-        if (controller) await controller.destroy(reason);
-        if (relayController === controller) relayController = null;
-      } else {
-        await self.destroyRuntime(reason);
+      try {
+        if (relayMode) {
+          const controller = relayController;
+          if (controller) await controller.destroy(reason);
+          if (relayController === controller) relayController = null;
+        } else {
+          await self.destroyRuntime(reason);
+        }
+      } catch (err) {
+        throw asProviderQuiescenceError(err, `OpenCode runtime teardown failed (${reason})`);
       }
     };
     let persistedToolKey = 'none';
