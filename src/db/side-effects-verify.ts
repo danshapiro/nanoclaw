@@ -330,6 +330,13 @@ function parseCanonicalSchemaV2(payload: RawSideEffectRecord['payload']): {
   return { canonical, value: typed };
 }
 
+/** Inspect bindings using the same canonical schema-v2 parser as classification. */
+export function parseCanonicalGwsSideEffectPayload(
+  payload: RawSideEffectRecord['payload'],
+): SchemaV2SideEffectPayload | null {
+  return parseCanonicalSchemaV2(payload)?.value ?? null;
+}
+
 function exactSignedOperation(payload: SchemaV2SideEffectPayload): string | null {
   if (!/^[a-z][a-z0-9-]*$/.test(payload.service) || !/^[+a-zA-Z0-9][+a-zA-Z0-9_.-]*$/.test(payload.method)) {
     return null;

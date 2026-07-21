@@ -13,6 +13,7 @@ import Database from 'better-sqlite3';
 import { INBOUND_SCHEMA, OUTBOUND_SCHEMA } from './schema.js';
 import {
   classifyAndSanitize,
+  parseCanonicalGwsSideEffectPayload,
   parseLedgerLines,
   type RawSideEffectRecord,
   type ValidatedSideEffect,
@@ -885,25 +886,42 @@ export function discoverGwsCrashWindowDrafts(opts: {
       },
       { gwsPublicKey: opts.gwsPublicKey },
     );
+    const signed = parseCanonicalGwsSideEffectPayload(e.payload);
+    const outerIdentifierCandidate = e.input_id === opts.inputId || e.route_key === opts.routeKey;
+    const signedIdentifierCandidate = signed?.input_id === opts.inputId || signed?.route_key === opts.routeKey;
+    const operatorCandidate = outerIdentifierCandidate || signedIdentifierCandidate;
+    if (!operatorCandidate) continue;
     if (!validated?.validation.authoritative) {
-      const occurredMs = e.occurred_at ? Date.parse(e.occurred_at) : NaN;
-      const exactOuterScope =
-        e.input_id === opts.inputId &&
-        e.route_key === opts.routeKey &&
-        Number.isFinite(occurredMs) &&
-        occurredMs >= notBeforeMs &&
-        occurredMs <= notAfterMs;
-      if (opts.failOnUnresolved && exactOuterScope) {
+      if (opts.failOnUnresolved) {
         throw new Error(
-          `GWS audit store contains unresolved evidence for exact operator scope (${e.audit_id ?? 'missing-audit-id'})`,
+          `GWS audit store contains unresolved candidate evidence for operator scope (${e.audit_id ?? 'missing-audit-id'})`,
         );
       }
       continue;
     }
-    if (validated.inputId !== opts.inputId) continue;
-    if (validated.routeKey !== opts.routeKey) continue;
-    const occurredMs = validated.occurredAt ? Date.parse(validated.occurredAt) : NaN;
-    if (!Number.isFinite(occurredMs) || occurredMs < notBeforeMs || occurredMs > notAfterMs) continue;
+    const outerOccurredMs = e.occurred_at ? Date.parse(e.occurred_at) : NaN;
+    const signedOccurredMs = signed?.occurred_at ? Date.parse(signed.occurred_at) : NaN;
+    const exactSignedIdentifiers = Boolean(
+      signed && signed.input_id === opts.inputId && signed.route_key === opts.routeKey,
+    );
+    const exactOperatorEvidence =
+      e.input_id === opts.inputId &&
+      e.route_key === opts.routeKey &&
+      exactSignedIdentifiers &&
+      Number.isFinite(outerOccurredMs) &&
+      outerOccurredMs >= notBeforeMs &&
+      outerOccurredMs <= notAfterMs &&
+      Number.isFinite(signedOccurredMs) &&
+      signedOccurredMs >= notBeforeMs &&
+      signedOccurredMs <= notAfterMs;
+    if (!exactOperatorEvidence) {
+      if (opts.failOnUnresolved) {
+        throw new Error(
+          `GWS audit store candidate is outside the exact operator bindings or time window (${e.audit_id ?? 'missing-audit-id'})`,
+        );
+      }
+      continue;
+    }
     matches.push({ entry: e, validated });
   }
   if (matches.length === 0) return result;

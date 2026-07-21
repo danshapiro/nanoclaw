@@ -505,4 +505,86 @@ describe('operator-owned GWS session lifecycle', () => {
     expect(fs.existsSync(operator.activeLeasePath)).toBe(true);
     expect(fs.existsSync(operator.reconciliationReceiptPath)).toBe(false);
   });
+
+  it.each([
+    ['signed payload is current but outer bindings are stale', 'payload-current-outer-stale', true],
+    ['outer bindings are current but signed payload and timestamp disagree', 'outer-current-payload-other', true],
+    ['authoritative exact evidence is outside the operator window', 'exact-outside-window', true],
+    ['unrelated malformed evidence belongs to another session', 'unrelated-other-session', false],
+  ])('%s', (_label, mode, shouldRetain) => {
+    const base = tempRoot(`nanoclaw-operator-audit-candidate-${mode}`);
+    const operator = startOperatorGwsSession({
+      root: path.join(base, 'operator-session'),
+      agentGroupId: 'ag-main',
+      groupFolder: 'main',
+      operatorId: `operator-audit-candidate-${mode}`,
+      containerUid: process.getuid?.() ?? 0,
+      containerGid: process.getgid?.() ?? 0,
+      acceptedAt: '2026-07-21T20:00:00.000Z',
+      leaseId: `operator-lease-audit-candidate-${mode}`,
+    });
+    const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+    const signedUsesCurrentIds = mode === 'payload-current-outer-stale' || mode === 'exact-outside-window';
+    const malformedTime = mode === 'unrelated-other-session';
+    const signed = {
+      schema_version: 2,
+      audit_id: `operator-audit-candidate-${mode}-write`,
+      profile: 'nanoclaw',
+      account_label: 'glowforge',
+      account_email: 'dan@glowforge.com',
+      input_id: signedUsesCurrentIds ? operator.inputId : 'operator:different-session',
+      route_key: signedUsesCurrentIds ? operator.routeKey : 'operator|ag-other|different-session',
+      service: 'drive',
+      method: 'files.create',
+      request_class: 'api',
+      api_effect: true,
+      operation_succeeded: true,
+      occurred_at:
+        mode === 'exact-outside-window'
+          ? '2026-07-21T19:59:59.000Z'
+          : malformedTime
+            ? 'not-a-timestamp'
+            : '2026-07-21T20:00:05.000Z',
+      result_digest: `operator-audit-candidate-${mode}-result`,
+    };
+    const payload = canonicalSideEffectPayload(signed);
+    const outer = {
+      ...signed,
+      ...(mode === 'payload-current-outer-stale'
+        ? {
+            input_id: 'operator:stale-outer-session',
+            route_key: 'operator|ag-stale|stale-outer-session',
+            occurred_at: '2026-07-20T20:00:05.000Z',
+          }
+        : {}),
+      ...(mode === 'outer-current-payload-other'
+        ? { input_id: operator.inputId, route_key: operator.routeKey, occurred_at: 'not-a-timestamp' }
+        : {}),
+      payload,
+      signature: crypto.sign(null, Buffer.from(payload), privateKey).toString('base64'),
+    };
+    const auditStorePath = path.join(base, 'gws-audit.jsonl');
+    fs.writeFileSync(auditStorePath, `${JSON.stringify(outer)}\n`);
+
+    const finalize = () =>
+      finalizeOperatorGwsSession({
+        operator,
+        containerStopped: true,
+        auditStorePath,
+        gwsPublicKey: publicKey.export({ format: 'pem', type: 'spki' }).toString(),
+        stoppedAt: '2026-07-21T20:00:10.000Z',
+      });
+
+    if (shouldRetain) {
+      expect(finalize).toThrow(/unresolved|scope|window|binding/i);
+      expect(fs.existsSync(operator.correlationPath)).toBe(true);
+      expect(fs.existsSync(operator.activeLeasePath)).toBe(true);
+      expect(fs.existsSync(operator.reconciliationReceiptPath)).toBe(false);
+    } else {
+      expect(finalize).not.toThrow();
+      expect(fs.existsSync(operator.correlationPath)).toBe(false);
+      expect(fs.existsSync(operator.activeLeasePath)).toBe(false);
+      expect(fs.existsSync(operator.reconciliationReceiptPath)).toBe(true);
+    }
+  });
 });
