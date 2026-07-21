@@ -9,6 +9,21 @@ const TIMEOUT_MS = 10_000;
 const MAX_FRAME_BYTES = 64 * 1024;
 const MAX_CONTROL_BYTES = 4096;
 
+/**
+ * The host durably committed an acceptance mutation, but the authenticated
+ * response was lost before the runner could prove completion. Retrying or
+ * returning the claim to pending would risk duplicate provider/tool work, so
+ * this is a fatal container-lifecycle fault owned by host recovery.
+ */
+export class GwsCorrelationLifecycleFault extends Error {
+  readonly hostCommitMayHaveSucceeded = true;
+
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'GwsCorrelationLifecycleFault';
+  }
+}
+
 export interface GwsCorrelationLaunchControl {
   schemaVersion: 1;
   agentGroupId: string;
@@ -201,6 +216,24 @@ function readCurrent(): CurrentCorrelation | null {
   }
 }
 
+function currentMatchesAcceptedBind(
+  current: CurrentCorrelation | null,
+  request: AuthenticatedRequest,
+  expectedMessageIds: string[],
+): boolean {
+  const currentIds = Array.isArray(current?.messageIds) ? [...current.messageIds].sort() : [];
+  return (
+    current?.schemaVersion === 1 &&
+    current.requestId === request.requestId &&
+    current.sessionId === request.sessionId &&
+    current.inputId === request.inputId &&
+    current.routeKey === request.routeKey &&
+    current.acceptedAt === request.originalAcceptedAt &&
+    current.leaseId === request.leaseId &&
+    JSON.stringify(currentIds) === JSON.stringify(expectedMessageIds)
+  );
+}
+
 function encodeFrame(value: unknown): Buffer {
   const payload = Buffer.from(JSON.stringify(value));
   if (payload.length > MAX_FRAME_BYTES) throw new Error('GWS control frame exceeds size limit');
@@ -361,19 +394,15 @@ export async function bindHostGwsCorrelation(
   );
   const combinedIds = [...new Set([...(existing?.messageIds ?? []), ...expectedIds])].sort();
   const operation = lease.requestTail.then(async () => {
-    await sendControlFrame(lease, request.requestId, request);
-    const current = readCurrent();
-    const currentIds = Array.isArray(current?.messageIds) ? [...current.messageIds].sort() : [];
-    if (
-      current?.schemaVersion === 1 &&
-      current.requestId === request.requestId &&
-      current.sessionId === lease.sessionId &&
-      current.inputId === inputId &&
-      current.routeKey === routeKey &&
-      current.acceptedAt === request.originalAcceptedAt &&
-      current.leaseId === lease.leaseId &&
-      JSON.stringify(currentIds) === JSON.stringify(combinedIds)
-    ) {
+    try {
+      await sendControlFrame(lease, request.requestId, request);
+    } catch (err) {
+      // The authenticated response can be lost after the host transaction and
+      // pointer publication have committed. Exact pointer evidence proves that
+      // this claim crossed the acceptance boundary, but not that the provider
+      // observed the response. Record it locally and force recovery ownership;
+      // retrying the bind/input could duplicate tool work.
+      if (!currentMatchesAcceptedBind(readCurrent(), request, combinedIds)) throw err;
       lease.acceptedInputs.set(inputId, {
         originalAcceptedAt: request.originalAcceptedAt,
         routeKey,
@@ -382,13 +411,28 @@ export async function bindHostGwsCorrelation(
         lastProviderAcceptance: proof,
       });
       lease.nextSequence++;
-      return;
+      throw new GwsCorrelationLifecycleFault(
+        `trusted host committed GWS correlation for input ${inputId}, but its response was lost`,
+        { cause: err },
+      );
     }
-    const err = new Error(`host did not publish exact GWS correlation for input ${inputId}`);
-    // The host may already have committed the bind. Dropping the authenticated
-    // authority fd makes the host synchronously revoke that partial success.
-    lease.socket?.destroy(err);
-    throw err;
+
+    if (!currentMatchesAcceptedBind(readCurrent(), request, combinedIds)) {
+      // An authenticated success response is itself host-commit evidence. If
+      // the exact pointer cannot be observed, the lifecycle is ambiguous; do
+      // not revoke or retry from inside the still-running container.
+      throw new GwsCorrelationLifecycleFault(
+        `trusted host accepted GWS correlation for input ${inputId}, but exact publication could not be verified`,
+      );
+    }
+    lease.acceptedInputs.set(inputId, {
+      originalAcceptedAt: request.originalAcceptedAt,
+      routeKey,
+      messageIds: combinedIds,
+      lastClaimToken: claimToken,
+      lastProviderAcceptance: proof,
+    });
+    lease.nextSequence++;
   });
   lease.requestTail = operation.catch(() => undefined);
   return operation;

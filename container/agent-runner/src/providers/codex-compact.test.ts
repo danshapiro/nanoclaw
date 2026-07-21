@@ -176,6 +176,46 @@ describe('compactCodexThread', () => {
     expect(requests).toHaveLength(0);
   });
 
+  it('cancels promptly after compact submission without falling back to a normal turn', async () => {
+    const { server, requests } = makeFakeAppServer();
+    let aborted = false;
+    const handlers = new Set<() => void>();
+    const gen = compactCodexThread(
+      server,
+      'thread-cancelled-after-submit',
+      'input-cancelled-after-submit',
+      undefined,
+      { now: () => Date.now() },
+      'initial',
+      async () => {},
+      {
+        isAborted: () => aborted,
+        onAbort: (handler) => {
+          handlers.add(handler);
+          return () => handlers.delete(handler);
+        },
+      },
+    );
+
+    await expect(gen.next()).resolves.toMatchObject({
+      done: false,
+      value: { type: 'input-accepted', inputId: 'input-cancelled-after-submit' },
+    });
+    const rest = drainCompactGenerator(gen);
+    aborted = true;
+    for (const handler of handlers) handler();
+
+    const settled = await Promise.race([
+      rest.then((events) => ({ kind: 'done' as const, events })),
+      new Promise<{ kind: 'timeout'; events: [] }>((resolve) =>
+        setTimeout(() => resolve({ kind: 'timeout', events: [] }), 100),
+      ),
+    ]);
+    expect(settled.kind).toBe('done');
+    expect(settled.events.some((event) => event.type === 'result')).toBe(false);
+    expect(requests.map((request) => request.method)).toEqual(['thread/compact/start']);
+  });
+
   it('emits progress + result after item/completed with a contextCompaction item', async () => {
     const { server, requests, dispatchNotification, resolveAll } = makeFakeAppServer();
     const clock = { now: () => Date.now() };

@@ -33,9 +33,17 @@ import {
   type ProviderRecoveryScope,
 } from './db/session-state.js';
 import { formatMessages, extractRouting, normalizeRoute } from './formatter.js';
+import { GwsCorrelationLifecycleFault } from './gws-correlation.js';
 import { decideProviderStatusAction, runPollLoop as runProductionPollLoop, type PollLoopConfig } from './poll-loop.js';
 import { MockProvider } from './providers/mock.js';
-import type { AgentProvider, AgentQuery, ProviderEvent, QueryInput, QueryTurnInput } from './providers/types.js';
+import {
+  ProviderQuiescenceError,
+  type AgentProvider,
+  type AgentQuery,
+  type ProviderEvent,
+  type QueryInput,
+  type QueryTurnInput,
+} from './providers/types.js';
 
 function runPollLoop(config: PollLoopConfig): Promise<void> {
   const provider = config.provider;
@@ -3968,6 +3976,219 @@ describe('poll-loop inactivity status and terminal recovery', () => {
 
     await waitFor(() => getContinuation('test') === undefined, 3000);
     expect(getContinuation('test')).toBeUndefined();
+
+    controller.abort();
+    await loopPromise.catch(() => {});
+  });
+});
+
+describe('provider finalization barriers', () => {
+  it('keeps a bound input live until the provider abort promise proves quiescence', async () => {
+    insertMessage(
+      'quiescence-init',
+      'chat',
+      { sender: 'User', text: 'run a paused GWS tool' },
+      { platformId: 'chan-quiescence', channelType: 'discord' },
+    );
+    const streamEnded = deferred();
+    const providerQuiescent = deferred();
+    const abortCalled = deferred();
+    let releaseCalls = 0;
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query(input) {
+        return {
+          push() {},
+          end() {},
+          abort() {
+            abortCalled.resolve();
+            streamEnded.resolve();
+            return providerQuiescent.promise;
+          },
+          events: (async function* () {
+            yield { type: 'input-accepted', inputId: input.inputId, scope: 'initial' };
+            await streamEnded.promise;
+          })(),
+        };
+      },
+    };
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({
+      provider,
+      providerName: 'test',
+      cwd: '/tmp',
+      signal: controller.signal,
+      releaseGwsCorrelation: async () => {
+        releaseCalls++;
+      },
+    });
+
+    await waitFor(() => getAckStatus('quiescence-init') === 'processing', 1500);
+    controller.abort();
+    await abortCalled.promise;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(releaseCalls).toBe(0);
+
+    providerQuiescent.resolve();
+    await loopPromise;
+    expect(releaseCalls).toBe(1);
+    expect(getAckStatus('quiescence-init')).toBe('recovery');
+  });
+
+  it('exits fatally and retains correlation when provider quiescence cannot be proved', async () => {
+    insertMessage(
+      'quiescence-failed-init',
+      'chat',
+      { sender: 'User', text: 'run a tool that cannot prove it stopped' },
+      { platformId: 'chan-quiescence-failed', channelType: 'discord' },
+    );
+    const streamEnded = deferred();
+    let releaseCalls = 0;
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query(input) {
+        return {
+          push() {},
+          end() {},
+          abort() {
+            streamEnded.resolve();
+            return Promise.reject(new ProviderQuiescenceError('tool callback remained active'));
+          },
+          events: (async function* () {
+            yield { type: 'input-accepted', inputId: input.inputId, scope: 'initial' };
+            await streamEnded.promise;
+          })(),
+        };
+      },
+    };
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({
+      provider,
+      providerName: 'test',
+      cwd: '/tmp',
+      signal: controller.signal,
+      releaseGwsCorrelation: async () => {
+        releaseCalls++;
+      },
+    });
+
+    await waitFor(() => getAckStatus('quiescence-failed-init') === 'processing', 1500);
+    controller.abort();
+    await expect(loopPromise).rejects.toBeInstanceOf(ProviderQuiescenceError);
+    expect(releaseCalls).toBe(0);
+    expect(getAckStatus('quiescence-failed-init')).toBe('recovery');
+  });
+
+  it('makes response loss after host acceptance a fatal recovery-owned lifecycle fault', async () => {
+    insertMessage(
+      'ambiguous-bind-init',
+      'chat',
+      { sender: 'User', text: 'draft once' },
+      { platformId: 'chan-ambiguous-bind', channelType: 'discord' },
+    );
+    let bindCalls = 0;
+    let releaseCalls = 0;
+    const provider = new ScriptedProvider(async function* () {
+      throw new Error('provider must never run after ambiguous bind');
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({
+      provider,
+      providerName: 'test',
+      cwd: '/tmp',
+      signal: controller.signal,
+      bindGwsCorrelation: async () => {
+        bindCalls++;
+        throw new GwsCorrelationLifecycleFault('authenticated response dropped after host commit');
+      },
+      releaseGwsCorrelation: async () => {
+        releaseCalls++;
+      },
+    });
+
+    const settled = await Promise.race([
+      loopPromise.then(
+        () => 'resolved',
+        () => 'rejected',
+      ),
+      new Promise<'timeout'>((resolve) => setTimeout(() => resolve('timeout'), 350)),
+    ]);
+    controller.abort();
+    await loopPromise.catch(() => {});
+
+    expect(settled).toBe('rejected');
+    expect(bindCalls).toBe(1);
+    expect(releaseCalls).toBe(0);
+    expect(getAckStatus('ambiguous-bind-init')).toBe('recovery');
+    expect(getPendingMessages().map((message) => message.id)).not.toContain('ambiguous-bind-init');
+    const route = normalizeRoute('test', {
+      platformId: 'chan-ambiguous-bind',
+      channelType: 'discord',
+      threadId: null,
+      messagingGroupId: null,
+      isGroup: null,
+    }).routeKey;
+    expect(
+      listRecoveryEntries({
+        providerName: 'test',
+        routeKey: route,
+        messagingGroupId: null,
+        isGroup: null,
+        platformId: 'chan-ambiguous-bind',
+        channelType: 'discord',
+        threadKey: null,
+      })[0]?.classification,
+    ).toBe('trusted_acceptance_ambiguous');
+  });
+
+  it('durably backs off a provider failure before input-accepted and emits one bounded user error', async () => {
+    insertMessage(
+      'preaccept-backoff-init',
+      'chat',
+      { sender: 'User', text: 'retry safely' },
+      { platformId: 'chan-preaccept-backoff', channelType: 'discord' },
+    );
+    let attempts = 0;
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query() {
+        attempts++;
+        return {
+          push() {},
+          end() {},
+          abort() {},
+          events: (async function* () {
+            throw new Error('pre-accept transport failed');
+          })(),
+        };
+      },
+    };
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+    await waitFor(() => attempts >= 1, 1500);
+    // The durable retry fires once after 1s, then backs off to 2s. Neither the
+    // retry nor a process restart may repeat the user-facing error for this
+    // retry series.
+    await new Promise((resolve) => setTimeout(resolve, 1250));
+    const surfaced = getUndeliveredMessages().filter((message) =>
+      message.content.includes('pre-accept transport failed'),
+    );
+    const retryRows = getOutboundDb()
+      .prepare("SELECT value FROM session_state WHERE key LIKE 'provider_retry:%'")
+      .all() as Array<{ value: string }>;
+
+    expect(attempts).toBe(2);
+    expect(surfaced).toHaveLength(1);
+    expect(getAckStatus('preaccept-backoff-init')).toBeNull();
+    expect(getPendingMessages().map((message) => message.id)).toContain('preaccept-backoff-init');
+    expect(retryRows).toHaveLength(1);
+    expect(Date.parse((JSON.parse(retryRows[0].value) as { nextAttemptAt: string }).nextAttemptAt)).toBeGreaterThan(
+      Date.now(),
+    );
 
     controller.abort();
     await loopPromise.catch(() => {});

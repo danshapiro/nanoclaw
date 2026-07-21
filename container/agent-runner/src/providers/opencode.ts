@@ -10,6 +10,7 @@ import { createOpencodeClient, type OpencodeClient } from '@opencode-ai/sdk';
 import { registerProvider } from './provider-registry.js';
 import {
   normalizeQueryTurnInput,
+  ProviderQuiescenceError,
   type AgentProvider,
   type AgentQuery,
   type ProviderCapabilities,
@@ -313,8 +314,8 @@ export interface OpenCodeRuntimeController {
   denyPermission(sessionId: string, permissionId: string, reason: string): Promise<void>;
   /** Positive existence check for the exact attempted session id. */
   sessionExists(id: string): Promise<boolean>;
-  /** Tear down THIS runtime (and quiesce its stream) — never the relay's. */
-  destroy(reason: string): void;
+  /** Tear down THIS runtime and resolve only after its process exits. */
+  destroy(reason: string): Promise<void>;
 }
 
 /** Factory seam so tests can inject a deterministic controller. */
@@ -363,6 +364,8 @@ function hasConfiguredOpenCodeRuntimeIdentity(): boolean {
  * provider API.
  */
 export class RealOpenCodeRuntimeController implements OpenCodeRuntimeController {
+  private destroyPromise: Promise<void> | null = null;
+
   constructor(
     readonly proc: ChildProcess,
     readonly client: OpencodeClient,
@@ -389,16 +392,52 @@ export class RealOpenCodeRuntimeController implements OpenCodeRuntimeController 
     }
   }
 
-  destroy(_reason: string): void {
-    // Quiesce the in-flight read BEFORE killing the proc so a retiring runtime's
-    // outstanding pump read cannot steal a new query's first event (cross-query
-    // protected-event-loss race). stream.return() ends the generator cleanly.
-    try {
-      void this.stream.return?.(undefined);
-    } catch {
-      /* ignore */
-    }
-    killProcessTree(this.proc);
+  destroy(_reason: string): Promise<void> {
+    if (this.destroyPromise) return this.destroyPromise;
+    this.destroyPromise = (async () => {
+      // Begin quiescing the in-flight read before killing the proc so a
+      // retiring runtime's outstanding pump read cannot steal a new query's
+      // first event. Do not await it before signalling: a blocked SSE read must
+      // not prevent the process-group termination that unblocks that read.
+      const streamStopped = Promise.resolve(this.stream.return?.(undefined)).then(() => undefined);
+      let removeExitListeners = (): void => {};
+      const processExited =
+        typeof this.proc.exitCode === 'number' || this.proc.signalCode != null
+          ? Promise.resolve()
+          : new Promise<void>((resolve, reject) => {
+              const onExit = (): void => {
+                removeExitListeners();
+                resolve();
+              };
+              const onError = (err: Error): void => {
+                removeExitListeners();
+                reject(err);
+              };
+              removeExitListeners = (): void => {
+                this.proc.off('exit', onExit);
+                this.proc.off('error', onError);
+              };
+              this.proc.once('exit', onExit);
+              this.proc.once('error', onError);
+            });
+      killProcessTree(this.proc);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          Promise.all([streamStopped, processExited]).then(() => undefined),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(
+              () => reject(new ProviderQuiescenceError('OpenCode runtime did not exit after SIGKILL')),
+              10_000,
+            );
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+        removeExitListeners();
+      }
+    })();
+    return this.destroyPromise;
   }
 }
 
@@ -733,7 +772,7 @@ export class OpenCodeProvider implements AgentProvider {
     this.controllerInit = (async () => {
       // A config change retires the prior runtime — dispose its stream first so
       // its in-flight read can't steal a new query's first event.
-      if (this.controller) this.controller.destroy('runtime_config_changed');
+      if (this.controller) await this.controller.destroy('runtime_config_changed');
       const rt = await this.runtimeFactory.createRuntime(this.options, opts);
       this.controller = rt;
       this.controllerKey = key;
@@ -744,9 +783,18 @@ export class OpenCodeProvider implements AgentProvider {
   }
 
   /** Destroy ONLY this instance's normal runtime (never a relay's). */
-  private destroyRuntime(reason: string): void {
-    if (this.controller) {
-      this.controller.destroy(reason);
+  private async destroyRuntime(reason: string): Promise<void> {
+    const initializing = this.controllerInit;
+    if (initializing && !this.controller) {
+      try {
+        await initializing;
+      } catch {
+        // A failed spawn has no live runtime to destroy.
+      }
+    }
+    const controller = this.controller;
+    if (controller) await controller.destroy(reason);
+    if (this.controller === controller) {
       this.controller = null;
       this.controllerKey = null;
     }
@@ -778,6 +826,7 @@ export class OpenCodeProvider implements AgentProvider {
     let waiting: (() => void) | null = null;
     let ended = false;
     let aborted = false;
+    let abortPromise: Promise<void> | null = null;
 
     const systemInstructions = input.systemContext?.instructions;
     pending.push(wrapTurnWithContext(input, systemInstructions));
@@ -790,12 +839,13 @@ export class OpenCodeProvider implements AgentProvider {
       if (relayMode) relayActiveSessionId = id;
       else self.activeSessionId = id;
     };
-    const teardownRuntime = (reason: string): void => {
+    const teardownRuntime = async (reason: string): Promise<void> => {
       if (relayMode) {
-        relayController?.destroy(reason);
-        relayController = null;
+        const controller = relayController;
+        if (controller) await controller.destroy(reason);
+        if (relayController === controller) relayController = null;
       } else {
-        self.destroyRuntime(reason);
+        await self.destroyRuntime(reason);
       }
     };
     let persistedToolKey = 'none';
@@ -1117,7 +1167,7 @@ export class OpenCodeProvider implements AgentProvider {
                   continuationPolicy,
                 );
                 pump.dispose();
-                teardownRuntime(err.classification);
+                await teardownRuntime(err.classification);
                 break turn;
               }
 
@@ -1244,7 +1294,7 @@ export class OpenCodeProvider implements AgentProvider {
                       'clear',
                     );
                     pump.dispose();
-                    teardownRuntime('native_question_denied');
+                    await teardownRuntime('native_question_denied');
                     break turn;
                   }
                   // Non-question permission: auto-approve (existing behavior).
@@ -1287,7 +1337,7 @@ export class OpenCodeProvider implements AgentProvider {
                       st.message,
                     );
                     pump.dispose();
-                    teardownRuntime('session_retry_limit');
+                    await teardownRuntime('session_retry_limit');
                     break turn;
                   }
                   break;
@@ -1319,7 +1369,7 @@ export class OpenCodeProvider implements AgentProvider {
                       providerMessage,
                     );
                     pump.dispose();
-                    teardownRuntime('session_error');
+                    await teardownRuntime('session_error');
                     break turn;
                   }
                   break;
@@ -1362,6 +1412,11 @@ export class OpenCodeProvider implements AgentProvider {
         }
       } finally {
         pump.dispose();
+        // A closed event stream is a terminal query boundary. Retire the
+        // controller even for unexpected generator failures so no OpenCode
+        // process or SSE reader can outlive the query whose correlation the
+        // poll loop is about to release.
+        await teardownRuntime('query_stream_finalized');
       }
     }
 
@@ -1376,12 +1431,14 @@ export class OpenCodeProvider implements AgentProvider {
       },
       events: gen(),
       abort: () => {
+        if (abortPromise) return abortPromise;
         aborted = true;
         // Relay aborts tear down only the relay's own controller and never
         // touch the instance's normal-turn session/runtime.
         setActiveSession(undefined);
         kick();
-        teardownRuntime('abort');
+        abortPromise = teardownRuntime('abort');
+        return abortPromise;
       },
     };
   }

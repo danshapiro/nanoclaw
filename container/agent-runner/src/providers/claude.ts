@@ -5,7 +5,7 @@ import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '
 
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
 import { registerProvider } from './provider-registry.js';
-import { normalizeQueryTurnInput } from './types.js';
+import { normalizeQueryTurnInput, ProviderQuiescenceError } from './types.js';
 import type {
   AgentProvider,
   AgentQuery,
@@ -42,6 +42,7 @@ const SDK_DISALLOWED_TOOLS = [
   'EnterWorktree',
   'ExitWorktree',
 ];
+const CLAUDE_QUIESCENCE_TIMEOUT_MS = 30_000;
 
 // Base tool allowlist for NanoClaw agent containers.
 const BASE_TOOL_ALLOWLIST = [
@@ -100,7 +101,8 @@ class ClaudeExecutionBarrier {
 
   cancel(): void {
     this.cancelled = true;
-    for (const resolve of this.toolsDrainedWaiters.splice(0)) resolve();
+    // Do not wake drain waiters on cancellation. Only the matching PostToolUse
+    // hook proves an admitted tool stopped executing.
   }
 
   transition(acceptInput: () => Promise<void>): Promise<void> {
@@ -153,6 +155,29 @@ class ClaudeExecutionBarrier {
     if (this.activeTools.size === 0) {
       for (const resolve of this.toolsDrainedWaiters.splice(0)) resolve();
     }
+  }
+
+  async waitForQuiescence(): Promise<void> {
+    await this.transitionTail;
+    if (this.activeTools.size === 0) return;
+    await new Promise<void>((resolve) => this.toolsDrainedWaiters.push(resolve));
+  }
+}
+
+async function waitForClaudeQuiescence(promise: Promise<void>): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new ProviderQuiescenceError('Claude did not quiesce after interrupt before the deadline')),
+          CLAUDE_QUIESCENCE_TIMEOUT_MS,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
@@ -575,18 +600,24 @@ export class ClaudeProvider implements AgentProvider {
     });
 
     let aborted = false;
-    let sdkCancellation: Promise<void> | null = null;
+    let cancellation: Promise<void> | null = null;
 
-    const cancelExecution = (): void => {
-      if (aborted) return;
+    const cancelExecution = (): Promise<void> => {
+      if (cancellation) return cancellation;
       aborted = true;
       stream.cancel();
-      const interrupt = (sdkResult as { interrupt?: () => Promise<void> }).interrupt;
-      sdkCancellation = interrupt
-        ? interrupt.call(sdkResult).catch((err) => {
-            log(`Claude SDK interrupt failed: ${err instanceof Error ? err.message : String(err)}`);
-          })
-        : Promise.resolve();
+      cancellation = (async () => {
+        const interrupt = (sdkResult as { interrupt?: () => Promise<void> }).interrupt;
+        if (interrupt) {
+          try {
+            await interrupt.call(sdkResult);
+          } catch (err) {
+            throw new ProviderQuiescenceError('Claude SDK interrupt failed', { cause: err });
+          }
+        }
+        await waitForClaudeQuiescence(executionBarrier.waitForQuiescence());
+      })();
+      return cancellation;
     };
 
     // Track accepted-but-unresolved input ids in arrival order. A Claude
@@ -684,7 +715,11 @@ export class ClaudeProvider implements AgentProvider {
         // recovery ownership of the submitted work. Cancellation before
         // prompt consumption never queues an event here.
         for (const ev of drainAccepted()) yield ev;
-        if (sdkCancellation) await sdkCancellation;
+        if (cancellation) {
+          await cancellation;
+        } else {
+          await waitForClaudeQuiescence(executionBarrier.waitForQuiescence());
+        }
       }
       log(`Query completed after ${messageCount} SDK messages`);
     }

@@ -1,6 +1,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { EventEmitter } from 'events';
 
 import { describe, it, expect, afterEach } from 'bun:test';
 
@@ -588,6 +589,14 @@ class FakeStream {
 
 const TEST_SESSION = 'ses_test_runtime';
 
+function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T | PromiseLike<T>) => void } {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 class FakeController implements OpenCodeRuntimeController {
   destroyed: string[] = [];
   promptCalls = 0;
@@ -624,7 +633,7 @@ class FakeController implements OpenCodeRuntimeController {
   async sessionExists(): Promise<boolean> {
     return this.sessionExistsResult;
   }
-  destroy(reason: string): void {
+  async destroy(reason: string): Promise<void> {
     this.destroyed.push(reason);
   }
 }
@@ -747,6 +756,38 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
 
     await expect(first).resolves.toMatchObject({ done: true });
     expect(controller.promptCalls).toBe(0);
+  });
+
+  it('awaits runtime process termination before abort reports quiescence', async () => {
+    const stream = new FakeStream();
+    const { provider, controller } = makeProvider({ stream });
+    const processExited = deferred<void>();
+    controller.destroy = async (reason: string) => {
+      controller.destroyed.push(reason);
+      await processExited.promise;
+    };
+    const query = provider.query({
+      inputId: 'in-abort-quiescence',
+      acceptInput: async () => {},
+      prompt: 'run a paused GWS tool',
+      cwd: '/workspace/agent',
+    });
+    const iter = query.events[Symbol.asyncIterator]();
+    await expect(iter.next()).resolves.toMatchObject({
+      value: { type: 'input-accepted', inputId: 'in-abort-quiescence' },
+    });
+
+    let quiescent = false;
+    const abort = Promise.resolve(query.abort()).then(() => {
+      quiescent = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(quiescent).toBe(false);
+    expect(controller.destroyed).toEqual(['abort']);
+
+    processExited.resolve();
+    await abort;
+    expect(quiescent).toBe(true);
   });
 
   it('starts prompt submission before emitting input-accepted, then resolves on session.idle', async () => {
@@ -1439,7 +1480,7 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
 });
 
 describe('RealOpenCodeRuntimeController.destroy ordering', () => {
-  it('quiesces the in-flight stream read (stream.return) BEFORE killing the process', () => {
+  it('quiesces the in-flight stream read (stream.return) BEFORE killing the process', async () => {
     const order: string[] = [];
     // Fake stream whose return() records the quiesce step.
     const stream = {
@@ -1454,6 +1495,8 @@ describe('RealOpenCodeRuntimeController.destroy ordering', () => {
     // proc.kill, which also records) — no real signal is ever sent.
     const proc = {
       pid: 4242,
+      exitCode: 0,
+      signalCode: null,
       kill: () => {
         order.push('proc.kill');
         return true;
@@ -1468,7 +1511,7 @@ describe('RealOpenCodeRuntimeController.destroy ordering', () => {
       throw new Error('ESRCH (stubbed — no real signal)');
     };
     try {
-      controller.destroy('test-ordering');
+      await controller.destroy('test-ordering');
     } finally {
       (process as unknown as { kill: typeof realKill }).kill = realKill;
     }
@@ -1480,5 +1523,45 @@ describe('RealOpenCodeRuntimeController.destroy ordering', () => {
     const killIdx = order.findIndex((s) => s.startsWith('process.kill') || s === 'proc.kill');
     expect(killIdx).toBeGreaterThan(0);
     expect(order.indexOf('stream.return')).toBeLessThan(killIdx);
+  });
+
+  it('does not resolve until the real controller observes process exit', async () => {
+    const stream = {
+      next: async () => ({ done: true as const, value: undefined }),
+      return: async () => ({ done: true as const, value: undefined }),
+    } as unknown as AsyncGenerator<{ type: string; properties: Record<string, unknown> }, void, void>;
+    const proc = new EventEmitter() as EventEmitter & {
+      pid: number;
+      exitCode: number | null;
+      signalCode: NodeJS.Signals | null;
+      kill(signal?: NodeJS.Signals): boolean;
+    };
+    proc.pid = 4243;
+    proc.exitCode = null;
+    proc.signalCode = null;
+    proc.kill = () => true;
+    const client = { session: {}, async postSessionIdPermissionsPermissionId() {} } as never;
+    const controller = new RealOpenCodeRuntimeController(
+      proc as unknown as import('child_process').ChildProcess,
+      client,
+      stream,
+    );
+    const realKill = process.kill;
+    (process as unknown as { kill: (pid: number, sig?: string | number) => boolean }).kill = () => true;
+    try {
+      let settled = false;
+      const destroying = controller.destroy('test-process-exit').then(() => {
+        settled = true;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(settled).toBe(false);
+
+      proc.exitCode = 0;
+      proc.emit('exit', 0, null);
+      await destroying;
+      expect(settled).toBe(true);
+    } finally {
+      (process as unknown as { kill: typeof realKill }).kill = realKill;
+    }
   });
 });

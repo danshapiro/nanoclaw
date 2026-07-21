@@ -93,6 +93,72 @@ export function clearContinuation(providerName: string, continuationScope?: stri
   deleteValue(continuationKey(providerName, continuationScope));
 }
 
+export interface ProviderRetrySchedule {
+  attempts: number;
+  nextAttemptAt: string;
+  lastErrorAt: string;
+  userErrorEmittedAt?: string;
+}
+
+function providerRetryKey(providerName: string, routeKey: string): string {
+  return `provider_retry:${keyPart(providerName)}:${Buffer.from(routeKey).toString('base64url')}`;
+}
+
+export function readProviderRetrySchedule(providerName: string, routeKey: string): ProviderRetrySchedule | undefined {
+  const raw = getValue(providerRetryKey(providerName, routeKey));
+  if (!raw) return undefined;
+  try {
+    const value = JSON.parse(raw) as Partial<ProviderRetrySchedule>;
+    if (
+      !Number.isSafeInteger(value.attempts) ||
+      (value.attempts as number) < 1 ||
+      typeof value.nextAttemptAt !== 'string' ||
+      !Number.isFinite(Date.parse(value.nextAttemptAt)) ||
+      typeof value.lastErrorAt !== 'string' ||
+      !Number.isFinite(Date.parse(value.lastErrorAt)) ||
+      (value.userErrorEmittedAt !== undefined &&
+        (typeof value.userErrorEmittedAt !== 'string' || !Number.isFinite(Date.parse(value.userErrorEmittedAt))))
+    ) {
+      return undefined;
+    }
+    return value as ProviderRetrySchedule;
+  } catch {
+    return undefined;
+  }
+}
+
+export function scheduleProviderRetry(
+  providerName: string,
+  routeKey: string,
+  nowMs = Date.now(),
+): ProviderRetrySchedule {
+  const prior = readProviderRetrySchedule(providerName, routeKey);
+  const attempts = Math.min(10, (prior?.attempts ?? 0) + 1);
+  const delayMs = Math.min(30_000, 1_000 * 2 ** (attempts - 1));
+  const schedule: ProviderRetrySchedule = {
+    attempts,
+    nextAttemptAt: new Date(nowMs + delayMs).toISOString(),
+    lastErrorAt: new Date(nowMs).toISOString(),
+    userErrorEmittedAt: prior?.userErrorEmittedAt,
+  };
+  setValue(providerRetryKey(providerName, routeKey), JSON.stringify(schedule));
+  return schedule;
+}
+
+export function markProviderRetryUserErrorEmitted(
+  providerName: string,
+  routeKey: string,
+  emittedAt = new Date().toISOString(),
+): void {
+  const schedule = readProviderRetrySchedule(providerName, routeKey);
+  if (!schedule || schedule.userErrorEmittedAt) return;
+  setValue(providerRetryKey(providerName, routeKey), JSON.stringify({ ...schedule, userErrorEmittedAt: emittedAt }));
+}
+
+export function clearProviderRetrySchedule(providerName: string, routeKey: string): void {
+  deleteValue(providerRetryKey(providerName, routeKey));
+}
+
 // ── Continuation-clear helper requiring attempted-continuation metadata ──────
 
 /**

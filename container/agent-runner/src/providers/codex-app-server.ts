@@ -15,6 +15,8 @@ import path from 'path';
 import { spawn, type ChildProcess } from 'child_process';
 import { createInterface, type Interface as ReadlineInterface } from 'readline';
 
+import { ProviderQuiescenceError } from './types.js';
+
 function log(msg: string): void {
   console.error(`[codex-app-server] ${msg}`);
 }
@@ -100,6 +102,18 @@ export interface AppServer {
   serverRequestHandlers: ((r: JsonRpcServerRequest) => void)[];
 }
 
+export interface CodexRequestCancellation {
+  isAborted(): boolean;
+  onAbort(handler: () => void): () => void;
+}
+
+export class CodexRequestAbortedError extends Error {
+  constructor(method: string) {
+    super(`Codex request aborted while waiting for ${method}`);
+    this.name = 'CodexRequestAbortedError';
+  }
+}
+
 export function spawnCodexAppServer(configOverrides: string[] = []): AppServer {
   // --strict-config makes a typo'd `-c` override fail-fast at spawn instead of
   // being silently ignored (which would downgrade reasoning with no warning).
@@ -173,32 +187,66 @@ export function sendCodexRequest(
   method: string,
   params: Record<string, unknown>,
   timeoutMs = 60_000,
+  cancellation?: CodexRequestCancellation,
 ): Promise<JsonRpcResponse> {
   const req = makeRequest(method, params);
   const line = JSON.stringify(req) + '\n';
 
   return new Promise<JsonRpcResponse>((resolve, reject) => {
+    if (cancellation?.isAborted()) {
+      reject(new CodexRequestAbortedError(method));
+      return;
+    }
+    let settled = false;
+    let unsubscribeAbort: (() => void) | undefined;
     const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
       server.pending.delete(req.id);
+      unsubscribeAbort?.();
       reject(new Error(`Timeout waiting for ${method} response (${timeoutMs}ms)`));
     }, timeoutMs);
 
     server.pending.set(req.id, {
       resolve: (r) => {
+        if (settled) return;
+        settled = true;
         clearTimeout(timer);
+        unsubscribeAbort?.();
         resolve(r);
       },
       reject: (e) => {
+        if (settled) return;
+        settled = true;
         clearTimeout(timer);
+        unsubscribeAbort?.();
         reject(e);
       },
     });
+    unsubscribeAbort = cancellation?.onAbort(() => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      server.pending.delete(req.id);
+      unsubscribeAbort?.();
+      reject(new CodexRequestAbortedError(method));
+    });
+    // onAbort implementations are allowed to invoke synchronously when an
+    // abort races subscription. In that case the request is already settled
+    // and must never be written after cancellation.
+    if (settled) {
+      unsubscribeAbort?.();
+      return;
+    }
 
     try {
       server.process.stdin!.write(line);
     } catch (err) {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
       server.pending.delete(req.id);
+      unsubscribeAbort?.();
       reject(err instanceof Error ? err : new Error(String(err)));
     }
   });
@@ -213,12 +261,55 @@ export function sendCodexResponse(server: AppServer, id: number, result: unknown
   }
 }
 
-export function killCodexAppServer(server: AppServer): void {
+export async function terminateCodexAppServer(server: AppServer): Promise<void> {
   try {
     server.readline.close();
-    server.process.kill('SIGTERM');
   } catch {
-    /* ignore */
+    // Process exit remains the authoritative proof.
+  }
+  if (server.process.exitCode !== null || server.process.signalCode !== null) return;
+
+  let hardKill: ReturnType<typeof setTimeout> | undefined;
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const onExit = (): void => {
+        cleanup();
+        resolve();
+      };
+      const onError = (err: Error): void => {
+        cleanup();
+        reject(new ProviderQuiescenceError('Codex app-server termination failed', { cause: err }));
+      };
+      const cleanup = (): void => {
+        server.process.off('exit', onExit);
+        server.process.off('error', onError);
+        if (hardKill) clearTimeout(hardKill);
+        if (deadline) clearTimeout(deadline);
+      };
+      server.process.once('exit', onExit);
+      server.process.once('error', onError);
+      try {
+        server.process.kill('SIGTERM');
+      } catch (err) {
+        onError(err instanceof Error ? err : new Error(String(err)));
+        return;
+      }
+      hardKill = setTimeout(() => {
+        try {
+          server.process.kill('SIGKILL');
+        } catch {
+          // The deadline below owns the fail-closed result.
+        }
+      }, 5_000);
+      deadline = setTimeout(() => {
+        cleanup();
+        reject(new ProviderQuiescenceError('Codex app-server did not exit after termination signals'));
+      }, 10_000);
+    });
+  } finally {
+    if (hardKill) clearTimeout(hardKill);
+    if (deadline) clearTimeout(deadline);
   }
 }
 
@@ -279,15 +370,32 @@ export function waitForCodexCompactionComplete(
   server: AppServer,
   threadId: string,
   timeoutMs = 30_000,
+  cancellation?: CodexRequestCancellation,
 ): Promise<CodexCompactCompletionNotification> {
   return new Promise((resolve, reject) => {
+    if (cancellation?.isAborted()) {
+      reject(new CodexRequestAbortedError('thread/compact completion'));
+      return;
+    }
     let settled = false;
+    let unsubscribeAbort: (() => void) | undefined;
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
       remove();
       reject(new Error(`Timeout waiting for Codex compaction completion on thread ${threadId}`));
     }, timeoutMs);
+    unsubscribeAbort = cancellation?.onAbort(() => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      remove();
+      reject(new CodexRequestAbortedError('thread/compact completion'));
+    });
+    if (settled) {
+      unsubscribeAbort?.();
+      return;
+    }
 
     function hasContextCompactionItem(items: unknown): boolean {
       if (!Array.isArray(items)) return false;
@@ -354,6 +462,7 @@ export function waitForCodexCompactionComplete(
     function remove(): void {
       const idx = server.notificationHandlers.indexOf(handler);
       if (idx >= 0) server.notificationHandlers.splice(idx, 1);
+      unsubscribeAbort?.();
     }
 
     server.notificationHandlers.push(handler);

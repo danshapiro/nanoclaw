@@ -243,6 +243,46 @@ describe('provider input-accepted/result contract', () => {
     query.abort();
   });
 
+  it('claude abort does not report quiescence until the active tool reaches PostToolUse', async () => {
+    let sdkOptions: any;
+    mock.module('@anthropic-ai/claude-agent-sdk', () => ({
+      query: ({ prompt, options }: { prompt: AsyncIterable<unknown>; options: unknown }) => {
+        sdkOptions = options;
+        const result = (async function* () {
+          for await (const _message of prompt) yield { type: 'assistant', message: { content: [] } };
+        })();
+        return Object.assign(result, { interrupt: async () => {} });
+      },
+    }));
+    const { ClaudeProvider } = await import('./claude.js');
+    const query = new ClaudeProvider().query({
+      inputId: 'claude-quiescence',
+      acceptInput: async () => {},
+      prompt: 'run a GWS tool',
+      cwd: '/tmp',
+    });
+    const iter = query.events[Symbol.asyncIterator]();
+    await nextEvent(iter, 'input-accepted');
+    const preTool = sdkOptions.hooks.PreToolUse[0].hooks[0];
+    const postTool = sdkOptions.hooks.PostToolUse[0].hooks[0];
+    await preTool({ tool_name: 'mcp__nanoclaw__gws', tool_input: {}, tool_use_id: 'gws-paused' }, 'gws-paused', {
+      signal: new AbortController().signal,
+    });
+
+    let quiescent = false;
+    const abort = Promise.resolve(query.abort()).then(() => {
+      quiescent = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(quiescent).toBe(false);
+
+    await postTool({ tool_name: 'mcp__nanoclaw__gws', tool_input: {}, tool_use_id: 'gws-paused' }, 'gws-paused', {
+      signal: new AbortController().signal,
+    });
+    await abort;
+    expect(quiescent).toBe(true);
+  });
+
   it('claude cancels prompt consumption when the trusted bind fails', async () => {
     let promptConsumed = false;
     mock.module('@anthropic-ai/claude-agent-sdk', () => ({

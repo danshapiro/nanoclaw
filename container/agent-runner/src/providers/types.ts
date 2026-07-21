@@ -188,6 +188,13 @@ export interface McpServerConfig {
   env: Record<string, string>;
 }
 
+export class ProviderQuiescenceError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'ProviderQuiescenceError';
+  }
+}
+
 export interface AgentQuery {
   /** Push a follow-up message into the active query. */
   push(input: string | QueryTurnInput): void;
@@ -198,8 +205,13 @@ export interface AgentQuery {
   /** Output event stream. */
   events: AsyncIterable<ProviderEvent>;
 
-  /** Force-stop the query. */
-  abort(): void;
+  /**
+   * Force-stop the query and resolve only after every provider process, SDK
+   * operation, and admitted tool is quiescent. A rejection is a fatal
+   * lifecycle fault: callers must retain accepted correlation for host-side
+   * stop/recovery rather than releasing it optimistically.
+   */
+  abort(): Promise<void>;
 }
 
 export function normalizeQueryTurnInput(input: string | QueryTurnInput): QueryTurnInput {

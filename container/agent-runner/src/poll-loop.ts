@@ -23,10 +23,14 @@ import {
   appendRecoveryEntry,
   appendRecoveryEntryAndOwnRows,
   clearContinuation,
+  clearProviderRetrySchedule,
   listRecoveryEntries,
+  markProviderRetryUserErrorEmitted,
   markRecoveryInFlight,
   migrateLegacyContinuation,
   resolveRecoveryEntry,
+  readProviderRetrySchedule,
+  scheduleProviderRetry,
   setContinuation,
   type ProviderRecoveryEntry,
   type ProviderRecoveryScope,
@@ -44,8 +48,8 @@ import {
   stripInternalTags,
   type RoutingContext,
 } from './formatter.js';
-import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
-import { bindHostGwsCorrelation, releaseHostGwsCorrelation } from './gws-correlation.js';
+import { ProviderQuiescenceError, type AgentProvider, type AgentQuery, type ProviderEvent } from './providers/types.js';
+import { bindHostGwsCorrelation, GwsCorrelationLifecycleFault, releaseHostGwsCorrelation } from './gws-correlation.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
@@ -385,10 +389,18 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           message_ids: idleStopMessages.map((m) => m.id),
         }),
       );
+      clearProviderRetrySchedule(config.providerName, activeRouteKey);
       activeMessages = activeMessages.filter((m) => !isStopControlMessage(m));
       if (!activeMessages.some((m) => m.trigger === 1)) {
         continue;
       }
+    }
+
+    const retrySchedule = readProviderRetrySchedule(config.providerName, activeRouteKey);
+    const retryRemainingMs = retrySchedule ? Date.parse(retrySchedule.nextAttemptAt) - Date.now() : 0;
+    if (retryRemainingMs > 0) {
+      await sleep(Math.min(retryRemainingMs, 500), config.signal);
+      continue;
     }
 
     const ids = activeMessages.map((m) => m.id);
@@ -419,6 +431,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const acceptanceContext: InputAcceptanceContext = {
       tail: Promise.resolve(),
       boundGwsInputs: new Set(),
+      lifecycleFault: null,
       bind: config.bindGwsCorrelation ?? bindHostGwsCorrelation,
       release: config.releaseGwsCorrelation ?? releaseHostGwsCorrelation,
     };
@@ -444,6 +457,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
       if (keep.length === 0) {
         log(`All ${activeMessages.length} message(s) gated by script, skipping query`);
+        clearProviderRetrySchedule(config.providerName, activeRouteKey);
         continue;
       }
 
@@ -465,6 +479,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             remaining_message_ids: keep.map((message) => message.id),
           }),
         );
+        clearProviderRetrySchedule(config.providerName, activeRouteKey);
         await sleep(POLL_INTERVAL_MS, config.signal);
         continue;
       }
@@ -525,6 +540,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       });
     } catch (preErr) {
       const preMsg = preErr instanceof Error ? preErr.message : String(preErr);
+      const retry = scheduleProviderRetry(config.providerName, activeRouteKey);
       log(
         JSON.stringify({
           severity: 'warn',
@@ -532,6 +548,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           route_key: activeRouteKey,
           message_ids: processingIds,
           error: preMsg,
+          retry_attempt: retry.attempts,
+          next_attempt_at: retry.nextAttemptAt,
         }),
       );
       // Store a route-scoped recovery entry so the next Yente turn has the
@@ -556,7 +574,6 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         updatedAt: now,
       });
       returnProcessingToPending(processingIds, 'pre_query_failure');
-      await sleep(POLL_INTERVAL_MS, config.signal);
       continue;
     }
 
@@ -605,6 +622,11 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       const errMsg = err instanceof Error ? err.message : String(err);
       log(`Query error: ${errMsg}`);
 
+      // These failures mean accepted work may still be live or host-committed.
+      // Leaving the process is intentional: host stop proof and recovery own
+      // the correlation from here. Never release/retry inside this runner.
+      if (err instanceof TrustedInputLifecycleError || err instanceof ProviderQuiescenceError) throw err;
+
       if (err instanceof TrustedInputAcceptanceError) {
         log(
           JSON.stringify({
@@ -618,6 +640,26 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         // The row is intentionally retryable, but a missing/broken host IPC
         // channel must not turn that retry into a microtask-only busy loop.
         await sleep(POLL_INTERVAL_MS, config.signal);
+        continue;
+      }
+
+      const failedBeforeAcceptance = initialClaim?.state === 'returned' && initialClaim.acceptanceObserved === false;
+      if (failedBeforeAcceptance) {
+        const retry = scheduleProviderRetry(config.providerName, activeRouteKey);
+        log(
+          JSON.stringify({
+            severity: 'warn',
+            event: 'provider_preaccept_failure_scheduled',
+            route_key: activeRouteKey,
+            retry_attempt: retry.attempts,
+            next_attempt_at: retry.nextAttemptAt,
+            error: errMsg,
+          }),
+        );
+        if (!retry.userErrorEmittedAt) {
+          writeRoutedMessage(routing, `Error: ${sanitizeProviderErrorText(errMsg)}`);
+          markProviderRetryUserErrorEmitted(config.providerName, activeRouteKey);
+        }
         continue;
       }
 
@@ -724,6 +766,7 @@ interface InputClaimBatch {
 interface InputAcceptanceContext {
   tail: Promise<void>;
   boundGwsInputs: Set<string>;
+  lifecycleFault: TrustedInputLifecycleError | null;
   bind: typeof bindHostGwsCorrelation;
   release: typeof releaseHostGwsCorrelation;
 }
@@ -732,6 +775,13 @@ class TrustedInputAcceptanceError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
     this.name = 'TrustedInputAcceptanceError';
+  }
+}
+
+class TrustedInputLifecycleError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'TrustedInputLifecycleError';
   }
 }
 
@@ -769,6 +819,19 @@ function createInputClaim(
           // Legacy agent-writable correlation remains for non-GWS tools only.
           writeActiveInput(opts.inputId, opts.routeKey);
         } catch (err) {
+          if (err instanceof GwsCorrelationLifecycleFault) {
+            // The host may have durably accepted this exact claim. Treat it as
+            // accepted/recovery-owned, cancel the provider, and exit the runner;
+            // returning it to pending could submit the same work twice.
+            ctx.boundGwsInputs.add(opts.inputId);
+            claim.state = 'accepted';
+            claim.acceptanceObserved = true;
+            ctx.lifecycleFault = new TrustedInputLifecycleError(
+              `trusted host input acceptance became ambiguous for ${opts.inputId}`,
+              { cause: err },
+            );
+            throw ctx.lifecycleFault;
+          }
           claim.state = 'queued';
           throw new TrustedInputAcceptanceError(`trusted host input bind failed for ${opts.inputId}`, { cause: err });
         }
@@ -829,7 +892,11 @@ async function processQuery(
   let done = false;
   let userStopRequested = false;
   let initialBatchSettled = false;
-  const abortQuery = () => query.abort();
+  let abortPromise: Promise<void> | null = null;
+  const abortQuery = (): void => {
+    if (abortPromise) return;
+    abortPromise = query.abort();
+  };
 
   // Stamp the authoritative active route metadata onto the routing context so
   // EVERY route-bearing outbound row this turn writes (result text, relay status,
@@ -888,6 +955,7 @@ async function processQuery(
     }
     claim.acceptanceObserved = true;
     entry.state = 'accepted';
+    clearProviderRetrySchedule(providerName, ledgerCtx.activeRouteKey);
     // Resuming a prior interrupted turn: mark its recovery entries in_flight for
     // THIS top-level input. They are NOT consumed yet (mere acceptance never
     // resolves recovery — Invariant 140); resolution happens only on success.
@@ -1013,7 +1081,7 @@ async function processQuery(
             completed_same_route_message_ids: sameRouteIds,
           }),
         );
-        query.abort();
+        abortQuery();
       }
       return;
     }
@@ -1127,6 +1195,7 @@ async function processQuery(
   }
 
   let topLevelResolvedAtLeastOnce = false;
+  let providerStreamFailure: unknown;
   try {
     for await (const event of query.events) {
       handleEvent(event, routing);
@@ -1319,10 +1388,18 @@ async function processQuery(
 
     // Stream ended. Settle reply accounting for the initial batch.
     settleInitialBatch(topLevelResolvedAtLeastOnce, null);
+  } catch (err) {
+    providerStreamFailure = err;
+    throw err;
   } finally {
     done = true;
     clearInterval(pollHandle);
     signal?.removeEventListener('abort', abortQuery);
+
+    // Once host acceptance is ambiguous the provider must stop immediately.
+    // The claim remains accepted/recovery-owned because retrying it could
+    // duplicate model or tool work that began after the host commit.
+    if (ledgerCtx.acceptanceContext.lifecycleFault) abortQuery();
 
     // Terminal handling for un-resolved ledger entries. User-requested stop is a
     // discard/complete path; ordinary terminal interruptions keep the existing
@@ -1379,15 +1456,21 @@ async function processQuery(
       const entry: ProviderRecoveryEntry = {
         id: recoveryId,
         status: 'pending',
-        classification: zombieFailureCleared
-          ? 'continuation_zombie_restart'
-          : 'terminal_interruption_accepted_unresolved',
-        agentMessage: zombieFailureCleared
-          ? 'The previous session became unusable after repeated failures; I am restarting this work from scratch.'
-          : 'I was interrupted mid-turn and will resume this work.',
-        fallbackUserMessage: zombieFailureCleared
-          ? 'I had to restart your request after the session repeatedly failed — I still have it and am retrying from scratch.'
-          : 'Something interrupted me while I was working on your request. I still have it queued — no need to resend.',
+        classification: ledgerCtx.acceptanceContext.lifecycleFault
+          ? 'trusted_acceptance_ambiguous'
+          : zombieFailureCleared
+            ? 'continuation_zombie_restart'
+            : 'terminal_interruption_accepted_unresolved',
+        agentMessage: ledgerCtx.acceptanceContext.lifecycleFault
+          ? 'The trusted host accepted this input, but the runner lost the acceptance response. Resume only through recovery.'
+          : zombieFailureCleared
+            ? 'The previous session became unusable after repeated failures; I am restarting this work from scratch.'
+            : 'I was interrupted mid-turn and will resume this work.',
+        fallbackUserMessage: ledgerCtx.acceptanceContext.lifecycleFault
+          ? 'I lost contact with the runtime after accepting your request. I still have it safely recorded — no need to resend.'
+          : zombieFailureCleared
+            ? 'I had to restart your request after the session repeatedly failed — I still have it and am retrying from scratch.'
+            : 'Something interrupted me while I was working on your request. I still have it queued — no need to resend.',
         // Ordered same-route wake-triggering rows (A3, Invariant 166).
         originalTasks: ledgerCtx.originalTasks,
         acceptedUnresolvedInputs,
@@ -1448,9 +1531,35 @@ async function processQuery(
         if (entry.claims.every((claim) => claim.state === 'returned')) entry.state = 'returned';
       }
     }
+
+    // Correlation can only be released after provider-controlled work has
+    // definitely quiesced. Aborts are asynchronous because SDK callbacks,
+    // tool hooks, and child processes may outlive signal dispatch. A failed
+    // quiescence proof is fatal and deliberately leaves every bound input for
+    // host stop/recovery instead of revoking its last trustworthy owner.
+    let quiescenceFailure: unknown =
+      providerStreamFailure instanceof ProviderQuiescenceError ? providerStreamFailure : null;
+    if (abortPromise) {
+      try {
+        await abortPromise;
+      } catch (err) {
+        quiescenceFailure = err;
+      }
+    }
+    if (ledgerCtx.acceptanceContext.lifecycleFault) {
+      throw ledgerCtx.acceptanceContext.lifecycleFault;
+    }
+    if (quiescenceFailure) {
+      if (quiescenceFailure instanceof ProviderQuiescenceError) throw quiescenceFailure;
+      throw new ProviderQuiescenceError('provider did not prove quiescence before correlation release', {
+        cause: quiescenceFailure,
+      });
+    }
+
     for (const inputId of boundGwsInputs) {
       try {
         await ledgerCtx.acceptanceContext.release(inputId);
+        boundGwsInputs.delete(inputId);
       } catch (err) {
         log(
           JSON.stringify({
@@ -1460,9 +1569,9 @@ async function processQuery(
             error: err instanceof Error ? err.message : String(err),
           }),
         );
+        throw new TrustedInputLifecycleError(`trusted host input release failed for ${inputId}`, { cause: err });
       }
     }
-    boundGwsInputs.clear();
   }
 
   return { continuation: queryContinuation, clearContinuation: clearContinuationRequested };

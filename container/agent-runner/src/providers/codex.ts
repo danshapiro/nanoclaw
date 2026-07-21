@@ -35,11 +35,11 @@ import {
   createCodexConfigOverrides,
   initializeCodexAppServer,
   interruptCodexTurn,
-  killCodexAppServer,
   sendCodexRequest,
   spawnCodexAppServer,
   startCodexTurn,
   startOrResumeCodexThread,
+  terminateCodexAppServer,
   waitForCodexCompactionComplete,
   writeCodexMcpConfigToml,
 } from './codex-app-server.js';
@@ -317,6 +317,15 @@ export class CodexProvider implements AgentProvider {
     const kick = (): void => {
       waiting?.();
     };
+    let resolveQuiescence!: () => void;
+    let rejectQuiescence!: (reason: unknown) => void;
+    const quiescence = new Promise<void>((resolve, reject) => {
+      resolveQuiescence = resolve;
+      rejectQuiescence = reject;
+    });
+    // Natural stream failures surface through `events`; this catch prevents the
+    // parallel abort waiter from becoming an unhandled rejection when unused.
+    void quiescence.catch(() => {});
 
     pending.push({
       prompt: input.prompt,
@@ -447,7 +456,13 @@ export class CodexProvider implements AgentProvider {
           if (terminal) return;
         }
       } finally {
-        killCodexAppServer(server);
+        try {
+          await terminateCodexAppServer(server);
+          resolveQuiescence();
+        } catch (err) {
+          rejectQuiescence(err);
+          throw err;
+        }
       }
     }
 
@@ -463,11 +478,12 @@ export class CodexProvider implements AgentProvider {
         ended = true;
         kick();
       },
-      abort: () => {
-        if (aborted) return;
+      abort: async () => {
+        if (aborted) return await quiescence;
         aborted = true;
         for (const handler of [...abortHandlers]) handler();
         kick();
+        await quiescence;
       },
       events: gen(),
     };
@@ -822,16 +838,27 @@ export async function* compactCodexThread(
     if (!acceptInput) throw new Error('Codex compact turn has no trusted acceptance gate');
     await acceptInput();
     if (abortSignal?.isAborted()) return;
-    const request = sendCodexRequest(server, 'thread/compact/start', { threadId }, COMPACT_REQUEST_TIMEOUT_MS);
+    const request = sendCodexRequest(
+      server,
+      'thread/compact/start',
+      { threadId },
+      COMPACT_REQUEST_TIMEOUT_MS,
+      abortSignal,
+    );
     yield { type: 'input-accepted', inputId, scope: acceptanceScope };
     yield { type: 'activity' };
     const startedAt = clock.now();
-    const resp = await request;
-    if (resp.error) {
-      throw new Error(`thread/compact/start failed: ${resp.error.message}`);
+    try {
+      const resp = await request;
+      if (resp.error) {
+        throw new Error(`thread/compact/start failed: ${resp.error.message}`);
+      }
+      const remainingNotificationMs = Math.max(0, COMPACT_NOTIFICATION_TIMEOUT_MS - (clock.now() - startedAt));
+      await waitForCodexCompactionComplete(server, threadId, remainingNotificationMs, abortSignal);
+    } catch (err) {
+      if (abortSignal?.isAborted()) return;
+      throw err;
     }
-    const remainingNotificationMs = Math.max(0, COMPACT_NOTIFICATION_TIMEOUT_MS - (clock.now() - startedAt));
-    await waitForCodexCompactionComplete(server, threadId, remainingNotificationMs);
   } else {
     yield { type: 'activity' };
     const startedAt = clock.now();
