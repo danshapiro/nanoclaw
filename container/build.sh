@@ -37,6 +37,24 @@ echo "Image: ${IMAGE_NAME}:${TAG}"
 
 ${CONTAINER_RUNTIME} build "${BUILD_ARGS[@]}" -t "${IMAGE_NAME}:${TAG}" .
 
+echo "Verifying yt-dlp and ffmpeg in the built image..."
+# shellcheck disable=SC2016 # The quoted script expands inside the container.
+${CONTAINER_RUNTIME} run --rm \
+    --network none \
+    --entrypoint sh \
+    "${IMAGE_NAME}:${TAG}" \
+    -lc 'set -eu
+test -x /usr/local/bin/yt-dlp
+yt-dlp --version
+rm -f /tmp/yt-dlp-smoke.out
+yt_dlp_status=0
+yt-dlp --verbose --simulate "data:text/html,<title>yt-dlp-smoke</title>" >/tmp/yt-dlp-smoke.out 2>&1 || yt_dlp_status=$?
+cat /tmp/yt-dlp-smoke.out
+test "$yt_dlp_status" -ne 0
+grep -Eq "JS runtimes: node(-[0-9.]+)?" /tmp/yt-dlp-smoke.out
+grep -Eq "exe versions:.*ffmpeg .*ffprobe " /tmp/yt-dlp-smoke.out
+grep -q "ERROR: Unsupported URL:" /tmp/yt-dlp-smoke.out'
+
 echo ""
 echo "Build complete!"
 echo "Image: ${IMAGE_NAME}:${TAG}"
