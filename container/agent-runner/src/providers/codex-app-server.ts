@@ -362,9 +362,13 @@ export function terminateCodexAppServer(server: AppServer, options: CodexTermina
 
     const gracefulExit = await waitForCodexProcessExit(server, options.gracefulShutdownMs ?? 3_000);
     if (gracefulExit) {
-      if (!transportState.error && gracefulExit.signal === null && gracefulExit.code === 0) return;
+      // A clean stdin-EOF/direct-process exit is still only proof about the
+      // app-server PID. MCP servers and tool subprocesses can outlive it, and
+      // this runner has no independent cgroup/process-namespace emptiness
+      // proof. Every post-spawn teardown therefore remains fatal so the host
+      // can verify the whole container stopped before releasing correlation.
       throw new ProviderQuiescenceError(
-        `Codex app-server did not complete a clean transport shutdown: code=${gracefulExit.code} signal=${gracefulExit.signal}`,
+        `Codex app-server exited after transport shutdown, but whole process tree quiescence is unproven until host container stop: code=${gracefulExit.code} signal=${gracefulExit.signal}`,
         transportState.error ? { cause: transportState.error } : undefined,
       );
     }

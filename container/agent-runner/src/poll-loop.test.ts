@@ -4126,7 +4126,6 @@ describe('provider finalization barriers', () => {
         releaseCalls++;
       },
     });
-
     try {
       await waitFor(() => getAckStatus('codex-descendant-quiescence-failed') === 'processing', 1500);
       controller.abort();
@@ -4191,6 +4190,9 @@ describe('provider finalization barriers', () => {
         releaseCalls++;
       },
     });
+    // The normal result and fatal teardown can complete in the same microtask
+    // turn; observe rejection immediately while the assertions wait on the DB.
+    void loopPromise.catch(() => {});
 
     try {
       await waitFor(
