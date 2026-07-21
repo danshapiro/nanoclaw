@@ -263,60 +263,143 @@ export function sendCodexResponse(server: AppServer, id: number, result: unknown
 
 const codexTerminationPromises = new WeakMap<AppServer, Promise<void>>();
 
-export function terminateCodexAppServer(server: AppServer): Promise<void> {
+export interface CodexTerminationOptions {
+  gracefulShutdownMs?: number;
+  termExitMs?: number;
+  killExitMs?: number;
+}
+
+interface CodexProcessExit {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+}
+
+function currentCodexProcessExit(server: AppServer): CodexProcessExit | undefined {
+  if (server.process.exitCode === null && server.process.signalCode === null) return undefined;
+  return { code: server.process.exitCode, signal: server.process.signalCode };
+}
+
+function waitForCodexProcessExit(server: AppServer, timeoutMs: number): Promise<CodexProcessExit | undefined> {
+  const existing = currentCodexProcessExit(server);
+  if (existing) return Promise.resolve(existing);
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(undefined);
+    }, timeoutMs);
+    const onExit = (code: number | null, signal: NodeJS.Signals | null): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve({ code, signal });
+    };
+    const onError = (err: Error): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new ProviderQuiescenceError('Codex app-server process failed during shutdown', { cause: err }));
+    };
+    function cleanup(): void {
+      clearTimeout(timer);
+      server.process.off('exit', onExit);
+      server.process.off('error', onError);
+    }
+    server.process.once('exit', onExit);
+    server.process.once('error', onError);
+
+    // Close the race between the initial state check and listener attachment.
+    const racedExit = currentCodexProcessExit(server);
+    if (racedExit && !settled) {
+      settled = true;
+      cleanup();
+      resolve(racedExit);
+    }
+  });
+}
+
+function closeCodexStdioTransport(server: AppServer): { error?: Error } {
+  const state: { error?: Error } = {};
+  try {
+    server.readline.close();
+  } catch (err) {
+    state.error = err instanceof Error ? err : new Error(String(err));
+  }
+
+  const stdin = server.process.stdin;
+  if (!stdin) {
+    state.error ??= new Error('Codex app-server stdin is unavailable');
+    return state;
+  }
+  // Retain this listener through process exit so a late EPIPE cannot become an
+  // unhandled stream error. Any such error also disqualifies graceful proof.
+  stdin.on('error', (err) => {
+    state.error ??= err;
+  });
+  try {
+    if (!stdin.destroyed && !stdin.writableEnded) stdin.end();
+  } catch (err) {
+    state.error ??= err instanceof Error ? err : new Error(String(err));
+  }
+  return state;
+}
+
+export function terminateCodexAppServer(server: AppServer, options: CodexTerminationOptions = {}): Promise<void> {
   const existing = codexTerminationPromises.get(server);
   if (existing) return existing;
 
   const termination = (async () => {
-    try {
-      server.readline.close();
-    } catch {
-      // Process exit remains the authoritative proof.
+    const exitedBeforeTransportClose = currentCodexProcessExit(server);
+    const transportState = closeCodexStdioTransport(server);
+    if (exitedBeforeTransportClose) {
+      throw new ProviderQuiescenceError(
+        'Codex app-server exited before verified transport shutdown; descendant quiescence is unproven',
+      );
     }
-    if (server.process.exitCode !== null || server.process.signalCode !== null) return;
 
-    let hardKill: ReturnType<typeof setTimeout> | undefined;
-    let deadline: ReturnType<typeof setTimeout> | undefined;
-    try {
-      await new Promise<void>((resolve, reject) => {
-        const onExit = (): void => {
-          cleanup();
-          resolve();
-        };
-        const onError = (err: Error): void => {
-          cleanup();
-          reject(new ProviderQuiescenceError('Codex app-server termination failed', { cause: err }));
-        };
-        const cleanup = (): void => {
-          server.process.off('exit', onExit);
-          server.process.off('error', onError);
-          if (hardKill) clearTimeout(hardKill);
-          if (deadline) clearTimeout(deadline);
-        };
-        server.process.once('exit', onExit);
-        server.process.once('error', onError);
-        try {
-          server.process.kill('SIGTERM');
-        } catch (err) {
-          onError(err instanceof Error ? err : new Error(String(err)));
-          return;
-        }
-        hardKill = setTimeout(() => {
-          try {
-            server.process.kill('SIGKILL');
-          } catch {
-            // The deadline below owns the fail-closed result.
-          }
-        }, 1_000);
-        deadline = setTimeout(() => {
-          cleanup();
-          reject(new ProviderQuiescenceError('Codex app-server did not exit after termination signals'));
-        }, 5_000);
-      });
-    } finally {
-      if (hardKill) clearTimeout(hardKill);
-      if (deadline) clearTimeout(deadline);
+    const gracefulExit = await waitForCodexProcessExit(server, options.gracefulShutdownMs ?? 3_000);
+    if (gracefulExit) {
+      if (!transportState.error && gracefulExit.signal === null && gracefulExit.code === 0) return;
+      throw new ProviderQuiescenceError(
+        `Codex app-server did not complete a clean transport shutdown: code=${gracefulExit.code} signal=${gracefulExit.signal}`,
+        transportState.error ? { cause: transportState.error } : undefined,
+      );
     }
+
+    let escalation: 'SIGTERM' | 'SIGKILL' = 'SIGTERM';
+    let signalError: Error | undefined;
+    try {
+      server.process.kill('SIGTERM');
+    } catch (err) {
+      signalError = err instanceof Error ? err : new Error(String(err));
+    }
+    let directExit = await waitForCodexProcessExit(server, options.termExitMs ?? 1_000);
+    if (!directExit) {
+      escalation = 'SIGKILL';
+      try {
+        server.process.kill('SIGKILL');
+      } catch (err) {
+        signalError ??= err instanceof Error ? err : new Error(String(err));
+      }
+      directExit = await waitForCodexProcessExit(server, options.killExitMs ?? 5_000);
+    }
+    if (!directExit) {
+      throw new ProviderQuiescenceError(
+        'Codex app-server did not exit after direct termination signals',
+        signalError ? { cause: signalError } : undefined,
+      );
+    }
+    // Rust Drop and the normal stdio transport drain are bypassed once a direct
+    // signal is required. The PID exit is bounded, but it is not proof that MCP
+    // or tool descendants stopped; only the host's whole-container stop can
+    // establish that boundary.
+    throw new ProviderQuiescenceError(
+      `Codex app-server required direct ${escalation}; descendant quiescence is unproven until host container stop`,
+      signalError ? { cause: signalError } : undefined,
+    );
   })().catch((err) => {
     if (err instanceof ProviderQuiescenceError) throw err;
     throw new ProviderQuiescenceError('Codex app-server termination failed', {

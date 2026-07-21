@@ -12,7 +12,8 @@ import {
   writeCodexMcpConfigToml,
   type AppServer,
 } from './codex-app-server.js';
-import { spawnCodexTestProcessTree, waitForProcessExit } from './codex-process-tree.test-support.js';
+import { isProcessAlive, spawnCodexTestProcessTree, waitForProcessExit } from './codex-process-tree.test-support.js';
+import { ProviderQuiescenceError } from './types.js';
 
 describe('Codex app-server termination', () => {
   it('closes stdio normally and reports quiescence only after the app-server reaps its descendant', async () => {
@@ -24,6 +25,28 @@ describe('Codex app-server termination', () => {
         killExitMs: 250,
       });
       expect(await waitForProcessExit(tree.descendantPid, 250)).toBe(true);
+    } finally {
+      await tree.cleanup();
+    }
+  });
+
+  it('keeps SIGKILL escalation fatally cached while a real descendant remains alive', async () => {
+    const tree = await spawnCodexTestProcessTree('sigkill');
+    try {
+      const termination = terminateCodexAppServer(tree.server, {
+        gracefulShutdownMs: 50,
+        termExitMs: 50,
+        killExitMs: 250,
+      });
+      await expect(termination).rejects.toMatchObject({
+        name: 'ProviderQuiescenceError',
+        message: expect.stringContaining('direct SIGKILL'),
+      });
+      expect(isProcessAlive(tree.descendantPid)).toBe(true);
+
+      const repeatedTermination = terminateCodexAppServer(tree.server);
+      expect(repeatedTermination).toBe(termination);
+      await expect(repeatedTermination).rejects.toBeInstanceOf(ProviderQuiescenceError);
     } finally {
       await tree.cleanup();
     }

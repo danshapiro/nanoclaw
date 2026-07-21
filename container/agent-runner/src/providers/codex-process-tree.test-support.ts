@@ -3,7 +3,7 @@ import { createInterface } from 'readline';
 
 import type { AppServer } from './codex-app-server.js';
 
-export type CodexTestProcessTreeMode = 'graceful' | 'stubborn';
+export type CodexTestProcessTreeMode = 'graceful' | 'stubborn' | 'sigkill';
 
 export function isProcessAlive(pid: number): boolean {
   try {
@@ -42,11 +42,13 @@ export async function spawnCodexTestProcessTree(mode: CodexTestProcessTreeMode):
           "  descendant.kill('SIGTERM');",
           '});',
         ]
-      : [
-          'process.stdin.resume();',
-          "process.stdin.on('end', () => {});",
-          "process.on('SIGTERM', () => process.exit(0));",
-        ];
+      : mode === 'stubborn'
+        ? [
+            'process.stdin.resume();',
+            "process.stdin.on('end', () => {});",
+            "process.on('SIGTERM', () => process.exit(0));",
+          ]
+        : ['process.stdin.resume();', "process.stdin.on('end', () => {});", "process.on('SIGTERM', () => {});"];
   const parentSource = [
     "const { spawn } = require('child_process');",
     `const descendant = spawn(process.execPath, ['-e', ${JSON.stringify(descendantSource)}], { stdio: 'ignore' });`,
