@@ -2,11 +2,13 @@ import { describe, it, expect } from 'bun:test';
 
 import {
   type AppServer,
+  CodexRequestAbortedError,
+  type CodexRequestCancellation,
   type JsonRpcNotification,
   type JsonRpcResponse,
   interruptCodexTurn,
 } from './codex-app-server.js';
-import { type CodexAbortSignal, runOneTurn } from './codex.js';
+import { type CodexAbortSignal, CodexProvider, runOneTurn } from './codex.js';
 import type { ProviderEvent } from './types.js';
 
 type CapturedRequest = { id: number; method: string; params: Record<string, unknown> };
@@ -322,5 +324,160 @@ describe('runOneTurn Codex interrupt handling', () => {
       classification: 'codex_turn_interrupted',
       terminal: true,
     });
+  });
+});
+
+describe('CodexProvider query setup abort handling', () => {
+  function queryServer(): AppServer {
+    return {
+      process: {},
+      readline: { close() {} },
+      pending: new Map(),
+      notificationHandlers: [],
+      serverRequestHandlers: [],
+    } as unknown as AppServer;
+  }
+
+  function startQuery(provider: CodexProvider): {
+    abort: () => Promise<void>;
+    events: Promise<ProviderEvent[]>;
+  } {
+    const query = provider.query({
+      inputId: 'setup-abort-input',
+      acceptInput: async () => {},
+      prompt: 'do not start after abort',
+      cwd: '/workspace/agent',
+    });
+    return { abort: query.abort, events: collectEvents(query.events) };
+  }
+
+  it('settles abort after a pre-spawn setup failure proves that no process exists', async () => {
+    let spawnCalls = 0;
+    let terminationCalls = 0;
+    const provider = new CodexProvider(
+      {},
+      {
+        syncManagedSkillLinks: () => {
+          throw new Error('skill setup failed before spawn');
+        },
+        spawnServer: () => {
+          spawnCalls += 1;
+          return queryServer();
+        },
+        terminateServer: async () => {
+          terminationCalls += 1;
+        },
+      },
+    );
+    const query = startQuery(provider);
+
+    await expect(query.events).rejects.toThrow('skill setup failed before spawn');
+    await withTimeout(query.abort(), 'abort after pre-spawn setup failure');
+
+    expect(spawnCalls).toBe(0);
+    expect(terminationCalls).toBe(0);
+  });
+
+  it('cancels initialize on abort and waits for confirmed app-server exit', async () => {
+    const initializeStarted = makeDeferred<void>();
+    const terminationStarted = makeDeferred<void>();
+    const processExited = makeDeferred<void>();
+    let initializeCancelled = false;
+    let terminationCalls = 0;
+    const provider = new CodexProvider(
+      {},
+      {
+        syncManagedSkillLinks: () => [],
+        writeMcpConfig: () => {},
+        createConfigOverrides: () => [],
+        spawnServer: () => queryServer(),
+        attachAutoApproval: () => {},
+        initializeServer: async (_server: AppServer, cancellation?: CodexRequestCancellation) => {
+          initializeStarted.resolve();
+          await new Promise<void>((_resolve, reject) => {
+            cancellation?.onAbort(() => {
+              initializeCancelled = true;
+              reject(new CodexRequestAbortedError('initialize'));
+            });
+          });
+        },
+        terminateServer: async () => {
+          terminationCalls += 1;
+          terminationStarted.resolve();
+          await processExited.promise;
+        },
+      },
+    );
+    const query = startQuery(provider);
+    void query.events.catch(() => {});
+    await initializeStarted.promise;
+
+    let abortSettled = false;
+    const abort = query.abort().then(() => {
+      abortSettled = true;
+    });
+    await withTimeout(terminationStarted.promise, 'initialize-abort termination');
+
+    expect(initializeCancelled).toBe(true);
+    expect(abortSettled).toBe(false);
+    processExited.resolve();
+    await withTimeout(abort, 'initialize-abort exit proof');
+    await expect(query.events).rejects.toThrow('initialize');
+    expect(terminationCalls).toBe(1);
+  });
+
+  it('cancels thread startup on abort and waits for confirmed app-server exit', async () => {
+    const threadStartBegan = makeDeferred<void>();
+    const terminationStarted = makeDeferred<void>();
+    const processExited = makeDeferred<void>();
+    let threadStartCancelled = false;
+    let terminationCalls = 0;
+    const provider = new CodexProvider(
+      {},
+      {
+        syncManagedSkillLinks: () => [],
+        writeMcpConfig: () => {},
+        createConfigOverrides: () => [],
+        spawnServer: () => queryServer(),
+        attachAutoApproval: () => {},
+        initializeServer: async () => {},
+        startThread: async (
+          _server: AppServer,
+          _threadId: string | undefined,
+          _params,
+          cancellation?: CodexRequestCancellation,
+        ) => {
+          threadStartBegan.resolve();
+          await new Promise<void>((_resolve, reject) => {
+            cancellation?.onAbort(() => {
+              threadStartCancelled = true;
+              reject(new CodexRequestAbortedError('thread/start'));
+            });
+          });
+          return 'unreachable-thread';
+        },
+        terminateServer: async () => {
+          terminationCalls += 1;
+          terminationStarted.resolve();
+          await processExited.promise;
+        },
+      },
+    );
+    const query = startQuery(provider);
+    void query.events.catch(() => {});
+    await threadStartBegan.promise;
+
+    let abortSettled = false;
+    const abort = query.abort().then(() => {
+      abortSettled = true;
+    });
+    await withTimeout(terminationStarted.promise, 'thread-start-abort termination');
+
+    expect(threadStartCancelled).toBe(true);
+    expect(abortSettled).toBe(false);
+    processExited.resolve();
+    await withTimeout(abort, 'thread-start-abort exit proof');
+    await expect(query.events).rejects.toThrow('thread/start');
+    expect(terminationCalls).toBe(1);
   });
 });

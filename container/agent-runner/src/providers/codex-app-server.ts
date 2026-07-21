@@ -569,7 +569,10 @@ export function attachCodexAutoApproval(server: AppServer, { relay }: { relay: b
 
 // ── High-level helpers ──────────────────────────────────────────────────────
 
-export async function initializeCodexAppServer(server: AppServer): Promise<void> {
+export async function initializeCodexAppServer(
+  server: AppServer,
+  _cancellation?: CodexRequestCancellation,
+): Promise<void> {
   log('Sending initialize…');
   const resp = await sendCodexRequest(
     server,
@@ -603,6 +606,7 @@ export async function startOrResumeCodexThread(
   server: AppServer,
   threadId: string | undefined,
   params: ThreadParams,
+  _cancellation?: CodexRequestCancellation,
 ): Promise<string> {
   if (threadId) {
     log(`Resuming thread: ${threadId}`);

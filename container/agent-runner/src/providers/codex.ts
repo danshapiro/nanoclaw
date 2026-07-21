@@ -272,6 +272,18 @@ function composeBaseInstructions(promptAddendum: string | undefined): string | u
 
 // ── Provider ────────────────────────────────────────────────────────────────
 
+/** @internal dependency seam for query-lifecycle tests. */
+export interface CodexQueryDependencies {
+  syncManagedSkillLinks?: typeof syncCodexManagedSkillLinks;
+  writeMcpConfig?: typeof writeCodexMcpConfigToml;
+  createConfigOverrides?: typeof createCodexConfigOverrides;
+  spawnServer?: typeof spawnCodexAppServer;
+  attachAutoApproval?: typeof attachCodexAutoApproval;
+  initializeServer?: typeof initializeCodexAppServer;
+  startThread?: typeof startOrResumeCodexThread;
+  terminateServer?: typeof terminateCodexAppServer;
+}
+
 export class CodexProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = false;
 
@@ -281,9 +293,11 @@ export class CodexProvider implements AgentProvider {
 
   private readonly mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }>;
   private readonly model: string;
+  private readonly queryDependencies: CodexQueryDependencies;
 
-  constructor(options: ProviderOptions = {}) {
+  constructor(options: ProviderOptions = {}, queryDependencies: CodexQueryDependencies = {}) {
     this.mcpServers = options.mcpServers ?? {};
+    this.queryDependencies = queryDependencies;
     // Yente default. Per-group override via CODEX_MODEL in the runtime env
     // supplied by the host-side provider config.
     this.model = (options.env?.CODEX_MODEL as string | undefined) ?? 'gpt-5.5';
@@ -342,14 +356,16 @@ export class CodexProvider implements AgentProvider {
       // One app-server per query invocation. The poll-loop keeps a single
       // query active per batch of pending messages and ends it on idle, so
       // spawn-per-query matches that cadence naturally.
-      syncCodexManagedSkillLinks();
-      writeCodexMcpConfigToml(self.mcpServers);
-      const server = spawnCodexAppServer(createCodexConfigOverrides());
+      (self.queryDependencies.syncManagedSkillLinks ?? syncCodexManagedSkillLinks)();
+      (self.queryDependencies.writeMcpConfig ?? writeCodexMcpConfigToml)(self.mcpServers);
+      const server = (self.queryDependencies.spawnServer ?? spawnCodexAppServer)(
+        (self.queryDependencies.createConfigOverrides ?? createCodexConfigOverrides)(),
+      );
       // Relay turns run read-only (codexThreadSandbox(relay)); auto-approval is
       // made relay-aware so a relay can't bypass that boundary by side-effecting
       // through an approval prompt.
       const relay = input.relayMode === true;
-      attachCodexAutoApproval(server, { relay });
+      (self.queryDependencies.attachAutoApproval ?? attachCodexAutoApproval)(server, { relay });
 
       let threadId: string | undefined = input.continuation;
       let initYielded = false;
@@ -357,7 +373,7 @@ export class CodexProvider implements AgentProvider {
       let visibleDestinationName: string | undefined = input.visibleDestinationName;
 
       try {
-        await initializeCodexAppServer(server);
+        await (self.queryDependencies.initializeServer ?? initializeCodexAppServer)(server);
 
         const threadParams = {
           model: self.model,
@@ -370,7 +386,11 @@ export class CodexProvider implements AgentProvider {
           baseInstructions: composeBaseInstructions(input.systemContext?.instructions),
         };
 
-        threadId = await startOrResumeCodexThread(server, threadId, threadParams);
+        threadId = await (self.queryDependencies.startThread ?? startOrResumeCodexThread)(
+          server,
+          threadId,
+          threadParams,
+        );
 
         // Emit the continuation as soon as we have a live thread. Compact turns
         // bypass runOneTurn, so we must yield init here to match the path that
@@ -458,7 +478,7 @@ export class CodexProvider implements AgentProvider {
         }
       } finally {
         try {
-          await terminateCodexAppServer(server);
+          await (self.queryDependencies.terminateServer ?? terminateCodexAppServer)(server);
           resolveQuiescence();
         } catch (err) {
           rejectQuiescence(err);
