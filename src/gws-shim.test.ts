@@ -419,6 +419,48 @@ describe('gws proxy shim', () => {
     expect(result.stderr).not.toContain('must-not-print');
   });
 
+  it.each([
+    ['401', 401],
+    ['403', 403],
+    ['default error', 502],
+  ])('rejects a wrong-account %s /exec response without leaking its body', async (_name, status) => {
+    const proxy = await withProxy((_req, res) => {
+      res.setHeader('X-GWS-Account', 'glowforge');
+      res.writeHead(status, { 'Content-Type': 'text/plain' });
+      res.end('private upstream error must-not-print');
+    });
+
+    const result = await runShimRaw(['--account', 'personal', 'gmail', 'users', 'getProfile'], {
+      GWS_PROXY_URL: proxy.url,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('response account');
+    expect(result.stderr).not.toContain('private upstream error');
+    expect(result.stderr).not.toContain('must-not-print');
+  });
+
+  it.each([
+    ['401', 401],
+    ['403', 403],
+    ['default error', 502],
+  ])('rejects a missing-account %s /whoami response without leaking its body', async (_name, status) => {
+    const proxy = await withProxy((_req, res) => {
+      res.removeHeader('X-GWS-Account');
+      res.writeHead(status, { 'Content-Type': 'text/plain' });
+      res.end('private identity error must-not-print');
+    });
+
+    const result = await runShimRaw(['--account', 'personal', 'auth', 'status'], { GWS_PROXY_URL: proxy.url });
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('response account');
+    expect(result.stderr).not.toContain('private identity error');
+    expect(result.stderr).not.toContain('must-not-print');
+  });
+
   it('does not publish downloaded bytes when the response account mismatches', async () => {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-shim-account-output-'));
     const shim = shimWithOutputRootsForTest([workspace]);

@@ -112,14 +112,14 @@ case "${1:-}" in
         echo "Error: unable to reach GWS proxy at $GWS_PROXY_URL" >&2
         exit 1
       fi
-      if [ "$http_code" != "200" ]; then
-        printf 'Error: GWS proxy identity check returned HTTP %s\n' "$http_code" >&2
-        cat "$tmp_body" >&2
-        exit 1
-      fi
       response_account="$(header_value 'X-GWS-Account')"
       if [ "$response_account" != "$account" ]; then
         printf 'Error: GWS proxy response account did not match requested account %s.\n' "$account" >&2
+        exit 1
+      fi
+      if [ "$http_code" != "200" ]; then
+        printf 'Error: GWS proxy identity check returned HTTP %s\n' "$http_code" >&2
+        cat "$tmp_body" >&2
         exit 1
       fi
       cat "$tmp_body"
@@ -450,6 +450,15 @@ print_output_success_json() {
 }
 
 body=""
+# A non-200 response cannot carry completed-write recovery under the proxy
+# contract. Authenticate its account label before reading or printing any body,
+# including authentication, policy, and generic upstream error payloads.
+if [ "$http_code" != "200" ] && [ "$account_matches" != "true" ]; then
+  rm -f "$tmp_output_body"
+  tmp_output_body=""
+  printf 'Error: GWS proxy response account did not match requested account %s.\n' "$account" >&2
+  exit 1
+fi
 if [ -z "$output_resolved_path" ] || [ "$http_code" != "200" ]; then
   body="$(cat "$curl_body_target" 2>/dev/null || true)"
 fi
