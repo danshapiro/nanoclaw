@@ -1294,6 +1294,101 @@ describe('gws proxy shim — side-effect ledger', () => {
     expect(row.account_email).toBe('dan@danshapiro.com');
   });
 
+  it.each([
+    { label: 'missing response account', responseAccount: undefined, outcome: undefined },
+    {
+      label: 'mismatched response account with failed global audit',
+      responseAccount: 'glowforge',
+      outcome: 'completed_audit_failed',
+    },
+  ])('stages signed completed-mutation evidence and exits 75 for $label', async ({ responseAccount, outcome }) => {
+    tmp = freshTmp();
+    const ledger = path.join(tmp, 'side-effects.jsonl');
+    const signed = {
+      schema_version: 2,
+      audit_id: `aud-account-${responseAccount ?? 'missing'}`,
+      profile: 'nanoclaw',
+      account_label: 'personal',
+      account_email: 'dan@danshapiro.com',
+      input_id: 'operator-input-1',
+      route_key: 'operator|ag-main|operator-session-1',
+      service: 'gmail',
+      method: 'users.drafts.create',
+      request_class: 'api',
+      api_effect: true,
+      operation_succeeded: true,
+      occurred_at: '2026-07-21T15:00:00.000Z',
+      result_digest: 'completed-result-digest',
+    };
+    const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+    const payload = canonicalSideEffectPayload(signed);
+    const signature = crypto.sign(null, Buffer.from(payload), privateKey).toString('base64');
+    const proxy = await withProxy((_req, res) => {
+      if (responseAccount) res.setHeader('X-GWS-Account', responseAccount);
+      else res.removeHeader('X-GWS-Account');
+      res.writeHead(200, {
+        'Content-Type': 'text/plain',
+        'X-Exit-Code': outcome ? '75' : '0',
+        ...(outcome ? { 'X-GWS-Outcome': outcome } : {}),
+        'X-GWS-Audit-Id': signed.audit_id,
+        'X-GWS-Request-Class': 'api',
+        'X-GWS-Api-Effect': 'true',
+        'X-GWS-Operation-Succeeded': 'true',
+        'X-GWS-Side-Effect-Signature': signature,
+        'X-GWS-Side-Effect-Payload': payload,
+        'X-GWS-Side-Effect-Schema': '2',
+        'X-GWS-Profile': signed.profile,
+        'X-GWS-Account-Email': signed.account_email,
+        'X-GWS-Input-Id': signed.input_id,
+        'X-GWS-Route-Key': signed.route_key,
+        'X-GWS-Service': signed.service,
+        'X-GWS-Method': signed.method,
+        'X-GWS-Occurred-At': signed.occurred_at,
+      });
+      res.end('sensitive completed mutation result must not be printed');
+    });
+    const correlation = path.join(tmp, 'operator-correlation.json');
+    fs.writeFileSync(
+      correlation,
+      JSON.stringify({
+        schemaVersion: 1,
+        inputId: signed.input_id,
+        routeKey: signed.route_key,
+        acceptedAt: freshUpdatedAt(),
+      }),
+    );
+
+    const result = await runShimRaw(['--account', 'personal', 'gmail', 'users', 'drafts', 'create'], {
+      GWS_PROXY_URL: proxy.url,
+      NANOCLAW_SIDE_EFFECT_LEDGER: ledger,
+      NANOCLAW_HOST_CORRELATION_FILE: correlation,
+    });
+
+    expect(result.status).toBe(75);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('response account');
+    expect(result.stderr).toContain('Do not retry automatically');
+    expect(result.stderr).not.toContain('sensitive completed mutation result');
+    if (outcome) expect(result.stderr).toContain('global audit failed');
+    const rows = readLedger(ledger);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      audit_id: signed.audit_id,
+      account_label: 'personal',
+      input_id: signed.input_id,
+      route_key: signed.route_key,
+      response_account_label: responseAccount ?? null,
+    });
+    expect(
+      classifyAndSanitize(rows[0], {
+        gwsPublicKey: publicKey.export({ format: 'pem', type: 'spki' }).toString(),
+      }),
+    ).toMatchObject({
+      validation: { authoritative: true },
+      replayPolicy: 'no_duplicate_draft',
+    });
+  });
+
   it('also sends inputId/routeKey in the POST body', async () => {
     tmp = freshTmp();
     const ledger = path.join(tmp, 'side-effects.jsonl');

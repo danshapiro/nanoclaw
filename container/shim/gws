@@ -359,11 +359,9 @@ if [ -z "$http_code" ] || [ "$http_code" = "000" ]; then
 fi
 
 response_account="$(header_value 'X-GWS-Account')"
+account_matches=true
 if [ "$response_account" != "$account" ]; then
-  rm -f "$tmp_output_body"
-  tmp_output_body=""
-  printf 'Error: GWS proxy response account did not match requested account %s.\n' "$account" >&2
-  exit 1
+  account_matches=false
 fi
 
 exit_code="$(awk 'BEGIN{IGNORECASE=1} /^X-Exit-Code:/ {gsub("\r","",$2); print $2; exit}' "$tmp_headers")"
@@ -459,8 +457,16 @@ fi
 case "$http_code" in
   200)
     if [ -n "$output_resolved_path" ]; then
-      proxy_output_kind="$(header_value 'X-GWS-Proxy-Output')"
-      if [ "$exit_code" = "0" ] && [ "$proxy_output_kind" = "file" ]; then
+      if [ "$account_matches" != "true" ]; then
+        # Retain bytes only in memory long enough to extract bounded mutation
+        # evidence below. Never publish a file under an untrusted account label.
+        body="$(cat "$tmp_output_body" 2>/dev/null || true)"
+        rm -f "$tmp_output_body"
+        tmp_output_body=""
+      else
+        proxy_output_kind="$(header_value 'X-GWS-Proxy-Output')"
+      fi
+      if [ "$account_matches" = "true" ] && [ "$exit_code" = "0" ] && [ "$proxy_output_kind" = "file" ]; then
         expected_bytes="$(header_value 'X-GWS-Output-Bytes')"
         expected_sha256="$(header_value 'X-GWS-Output-SHA256')"
         actual_bytes="$(file_size_bytes "$tmp_output_body")"
@@ -484,18 +490,21 @@ case "$http_code" in
         print_output_success_json
         exit 0
       fi
-      if [ "$exit_code" = "0" ]; then
+      if [ "$account_matches" = "true" ] && [ "$exit_code" = "0" ]; then
         rm -f "$tmp_output_body"
         tmp_output_body=""
         printf 'Error: GWS proxy did not return output bytes for -o/--output request.\n' >&2
         exit 1
       fi
-      body="$(cat "$tmp_output_body" 2>/dev/null || true)"
-      rm -f "$tmp_output_body"
-      tmp_output_body=""
+      if [ -n "$tmp_output_body" ]; then
+        body="$(cat "$tmp_output_body" 2>/dev/null || true)"
+        rm -f "$tmp_output_body"
+        tmp_output_body=""
+      fi
     fi
     api_effect="$(header_value 'X-GWS-Api-Effect')"
     op_succeeded="$(header_value 'X-GWS-Operation-Succeeded')"
+    signed_mutation_staged=false
     # Stage a sanitized GWS mutation ledger record ONLY for a successful
     # API-effect mutation, AFTER the response and BEFORE printing success. Only
     # the exact signed gmail/users.drafts.create operation is classified as a
@@ -538,6 +547,7 @@ case "$http_code" in
           NC_RESPONSE_INPUT_ID="$response_input_id" NC_RESPONSE_ROUTE_KEY="$response_route_key" \
           NC_RESPONSE_SERVICE="$response_service" NC_RESPONSE_METHOD="$response_method" \
           NC_RESPONSE_OCCURRED_AT="$response_occurred_at" \
+          NC_ACCOUNT_MATCHES="$account_matches" \
           NANOCLAW_HOST_CORRELATION_FILE="$host_correlation_file" \
           node -e '
             const fs = require("fs");
@@ -579,9 +589,9 @@ case "$http_code" in
             const invokedMethod = positional.length > 1 ? positional.slice(1).join(".") : null;
             const responseService = process.env.NC_RESPONSE_SERVICE || null;
             const responseMethod = process.env.NC_RESPONSE_METHOD || null;
-            let signedService = null, signedMethod = null;
+            let signed = null, signedService = null, signedMethod = null;
             try {
-              const signed = JSON.parse(process.env.NC_PAYLOAD || "");
+              signed = JSON.parse(process.env.NC_PAYLOAD || "");
               if (signed && signed.schema_version === 2) {
                 signedService = typeof signed.service === "string" ? signed.service : null;
                 signedMethod = typeof signed.method === "string" ? signed.method : null;
@@ -594,18 +604,25 @@ case "$http_code" in
               responseMethod === invokedMethod &&
               signedService === invokedService &&
               signedMethod === invokedMethod;
+            // Ordinarily keep transport/invocation bindings independent so a
+            // valid signature for a different call is rejected. If the sole
+            // transport anomaly is its account label, retain the signed v2
+            // bindings so the host can authenticate the already-completed
+            // mutation while recording that bad label separately.
+            const useSignedBindings = process.env.NC_ACCOUNT_MATCHES !== "true" && signed && signed.schema_version === 2;
             const rec = {
               kind: exactDraft ? "gmail_draft_created" : "gws_mutation_completed",
               payload_schema_version: Number(process.env.NC_RESPONSE_SCHEMA) === 2 ? 2 : 1,
-              audit_id: process.env.NC_AUDIT_ID || null,
-              profile: process.env.NC_RESPONSE_PROFILE || null,
-              account_label: process.env.NC_RESPONSE_ACCOUNT_LABEL || null,
-              account_email: process.env.NC_RESPONSE_ACCOUNT_EMAIL || null,
+              audit_id: useSignedBindings ? signed.audit_id : (process.env.NC_AUDIT_ID || null),
+              profile: useSignedBindings ? signed.profile : (process.env.NC_RESPONSE_PROFILE || null),
+              account_label: useSignedBindings ? signed.account_label : (process.env.NC_RESPONSE_ACCOUNT_LABEL || null),
+              response_account_label: process.env.NC_RESPONSE_ACCOUNT_LABEL || null,
+              account_email: useSignedBindings ? signed.account_email : (process.env.NC_RESPONSE_ACCOUNT_EMAIL || null),
               request_class: process.env.NC_REQUEST_CLASS || null,
-              occurred_at: process.env.NC_RESPONSE_OCCURRED_AT || acceptedAt || null,
-              input_id: inputId,
-              route_key: routeKey,
-              operation: invokedService && invokedMethod ? `${invokedService} ${invokedMethod}` : null,
+              occurred_at: useSignedBindings ? signed.occurred_at : (process.env.NC_RESPONSE_OCCURRED_AT || acceptedAt || null),
+              input_id: useSignedBindings ? signed.input_id : inputId,
+              route_key: useSignedBindings ? signed.route_key : routeKey,
+              operation: useSignedBindings && signedService && signedMethod ? `${signedService} ${signedMethod}` : (invokedService && invokedMethod ? `${invokedService} ${invokedMethod}` : null),
               response_input_id: process.env.NC_RESPONSE_INPUT_ID || null,
               response_route_key: process.env.NC_RESPONSE_ROUTE_KEY || null,
               response_service: responseService,
@@ -664,9 +681,26 @@ case "$http_code" in
           printf 'Error: GWS operation completed (audit_id=%s) but the durable side-effect ledger append failed. Do not recreate it automatically.\n' "$audit_id" >&2
           exit 75
         fi
+        if [ "$response_schema" = "2" ] && [ -n "$sig" ] && [ -n "$payload" ]; then
+          signed_mutation_staged=true
+        fi
       fi
     fi
     outcome="$(header_value 'X-GWS-Outcome')"
+    if [ "$account_matches" != "true" ]; then
+      rm -f "$tmp_output_body"
+      tmp_output_body=""
+      if [ "$signed_mutation_staged" = "true" ]; then
+        if [ "$outcome" = "completed_audit_failed" ]; then
+          printf 'Error: GWS operation completed (audit_id=%s), but the response account did not match requested account %s and global audit failed. Reconcile the durable evidence; Do not retry automatically.\n' "$audit_id" "$account" >&2
+        else
+          printf 'Error: GWS operation completed (audit_id=%s), but the response account did not match requested account %s. Reconcile the durable evidence; Do not retry automatically.\n' "$audit_id" "$account" >&2
+        fi
+        exit 75
+      fi
+      printf 'Error: GWS proxy response account did not match requested account %s.\n' "$account" >&2
+      exit 1
+    fi
     if [ "$outcome" = "completed_audit_failed" ]; then
       printf 'Error: GWS operation completed (audit_id=%s) but global audit failed. Reconcile it; do not retry automatically.\n' "$(header_value 'X-GWS-Audit-Id')" >&2
       exit 75
