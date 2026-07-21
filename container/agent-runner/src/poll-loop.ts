@@ -406,7 +406,14 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     );
     // Generate a top-level inputId for this wake's prompt. Acceptance is tracked
     // when the provider emits input-accepted for this id.
-    const topLevelInputId = generateInputId('initial');
+    const hostTrigger = triggerRows[triggerRows.length - 1];
+    const topLevelInputId =
+      hostTrigger.host_input_id &&
+      hostTrigger.host_route_key === activeRouteKey &&
+      typeof hostTrigger.host_received_at === 'string' &&
+      Number.isFinite(Date.parse(hostTrigger.host_received_at))
+        ? hostTrigger.host_input_id
+        : generateInputId('initial');
     markProcessing(ids);
 
     const routing = extractRouting(activeMessages);
@@ -742,7 +749,7 @@ async function processQuery(
     if (!entry) return;
     entry.state = 'accepted';
     // Stamp the current accepted input for tool-time side-effect correlation.
-    writeActiveInput(inputId, ledgerCtx.activeRouteKey);
+    writeActiveInput(ledgerCtx.topLevelInputId, ledgerCtx.activeRouteKey);
     // Resuming a prior interrupted turn: mark its recovery entries in_flight for
     // THIS top-level input. They are NOT consumed yet (mere acceptance never
     // resolves recovery — Invariant 140); resolution happens only on success.

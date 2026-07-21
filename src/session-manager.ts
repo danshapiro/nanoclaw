@@ -11,6 +11,7 @@
  *      the mount; concurrent writers corrupt the DB.
  */
 import type Database from 'better-sqlite3';
+import { createHash } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
@@ -36,6 +37,7 @@ import {
   insertMessage,
 } from './db/session-db.js';
 import { log } from './log.js';
+import { readContainerConfig } from './container-config.js';
 import type { Session } from './types.js';
 import {
   formatAttachmentErrorPromptMetadata,
@@ -68,6 +70,69 @@ export function outboundDbPath(agentGroupId: string, sessionId: string): string 
 /** Path to the container heartbeat file (touched instead of DB writes). */
 export function heartbeatPath(agentGroupId: string, sessionId: string): string {
   return path.join(sessionDir(agentGroupId, sessionId), '.heartbeat');
+}
+
+/** Host-owned correlation state lives outside the agent-writable session tree. */
+export function hostCorrelationDir(agentGroupId: string, sessionId: string): string {
+  return path.join(DATA_DIR, 'v2-host-correlation', agentGroupId, sessionId);
+}
+
+export function hostCorrelationPath(agentGroupId: string, sessionId: string): string {
+  return path.join(hostCorrelationDir(agentGroupId, sessionId), 'current.json');
+}
+
+function hostRouteKey(
+  providerName: string,
+  message: {
+    platformId?: string | null;
+    channelType?: string | null;
+    threadId?: string | null;
+    messagingGroupId?: string | null;
+    isGroup?: 0 | 1 | null;
+  },
+): string {
+  const channelType = message.channelType ?? null;
+  const platformId = message.platformId ?? null;
+  let threadKey: string;
+  if (message.messagingGroupId != null && message.isGroup === 0) {
+    threadKey = `dm:${message.messagingGroupId}`;
+  } else if (message.messagingGroupId != null && message.isGroup === 1) {
+    threadKey = `grp:${message.messagingGroupId}:${message.threadId ?? 'main'}`;
+  } else {
+    threadKey = `nometa:${channelType ?? ''}:${platformId ?? ''}:${message.threadId ?? 'null'}`;
+  }
+  return `${providerName}|${channelType ?? ''}|${platformId ?? ''}|${threadKey}`;
+}
+
+function writeHostCorrelation(
+  agentGroupId: string,
+  sessionId: string,
+  value: { inputId: string; routeKey: string; receivedAt: string },
+): void {
+  const dir = hostCorrelationDir(agentGroupId, sessionId);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const dest = hostCorrelationPath(agentGroupId, sessionId);
+  const tmp = `${dest}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(value), { mode: 0o600 });
+  fs.renameSync(tmp, dest);
+}
+
+function mayAdvanceHostCorrelation(agentGroupId: string, sessionId: string): boolean {
+  const current = hostCorrelationPath(agentGroupId, sessionId);
+  const outPath = outboundDbPath(agentGroupId, sessionId);
+  if (!fs.existsSync(current) || !fs.existsSync(outPath)) return true;
+  let db: Database.Database | null = null;
+  try {
+    db = openOutboundDb(agentGroupId, sessionId);
+    const active = db.prepare("SELECT 1 FROM processing_ack WHERE status = 'processing' LIMIT 1").get();
+    return !active;
+  } catch {
+    // Preserve the already-authenticated active correlation when liveness
+    // cannot be proven. This can miss evidence, but cannot cross-attribute it.
+    return false;
+  } finally {
+    db?.close();
+  }
 }
 
 /**
@@ -206,6 +271,7 @@ export function initSessionFolder(agentGroupId: string, sessionId: string): void
 export function ensureSessionWorkspaceDirs(agentGroupId: string, sessionId: string): void {
   const dir = sessionDir(agentGroupId, sessionId);
   ensureWritableSessionSubdir(dir, 'group');
+  fs.mkdirSync(hostCorrelationDir(agentGroupId, sessionId), { recursive: true, mode: 0o700 });
 }
 
 function ensureWritableSessionSubdir(dir: string, name: string): void {
@@ -322,6 +388,14 @@ export function writeSessionMessage(
   // Extract base64 attachment data, save to inbox, replace with file paths
   const content = extractAttachmentFiles(agentGroupId, message.id, message.channelType, message.content);
 
+  const agentGroup = getAgentGroup(agentGroupId);
+  const providerName = agentGroup
+    ? (readContainerConfig(agentGroup.folder).provider ?? 'claude').trim().toLowerCase()
+    : 'claude';
+  const hostReceivedAt = new Date().toISOString();
+  const hostInputId = `in-host-${createHash('sha256').update(`${sessionId}\0${message.id}`).digest('hex').slice(0, 24)}`;
+  const routeKey = hostRouteKey(providerName, message);
+
   const db = openInboundDb(agentGroupId, sessionId);
   try {
     insertMessage(db, {
@@ -338,9 +412,16 @@ export function writeSessionMessage(
       trigger: message.trigger ?? 1,
       messagingGroupId: message.messagingGroupId ?? null,
       isGroup: message.isGroup ?? null,
+      hostInputId,
+      hostRouteKey: routeKey,
+      hostReceivedAt,
     });
   } finally {
     db.close();
+  }
+
+  if ((message.trigger ?? 1) === 1 && mayAdvanceHostCorrelation(agentGroupId, sessionId)) {
+    writeHostCorrelation(agentGroupId, sessionId, { inputId: hostInputId, routeKey, receivedAt: hostReceivedAt });
   }
 
   updateSession(sessionId, { last_active: new Date().toISOString() });

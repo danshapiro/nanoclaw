@@ -427,6 +427,10 @@ function signedGmailLine(
     account_email: accountEmail,
     input_id: 'in-1',
     route_key: 'opencode|discord|chan-1|dm:mg-1',
+    response_input_id: 'in-1',
+    response_route_key: 'opencode|discord|chan-1|dm:mg-1',
+    response_service: 'gmail',
+    response_method: 'users.drafts.create',
     service: 'gmail',
     method: 'users.drafts.create',
     request_class: 'api',
@@ -468,6 +472,10 @@ function signedGmailLine(
     occurred_at: '2026-05-29T00:00:00.000Z',
     input_id: 'in-1',
     route_key: 'opencode|discord|chan-1|dm:mg-1',
+    response_input_id: 'in-1',
+    response_route_key: 'opencode|discord|chan-1|dm:mg-1',
+    response_service: 'gmail',
+    response_method: 'users.drafts.create',
     signature: sig,
     payload: forwardedPayload,
     evidence: { draft_id: 'r-abc' },
@@ -496,6 +504,43 @@ describe('side_effect_ledger signed gmail import (Task 4B)', () => {
     expect(row.operation).toBe('gmail users.drafts.create');
     expect(row.signed_payload).toBeTruthy();
     expect(row.signature).toBeTruthy();
+  });
+
+  test('re-verifies persisted SQL bytes on every authoritative read and repairs tampered rows from signed evidence', () => {
+    const key = generateKeyPairSync('ed25519');
+    const pem = key.publicKey.export({ format: 'pem', type: 'spki' }).toString();
+    const jsonl = signedGmailLine('sql-tamper', key);
+    expect(importSideEffectLedger({ jsonl, gwsPublicKey: pem }).validated).toBe(1);
+
+    const db = getOutboundDb();
+    db.prepare('UPDATE side_effect_ledger SET validation_json = \'{"authoritative":false}\' WHERE id = ?').run(
+      'sql-tamper',
+    );
+    expect(getAuthoritativeSideEffects({ gwsPublicKey: pem }).map((effect) => effect.id)).toEqual(['sql-tamper']);
+
+    const mutations: Array<[string, unknown]> = [
+      ['signed_payload', '{}'],
+      ['signature', 'Zm9yZ2Vk'],
+      ['operation', 'gmail users.messages.list'],
+      ['profile', 'other'],
+      ['account_label', 'glowforge'],
+      ['account_email', 'dan@glowforge.com'],
+      ['input_id', 'other-input'],
+      ['route_key', 'other-route'],
+      ['occurred_at', '2020-01-01T00:00:00.000Z'],
+      ['payload_schema_version', 1],
+      ['kind', 'gws_mutation_completed'],
+      ['source', 'tool'],
+    ];
+    for (const [column, value] of mutations) {
+      db.prepare(`UPDATE side_effect_ledger SET ${column} = ? WHERE id = ?`).run(value, 'sql-tamper');
+      expect(getAuthoritativeSideEffects({ gwsPublicKey: pem }), column).toEqual([]);
+      expect(importSideEffectLedger({ jsonl, gwsPublicKey: pem }).validated, `repair ${column}`).toBe(1);
+      expect(
+        getAuthoritativeSideEffects({ gwsPublicKey: pem }).map((effect) => effect.id),
+        column,
+      ).toEqual(['sql-tamper']);
+    }
   });
 
   test('personal and Glowforge incident replays retain their exact signed Gmail account', () => {
@@ -529,7 +574,12 @@ describe('side_effect_ledger signed gmail import (Task 4B)', () => {
           (id, source, kind, operation, evidence_json, validation_json, replay_policy, occurred_at, imported_at)
          VALUES (?, 'gws', 'gmail_draft_created', 'gmail users.drafts.create', '{}', ?, 'no_duplicate_draft', ?, ?)`,
       )
-      .run('legacy-authoritative', JSON.stringify({ authoritative: true }), '2026-05-29T00:00:00Z', new Date().toISOString());
+      .run(
+        'legacy-authoritative',
+        JSON.stringify({ authoritative: true }),
+        '2026-05-29T00:00:00Z',
+        new Date().toISOString(),
+      );
 
     expect(getAuthoritativeSideEffects().some((s) => s.id === 'legacy-authoritative')).toBe(false);
     const legacy = getSideEffectHints().find((s) => s.id === 'legacy-authoritative');
@@ -646,6 +696,10 @@ describe('side-effects-verify cross-check (container copy)', () => {
         account_email: corpus.non_gmail_payload.account_email,
         input_id: corpus.non_gmail_payload.input_id,
         route_key: corpus.non_gmail_payload.route_key,
+        response_input_id: corpus.non_gmail_payload.input_id,
+        response_route_key: corpus.non_gmail_payload.route_key,
+        response_service: corpus.non_gmail_payload.service,
+        response_method: corpus.non_gmail_payload.method,
         operation: `${corpus.non_gmail_payload.service} ${corpus.non_gmail_payload.method}`,
         occurred_at: corpus.non_gmail_payload.occurred_at,
         payload: drivePayload,

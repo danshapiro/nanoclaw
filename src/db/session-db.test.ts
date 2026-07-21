@@ -621,6 +621,10 @@ describe('importHostSideEffects gmail Ed25519 verifier wiring', () => {
       occurred_at: '2026-05-29T00:00:00.000Z',
       input_id: 'in-1',
       route_key: 'opencode|discord|chan-1|dm:mg-1',
+      response_input_id: 'in-1',
+      response_route_key: 'opencode|discord|chan-1|dm:mg-1',
+      response_service: 'gmail',
+      response_method: 'users.drafts.create',
       signature: sig,
       payload,
       evidence: { draft_id: 'r-abc' },
@@ -747,6 +751,7 @@ describe('discoverGwsCrashWindowDrafts (host-only)', () => {
       auditStorePath: auditStore,
       inputId: 'in-1',
       routeKey: 'opencode|discord|chan-1|dm:mg-1',
+      notBefore: '2026-05-28T23:59:59.000Z',
       gwsPublicKey: publicKey,
     });
     expect(r1.discovered).toBe(1);
@@ -758,6 +763,7 @@ describe('discoverGwsCrashWindowDrafts (host-only)', () => {
       auditStorePath: auditStore,
       inputId: 'in-1',
       routeKey: 'opencode|discord|chan-1|dm:mg-1',
+      notBefore: '2026-05-28T23:59:59.000Z',
       gwsPublicKey: publicKey,
     });
     expect(r2.discovered).toBe(0);

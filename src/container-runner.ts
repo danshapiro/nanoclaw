@@ -67,6 +67,8 @@ import {
 import {
   ensureSessionWorkspaceDirs,
   heartbeatPath,
+  hostCorrelationDir,
+  inboundDbPath,
   markContainerRunning,
   markContainerStopped,
   sessionDir,
@@ -890,6 +892,20 @@ function buildMounts(
     // Session folder at /workspace (contains inbound.db, outbound.db, outbox/, .claude/)
     mounts.push({ hostPath: sessDir, containerPath: '/workspace', readonly: false });
 
+    // Re-overlay host-authenticated inputs read-only. The parent workspace is
+    // writable for agent files, but neither inbound.db nor tool correlation
+    // may be mutable by the agent that later presents those values as evidence.
+    mounts.push({
+      hostPath: inboundDbPath(agentGroup.id, session.id),
+      containerPath: '/workspace/inbound.db',
+      readonly: true,
+    });
+    mounts.push({
+      hostPath: hostCorrelationDir(agentGroup.id, session.id),
+      containerPath: '/workspace/.host-correlation',
+      readonly: true,
+    });
+
     // Agent group folder at /workspace/agent (RW for working files + CLAUDE.local.md)
     mounts.push({ hostPath: groupDir, containerPath: '/workspace/agent', readonly: false });
 
@@ -1262,6 +1278,7 @@ async function buildContainerArgs(
   // input-accepted. We only need /workspace writable by the poll loop and
   // readable by tools, which the workspace mount already provides.
   args.push('-e', 'NANOCLAW_SIDE_EFFECT_LEDGER=/workspace/side-effects.jsonl');
+  args.push('-e', 'NANOCLAW_HOST_CORRELATION_FILE=/workspace/.host-correlation/current.json');
   args.push('-e', `NANOCLAW_AGENT_GROUP_ID=${agentGroup.id}`);
   args.push('-e', `NANOCLAW_AGENT_GROUP_FOLDER=${agentGroup.folder}`);
 

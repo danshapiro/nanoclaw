@@ -59,18 +59,17 @@ case "${1:-}" in
     ;;
 esac
 
-# Read the poll-loop-written active-input file at INVOCATION time (not from env,
-# which would be stale across follow-ups in this long-lived container). Absent,
-# unparseable, OR stale-by-timestamp ⇒ an uncorrelated diagnostic record (no
-# inputId). The path is overridable for tests via NANOCLAW_ACTIVE_INPUT_FILE.
-active_input_file="${NANOCLAW_ACTIVE_INPUT_FILE:-/workspace/.active-input.json}"
+# Correlation is host-authenticated and mounted read-only over the otherwise
+# agent-writable workspace. Never fall back to .active-input.json: the agent can
+# edit that file and must not be able to forge recovery scope.
+host_correlation_file="${NANOCLAW_HOST_CORRELATION_FILE:-/workspace/.host-correlation/current.json}"
 
 # Staleness ceiling for the active-input correlation. The poll loop refreshes
 # `updatedAt` on every input-accepted; a normal in-turn tool call therefore sees
 # a fresh timestamp. We default to the absolute turn ceiling (6h) so a live turn
 # is NEVER wrongly treated stale, while an ancient file left by a long-dead turn
 # does not mis-correlate a fresh tool call. Env-overridable for tests/operators.
-active_input_max_age_ms="${NANOCLAW_ACTIVE_INPUT_MAX_AGE_MS:-21600000}"
+host_correlation_max_age_ms="${NANOCLAW_HOST_CORRELATION_MAX_AGE_MS:-21600000}"
 
 tmp_headers="$(mktemp)"
 tmp_body="$(mktemp)"
@@ -227,25 +226,22 @@ if [ "$parse_status" -ne 0 ]; then
   exit "$parse_status"
 fi
 
-# Build the request body, folding in inputId/routeKey from the active-input file
+# Build the request body, folding in inputId/routeKey from the host correlation file
 # so the proxy's audit store is correlated for crash-window discovery even when a
 # kill happens before the JSONL append. The shim NEVER adds an Authorization
 # header (OneCLI injects it at the gateway).
 request_body="$(
-  NODE_NO_WARNINGS=1 NANOCLAW_ACTIVE_INPUT_FILE="$active_input_file" \
+  NODE_NO_WARNINGS=1 NANOCLAW_HOST_CORRELATION_FILE="$host_correlation_file" \
   GWS_ARG_PLAN_FILE="$tmp_arg_plan" \
-  NANOCLAW_ACTIVE_INPUT_MAX_AGE_MS="$active_input_max_age_ms" node -e '
+  NANOCLAW_HOST_CORRELATION_MAX_AGE_MS="$host_correlation_max_age_ms" node -e '
     const fs = require("fs");
     const plan = JSON.parse(fs.readFileSync(process.env.GWS_ARG_PLAN_FILE, "utf8"));
     const body = { args: plan.proxyArgs };
     if (plan.output) body.output = { mode: "return_file" };
     try {
-      const ai = JSON.parse(fs.readFileSync(process.env.NANOCLAW_ACTIVE_INPUT_FILE, "utf8"));
-      // Stale-by-timestamp ⇒ uncorrelated. updatedAt is refreshed each
-      // input-accepted; an ancient file from a long-dead turn must not stamp a
-      // fresh tool call. Missing/invalid updatedAt is treated as stale.
-      const maxAge = Number(process.env.NANOCLAW_ACTIVE_INPUT_MAX_AGE_MS);
-      const updatedAt = ai && typeof ai.updatedAt === "string" ? Date.parse(ai.updatedAt) : NaN;
+      const ai = JSON.parse(fs.readFileSync(process.env.NANOCLAW_HOST_CORRELATION_FILE, "utf8"));
+      const maxAge = Number(process.env.NANOCLAW_HOST_CORRELATION_MAX_AGE_MS);
+      const updatedAt = ai && typeof ai.receivedAt === "string" ? Date.parse(ai.receivedAt) : NaN;
       const stale =
         !Number.isFinite(updatedAt) || (Number.isFinite(maxAge) && maxAge > 0 && Date.now() - updatedAt > maxAge);
       if (ai && !stale) {
@@ -450,6 +446,15 @@ case "$http_code" in
       request_class="$(header_value 'X-GWS-Request-Class')"
       sig="$(header_value 'X-GWS-Side-Effect-Signature')"
       payload="$(header_value 'X-GWS-Side-Effect-Payload')"
+      response_schema="$(header_value 'X-GWS-Side-Effect-Schema')"
+      response_profile="$(header_value 'X-GWS-Profile')"
+      response_account_label="$(header_value 'X-GWS-Account')"
+      response_account_email="$(header_value 'X-GWS-Account-Email')"
+      response_input_id="$(header_value 'X-GWS-Input-Id')"
+      response_route_key="$(header_value 'X-GWS-Route-Key')"
+      response_service="$(header_value 'X-GWS-Service')"
+      response_method="$(header_value 'X-GWS-Method')"
+      response_occurred_at="$(header_value 'X-GWS-Occurred-At')"
       if [ -n "${NANOCLAW_SIDE_EFFECT_LEDGER:-}" ] || [ -e "/workspace" ]; then
         # Build the sanitized JSONL record with node (robust escaping). Args are
         # sanitized (method/resource preserved, long body fields redacted); the
@@ -466,8 +471,13 @@ case "$http_code" in
           NODE_NO_WARNINGS=1 \
           NC_AUDIT_ID="$audit_id" NC_REQUEST_CLASS="$request_class" \
           NC_SIG="$sig" NC_PAYLOAD="$payload" NC_BODY="$body" \
-          NANOCLAW_ACTIVE_INPUT_FILE="$active_input_file" \
-          NANOCLAW_ACTIVE_INPUT_MAX_AGE_MS="$active_input_max_age_ms" \
+          NC_RESPONSE_SCHEMA="$response_schema" NC_RESPONSE_PROFILE="$response_profile" \
+          NC_RESPONSE_ACCOUNT_LABEL="$response_account_label" NC_RESPONSE_ACCOUNT_EMAIL="$response_account_email" \
+          NC_RESPONSE_INPUT_ID="$response_input_id" NC_RESPONSE_ROUTE_KEY="$response_route_key" \
+          NC_RESPONSE_SERVICE="$response_service" NC_RESPONSE_METHOD="$response_method" \
+          NC_RESPONSE_OCCURRED_AT="$response_occurred_at" \
+          NANOCLAW_HOST_CORRELATION_FILE="$host_correlation_file" \
+          NANOCLAW_HOST_CORRELATION_MAX_AGE_MS="$host_correlation_max_age_ms" \
           node -e '
             const fs = require("fs");
             const args = process.argv.slice(1);
@@ -482,18 +492,18 @@ case "$http_code" in
                 i++;
               }
             }
-            let inputId = null, routeKey = null;
+            let inputId = null, routeKey = null, receivedAt = null;
             try {
-              const ai = JSON.parse(fs.readFileSync(process.env.NANOCLAW_ACTIVE_INPUT_FILE, "utf8"));
-              // Stale-by-timestamp ⇒ uncorrelated (same policy as the request body).
-              const maxAge = Number(process.env.NANOCLAW_ACTIVE_INPUT_MAX_AGE_MS);
-              const updatedAt = ai && typeof ai.updatedAt === "string" ? Date.parse(ai.updatedAt) : NaN;
+              const ai = JSON.parse(fs.readFileSync(process.env.NANOCLAW_HOST_CORRELATION_FILE, "utf8"));
+              const maxAge = Number(process.env.NANOCLAW_HOST_CORRELATION_MAX_AGE_MS);
+              const updatedAt = ai && typeof ai.receivedAt === "string" ? Date.parse(ai.receivedAt) : NaN;
               const stale =
                 !Number.isFinite(updatedAt) ||
                 (Number.isFinite(maxAge) && maxAge > 0 && Date.now() - updatedAt > maxAge);
               if (ai && !stale) {
                 if (typeof ai.inputId === "string") inputId = ai.inputId;
                 if (typeof ai.routeKey === "string") routeKey = ai.routeKey;
+                if (typeof ai.receivedAt === "string") receivedAt = ai.receivedAt;
               }
             } catch (e) { /* uncorrelated diagnostic */ }
             // Best-effort draft id from stdout (e.g. "Draft created: r-987654" or JSON id).
@@ -502,36 +512,50 @@ case "$http_code" in
             let m = body.match(/\br-[0-9a-zA-Z_-]{4,}\b/);
             if (!m) m = body.match(/"(?:id|draft_id|draftId)"\s*:\s*"([^"]+)"/);
             if (m) draftId = m[1] || m[0];
-            let signed = null;
+            const positional = [];
+            for (const arg of args) {
+              if (arg === "--" || arg.startsWith("-")) break;
+              positional.push(arg);
+            }
+            const invokedService = positional[0] || null;
+            const invokedMethod = positional.length > 1 ? positional.slice(1).join(".") : null;
+            const responseService = process.env.NC_RESPONSE_SERVICE || null;
+            const responseMethod = process.env.NC_RESPONSE_METHOD || null;
+            let signedService = null, signedMethod = null;
             try {
-              const parsed = JSON.parse(process.env.NC_PAYLOAD || "");
-              if (parsed && parsed.schema_version === 2) signed = parsed;
-            } catch (e) { /* schema-v1 diagnostic fallback */ }
-            const signedService = signed && typeof signed.service === "string" ? signed.service : null;
-            const signedMethod = signed && typeof signed.method === "string" ? signed.method : null;
+              const signed = JSON.parse(process.env.NC_PAYLOAD || "");
+              if (signed && signed.schema_version === 2) {
+                signedService = typeof signed.service === "string" ? signed.service : null;
+                signedMethod = typeof signed.method === "string" ? signed.method : null;
+              }
+            } catch (e) { /* schema-v1 diagnostic */ }
+            const exactDraft =
+              invokedService === "gmail" &&
+              invokedMethod === "users.drafts.create" &&
+              responseService === invokedService &&
+              responseMethod === invokedMethod &&
+              signedService === invokedService &&
+              signedMethod === invokedMethod;
             const rec = {
-              kind:
-                signedService === "gmail" && signedMethod === "users.drafts.create"
-                  ? "gmail_draft_created"
-                  : "gws_mutation_completed",
-              payload_schema_version: signed ? 2 : 1,
-              audit_id: signed && typeof signed.audit_id === "string" ? signed.audit_id : process.env.NC_AUDIT_ID || null,
-              profile: signed && typeof signed.profile === "string" ? signed.profile : null,
-              account_label: signed && typeof signed.account_label === "string" ? signed.account_label : null,
-              account_email: signed && typeof signed.account_email === "string" ? signed.account_email : null,
-              request_class:
-                signed && typeof signed.request_class === "string"
-                  ? signed.request_class
-                  : process.env.NC_REQUEST_CLASS || null,
-              occurred_at:
-                signed && typeof signed.occurred_at === "string" ? signed.occurred_at : new Date().toISOString(),
-              input_id: signed && typeof signed.input_id === "string" ? signed.input_id : inputId,
-              route_key: signed && typeof signed.route_key === "string" ? signed.route_key : routeKey,
-              operation: signedService && signedMethod ? `${signedService} ${signedMethod}` : null,
+              kind: exactDraft ? "gmail_draft_created" : "gws_mutation_completed",
+              payload_schema_version: Number(process.env.NC_RESPONSE_SCHEMA) === 2 ? 2 : 1,
+              audit_id: process.env.NC_AUDIT_ID || null,
+              profile: process.env.NC_RESPONSE_PROFILE || null,
+              account_label: process.env.NC_RESPONSE_ACCOUNT_LABEL || null,
+              account_email: process.env.NC_RESPONSE_ACCOUNT_EMAIL || null,
+              request_class: process.env.NC_REQUEST_CLASS || null,
+              occurred_at: process.env.NC_RESPONSE_OCCURRED_AT || receivedAt || null,
+              input_id: inputId,
+              route_key: routeKey,
+              operation: invokedService && invokedMethod ? `${invokedService} ${invokedMethod}` : null,
+              response_input_id: process.env.NC_RESPONSE_INPUT_ID || null,
+              response_route_key: process.env.NC_RESPONSE_ROUTE_KEY || null,
+              response_service: responseService,
+              response_method: responseMethod,
               args: sanitized,
               signature: process.env.NC_SIG || undefined,
               payload: process.env.NC_PAYLOAD || undefined,
-              evidence: draftId ? { draft_id: draftId } : {},
+              evidence: exactDraft && draftId ? { draft_id: draftId } : {},
             };
             process.stdout.write(JSON.stringify(rec));
           ' -- "$@"
@@ -556,9 +580,18 @@ case "$http_code" in
           try {
             fd = fs.openSync(
               process.env.NC_LEDGER_PATH,
-              fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW,
+              fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW,
               0o600,
             );
+            const existing = fs.readFileSync(fd, "utf8");
+            if (existing.length > 0 && !existing.endsWith("\n")) {
+              throw new Error("incomplete side-effect ledger tail");
+            }
+            for (const prior of existing.split("\n")) {
+              if (!prior) continue;
+              JSON.parse(prior);
+            }
+            JSON.parse(process.env.NC_RECORD_LINE);
             const line = Buffer.from(`${process.env.NC_RECORD_LINE}\n`);
             if (fs.writeSync(fd, line) !== line.length) throw new Error("short side-effect ledger append");
             fs.fsyncSync(fd);

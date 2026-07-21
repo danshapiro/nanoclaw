@@ -1495,6 +1495,21 @@ describe('side-effect ledger container env', () => {
       const args = await buildArgs(harness);
       // Env now travels via --env-file (never on the command line).
       expect(readSpawnEnvFile(args).env.get('NANOCLAW_SIDE_EFFECT_LEDGER')).toBe('/workspace/side-effects.jsonl');
+      expect(readSpawnEnvFile(args).env.get('NANOCLAW_HOST_CORRELATION_FILE')).toBe(
+        '/workspace/.host-correlation/current.json',
+      );
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('re-overlays inbound correlation inputs read-only inside the writable workspace', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      const args = await buildArgs(harness);
+      const mounts = args.filter((arg) => arg.includes(':/workspace/'));
+      expect(mounts.some((arg) => arg.endsWith(':/workspace/inbound.db:ro'))).toBe(true);
+      expect(mounts.some((arg) => arg.endsWith(':/workspace/.host-correlation:ro'))).toBe(true);
     } finally {
       harness.close();
     }
@@ -1536,7 +1551,7 @@ describe('side-effect ledger container env', () => {
     }
   });
 
-  it('reads a root-controlled public-key file on the host and passes only its public value into the container', async () => {
+  it('rejects a host-user-controlled public-key file before container assembly', async () => {
     const harness = await loadContainerRunnerHarness();
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-verify-key-'));
     const keyPath = path.join(dir, 'verify.pub');
@@ -1550,11 +1565,9 @@ describe('side-effect ledger container env', () => {
       fs.writeFileSync(keyPath, `${publicValue}\n`, { mode: 0o644 });
       delete process.env.GWS_SIDE_EFFECT_VERIFY_KEY;
       process.env.GWS_SIDE_EFFECT_VERIFY_KEY_FILE = keyPath;
-      const args = await buildArgs(harness);
-      const envFile = readSpawnEnvFile(args);
-      expect(envFile.env.get('GWS_SIDE_EFFECT_VERIFY_KEY')).toBe(publicValue);
-      expect(envFile.raw).not.toContain('GWS_SIDE_EFFECT_VERIFY_KEY_FILE');
-      expect(envFile.raw).not.toContain(keyPath);
+      await expect(harness.containerRunner.wakeContainer(harness.session)).rejects.toThrow(
+        /parent chain|owned by root/i,
+      );
     } finally {
       if (savedFile === undefined) delete process.env.GWS_SIDE_EFFECT_VERIFY_KEY_FILE;
       else process.env.GWS_SIDE_EFFECT_VERIFY_KEY_FILE = savedFile;
@@ -1604,7 +1617,7 @@ describe('side-effect ledger container env', () => {
       expect(() => resolveGwsSideEffectVerifyKey({ GWS_SIDE_EFFECT_VERIFY_KEY_FILE: linkPath })).toThrow();
       fs.chmodSync(keyPath, 0o664);
       expect(() => resolveGwsSideEffectVerifyKey({ GWS_SIDE_EFFECT_VERIFY_KEY_FILE: keyPath })).toThrow(
-        /non-writable/i,
+        /parent chain|non-writable/i,
       );
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });

@@ -24,9 +24,37 @@ function validatePublicKey(value: string): string {
   return trimmed;
 }
 
+interface TrustedStat {
+  uid: number;
+  mode: number;
+  nlink: number;
+  isFile(): boolean;
+  isDirectory(): boolean;
+  isSymbolicLink(): boolean;
+}
+
+export interface GwsKeyTrustFs {
+  open(filePath: string): number;
+  fstat(fd: number): TrustedStat;
+  lstat(filePath: string): TrustedStat;
+  read(fd: number): string;
+  close(fd: number): void;
+}
+
+const realTrustFs: GwsKeyTrustFs = {
+  open: (filePath) => fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW),
+  fstat: (fd) => fs.fstatSync(fd),
+  lstat: (filePath) => fs.lstatSync(filePath),
+  read: (fd) => fs.readFileSync(fd, 'utf8'),
+  close: (fd) => fs.closeSync(fd),
+};
+
 /** Resolve the host-only verification-key file while keeping direct value
  * support for hermetic tests. The path is never forwarded to a container. */
-export function resolveGwsSideEffectVerifyKey(env: NodeJS.ProcessEnv = process.env): string | undefined {
+export function resolveGwsSideEffectVerifyKey(
+  env: NodeJS.ProcessEnv = process.env,
+  trustFs: GwsKeyTrustFs = realTrustFs,
+): string | undefined {
   const direct = env.GWS_SIDE_EFFECT_VERIFY_KEY?.trim();
   const filePath = env.GWS_SIDE_EFFECT_VERIFY_KEY_FILE?.trim();
   if (direct && filePath) {
@@ -35,17 +63,28 @@ export function resolveGwsSideEffectVerifyKey(env: NodeJS.ProcessEnv = process.e
   if (direct) return validatePublicKey(direct);
   if (!filePath) return undefined;
   if (!path.isAbsolute(filePath)) throw new Error('GWS_SIDE_EFFECT_VERIFY_KEY_FILE must be an absolute path');
-  const fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  let current = path.dirname(filePath);
+  while (true) {
+    const parent = trustFs.lstat(current);
+    if (parent.isSymbolicLink() || !parent.isDirectory() || parent.uid !== 0 || (parent.mode & 0o022) !== 0) {
+      throw new Error('GWS_SIDE_EFFECT_VERIFY_KEY_FILE parent chain must be root-owned, non-symlink, and non-writable');
+    }
+    const next = path.dirname(current);
+    if (next === current) break;
+    current = next;
+  }
+
+  const fd = trustFs.open(filePath);
   try {
-    const stat = fs.fstatSync(fd);
+    const stat = trustFs.fstat(fd);
     if (!stat.isFile() || stat.nlink !== 1 || (stat.mode & 0o022) !== 0) {
       throw new Error('GWS_SIDE_EFFECT_VERIFY_KEY_FILE must be a non-writable, single-link regular file');
     }
-    if (typeof process.getuid === 'function' && stat.uid !== 0 && stat.uid !== process.getuid()) {
-      throw new Error('GWS_SIDE_EFFECT_VERIFY_KEY_FILE must be owned by root or the NanoClaw host user');
+    if (stat.uid !== 0) {
+      throw new Error('GWS_SIDE_EFFECT_VERIFY_KEY_FILE must be owned by root');
     }
-    return validatePublicKey(fs.readFileSync(fd, 'utf8'));
+    return validatePublicKey(trustFs.read(fd));
   } finally {
-    fs.closeSync(fd);
+    trustFs.close(fd);
   }
 }

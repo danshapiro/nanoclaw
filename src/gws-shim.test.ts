@@ -7,6 +7,8 @@ import path from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { canonicalSideEffectPayload, classifyAndSanitize } from './db/side-effects-verify.js';
+
 type RequestRecord = {
   method?: string;
   url?: string;
@@ -697,10 +699,8 @@ function readLedger(p: string): Array<Record<string, unknown>> {
     .map((l) => JSON.parse(l) as Record<string, unknown>);
 }
 
-// A fresh active-input updatedAt: the poll loop refreshes this on every
-// input-accepted, so a normal in-turn tool call always sees a recent value. The
-// shim drops correlation when updatedAt is stale (older than
-// NANOCLAW_ACTIVE_INPUT_MAX_AGE_MS, default 6h), so tests that assert the
+// A fresh host correlation timestamp. The shim drops correlation when it is
+// stale (older than NANOCLAW_HOST_CORRELATION_MAX_AGE_MS, default 6h), so tests that assert the
 // CORRELATED path must stamp a current timestamp.
 function freshUpdatedAt(): string {
   return new Date().toISOString();
@@ -708,6 +708,13 @@ function freshUpdatedAt(): string {
 
 function apiEffectSuccessProxy(body: string, sig: string, payload: string, auditId = 'aud-1') {
   return (_req: http.IncomingMessage, res: http.ServerResponse): void => {
+    let signed: Record<string, unknown> | null = null;
+    try {
+      const parsed = JSON.parse(payload) as Record<string, unknown>;
+      if (parsed.schema_version === 2) signed = parsed;
+    } catch {
+      // Legacy payload.
+    }
     res.writeHead(200, {
       'Content-Type': 'text/plain',
       'X-Exit-Code': '0',
@@ -717,6 +724,19 @@ function apiEffectSuccessProxy(body: string, sig: string, payload: string, audit
       'X-GWS-Operation-Succeeded': 'true',
       'X-GWS-Side-Effect-Signature': sig,
       'X-GWS-Side-Effect-Payload': payload,
+      ...(signed
+        ? {
+            'X-GWS-Side-Effect-Schema': '2',
+            'X-GWS-Profile': String(signed.profile ?? ''),
+            'X-GWS-Account': String(signed.account_label ?? ''),
+            'X-GWS-Account-Email': String(signed.account_email ?? ''),
+            'X-GWS-Input-Id': String(signed.input_id ?? ''),
+            'X-GWS-Route-Key': String(signed.route_key ?? ''),
+            'X-GWS-Service': String(signed.service ?? ''),
+            'X-GWS-Method': String(signed.method ?? ''),
+            'X-GWS-Occurred-At': String(signed.occurred_at ?? ''),
+          }
+        : {}),
     });
     res.end(body);
   };
@@ -742,8 +762,8 @@ describe('gws proxy shim — side-effect ledger', () => {
   it('keeps schema-v1 evidence generic while preserving sig+payload verbatim before stdout', async () => {
     tmp = freshTmp();
     const ledger = path.join(tmp, 'side-effects.jsonl');
-    const active = path.join(tmp, 'active-input.json');
-    fs.writeFileSync(active, JSON.stringify({ inputId: 'in-9', routeKey: 'discord:7', updatedAt: freshUpdatedAt() }));
+    const active = path.join(tmp, 'host-correlation.json');
+    fs.writeFileSync(active, JSON.stringify({ inputId: 'in-9', routeKey: 'discord:7', receivedAt: freshUpdatedAt() }));
     const sig = 'BASE64SIGNATURE==';
     const payload = '{"audit_id":"aud-1","service":"gmail","method":"users.drafts.create"}';
     const proxy = await withProxy(apiEffectSuccessProxy('Draft created: r-987654', sig, payload));
@@ -753,7 +773,7 @@ describe('gws proxy shim — side-effect ledger', () => {
       {
         GWS_PROXY_URL: proxy.url,
         NANOCLAW_SIDE_EFFECT_LEDGER: ledger,
-        NANOCLAW_ACTIVE_INPUT_FILE: active,
+        NANOCLAW_HOST_CORRELATION_FILE: active,
       },
     );
 
@@ -798,9 +818,15 @@ describe('gws proxy shim — side-effect ledger', () => {
     };
     const payload = JSON.stringify(signed);
     const proxy = await withProxy(apiEffectSuccessProxy('{"id":"file-1"}', 'SIG', payload, 'aud-drive'));
+    const correlation = path.join(tmp, 'host-correlation.json');
+    fs.writeFileSync(
+      correlation,
+      JSON.stringify({ inputId: signed.input_id, routeKey: signed.route_key, receivedAt: freshUpdatedAt() }),
+    );
     const result = await runShim(['drive', 'files', 'create', '--json', '{"name":"x"}'], {
       GWS_PROXY_URL: proxy.url,
       NANOCLAW_SIDE_EFFECT_LEDGER: ledger,
+      NANOCLAW_HOST_CORRELATION_FILE: correlation,
     });
 
     expect(result.status).toBe(0);
@@ -814,6 +840,50 @@ describe('gws proxy shim — side-effect ledger', () => {
     expect(row.operation).toBe('drive files.create');
     expect(row.occurred_at).toBe('2026-07-20T12:35:56.789Z');
     expect(row.payload).toBe(payload);
+  });
+
+  it('records the invoked operation independently and rejects a valid signature for a different operation', async () => {
+    tmp = freshTmp();
+    const ledger = path.join(tmp, 'side-effects.jsonl');
+    const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+    const signed = {
+      schema_version: 2,
+      audit_id: 'aud-wrong-op',
+      profile: 'nanoclaw',
+      account_label: 'personal',
+      account_email: 'dan@danshapiro.com',
+      input_id: 'input-1',
+      route_key: 'opencode|discord|chan-1|dm:mg-1',
+      service: 'drive',
+      method: 'files.create',
+      request_class: 'api',
+      api_effect: true,
+      operation_succeeded: true,
+      occurred_at: new Date().toISOString(),
+      result_digest: 'abcdef',
+    };
+    const payload = canonicalSideEffectPayload(signed);
+    const signature = crypto.sign(null, Buffer.from(payload), privateKey).toString('base64');
+    const correlation = path.join(tmp, 'host-correlation.json');
+    fs.writeFileSync(
+      correlation,
+      JSON.stringify({ inputId: signed.input_id, routeKey: signed.route_key, receivedAt: freshUpdatedAt() }),
+    );
+    const proxy = await withProxy(apiEffectSuccessProxy('{"id":"file-1"}', signature, payload, signed.audit_id));
+
+    await runShim(['gmail', 'users', 'drafts', 'create'], {
+      GWS_PROXY_URL: proxy.url,
+      NANOCLAW_SIDE_EFFECT_LEDGER: ledger,
+      NANOCLAW_HOST_CORRELATION_FILE: correlation,
+    });
+    const [row] = readLedger(ledger);
+    expect(row.operation).toBe('gmail users.drafts.create');
+    expect(row.response_service).toBe('drive');
+    expect(
+      classifyAndSanitize(row, {
+        gwsPublicKey: publicKey.export({ format: 'pem', type: 'spki' }).toString(),
+      })?.validation,
+    ).toEqual({ authoritative: false, reason: 'gws_binding_invalid' });
   });
 
   it('durably stages signed evidence and exits 75 when the proxy says Google completed but global audit failed', async () => {
@@ -847,13 +917,28 @@ describe('gws proxy shim — side-effect ledger', () => {
         'X-GWS-Operation-Succeeded': 'true',
         'X-GWS-Side-Effect-Signature': 'SIG',
         'X-GWS-Side-Effect-Payload': payload,
+        'X-GWS-Side-Effect-Schema': '2',
+        'X-GWS-Profile': signed.profile,
+        'X-GWS-Account': signed.account_label,
+        'X-GWS-Account-Email': signed.account_email,
+        'X-GWS-Input-Id': signed.input_id,
+        'X-GWS-Route-Key': signed.route_key,
+        'X-GWS-Service': signed.service,
+        'X-GWS-Method': signed.method,
+        'X-GWS-Occurred-At': signed.occurred_at,
       });
       res.end('sensitive ordinary result must not be printed');
     });
 
+    const correlation = path.join(tmp, 'host-correlation.json');
+    fs.writeFileSync(
+      correlation,
+      JSON.stringify({ inputId: signed.input_id, routeKey: signed.route_key, receivedAt: freshUpdatedAt() }),
+    );
     const result = await runShim(['gmail', 'users', 'drafts', 'create'], {
       GWS_PROXY_URL: proxy.url,
       NANOCLAW_SIDE_EFFECT_LEDGER: ledger,
+      NANOCLAW_HOST_CORRELATION_FILE: correlation,
     });
     expect(result.status).toBe(75);
     expect(result.stdout).toBe('');
@@ -869,8 +954,13 @@ describe('gws proxy shim — side-effect ledger', () => {
   it('also sends inputId/routeKey in the POST body', async () => {
     tmp = freshTmp();
     const ledger = path.join(tmp, 'side-effects.jsonl');
-    const active = path.join(tmp, 'active-input.json');
-    fs.writeFileSync(active, JSON.stringify({ inputId: 'in-9', routeKey: 'discord:7', updatedAt: freshUpdatedAt() }));
+    const active = path.join(tmp, 'host-correlation.json');
+    fs.writeFileSync(active, JSON.stringify({ inputId: 'in-9', routeKey: 'discord:7', receivedAt: freshUpdatedAt() }));
+    const attackerControlled = path.join(tmp, 'active-input.json');
+    fs.writeFileSync(
+      attackerControlled,
+      JSON.stringify({ inputId: 'forged-input', routeKey: 'forged-route', updatedAt: freshUpdatedAt() }),
+    );
     let captured = '';
     const proxy = await withProxy((_req, res, body) => {
       captured = body;
@@ -887,7 +977,8 @@ describe('gws proxy shim — side-effect ledger', () => {
     await runShim(['gmail', '+triage'], {
       GWS_PROXY_URL: proxy.url,
       NANOCLAW_SIDE_EFFECT_LEDGER: ledger,
-      NANOCLAW_ACTIVE_INPUT_FILE: active,
+      NANOCLAW_HOST_CORRELATION_FILE: active,
+      NANOCLAW_ACTIVE_INPUT_FILE: attackerControlled,
     });
 
     const parsed = JSON.parse(captured) as { args: string[]; input_id?: string; route_key?: string };
@@ -895,7 +986,7 @@ describe('gws proxy shim — side-effect ledger', () => {
     expect(parsed.route_key).toBe('discord:7');
   });
 
-  it('writes an uncorrelated diagnostic record when .active-input.json is absent', async () => {
+  it('writes an uncorrelated diagnostic record when host correlation is absent', async () => {
     tmp = freshTmp();
     const ledger = path.join(tmp, 'side-effects.jsonl');
     const active = path.join(tmp, 'missing-active-input.json'); // does not exist
@@ -904,7 +995,7 @@ describe('gws proxy shim — side-effect ledger', () => {
     await runShim(['gmail', 'users', 'drafts', 'create', '--to', 'dan@x.com', '--body', 'b'], {
       GWS_PROXY_URL: proxy.url,
       NANOCLAW_SIDE_EFFECT_LEDGER: ledger,
-      NANOCLAW_ACTIVE_INPUT_FILE: active,
+      NANOCLAW_HOST_CORRELATION_FILE: active,
     });
 
     const rows = readLedger(ledger);
@@ -997,20 +1088,20 @@ describe('gws proxy shim — side-effect ledger', () => {
     expect(result.stderr).not.toContain('SECRETBODY');
   });
 
-  it('correlates with a FRESH active-input updatedAt but drops correlation when it is stale-by-timestamp', async () => {
+  it('correlates with fresh host state but drops correlation when it is stale-by-timestamp', async () => {
     // Fresh updatedAt ⇒ correlated (input_id/route_key stamped).
     tmp = freshTmp();
     const freshLedger = path.join(tmp, 'fresh.jsonl');
     const freshActive = path.join(tmp, 'fresh-active.json');
     fs.writeFileSync(
       freshActive,
-      JSON.stringify({ inputId: 'in-fresh', routeKey: 'discord:1', updatedAt: freshUpdatedAt() }),
+      JSON.stringify({ inputId: 'in-fresh', routeKey: 'discord:1', receivedAt: freshUpdatedAt() }),
     );
     const proxyFresh = await withProxy(apiEffectSuccessProxy('Draft created: r-1', 'SIG', '{"audit_id":"aud-1"}'));
     await runShim(['gmail', 'users', 'drafts', 'create', '--to', 'a@x.com', '--body', 'b'], {
       GWS_PROXY_URL: proxyFresh.url,
       NANOCLAW_SIDE_EFFECT_LEDGER: freshLedger,
-      NANOCLAW_ACTIVE_INPUT_FILE: freshActive,
+      NANOCLAW_HOST_CORRELATION_FILE: freshActive,
     });
     const freshRows = readLedger(freshLedger);
     expect(freshRows.length).toBe(1);
@@ -1024,7 +1115,7 @@ describe('gws proxy shim — side-effect ledger', () => {
     const staleActive = path.join(tmp, 'stale-active.json');
     fs.writeFileSync(
       staleActive,
-      JSON.stringify({ inputId: 'in-old', routeKey: 'discord:9', updatedAt: '2020-01-01T00:00:00.000Z' }),
+      JSON.stringify({ inputId: 'in-old', routeKey: 'discord:9', receivedAt: '2020-01-01T00:00:00.000Z' }),
     );
     let captured = '';
     const proxyStale = await withProxy((_req, res, body) => {
@@ -1043,7 +1134,7 @@ describe('gws proxy shim — side-effect ledger', () => {
     await runShim(['gmail', 'users', 'drafts', 'create', '--to', 'a@x.com', '--body', 'b'], {
       GWS_PROXY_URL: proxyStale.url,
       NANOCLAW_SIDE_EFFECT_LEDGER: staleLedger,
-      NANOCLAW_ACTIVE_INPUT_FILE: staleActive,
+      NANOCLAW_HOST_CORRELATION_FILE: staleActive,
     });
     const staleRows = readLedger(staleLedger);
     expect(staleRows.length).toBe(1);
@@ -1105,6 +1196,23 @@ describe('gws proxy shim — side-effect ledger', () => {
     expect(result.stderr).not.toContain('SECRETBODY');
     // No half-written record landed in the ledger.
     expect(readLedger(ledger)).toEqual([]);
+  });
+
+  it('fails closed without concatenating onto an incomplete pre-existing JSONL tail', async () => {
+    tmp = freshTmp();
+    const ledger = path.join(tmp, 'side-effects.jsonl');
+    const partial = '{"audit_id":"prior-incomplete"';
+    fs.writeFileSync(ledger, partial);
+    const proxy = await withProxy(
+      apiEffectSuccessProxy('Draft created: r-1', 'SIG', '{"audit_id":"aud-after-partial"}', 'aud-after-partial'),
+    );
+    const result = await runShim(['gmail', 'users', 'drafts', 'create'], {
+      GWS_PROXY_URL: proxy.url,
+      NANOCLAW_SIDE_EFFECT_LEDGER: ledger,
+    });
+    expect(result.status).toBe(75);
+    expect(result.stderr).toContain('durable side-effect ledger append failed');
+    expect(fs.readFileSync(ledger, 'utf8')).toBe(partial);
   });
 
   it('does not write a record when NANOCLAW_SIDE_EFFECT_LEDGER is unset', async () => {

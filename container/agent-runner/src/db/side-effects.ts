@@ -28,6 +28,7 @@ import { getOutboundDb } from './connection.js';
 import {
   classifyAndSanitize,
   parseLedgerLines,
+  type RawSideEffectRecord,
   type ValidatedSideEffect,
 } from './side-effects-verify.js';
 import type { ProviderSideEffect } from '../providers/types.js';
@@ -58,6 +59,9 @@ export interface ImportLedgerResult {
   validated: number;
 }
 
+let activeGwsPublicKey: string | undefined;
+let activeArtifactRoots: string[] | undefined;
+
 /**
  * Idempotently import staged side-effect JSONL into `side_effect_ledger`.
  * Idempotency key = the record id (proxy `audit_id` for GWS, stable
@@ -75,14 +79,25 @@ export function importSideEffectLedger(opts: ImportLedgerOptions = {}): ImportLe
   const raws = parseLedgerLines(text);
   if (raws.length === 0) return result;
 
+  if (opts.gwsPublicKey) activeGwsPublicKey = opts.gwsPublicKey;
+  if (opts.allowedArtifactRoots) activeArtifactRoots = [...opts.allowedArtifactRoots];
+
   const db = getOutboundDb();
-  const existsStmt = db.prepare('SELECT 1 AS ok FROM side_effect_ledger WHERE id = $id');
-  const insertStmt = db.prepare(
+  const existingStmt = db.prepare('SELECT * FROM side_effect_ledger WHERE id = $id');
+  const persistStmt = db.prepare(
     `INSERT INTO side_effect_ledger
-       (id, source, kind, operation, payload_schema_version, account_label, account_email, input_id, route_key,
+       (id, source, kind, operation, payload_schema_version, profile, account_label, account_email, input_id, route_key,
         signed_payload, signature, evidence_json, validation_json, replay_policy, occurred_at, imported_at)
-     VALUES ($id, $source, $kind, $operation, $payload_schema_version, $account_label, $account_email, $input_id, $route_key,
-        $signed_payload, $signature, $evidence_json, $validation_json, $replay_policy, $occurred_at, $imported_at)`,
+     VALUES ($id, $source, $kind, $operation, $payload_schema_version, $profile, $account_label, $account_email, $input_id, $route_key,
+        $signed_payload, $signature, $evidence_json, $validation_json, $replay_policy, $occurred_at, $imported_at)
+     ON CONFLICT(id) DO UPDATE SET
+       source=excluded.source, kind=excluded.kind, operation=excluded.operation,
+       payload_schema_version=excluded.payload_schema_version, profile=excluded.profile,
+       account_label=excluded.account_label, account_email=excluded.account_email,
+       input_id=excluded.input_id, route_key=excluded.route_key,
+       signed_payload=excluded.signed_payload, signature=excluded.signature,
+       evidence_json=excluded.evidence_json, validation_json=excluded.validation_json,
+       replay_policy=excluded.replay_policy, occurred_at=excluded.occurred_at, imported_at=excluded.imported_at`,
   );
   const now = new Date().toISOString();
   db.transaction(() => {
@@ -96,16 +111,29 @@ export function importSideEffectLedger(opts: ImportLedgerOptions = {}): ImportLe
         result.skipped++;
         continue;
       }
-      if (existsStmt.get({ $id: validated.id })) {
-        result.skipped++;
-        continue;
+      const existing = existingStmt.get({ $id: validated.id }) as LedgerRow | undefined;
+      if (existing) {
+        if (!validated.validation.authoritative) {
+          result.skipped++;
+          continue;
+        }
+        const existingValidated = revalidateStoredRow(existing, opts.gwsPublicKey, opts.allowedArtifactRoots);
+        if (
+          existingValidated?.validation.authoritative &&
+          rowMatchesValidated(existing, existingValidated) &&
+          rowMatchesValidated(existing, validated)
+        ) {
+          result.skipped++;
+          continue;
+        }
       }
-      insertStmt.run({
+      persistStmt.run({
         $id: validated.id,
         $source: validated.source,
         $kind: validated.kind,
         $operation: validated.operation,
         $payload_schema_version: validated.payloadSchemaVersion,
+        $profile: validated.profile,
         $account_label: validated.accountLabel,
         $account_email: validated.accountEmail,
         $input_id: validated.inputId,
@@ -131,6 +159,7 @@ interface LedgerRow {
   kind: string;
   operation: string | null;
   payload_schema_version: number;
+  profile: string | null;
   account_label: string | null;
   account_email: string | null;
   input_id: string | null;
@@ -142,6 +171,64 @@ interface LedgerRow {
   occurred_at: string | null;
 }
 
+function rawFromRow(row: LedgerRow): RawSideEffectRecord {
+  let evidence: Record<string, unknown> = {};
+  try {
+    evidence = JSON.parse(row.evidence_json) as Record<string, unknown>;
+  } catch {
+    evidence = {};
+  }
+  return {
+    kind: row.kind,
+    payload_schema_version: row.payload_schema_version,
+    audit_id: row.id,
+    profile: row.profile ?? undefined,
+    account_label: row.account_label ?? undefined,
+    account_email: row.account_email ?? undefined,
+    operation: row.operation ?? undefined,
+    input_id: row.input_id ?? undefined,
+    route_key: row.route_key ?? undefined,
+    response_input_id: row.input_id ?? undefined,
+    response_route_key: row.route_key ?? undefined,
+    response_service: row.operation?.split(' ', 2)[0],
+    response_method: row.operation?.split(' ', 2)[1],
+    occurred_at: row.occurred_at ?? undefined,
+    payload: row.signed_payload ?? undefined,
+    signature: row.signature ?? undefined,
+    evidence,
+  };
+}
+
+function revalidateStoredRow(
+  row: LedgerRow,
+  gwsPublicKey = activeGwsPublicKey ?? process.env.GWS_SIDE_EFFECT_VERIFY_KEY,
+  allowedArtifactRoots = activeArtifactRoots ?? process.env.NANOCLAW_ARTIFACT_ROOTS?.split(':').filter(Boolean),
+): ValidatedSideEffect | null {
+  return classifyAndSanitize(rawFromRow(row), {
+    gwsPublicKey,
+    allowedArtifactRoots,
+    statSize: (p: string) => (fs.existsSync(p) ? fs.statSync(p).size : null),
+  });
+}
+
+function rowMatchesValidated(row: LedgerRow, validated: ValidatedSideEffect): boolean {
+  return (
+    row.id === validated.id &&
+    row.source === validated.source &&
+    row.kind === validated.kind &&
+    row.operation === validated.operation &&
+    row.payload_schema_version === validated.payloadSchemaVersion &&
+    row.profile === validated.profile &&
+    row.account_label === validated.accountLabel &&
+    row.account_email === validated.accountEmail &&
+    row.input_id === validated.inputId &&
+    row.route_key === validated.routeKey &&
+    row.signed_payload === validated.signedPayload &&
+    row.signature === validated.signature &&
+    row.occurred_at === validated.occurredAt
+  );
+}
+
 function rowToProviderSideEffect(row: LedgerRow): ProviderSideEffect {
   let evidence: Record<string, string | number | boolean | null> = {};
   try {
@@ -150,9 +237,13 @@ function rowToProviderSideEffect(row: LedgerRow): ProviderSideEffect {
     evidence = {};
   }
   const kind = (
-    ['gmail_draft_created', 'gws_mutation_completed', 'summarize_dnd_recording_cached', 'summarize_dnd_summary_artifact', 'tool_completed'].includes(
-      row.kind,
-    )
+    [
+      'gmail_draft_created',
+      'gws_mutation_completed',
+      'summarize_dnd_recording_cached',
+      'summarize_dnd_summary_artifact',
+      'tool_completed',
+    ].includes(row.kind)
       ? row.kind
       : 'other'
   ) as ProviderSideEffect['kind'];
@@ -163,7 +254,7 @@ function rowToProviderSideEffect(row: LedgerRow): ProviderSideEffect {
     label:
       row.source === 'gws' && row.payload_schema_version !== 2
         ? 'legacy account unknown; do not recreate automatically; reconcile'
-        : row.operation ?? row.kind,
+        : (row.operation ?? row.kind),
     payloadSchemaVersion: row.payload_schema_version,
     accountLabel: row.payload_schema_version === 2 ? row.account_label : null,
     accountEmail: row.payload_schema_version === 2 ? row.account_email : null,
@@ -172,23 +263,23 @@ function rowToProviderSideEffect(row: LedgerRow): ProviderSideEffect {
   };
 }
 
-function queryLedger(opts: { authoritativeOnly: boolean; routeKey?: string; inputId?: string }): ProviderSideEffect[] {
+function queryLedger(opts: {
+  authoritativeOnly: boolean;
+  routeKey?: string;
+  inputId?: string;
+  gwsPublicKey?: string;
+}): ProviderSideEffect[] {
   const db = getOutboundDb();
   const rows = db.prepare('SELECT * FROM side_effect_ledger').all() as Array<LedgerRow & { validation_json: string }>;
   const out: ProviderSideEffect[] = [];
   for (const row of rows) {
-    if (opts.routeKey && row.route_key && row.route_key !== opts.routeKey) continue;
+    if (opts.routeKey && row.route_key !== opts.routeKey) continue;
     // Input correlation: when an active inputId is supplied, only that turn's
     // entries surface (entries with a row input_id that differs are excluded).
     // A null row input_id is never assumed to belong to the active turn.
     if (opts.inputId && row.input_id !== opts.inputId) continue;
-    let authoritative = false;
-    try {
-      authoritative = Boolean((JSON.parse(row.validation_json) as { authoritative?: boolean }).authoritative);
-    } catch {
-      authoritative = false;
-    }
-    if (row.source === 'gws' && row.payload_schema_version !== 2) authoritative = false;
+    const revalidated = revalidateStoredRow(row, opts.gwsPublicKey);
+    const authoritative = Boolean(revalidated?.validation.authoritative && rowMatchesValidated(row, revalidated));
     if (opts.authoritativeOnly && !authoritative) continue;
     if (!opts.authoritativeOnly && authoritative) continue; // hints = non-authoritative only
     out.push(rowToProviderSideEffect(row));
@@ -200,8 +291,15 @@ function queryLedger(opts: { authoritativeOnly: boolean; routeKey?: string; inpu
  * Validated, authoritative side effects available to recovery construction
  * BEFORE any provider-observed tool event. Optionally route-scoped.
  */
-export function getAuthoritativeSideEffects(opts: { routeKey?: string; inputId?: string } = {}): ProviderSideEffect[] {
-  return queryLedger({ authoritativeOnly: true, routeKey: opts.routeKey, inputId: opts.inputId });
+export function getAuthoritativeSideEffects(
+  opts: { routeKey?: string; inputId?: string; gwsPublicKey?: string } = {},
+): ProviderSideEffect[] {
+  return queryLedger({
+    authoritativeOnly: true,
+    routeKey: opts.routeKey,
+    inputId: opts.inputId,
+    gwsPublicKey: opts.gwsPublicKey,
+  });
 }
 
 /**

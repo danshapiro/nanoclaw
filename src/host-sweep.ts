@@ -28,8 +28,8 @@
  *        claimed a message and went quiet past tolerance since the claim."
  */
 import type Database from 'better-sqlite3';
+import { createHash } from 'crypto';
 import fs from 'fs';
-import path from 'path';
 
 import { getActiveSessions } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
@@ -40,6 +40,7 @@ import {
   deleteOrphanProcessingClaims,
   discoverGwsCrashWindowDrafts,
   getContainerState,
+  getHostAuthoritativeSideEffects,
   getMessageForRetry,
   getProcessingClaims,
   importHostSideEffects,
@@ -59,7 +60,13 @@ import {
   readSpawnSkillGeneration,
   sessionDir,
 } from './session-manager.js';
-import { getContainerStartedAtMs, isContainerRunning, killContainer, wakeContainer } from './container-runner.js';
+import {
+  getContainerStartedAtMs,
+  isContainerRunning,
+  killContainer,
+  stopContainerAndVerify,
+  wakeContainer,
+} from './container-runner.js';
 import { currentManagedSkillGeneration } from './yente/managed-skills.js';
 import {
   ensureSessionSchedulerProjections,
@@ -331,12 +338,14 @@ async function sweepSession(session: Session): Promise<void> {
       log.error('Scheduler sync failed during host sweep', { sessionId: session.id, err });
     }
 
-    // 3. Wake a container if work is due and nothing is running. Ordered
-    // before the crashed-container cleanup so a fresh container gets a chance
-    // to clean its own orphan processing_ack rows on startup (see
-    // container/agent-runner/src/db/connection.ts). Otherwise the reset path
-    // would keep bumping process_after into the future, dueCount would stay 0,
-    // and the wake would never fire.
+    // 3. Recover a crashed accepted turn before any replacement can wake.
+    // Import/discovery and durable recovery must precede reset/retry, otherwise
+    // a replacement can repeat an already-completed external mutation.
+    if (!isContainerRunning(session.id) && outDb && getProcessingClaims(outDb).length > 0) {
+      await recoverAfterKill(inDb, session, 'container not running');
+    }
+
+    // 4. Wake a container if work is due and nothing is running.
     // Use the outbound-aware count when outDb is available so that
     // recovery-owned rows (processing_ack.status='recovery') are excluded and
     // do not trigger a redundant container wake. Fall back to the inbound-only
@@ -350,17 +359,9 @@ async function sweepSession(session: Session): Promise<void> {
 
     const alive = isContainerRunning(session.id);
 
-    // 4. Running-container SLA: absolute ceiling + per-claim stuck rules.
+    // 5. Running-container SLA: absolute ceiling + per-claim stuck rules.
     if (alive && outDb) {
-      enforceRunningContainerSla(inDb, outDb, session, agentGroup.id);
-    }
-
-    // 5. Crashed-container cleanup: processing rows left behind get retried.
-    // Only fires when wake in step 3 didn't pick up the work (no due messages,
-    // or wake failed). resetStuckProcessingRows itself is idempotent — it
-    // skips messages already scheduled for a future retry.
-    if (!alive && outDb) {
-      resetStuckProcessingRows(inDb, outDb, session, 'container not running');
+      await enforceRunningContainerSla(inDb, outDb, session, agentGroup.id);
     }
   } finally {
     inDb.close();
@@ -403,12 +404,12 @@ export function effectiveCeilingMs(state: ContainerState | null): number {
   return Math.min(raised, OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS);
 }
 
-function enforceRunningContainerSla(
+async function enforceRunningContainerSla(
   inDb: Database.Database,
   outDb: Database.Database,
   session: Session,
   agentGroupId: string,
-): void {
+): Promise<void> {
   const now = Date.now();
   const heartbeat = heartbeatMtimeMs(agentGroupId, session.id);
   const claims = getProcessingClaims(outDb);
@@ -426,8 +427,8 @@ function enforceRunningContainerSla(
       heartbeatAgeMs: decision.heartbeatAgeMs,
       ceilingMs: decision.ceilingMs,
     });
-    killContainer(session.id, 'absolute-ceiling');
-    resetStuckProcessingRows(inDb, outDb, session, 'absolute-ceiling');
+    await stopContainerAndVerify(session.id, 'absolute-ceiling');
+    await recoverAfterKill(inDb, session, 'absolute-ceiling');
     return;
   }
 
@@ -438,8 +439,8 @@ function enforceRunningContainerSla(
       claimAgeMs: decision.claimAgeMs,
       toleranceMs: decision.toleranceMs,
     });
-    killContainer(session.id, 'claim-stuck');
-    resetStuckProcessingRows(inDb, outDb, session, 'claim-stuck');
+    await stopContainerAndVerify(session.id, 'claim-stuck');
+    await recoverAfterKill(inDb, session, 'claim-stuck');
     return;
   }
 
@@ -451,8 +452,7 @@ function enforceRunningContainerSla(
       idleAgeMs: decision.idleAgeMs,
       idleReapMs: decision.idleReapMs,
     });
-    killContainer(session.id, 'kill-idle');
-    resetStuckProcessingRows(inDb, outDb, session, 'kill-idle');
+    await stopContainerAndVerify(session.id, 'kill-idle');
     return;
   }
 
@@ -625,56 +625,49 @@ export async function recoverInterruptedTurn(opts: {
  * orphan draft-create — never another session's/route's drafts from the shared
  * global audit store.
  *
- * Sources (all host-readable, host-authoritative — never agent-written truth):
- *   - `routeKey`/`inputId`: the poll loop's atomically-written
- *     `<sessionDir>/.active-input.json` ({inputId, routeKey, updatedAt}). This is
- *     the SAME file the in-container tools read to stamp staged JSONL, mapped to
- *     the host session dir (the container's /workspace). The poll loop is the
- *     trusted writer; the agent never writes it. `inputId` may be absent (e.g.
- *     the file is missing because the kill landed before the first
- *     input-accepted), in which case we scope by route + time only.
- *   - `notBefore`: the earliest processing-claim time on this session's
- *     interrupted rows (turn-start), so we never import a draft from an OLDER,
- *     already-recovered turn on the same route.
+ * Source: host-only columns on the exact inbound rows named by processing_ack.
+ * The agent sees inbound.db through a nested read-only mount, and the legacy
+ * agent-writable `.active-input.json` is never consulted. Every claimed row
+ * must have a non-empty host route/input and finite host-received time; mixed
+ * routes or missing state fail closed. `notBefore` is the earliest host receive
+ * time, so older work on the same route cannot be imported.
  *
  * The minimum scope is `routeKey` + `notBefore`; we never leave the global audit
  * store fully unscoped.
  */
 export function gwsDiscoveryScope(
-  sessionDir: string,
+  inDb: Database.Database,
   outDb: Database.Database,
 ): { inputId?: string; routeKey?: string; notBefore?: string } {
   const scope: { inputId?: string; routeKey?: string; notBefore?: string } = {};
-
-  // routeKey/inputId from the poll loop's active-input correlation file.
-  try {
-    const activeInputPath = path.join(sessionDir, '.active-input.json');
-    if (fs.existsSync(activeInputPath)) {
-      const parsed = JSON.parse(fs.readFileSync(activeInputPath, 'utf8')) as {
-        inputId?: unknown;
-        routeKey?: unknown;
-      };
-      if (typeof parsed.routeKey === 'string' && parsed.routeKey) scope.routeKey = parsed.routeKey;
-      if (typeof parsed.inputId === 'string' && parsed.inputId) scope.inputId = parsed.inputId;
-    }
-  } catch {
-    // Missing/unparseable correlation file ⇒ fall back to route+time only (route
-    // may also be absent here; notBefore still bounds the import window).
-  }
-
-  // notBefore = earliest interrupted-turn processing-claim time (turn-start).
-  // Convert the SQLite UTC claim string to a Z-suffixed ISO-8601 so it compares
-  // correctly against the audit store's `occurred_at` (also Z-suffixed ISO).
   try {
     const claims = getProcessingClaims(outDb);
+    if (claims.length === 0) return scope;
+    const lookup = inDb.prepare('SELECT host_input_id, host_route_key, host_received_at FROM messages_in WHERE id = ?');
     let earliest = Number.POSITIVE_INFINITY;
-    for (const c of claims) {
-      const ms = parseSqliteUtc(c.status_changed);
-      if (Number.isFinite(ms) && ms < earliest) earliest = ms;
+    let inputId: string | undefined;
+    let routeKey: string | undefined;
+    for (const claim of claims) {
+      const row = lookup.get(claim.message_id) as
+        | { host_input_id: string | null; host_route_key: string | null; host_received_at: string | null }
+        | undefined;
+      if (!row?.host_input_id || !row.host_route_key || !row.host_received_at) return {};
+      const receivedMs = Date.parse(row.host_received_at);
+      if (!Number.isFinite(receivedMs)) return {};
+      if (routeKey && row.host_route_key !== routeKey) return {};
+      routeKey = row.host_route_key;
+      if (receivedMs < earliest) earliest = receivedMs;
+      // Claims in a batch share a route but can have distinct input ids. Scope
+      // by input only when there is exactly one unambiguous host input.
+      if (inputId === undefined) inputId = row.host_input_id;
+      else if (inputId !== row.host_input_id) inputId = '';
     }
-    if (Number.isFinite(earliest)) scope.notBefore = new Date(earliest).toISOString();
+    if (!routeKey || !Number.isFinite(earliest)) return {};
+    scope.routeKey = routeKey;
+    scope.notBefore = new Date(earliest).toISOString();
+    if (inputId) scope.inputId = inputId;
   } catch {
-    // No claims / table missing ⇒ no time bound (route still scopes the import).
+    return {};
   }
 
   return scope;
@@ -690,12 +683,13 @@ export function gwsDiscoveryScope(
  */
 export function discoverGwsCrashWindowDraftsScoped(opts: {
   sessionDir: string;
+  inDb: Database.Database;
   outDb: Database.Database;
   containerStopped: boolean;
   auditStorePath: string | undefined;
   gwsPublicKey?: string;
 }): ReturnType<typeof discoverGwsCrashWindowDrafts> {
-  const scope = gwsDiscoveryScope(opts.sessionDir, opts.outDb);
+  const scope = gwsDiscoveryScope(opts.inDb, opts.outDb);
   return discoverGwsCrashWindowDrafts({
     sessionDir: opts.sessionDir,
     containerStopped: opts.containerStopped,
@@ -707,6 +701,96 @@ export function discoverGwsCrashWindowDraftsScoped(opts: {
   });
 }
 
+function inboundTaskText(content: string): string {
+  try {
+    const parsed = JSON.parse(content) as { text?: unknown; prompt?: unknown };
+    if (typeof parsed.text === 'string') return parsed.text;
+    if (typeof parsed.prompt === 'string') return parsed.prompt;
+  } catch {
+    // Preserve opaque legacy content below.
+  }
+  return content;
+}
+
+/** Persist a route-scoped recovery entry before interrupted rows are reset. */
+export function writeHostInterruptedRecovery(opts: {
+  inDb: Database.Database;
+  outDb: Database.Database;
+  reason: string;
+  gwsPublicKey?: string;
+}): string | null {
+  const scope = gwsDiscoveryScope(opts.inDb, opts.outDb);
+  if (!scope.routeKey || !scope.notBefore) return null;
+  const claims = getProcessingClaims(opts.outDb);
+  if (claims.length === 0) return null;
+
+  const ids = claims.map((claim) => claim.message_id).sort();
+  const recoveryId = `rec-host-${createHash('sha256')
+    .update(`${scope.routeKey}\0${ids.join('\0')}`)
+    .digest('hex')
+    .slice(0, 24)}`;
+  const rowStmt = opts.inDb.prepare('SELECT id, timestamp, content, host_input_id FROM messages_in WHERE id = ?');
+  const rows = claims
+    .map(
+      (claim) =>
+        rowStmt.get(claim.message_id) as
+          | { id: string; timestamp: string; content: string; host_input_id: string | null }
+          | undefined,
+    )
+    .filter((row): row is NonNullable<typeof row> => Boolean(row));
+  if (rows.length !== claims.length) return null;
+
+  const now = new Date().toISOString();
+  const providerName = scope.routeKey.split('|', 1)[0] || 'unknown';
+  const sideEffects = getHostAuthoritativeSideEffects(opts.outDb, {
+    routeKey: scope.routeKey,
+    inputId: scope.inputId,
+    gwsPublicKey: opts.gwsPublicKey,
+  });
+  const entry = {
+    id: recoveryId,
+    status: 'pending',
+    classification: 'host_confirmed_container_interruption',
+    agentMessage: 'The prior container stopped mid-turn; resume from the durable recovery evidence.',
+    fallbackUserMessage:
+      'I was interrupted while working, but I kept the completed-work record and will resume safely.',
+    originalTasks: rows.map((row) => ({
+      messageId: row.id,
+      text: inboundTaskText(row.content),
+      timestamp: row.timestamp,
+    })),
+    acceptedUnresolvedInputs: rows.map((row) => ({
+      inputId: row.host_input_id!,
+      messageIds: [row.id],
+      prompt: inboundTaskText(row.content),
+    })),
+    pendingFollowups: [],
+    priorProgress: [],
+    observations: [`host_stop_reason: ${opts.reason}`],
+    sideEffects,
+    continuationPolicy: 'preserve',
+    createdAt: now,
+    updatedAt: now,
+  };
+  const key = `recovery:${providerName}:${scope.routeKey}`;
+  opts.outDb.transaction(() => {
+    const prior = opts.outDb.prepare('SELECT value FROM session_state WHERE key = ?').get(key) as
+      | { value: string }
+      | undefined;
+    let entries: unknown[] = [];
+    if (prior) {
+      const parsed = JSON.parse(prior.value) as unknown;
+      if (!Array.isArray(parsed)) throw new Error(`malformed recovery state for ${key}`);
+      entries = parsed;
+    }
+    if (!entries.some((candidate) => (candidate as { id?: unknown })?.id === recoveryId)) entries.push(entry);
+    opts.outDb
+      .prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
+      .run(key, JSON.stringify(entries), now);
+  })();
+  return recoveryId;
+}
+
 /**
  * Production wiring for recoverInterruptedTurn from the sweep loop. Reopens the
  * outbound DB writable only after a verified container stop, imports the host
@@ -715,11 +799,11 @@ export function discoverGwsCrashWindowDraftsScoped(opts: {
 export async function recoverAfterKill(inDb: Database.Database, session: Session, reason: string): Promise<void> {
   const dir = sessionDir(session.agent_group_id, session.id);
   const gwsPublicKey = resolveGwsSideEffectVerifyKey(process.env);
-  // Verify stop BEFORE opening the outbound DB writable (single-writer invariant).
-  if (isContainerRunning(session.id)) {
-    throw new Error(`recoverAfterKill: container for session ${session.id} is still running; refusing recovery writes`);
-  }
+  // Confirm both the tracked process and runtime-label writer are gone BEFORE
+  // opening outbound.db writable.
+  await stopContainerAndVerify(session.id, `recovery-${reason}`);
   const writableOutDb = openOutboundDbRw(session.agent_group_id, session.id);
+  let shouldWake = false;
   try {
     await recoverInterruptedTurn({
       inDb,
@@ -751,6 +835,7 @@ export async function recoverAfterKill(inDb: Database.Database, session: Session
         try {
           discoverGwsCrashWindowDraftsScoped({
             sessionDir: dir,
+            inDb,
             outDb: writableOutDb,
             containerStopped,
             auditStorePath: process.env.GWS_AUDIT_STORE,
@@ -761,16 +846,22 @@ export async function recoverAfterKill(inDb: Database.Database, session: Session
         }
       },
       writeRecovery: () => {
-        // Route-scoped recovery payload construction is owned by the poll loop /
-        // session-state recovery APIs (Task 3 wires the full payload). The
-        // backstop here ensures rows are reset with backoff so the next turn
-        // resumes; the user-visible recovery context lands in Task 3.
+        const recoveryId = writeHostInterruptedRecovery({
+          inDb,
+          outDb: writableOutDb,
+          reason,
+          gwsPublicKey,
+        });
+        if (!recoveryId) {
+          throw new Error(`recoverAfterKill: missing host-authenticated recovery scope for session ${session.id}`);
+        }
       },
       wakeContainer: async () => {
-        /* replacement wake is driven by the next sweep tick's due-count path */
+        shouldWake = true;
       },
     });
   } finally {
     writableOutDb.close();
   }
+  if (shouldWake) await wakeContainer(session);
 }

@@ -144,6 +144,7 @@ export function ensureOutboundSchema(db: Database): void {
       kind            TEXT NOT NULL,
       operation       TEXT,
       payload_schema_version INTEGER NOT NULL DEFAULT 1,
+      profile         TEXT,
       account_label   TEXT,
       account_email   TEXT,
       input_id        TEXT,
@@ -167,6 +168,7 @@ function ensureSideEffectLedgerColumns(db: Database): void {
   );
   if (!cols.has('payload_schema_version'))
     db.exec('ALTER TABLE side_effect_ledger ADD COLUMN payload_schema_version INTEGER NOT NULL DEFAULT 1');
+  if (!cols.has('profile')) db.exec('ALTER TABLE side_effect_ledger ADD COLUMN profile TEXT');
   if (!cols.has('account_label')) db.exec('ALTER TABLE side_effect_ledger ADD COLUMN account_label TEXT');
   if (!cols.has('account_email')) db.exec('ALTER TABLE side_effect_ledger ADD COLUMN account_email TEXT');
   if (!cols.has('input_id')) db.exec('ALTER TABLE side_effect_ledger ADD COLUMN input_id TEXT');
@@ -378,6 +380,7 @@ export function initTestSessionDb(): { inbound: Database; outbound: Database } {
       kind            TEXT NOT NULL,
       operation       TEXT,
       payload_schema_version INTEGER NOT NULL DEFAULT 1,
+      profile         TEXT,
       account_label   TEXT,
       account_email   TEXT,
       input_id        TEXT,

@@ -11,7 +11,12 @@ import path from 'path';
 import Database from 'better-sqlite3';
 
 import { INBOUND_SCHEMA, OUTBOUND_SCHEMA } from './schema.js';
-import { classifyAndSanitize, parseLedgerLines } from './side-effects-verify.js';
+import {
+  classifyAndSanitize,
+  parseLedgerLines,
+  type RawSideEffectRecord,
+  type ValidatedSideEffect,
+} from './side-effects-verify.js';
 
 /** Apply the inbound or outbound schema to a DB file. Idempotent. */
 export function ensureSchema(dbPath: string, schema: 'inbound' | 'outbound'): void {
@@ -69,6 +74,7 @@ export function migrateOutboundRouteColumns(db: Database.Database): void {
       kind            TEXT NOT NULL,
       operation       TEXT,
       payload_schema_version INTEGER NOT NULL DEFAULT 1,
+      profile         TEXT,
       account_label   TEXT,
       account_email   TEXT,
       input_id        TEXT,
@@ -87,6 +93,7 @@ export function migrateOutboundRouteColumns(db: Database.Database): void {
   );
   if (!ledgerCols.has('payload_schema_version'))
     db.prepare('ALTER TABLE side_effect_ledger ADD COLUMN payload_schema_version INTEGER NOT NULL DEFAULT 1').run();
+  if (!ledgerCols.has('profile')) db.prepare('ALTER TABLE side_effect_ledger ADD COLUMN profile TEXT').run();
   if (!ledgerCols.has('account_label'))
     db.prepare('ALTER TABLE side_effect_ledger ADD COLUMN account_label TEXT').run();
   if (!ledgerCols.has('account_email'))
@@ -234,16 +241,22 @@ export function insertMessage(
      */
     messagingGroupId?: string | null;
     isGroup?: 0 | 1 | null;
+    hostInputId?: string | null;
+    hostRouteKey?: string | null;
+    hostReceivedAt?: string | null;
   },
 ): void {
   db.prepare(
-    `INSERT INTO messages_in (id, seq, kind, timestamp, status, platform_id, platform_message_id, channel_type, thread_id, messaging_group_id, is_group, content, process_after, recurrence, series_id, trigger)
-     VALUES (@id, @seq, @kind, @timestamp, 'pending', @platformId, @platformMessageId, @channelType, @threadId, @messagingGroupId, @isGroup, @content, @processAfter, @recurrence, @id, @trigger)`,
+    `INSERT INTO messages_in (id, seq, kind, timestamp, status, platform_id, platform_message_id, channel_type, thread_id, messaging_group_id, is_group, host_input_id, host_route_key, host_received_at, content, process_after, recurrence, series_id, trigger)
+     VALUES (@id, @seq, @kind, @timestamp, 'pending', @platformId, @platformMessageId, @channelType, @threadId, @messagingGroupId, @isGroup, @hostInputId, @hostRouteKey, @hostReceivedAt, @content, @processAfter, @recurrence, @id, @trigger)`,
   ).run({
     ...message,
     platformMessageId: message.platformMessageId ?? null,
     messagingGroupId: message.messagingGroupId ?? null,
     isGroup: message.isGroup ?? null,
+    hostInputId: message.hostInputId ?? null,
+    hostRouteKey: message.hostRouteKey ?? null,
+    hostReceivedAt: message.hostReceivedAt ?? null,
     trigger: message.trigger ?? 1,
     seq: nextEvenSeq(db),
   });
@@ -365,6 +378,120 @@ export interface ImportSideEffectsResult {
   validated: number;
 }
 
+interface StoredSideEffectRow {
+  id: string;
+  source: string;
+  kind: string;
+  operation: string | null;
+  payload_schema_version: number;
+  profile: string | null;
+  account_label: string | null;
+  account_email: string | null;
+  input_id: string | null;
+  route_key: string | null;
+  signed_payload: string | null;
+  signature: string | null;
+  evidence_json: string;
+  occurred_at: string | null;
+}
+
+function rawStoredSideEffect(row: StoredSideEffectRow): RawSideEffectRecord {
+  let evidence: Record<string, unknown> = {};
+  try {
+    evidence = JSON.parse(row.evidence_json) as Record<string, unknown>;
+  } catch {
+    evidence = {};
+  }
+  return {
+    kind: row.kind,
+    payload_schema_version: row.payload_schema_version,
+    audit_id: row.id,
+    profile: row.profile ?? undefined,
+    account_label: row.account_label ?? undefined,
+    account_email: row.account_email ?? undefined,
+    operation: row.operation ?? undefined,
+    input_id: row.input_id ?? undefined,
+    route_key: row.route_key ?? undefined,
+    response_input_id: row.input_id ?? undefined,
+    response_route_key: row.route_key ?? undefined,
+    response_service: row.operation?.split(' ', 2)[0],
+    response_method: row.operation?.split(' ', 2)[1],
+    occurred_at: row.occurred_at ?? undefined,
+    payload: row.signed_payload ?? undefined,
+    signature: row.signature ?? undefined,
+    evidence,
+  };
+}
+
+function revalidateStoredSideEffect(
+  row: StoredSideEffectRow,
+  opts: { gwsPublicKey?: string; allowedArtifactRoots?: string[] },
+): ValidatedSideEffect | null {
+  return classifyAndSanitize(rawStoredSideEffect(row), {
+    ...opts,
+    statSize: (p: string) => (fs.existsSync(p) ? fs.statSync(p).size : null),
+  });
+}
+
+function storedRowMatches(row: StoredSideEffectRow, validated: ValidatedSideEffect): boolean {
+  return (
+    row.id === validated.id &&
+    row.source === validated.source &&
+    row.kind === validated.kind &&
+    row.operation === validated.operation &&
+    row.payload_schema_version === validated.payloadSchemaVersion &&
+    row.profile === validated.profile &&
+    row.account_label === validated.accountLabel &&
+    row.account_email === validated.accountEmail &&
+    row.input_id === validated.inputId &&
+    row.route_key === validated.routeKey &&
+    row.signed_payload === validated.signedPayload &&
+    row.signature === validated.signature &&
+    row.occurred_at === validated.occurredAt
+  );
+}
+
+export interface HostAuthoritativeSideEffect {
+  id: string;
+  inputId: string;
+  kind: ValidatedSideEffect['kind'];
+  label: string;
+  payloadSchemaVersion: number;
+  accountLabel: string | null;
+  accountEmail: string | null;
+  evidence: Record<string, string | number | boolean | null>;
+  occurredAt: string;
+}
+
+/** Re-verify every stored byte before host recovery relies on it. */
+export function getHostAuthoritativeSideEffects(
+  outDb: Database.Database,
+  opts: { routeKey: string; inputId?: string; gwsPublicKey?: string },
+): HostAuthoritativeSideEffect[] {
+  const rows = outDb
+    .prepare('SELECT * FROM side_effect_ledger WHERE route_key = ?')
+    .all(opts.routeKey) as StoredSideEffectRow[];
+  const effects: HostAuthoritativeSideEffect[] = [];
+  for (const row of rows) {
+    if (opts.inputId && row.input_id !== opts.inputId) continue;
+    const validated = revalidateStoredSideEffect(row, { gwsPublicKey: opts.gwsPublicKey });
+    if (!validated?.validation.authoritative || !storedRowMatches(row, validated)) continue;
+    if (!validated.inputId || !validated.occurredAt) continue;
+    effects.push({
+      id: validated.id,
+      inputId: validated.inputId,
+      kind: validated.kind,
+      label: `${validated.operation ?? validated.kind}${validated.accountLabel ? ` (${validated.accountLabel})` : ''}`,
+      payloadSchemaVersion: validated.payloadSchemaVersion,
+      accountLabel: validated.accountLabel,
+      accountEmail: validated.accountEmail,
+      evidence: validated.evidence,
+      occurredAt: validated.occurredAt,
+    });
+  }
+  return effects;
+}
+
 // ── Side-effect validation (host) ────────────────────────────────────────────
 // The pure, DB-free validation (Ed25519 verify, canonical JSON, classify +
 // sanitize) lives in the host copy `./side-effects-verify.ts`, a byte-equivalent
@@ -415,13 +542,21 @@ export function importHostSideEffects(opts: {
   const db = openOutboundDbRw(outPath);
   try {
     migrateOutboundRouteColumns(db);
-    const existsStmt = db.prepare('SELECT 1 AS ok FROM side_effect_ledger WHERE id = ?');
-    const insertStmt = db.prepare(
+    const existingStmt = db.prepare('SELECT * FROM side_effect_ledger WHERE id = ?');
+    const persistStmt = db.prepare(
       `INSERT INTO side_effect_ledger
-         (id, source, kind, operation, payload_schema_version, account_label, account_email, input_id, route_key,
+         (id, source, kind, operation, payload_schema_version, profile, account_label, account_email, input_id, route_key,
           signed_payload, signature, evidence_json, validation_json, replay_policy, occurred_at, imported_at)
-       VALUES (@id, @source, @kind, @operation, @payload_schema_version, @account_label, @account_email, @input_id, @route_key,
-          @signed_payload, @signature, @evidence_json, @validation_json, @replay_policy, @occurred_at, @imported_at)`,
+       VALUES (@id, @source, @kind, @operation, @payload_schema_version, @profile, @account_label, @account_email, @input_id, @route_key,
+          @signed_payload, @signature, @evidence_json, @validation_json, @replay_policy, @occurred_at, @imported_at)
+       ON CONFLICT(id) DO UPDATE SET
+         source=excluded.source, kind=excluded.kind, operation=excluded.operation,
+         payload_schema_version=excluded.payload_schema_version, profile=excluded.profile,
+         account_label=excluded.account_label, account_email=excluded.account_email,
+         input_id=excluded.input_id, route_key=excluded.route_key,
+         signed_payload=excluded.signed_payload, signature=excluded.signature,
+         evidence_json=excluded.evidence_json, validation_json=excluded.validation_json,
+         replay_policy=excluded.replay_policy, occurred_at=excluded.occurred_at, imported_at=excluded.imported_at`,
     );
     const now = new Date().toISOString();
     db.transaction(() => {
@@ -435,16 +570,29 @@ export function importHostSideEffects(opts: {
           result.skipped++;
           continue;
         }
-        if (existsStmt.get(validated.id)) {
-          result.skipped++;
-          continue;
+        const existing = existingStmt.get(validated.id) as StoredSideEffectRow | undefined;
+        if (existing) {
+          if (!validated.validation.authoritative) {
+            result.skipped++;
+            continue;
+          }
+          const prior = revalidateStoredSideEffect(existing, opts);
+          if (
+            prior?.validation.authoritative &&
+            storedRowMatches(existing, prior) &&
+            storedRowMatches(existing, validated)
+          ) {
+            result.skipped++;
+            continue;
+          }
         }
-        insertStmt.run({
+        persistStmt.run({
           id: validated.id,
           source: validated.source,
           kind: validated.kind,
           operation: validated.operation,
           payload_schema_version: validated.payloadSchemaVersion,
+          profile: validated.profile,
           account_label: validated.accountLabel,
           account_email: validated.accountEmail,
           input_id: validated.inputId,
@@ -524,6 +672,9 @@ export function discoverGwsCrashWindowDrafts(opts: {
     );
   }
   const result: DiscoverCrashWindowResult = { discovered: 0 };
+  // The audit store is global. Never inspect it without a host-authenticated
+  // route and lower time bound for this exact interrupted turn.
+  if (!opts.routeKey || !opts.notBefore || !Number.isFinite(Date.parse(opts.notBefore))) return result;
   // Gating: no audit store configured ⇒ discovery inactive.
   if (!opts.auditStorePath || !fs.existsSync(opts.auditStorePath)) return result;
   const outPath = path.join(opts.sessionDir, 'outbound.db');
@@ -554,6 +705,10 @@ export function discoverGwsCrashWindowDrafts(opts: {
         account_email: e.account_email,
         input_id: e.input_id,
         route_key: e.route_key,
+        response_input_id: e.input_id,
+        response_route_key: e.route_key,
+        response_service: e.service,
+        response_method: e.method,
         operation: e.service && e.method ? `${e.service} ${e.method}` : undefined,
         occurred_at: e.occurred_at,
         payload: e.payload,
@@ -563,8 +718,8 @@ export function discoverGwsCrashWindowDrafts(opts: {
     );
     if (!validated?.validation.authoritative) continue;
     if (opts.inputId && validated.inputId !== opts.inputId) continue;
-    if (opts.routeKey && validated.routeKey !== opts.routeKey) continue;
-    if (opts.notBefore && validated.occurredAt && validated.occurredAt < opts.notBefore) continue;
+    if (validated.routeKey !== opts.routeKey) continue;
+    if (!validated.occurredAt || validated.occurredAt < opts.notBefore) continue;
     if (opts.notAfter && validated.occurredAt && validated.occurredAt > opts.notAfter) continue;
     matches.push({ entry: e, validated });
   }
@@ -573,26 +728,47 @@ export function discoverGwsCrashWindowDrafts(opts: {
   const db = openOutboundDbRw(outPath);
   try {
     migrateOutboundRouteColumns(db);
-    const existsStmt = db.prepare('SELECT 1 AS ok FROM side_effect_ledger WHERE id = ?');
-    const insertStmt = db.prepare(
+    const existingStmt = db.prepare('SELECT * FROM side_effect_ledger WHERE id = ?');
+    const persistStmt = db.prepare(
       `INSERT INTO side_effect_ledger
-         (id, source, kind, operation, payload_schema_version, account_label, account_email, input_id, route_key,
+         (id, source, kind, operation, payload_schema_version, profile, account_label, account_email, input_id, route_key,
           signed_payload, signature, evidence_json, validation_json, replay_policy, occurred_at, imported_at)
-       VALUES (@id, @source, @kind, @operation, @payload_schema_version, @account_label, @account_email, @input_id, @route_key,
-          @signed_payload, @signature, @evidence_json, @validation_json, @replay_policy, @occurred_at, @imported_at)`,
+       VALUES (@id, @source, @kind, @operation, @payload_schema_version, @profile, @account_label, @account_email, @input_id, @route_key,
+          @signed_payload, @signature, @evidence_json, @validation_json, @replay_policy, @occurred_at, @imported_at)
+       ON CONFLICT(id) DO UPDATE SET
+         source=excluded.source, kind=excluded.kind, operation=excluded.operation,
+         payload_schema_version=excluded.payload_schema_version, profile=excluded.profile,
+         account_label=excluded.account_label, account_email=excluded.account_email,
+         input_id=excluded.input_id, route_key=excluded.route_key,
+         signed_payload=excluded.signed_payload, signature=excluded.signature,
+         evidence_json=excluded.evidence_json, validation_json=excluded.validation_json,
+         replay_policy=excluded.replay_policy, occurred_at=excluded.occurred_at, imported_at=excluded.imported_at`,
     );
     const now = new Date().toISOString();
     db.transaction(() => {
       for (const { entry: e, validated } of matches) {
-        // Idempotent by audit_id: if the JSONL importer already created this row
-        // (the tool survived to append), discovery adds nothing — no duplicate.
-        if (existsStmt.get(e.audit_id!)) continue;
-        insertStmt.run({
+        // Preserve an existing row only when it independently re-verifies and
+        // is byte-for-byte identical. A forged/hint/tampered same-audit row is
+        // replaced by the root-owned signed evidence so it cannot suppress
+        // crash-window recovery.
+        const existing = existingStmt.get(e.audit_id!) as StoredSideEffectRow | undefined;
+        if (existing) {
+          const prior = revalidateStoredSideEffect(existing, { gwsPublicKey: opts.gwsPublicKey });
+          if (
+            prior?.validation.authoritative &&
+            storedRowMatches(existing, prior) &&
+            storedRowMatches(existing, validated)
+          ) {
+            continue;
+          }
+        }
+        persistStmt.run({
           id: e.audit_id!,
           source: 'gws',
           kind: validated.kind,
           operation: validated.operation,
           payload_schema_version: validated.payloadSchemaVersion,
+          profile: validated.profile,
           account_label: validated.accountLabel,
           account_email: validated.accountEmail,
           input_id: validated.inputId,
@@ -772,5 +948,14 @@ export function migrateMessagesInTable(db: Database.Database): void {
   }
   if (!cols.has('is_group')) {
     db.prepare('ALTER TABLE messages_in ADD COLUMN is_group INTEGER').run();
+  }
+  if (!cols.has('host_input_id')) {
+    db.prepare('ALTER TABLE messages_in ADD COLUMN host_input_id TEXT').run();
+  }
+  if (!cols.has('host_route_key')) {
+    db.prepare('ALTER TABLE messages_in ADD COLUMN host_route_key TEXT').run();
+  }
+  if (!cols.has('host_received_at')) {
+    db.prepare('ALTER TABLE messages_in ADD COLUMN host_received_at TEXT').run();
   }
 }

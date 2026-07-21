@@ -28,6 +28,9 @@ export interface MessageInRow {
   /** Host-stamped route identity (nullable; null is never collapsible). */
   messaging_group_id: string | null;
   is_group: number | null;
+  host_input_id: string | null;
+  host_route_key: string | null;
+  host_received_at: string | null;
   content: string;
 }
 
@@ -179,7 +182,13 @@ export function clearRecoveryOwnership(ids: string[], recoveryId: string, reason
   db.transaction(() => {
     for (const id of ids) stmt.run({ $id: id });
   })();
-  logAckEvent({ severity: 'info', event: 'clear_recovery_ownership', message_ids: ids, recovery_id: recoveryId, reason });
+  logAckEvent({
+    severity: 'info',
+    event: 'clear_recovery_ownership',
+    message_ids: ids,
+    recovery_id: recoveryId,
+    reason,
+  });
 }
 
 /** Get a message by ID (read from inbound.db). */

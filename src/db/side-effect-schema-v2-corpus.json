@@ -29,6 +29,23 @@
     { "field": "occurred_at", "value": "2026-07-20T12:34:57.789Z" },
     { "field": "result_digest", "value": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" }
   ],
+  "unicode_payload": {
+    "schema_version": 2,
+    "audit_id": "audit-unicode-\u2028-\u2029",
+    "profile": "nanoclaw",
+    "account_label": "personal",
+    "account_email": "dan@danshapiro.com",
+    "input_id": "input-unicode-1",
+    "route_key": "route-\u2028-\u2029",
+    "service": "gmail",
+    "method": "users.drafts.create",
+    "request_class": "api",
+    "api_effect": true,
+    "operation_succeeded": true,
+    "occurred_at": "2026-07-20T12:36:56.789Z",
+    "result_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "unicode_canonical": "{\"schema_version\":2,\"audit_id\":\"audit-unicode-\\u2028-\\u2029\",\"profile\":\"nanoclaw\",\"account_label\":\"personal\",\"account_email\":\"dan@danshapiro.com\",\"input_id\":\"input-unicode-1\",\"route_key\":\"route-\\u2028-\\u2029\",\"service\":\"gmail\",\"method\":\"users.drafts.create\",\"request_class\":\"api\",\"api_effect\":true,\"operation_succeeded\":true,\"occurred_at\":\"2026-07-20T12:36:56.789Z\",\"result_digest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}",
   "non_gmail_payload": {
     "schema_version": 2,
     "audit_id": "audit-drive-1",

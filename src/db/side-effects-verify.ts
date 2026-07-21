@@ -24,6 +24,7 @@
  * under an allowed root) needs no key.
  */
 import { createPublicKey, verify as edVerify, type KeyObject } from 'crypto';
+import writeInventory from './gws-v0.18.1-write-operations.json' with { type: 'json' };
 
 export type SideEffectSource = 'gws' | 'summarize_dnd' | 'tool' | 'unknown';
 
@@ -46,6 +47,10 @@ export interface RawSideEffectRecord {
   input_id?: string;
   route_key?: string;
   occurred_at?: string;
+  response_input_id?: string;
+  response_route_key?: string;
+  response_service?: string;
+  response_method?: string;
   signature?: string;
   /**
    * The proxy's canonical signed payload, forwarded VERBATIM by the shim as the
@@ -65,6 +70,7 @@ export interface ValidatedSideEffect {
   kind: SideEffectKind;
   operation: string | null;
   payloadSchemaVersion: number;
+  profile: string | null;
   accountLabel: string | null;
   accountEmail: string | null;
   inputId: string | null;
@@ -118,7 +124,9 @@ export function canonicalSideEffectPayload(payload: {
     operation_succeeded: payload.operation_succeeded,
     occurred_at: payload.occurred_at,
     result_digest: payload.result_digest,
-  });
+  })
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
 }
 
 export type GwsVerifyResult = 'valid' | 'invalid' | 'unvalidated';
@@ -286,6 +294,8 @@ const CANONICAL_ACCOUNT_EMAILS: Record<string, string> = {
   glowforge: 'dan@glowforge.com',
 };
 
+const EXACT_GWS_WRITE_OPERATIONS = new Set<string>(writeInventory.operations);
+
 function parseCanonicalSchemaV2(payload: RawSideEffectRecord['payload']): {
   canonical: string;
   value: SchemaV2SideEffectPayload;
@@ -327,12 +337,17 @@ function exactSignedOperation(payload: SchemaV2SideEffectPayload): string | null
   return `${payload.service} ${payload.method}`;
 }
 
+function isExactGuardedWrite(payload: SchemaV2SideEffectPayload): boolean {
+  return EXACT_GWS_WRITE_OPERATIONS.has(`${payload.service} ${payload.method.replaceAll('.', ' ')}`);
+}
+
 function baseValidatedFields(raw: RawSideEffectRecord) {
   return {
     payloadSchemaVersion:
       typeof raw.payload_schema_version === 'number' && Number.isInteger(raw.payload_schema_version)
         ? raw.payload_schema_version
         : 1,
+    profile: null,
     accountLabel: null,
     accountEmail: null,
     signedPayload: typeof raw.payload === 'string' ? raw.payload : null,
@@ -387,6 +402,10 @@ export function classifyAndSanitize(raw: RawSideEffectRecord, opts: ClassifyOpti
       raw.route_key === parsed.value.route_key &&
       raw.operation === signedOperation &&
       raw.occurred_at === parsed.value.occurred_at &&
+      raw.response_input_id === parsed.value.input_id &&
+      raw.response_route_key === parsed.value.route_key &&
+      raw.response_service === parsed.value.service &&
+      raw.response_method === parsed.value.method &&
       parsed.value.profile !== '' &&
       parsed.value.input_id !== '' &&
       parsed.value.route_key !== '' &&
@@ -396,7 +415,8 @@ export function classifyAndSanitize(raw: RawSideEffectRecord, opts: ClassifyOpti
       parsed.value.result_digest !== '' &&
       Number.isFinite(Date.parse(parsed.value.occurred_at)) &&
       accountPairValid &&
-      signedOperation !== null,
+      signedOperation !== null &&
+      isExactGuardedWrite(parsed.value),
     );
     const authoritative = payloadSchemaVersion === 2 && verify === 'valid' && bindingsValid;
     const authoritativeKind: SideEffectKind =
@@ -407,6 +427,7 @@ export function classifyAndSanitize(raw: RawSideEffectRecord, opts: ClassifyOpti
     if (payloadSchemaVersion === 2) {
       if (!parsed) reason = 'schema_v2_payload_noncanonical';
       else if (verify !== 'valid') reason = `gws_${verify}`;
+      else if (!isExactGuardedWrite(parsed.value)) reason = 'gws_operation_not_exact_guarded_write';
       else if (!bindingsValid) reason = 'gws_binding_invalid';
       else reason = 'ed25519_schema_v2_authoritative';
     }
@@ -420,6 +441,7 @@ export function classifyAndSanitize(raw: RawSideEffectRecord, opts: ClassifyOpti
           : 'gws_mutation_completed',
       operation: authoritative ? signedOperation : operation,
       payloadSchemaVersion,
+      profile: authoritative ? parsed!.value.profile : null,
       accountLabel: authoritative ? parsed!.value.account_label : null,
       accountEmail: authoritative ? parsed!.value.account_email : null,
       inputId,

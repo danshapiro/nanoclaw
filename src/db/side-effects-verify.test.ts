@@ -46,6 +46,8 @@ interface CorpusPayload {
 interface SchemaV2Corpus {
   payload: CorpusPayload;
   canonical: string;
+  unicode_payload: CorpusPayload;
+  unicode_canonical: string;
   seed_base64: string;
   adversarial: Array<{ field: keyof CorpusPayload; value: string | boolean }>;
   non_gmail_payload: CorpusPayload;
@@ -164,6 +166,7 @@ describe('side-effects-verify cross-check (host copy)', () => {
     const publicKey = createPublicKey(key).export({ format: 'pem', type: 'spki' }).toString();
     const canonical = canonicalSideEffectPayload(corpus.payload);
     expect(canonical).toBe(corpus.canonical);
+    expect(canonicalSideEffectPayload(corpus.unicode_payload)).toBe(corpus.unicode_canonical);
     const signature = edSign(null, Buffer.from(canonical), key).toString('base64');
     expect(verifyGwsSideEffectSignature(canonical, signature, publicKey)).toBe('valid');
     for (const substitution of corpus.adversarial) {
@@ -172,6 +175,43 @@ describe('side-effects-verify cross-check (host copy)', () => {
         [substitution.field]: substitution.value,
       });
       expect(verifyGwsSideEffectSignature(mutated, signature, publicKey), substitution.field).toBe('invalid');
+    }
+  });
+
+  it('rejects validly signed reads and plausible unknown operations outside the exact 154-write artifact', () => {
+    const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+    const pem = publicKey.export({ format: 'pem', type: 'spki' }).toString();
+    for (const [service, method] of [
+      ['gmail', 'users.messages.list'],
+      ['gmail', 'users.drafts.archiveForever'],
+    ]) {
+      const value = {
+        ...schemaV2Corpus().payload,
+        audit_id: `audit-${method}`,
+        service,
+        method,
+      };
+      const payload = canonicalSideEffectPayload(value);
+      const signature = edSign(null, Buffer.from(payload), privateKey).toString('base64');
+      const validated = classifyAndSanitize(
+        {
+          kind: 'gws_mutation_completed',
+          payload_schema_version: 2,
+          audit_id: value.audit_id,
+          profile: value.profile,
+          account_label: value.account_label,
+          account_email: value.account_email,
+          input_id: value.input_id,
+          route_key: value.route_key,
+          operation: `${service} ${method}`,
+          occurred_at: value.occurred_at,
+          payload,
+          signature,
+        },
+        { gwsPublicKey: pem },
+      );
+      expect(validated?.validation.authoritative, method).toBe(false);
+      expect(validated?.validation.reason, method).toBe('gws_operation_not_exact_guarded_write');
     }
   });
 
@@ -190,6 +230,10 @@ describe('side-effects-verify cross-check (host copy)', () => {
       account_email: corpus.payload.account_email,
       input_id: corpus.payload.input_id,
       route_key: corpus.payload.route_key,
+      response_input_id: corpus.payload.input_id,
+      response_route_key: corpus.payload.route_key,
+      response_service: corpus.payload.service,
+      response_method: corpus.payload.method,
       operation: `${corpus.payload.service} ${corpus.payload.method}`,
       occurred_at: corpus.payload.occurred_at,
       payload: canonical,
@@ -224,6 +268,10 @@ describe('side-effects-verify cross-check (host copy)', () => {
         account_email: corpus.non_gmail_payload.account_email,
         input_id: corpus.non_gmail_payload.input_id,
         route_key: corpus.non_gmail_payload.route_key,
+        response_input_id: corpus.non_gmail_payload.input_id,
+        response_route_key: corpus.non_gmail_payload.route_key,
+        response_service: corpus.non_gmail_payload.service,
+        response_method: corpus.non_gmail_payload.method,
         operation: 'drive files.create',
         occurred_at: corpus.non_gmail_payload.occurred_at,
         payload: drivePayload,
@@ -303,6 +351,10 @@ describe('side-effects-verify cross-check (host copy)', () => {
       account_email: 'dan@danshapiro.com',
       input_id: 'in-1',
       route_key: 'route-1',
+      response_input_id: 'in-1',
+      response_route_key: 'route-1',
+      response_service: 'gmail',
+      response_method: 'users.drafts.create',
       operation: 'gmail users.drafts.create',
       occurred_at: '2026-05-29T00:00:00.000Z',
     };

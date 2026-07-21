@@ -660,6 +660,7 @@ function startGwsBoundary(signWith: 'ephemeral' | 'forged' | 'unsigned' = 'ephem
           headers['X-GWS-Route-Key'] = body.route_key ?? '';
           headers['X-GWS-Service'] = service;
           headers['X-GWS-Method'] = method;
+          headers['X-GWS-Occurred-At'] = occurredAt;
         }
       }
       return new Response(out, { headers });
@@ -671,8 +672,27 @@ function startGwsBoundary(signWith: 'ephemeral' | 'forged' | 'unsigned' = 'ephem
     publicKeyB64,
     audits,
     async runShim(args, env) {
+      const shimEnv = { ...env };
+      // This test harness has no host process. Mirror the poll-loop fixture into
+      // the production shim's host-correlation shape; production mounts this
+      // file from a host-only directory and never trusts active-input.json.
+      const activeInput = shimEnv.NANOCLAW_ACTIVE_INPUT_FILE;
+      if (activeInput && !shimEnv.NANOCLAW_HOST_CORRELATION_FILE) {
+        const parsed = JSON.parse(fs.readFileSync(activeInput, 'utf8')) as {
+          inputId: string;
+          routeKey: string;
+          updatedAt: string;
+        };
+        const hostCorrelation = `${activeInput}.host-correlation`;
+        fs.writeFileSync(
+          hostCorrelation,
+          JSON.stringify({ inputId: parsed.inputId, routeKey: parsed.routeKey, receivedAt: parsed.updatedAt }),
+        );
+        shimEnv.NANOCLAW_HOST_CORRELATION_FILE = hostCorrelation;
+        delete shimEnv.NANOCLAW_ACTIVE_INPUT_FILE;
+      }
       const proc = Bun.spawn(['sh', SHIM_PATH, ...args], {
-        env: { ...process.env, GWS_PROXY_URL: `http://127.0.0.1:${server.port}`, ...env },
+        env: { ...process.env, GWS_PROXY_URL: `http://127.0.0.1:${server.port}`, ...shimEnv },
         stdout: 'pipe',
         stderr: 'pipe',
       });

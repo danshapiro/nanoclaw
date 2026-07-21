@@ -28,6 +28,7 @@ import {
   parseSqliteUtc,
   recoverInterruptedTurn,
   resetStuckProcessingRows,
+  writeHostInterruptedRecovery,
 } from './host-sweep.js';
 import { readSpawnSkillGeneration, skillGenerationPath, writeSpawnSkillGeneration } from './session-manager.js';
 import type { Session } from './types.js';
@@ -712,7 +713,7 @@ describe('host sweep wake decision excludes recovery-owned rows', () => {
  *
  * These tests exercise `discoverGwsCrashWindowDraftsScoped` (the exact scope
  * derivation + discovery call that `recoverAfterKill` runs) against a real
- * session dir, a real `.active-input.json`, real processing claims, and a global
+ * session dir, real host-owned inbound correlation, real processing claims, and a global
  * audit store holding both a MATCHING and a NON-MATCHING entry.
  */
 describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)', () => {
@@ -725,14 +726,22 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   });
 
-  function setupSession(): { sessionPath: string; outPath: string } {
+  function setupSession(): { sessionPath: string; inPath: string; outPath: string } {
     const sessionPath = path.join(tmpRoot, 'sess');
     fs.mkdirSync(sessionPath, { recursive: true });
     const outPath = path.join(sessionPath, 'outbound.db');
+    const inPath = path.join(sessionPath, 'inbound.db');
+    const inbound = new Database(inPath);
+    inbound.exec(`CREATE TABLE messages_in (
+      id TEXT PRIMARY KEY, status TEXT DEFAULT 'pending', tries INTEGER DEFAULT 0,
+      process_after TEXT, timestamp TEXT, content TEXT,
+      host_input_id TEXT, host_route_key TEXT, host_received_at TEXT
+    )`);
+    inbound.close();
     const out = new Database(outPath);
     out.exec(OUTBOUND_SCHEMA);
     out.close();
-    return { sessionPath, outPath };
+    return { sessionPath, inPath, outPath };
   }
 
   function writeAuditStore(p: string, entries: object[]): void {
@@ -768,7 +777,7 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
   }
 
   it('imports ONLY this turn’s route/window draft, excluding other-session/route entries from the shared global store', () => {
-    const { sessionPath, outPath } = setupSession();
+    const { sessionPath, inPath, outPath } = setupSession();
     const auditStore = path.join(tmpRoot, 'gws-audit.jsonl');
 
     const thisRoute = 'opencode|discord|chan-1|dm:mg-1';
@@ -777,10 +786,17 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
     const key = generateKeyPairSync('ed25519');
     const gwsPublicKey = key.publicKey.export({ format: 'pem', type: 'spki' }).toString();
 
-    // The poll loop's active-input correlation file: this turn's route/input.
+    const inbound = new Database(inPath);
+    inbound
+      .prepare(
+        'INSERT INTO messages_in (id, timestamp, content, host_input_id, host_route_key, host_received_at) VALUES (?, ?, ?, ?, ?, ?)',
+      )
+      .run('m-this', turnStart, '{"text":"create the draft"}', 'in-this', thisRoute, turnStart);
+    inbound.close();
+    // Agent-writable legacy correlation is malicious and must be ignored.
     fs.writeFileSync(
       path.join(sessionPath, '.active-input.json'),
-      JSON.stringify({ inputId: 'in-this', routeKey: thisRoute, updatedAt: turnStart }),
+      JSON.stringify({ inputId: 'in-other', routeKey: otherRoute, updatedAt: turnStart }),
     );
 
     // The interrupted turn's processing claim sets the turn-start (notBefore).
@@ -816,9 +832,20 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
     ]);
 
     const writableOutDb = new Database(outPath);
+    const readableInDb = new Database(inPath);
     try {
+      // Agent-writable SQL cannot squat on the root audit id. A conflicting
+      // unauthenticated row must be replaced by the verified root evidence.
+      writableOutDb
+        .prepare(
+          `INSERT INTO side_effect_ledger
+             (id, source, kind, operation, payload_schema_version, evidence_json, validation_json, imported_at)
+           VALUES (?, 'tool', 'tool_completed', 'forged', 1, '{}', '{"authoritative":true}', ?)`,
+        )
+        .run('draft-this', turnStart);
       const r = discoverGwsCrashWindowDraftsScoped({
         sessionDir: sessionPath,
+        inDb: readableInDb,
         outDb: writableOutDb,
         containerStopped: true,
         auditStorePath: auditStore,
@@ -826,21 +853,26 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
       });
       expect(r.discovered).toBe(1);
     } finally {
+      readableInDb.close();
       writableOutDb.close();
     }
 
     const verify = new Database(outPath, { readonly: true });
     const rows = verify
-      .prepare("SELECT id FROM side_effect_ledger WHERE kind = 'gmail_draft_created' ORDER BY id")
-      .all() as Array<{ id: string }>;
+      .prepare(
+        "SELECT id, source, validation_json FROM side_effect_ledger WHERE kind = 'gmail_draft_created' ORDER BY id",
+      )
+      .all() as Array<{ id: string; source: string; validation_json: string }>;
     verify.close();
     // Only the matching draft was imported; the other route's and the stale
     // pre-turn drafts were excluded.
     expect(rows.map((x) => x.id)).toEqual(['draft-this']);
+    expect(rows[0].source).toBe('gws');
+    expect(JSON.parse(rows[0].validation_json).authoritative).toBe(true);
   });
 
-  it('falls back to route + notBefore when .active-input.json has no inputId, still excluding the other route', () => {
-    const { sessionPath, outPath } = setupSession();
+  it('fails closed when the processing claim lacks host-owned route/time correlation', () => {
+    const { sessionPath, inPath, outPath } = setupSession();
     const auditStore = path.join(tmpRoot, 'gws-audit.jsonl');
 
     const thisRoute = 'opencode|discord|chan-1|dm:mg-1';
@@ -848,12 +880,16 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
     const key = generateKeyPairSync('ed25519');
     const gwsPublicKey = key.publicKey.export({ format: 'pem', type: 'spki' }).toString();
 
-    // The kill landed before a single accepted input id was recorded: route is
-    // known (host-authoritative) but inputId is absent.
+    // An agent-controlled correlation file cannot fill missing host columns.
     fs.writeFileSync(
       path.join(sessionPath, '.active-input.json'),
-      JSON.stringify({ routeKey: thisRoute, updatedAt: '2026-05-29T12:00:00.000Z' }),
+      JSON.stringify({ inputId: 'in-a', routeKey: thisRoute, updatedAt: '2026-05-29T12:00:00.000Z' }),
     );
+    const inbound = new Database(inPath);
+    inbound
+      .prepare('INSERT INTO messages_in (id, timestamp, content) VALUES (?, ?, ?)')
+      .run('m-this', '2026-05-29T12:00:00.000Z', '{"text":"create draft"}');
+    inbound.close();
 
     const out = new Database(outPath);
     out
@@ -877,16 +913,19 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
     ]);
 
     const writableOutDb = new Database(outPath);
+    const readableInDb = new Database(inPath);
     try {
       const r = discoverGwsCrashWindowDraftsScoped({
         sessionDir: sessionPath,
+        inDb: readableInDb,
         outDb: writableOutDb,
         containerStopped: true,
         auditStorePath: auditStore,
         gwsPublicKey,
       });
-      expect(r.discovered).toBe(1);
+      expect(r.discovered).toBe(0);
     } finally {
+      readableInDb.close();
       writableOutDb.close();
     }
 
@@ -895,7 +934,65 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
       id: string;
     }>;
     verify.close();
-    expect(rows.map((x) => x.id)).toEqual(['draft-this']);
+    expect(rows.map((x) => x.id)).toEqual([]);
+  });
+
+  it('persists discovered completed work into durable recovery before reset so retry cannot blindly repeat it', () => {
+    const { sessionPath, inPath, outPath } = setupSession();
+    const auditStore = path.join(tmpRoot, 'gws-audit.jsonl');
+    const routeKey = 'opencode|discord|chan-1|dm:mg-1';
+    const turnStart = '2026-05-29T12:00:00.000Z';
+    const key = generateKeyPairSync('ed25519');
+    const gwsPublicKey = key.publicKey.export({ format: 'pem', type: 'spki' }).toString();
+    writeAuditStore(auditStore, [
+      signedAuditEntry(key, {
+        auditId: 'completed-before-kill',
+        inputId: 'in-this',
+        routeKey,
+        occurredAt: '2026-05-29T12:00:05.000Z',
+      }),
+    ]);
+
+    const inDb = new Database(inPath);
+    inDb
+      .prepare(
+        'INSERT INTO messages_in (id, timestamp, content, host_input_id, host_route_key, host_received_at) VALUES (?, ?, ?, ?, ?, ?)',
+      )
+      .run('m-this', turnStart, '{"text":"create the draft"}', 'in-this', routeKey, turnStart);
+    const outDb = new Database(outPath);
+    outDb
+      .prepare('INSERT INTO processing_ack (message_id, status, status_changed) VALUES (?, ?, ?)')
+      .run('m-this', 'processing', '2026-05-29 12:00:00');
+
+    expect(
+      discoverGwsCrashWindowDraftsScoped({
+        sessionDir: sessionPath,
+        inDb,
+        outDb,
+        containerStopped: true,
+        auditStorePath: auditStore,
+        gwsPublicKey,
+      }).discovered,
+    ).toBe(1);
+    expect(writeHostInterruptedRecovery({ inDb, outDb, reason: 'claim-stuck', gwsPublicKey })).toMatch(/^rec-host-/);
+    const state = outDb.prepare("SELECT value FROM session_state WHERE key LIKE 'recovery:opencode:%'").get() as {
+      value: string;
+    };
+    const [entry] = JSON.parse(state.value) as Array<{ sideEffects: Array<{ id: string; kind: string }> }>;
+    expect(entry.sideEffects).toEqual([
+      expect.objectContaining({ id: 'completed-before-kill', kind: 'gmail_draft_created' }),
+    ]);
+
+    resetStuckProcessingRows(inDb, outDb, fakeSession(), 'claim-stuck', outDb);
+    expect(getProcessingClaims(outDb)).toEqual([]);
+    expect(inDb.prepare('SELECT tries FROM messages_in WHERE id = ?').get('m-this')).toEqual({ tries: 1 });
+    expect(outDb.prepare("SELECT COUNT(*) AS n FROM session_state WHERE key LIKE 'recovery:opencode:%'").get()).toEqual(
+      {
+        n: 1,
+      },
+    );
+    inDb.close();
+    outDb.close();
   });
 });
 

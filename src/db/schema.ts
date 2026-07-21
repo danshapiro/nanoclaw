@@ -305,6 +305,12 @@ CREATE TABLE IF NOT EXISTS messages_in (
   -- failure mode of a missing value is a missed merge, never a cross-route leak.
   messaging_group_id TEXT,
   is_group       INTEGER,
+  -- Host-authenticated correlation. These values are written only by the host
+  -- and are also mirrored into a separately-mounted read-only correlation
+  -- directory for tools that cannot safely trust the agent-writable workspace.
+  host_input_id  TEXT,
+  host_route_key TEXT,
+  host_received_at TEXT,
   content        TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_in_series ON messages_in(series_id);
@@ -393,6 +399,7 @@ CREATE TABLE IF NOT EXISTS side_effect_ledger (
   kind            TEXT NOT NULL,
   operation       TEXT,
   payload_schema_version INTEGER NOT NULL DEFAULT 1,
+  profile         TEXT,
   account_label   TEXT,
   account_email   TEXT,
   input_id        TEXT,
