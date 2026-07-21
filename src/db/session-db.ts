@@ -381,6 +381,13 @@ export interface ImportSideEffectsResult {
   validated: number;
 }
 
+export interface StrictGwsSideEffectScope {
+  inputId: string;
+  routeKey: string;
+  notBefore: string;
+  notAfter: string;
+}
+
 interface StoredSideEffectRow {
   id: string;
   source: string;
@@ -395,6 +402,7 @@ interface StoredSideEffectRow {
   signed_payload: string | null;
   signature: string | null;
   evidence_json: string;
+  replay_policy: string | null;
   occurred_at: string | null;
 }
 
@@ -450,8 +458,98 @@ function storedRowMatches(row: StoredSideEffectRow, validated: ValidatedSideEffe
     row.route_key === validated.routeKey &&
     row.signed_payload === validated.signedPayload &&
     row.signature === validated.signature &&
+    row.replay_policy === validated.replayPolicy &&
     row.occurred_at === validated.occurredAt
   );
+}
+
+function isGwsShapedRecord(raw: RawSideEffectRecord): boolean {
+  if (!raw || typeof raw !== 'object') return false;
+  return (
+    (raw as RawSideEffectRecord & { source?: unknown }).source === 'gws' ||
+    raw.kind === 'gmail_draft_created' ||
+    raw.kind === 'gws_mutation_completed' ||
+    raw.payload !== undefined ||
+    raw.signature !== undefined
+  );
+}
+
+function requireExactAuthoritativeGwsEffect(
+  validated: ValidatedSideEffect | null,
+  scope: StrictGwsSideEffectScope,
+  description: string,
+): asserts validated is ValidatedSideEffect {
+  if (!validated) throw new Error(`${description} is unresolved: unclassifiable or missing its outer audit id`);
+  if (!validated.validation.authoritative) {
+    throw new Error(`${description} is unresolved: nonauthoritative (${validated.validation.reason})`);
+  }
+  if (validated.inputId !== scope.inputId || validated.routeKey !== scope.routeKey) {
+    throw new Error(`${description} is outside the exact operator scope`);
+  }
+  const occurredMs = validated.occurredAt ? Date.parse(validated.occurredAt) : NaN;
+  const notBeforeMs = Date.parse(scope.notBefore);
+  const notAfterMs = Date.parse(scope.notAfter);
+  if (
+    !Number.isFinite(occurredMs) ||
+    !Number.isFinite(notBeforeMs) ||
+    !Number.isFinite(notAfterMs) ||
+    notAfterMs < notBeforeMs ||
+    occurredMs < notBeforeMs ||
+    occurredMs > notAfterMs
+  ) {
+    throw new Error(`${description} is outside the exact operator time window`);
+  }
+}
+
+function requireExactRawGwsScope(raw: RawSideEffectRecord, scope: StrictGwsSideEffectScope, description: string): void {
+  if (typeof raw.audit_id !== 'string' || !raw.audit_id) {
+    throw new Error(`${description} is unresolved: missing its outer audit id`);
+  }
+  if (raw.input_id !== scope.inputId || raw.route_key !== scope.routeKey) {
+    throw new Error(`${description} is outside the exact operator scope`);
+  }
+  const occurredMs = typeof raw.occurred_at === 'string' ? Date.parse(raw.occurred_at) : NaN;
+  const notBeforeMs = Date.parse(scope.notBefore);
+  const notAfterMs = Date.parse(scope.notAfter);
+  if (
+    !Number.isFinite(occurredMs) ||
+    !Number.isFinite(notBeforeMs) ||
+    !Number.isFinite(notAfterMs) ||
+    notAfterMs < notBeforeMs ||
+    occurredMs < notBeforeMs ||
+    occurredMs > notAfterMs
+  ) {
+    throw new Error(`${description} is outside the exact operator time window`);
+  }
+}
+
+/**
+ * Fail closed unless every GWS-shaped stored row re-verifies from its signed
+ * payload bytes and independently stored bindings for this exact operator.
+ * `validation_json` is intentionally not selected or trusted: outbound.db is
+ * mounted writable in the operator container.
+ */
+export function assertHostGwsSideEffectsReconciled(
+  outDb: Database.Database,
+  opts: StrictGwsSideEffectScope & { gwsPublicKey?: string },
+): number {
+  const rows = outDb
+    .prepare(
+      `SELECT * FROM side_effect_ledger
+        WHERE source = 'gws'
+           OR kind IN ('gmail_draft_created', 'gws_mutation_completed')
+           OR signed_payload IS NOT NULL
+           OR signature IS NOT NULL`,
+    )
+    .all() as StoredSideEffectRow[];
+  for (const row of rows) {
+    const validated = revalidateStoredSideEffect(row, { gwsPublicKey: opts.gwsPublicKey });
+    requireExactAuthoritativeGwsEffect(validated, opts, `stored operator GWS evidence ${row.id}`);
+    if (!storedRowMatches(row, validated)) {
+      throw new Error(`stored operator GWS evidence ${row.id} has tampered duplicated bindings`);
+    }
+  }
+  return rows.length;
 }
 
 export interface HostAuthoritativeSideEffect {
@@ -505,7 +603,9 @@ export function getHostAuthoritativeSideEffects(
 // `classifyAndSanitize` with the configured PUBLIC verify key, so a signed
 // `gmail_draft_created` becomes authoritative ONLY when the proxy's Ed25519
 // signature verifies; without a key (or for forged/tampered entries) it stays an
-// unvalidated hint. Recovery reads `validation_json.authoritative`.
+// unvalidated hint. Host recovery re-verifies the stored immutable payload and
+// signature bytes plus every duplicated binding; it never trusts validation
+// metadata written by the container.
 
 /**
  * Idempotently import the staged side-effect JSONL for a session into the
@@ -517,8 +617,8 @@ export function getHostAuthoritativeSideEffects(
  * entries require artifact existence + size under an allowed root; gmail
  * entries require a valid Ed25519 signature verified with the PUBLIC key (no
  * key, or forged/tampered ⇒ unvalidated hint). All rows — validated or not — are
- * stored idempotently keyed by id; recovery consults `validation_json.
- * authoritative` to decide what it may rely on.
+ * stored idempotently keyed by id. Recovery re-verifies stored bytes rather
+ * than trusting persisted validation metadata.
  */
 export function importHostSideEffects(opts: {
   sessionDir: string;
@@ -527,6 +627,8 @@ export function importHostSideEffects(opts: {
   gwsPublicKey?: string;
   /** Operator finalization requires a complete JSONL tail before releasing authority. */
   requireCompleteLedger?: boolean;
+  /** Operator-only fail-closed accounting for every GWS-shaped ledger row. */
+  strictGwsScope?: StrictGwsSideEffectScope;
 }): ImportSideEffectsResult {
   if (opts.containerStopped !== true) {
     throw new Error(
@@ -538,7 +640,10 @@ export function importHostSideEffects(opts: {
   const ledgerPath = path.join(opts.sessionDir, 'side-effects.jsonl');
   const outPath = path.join(opts.sessionDir, 'outbound.db');
   const result: ImportSideEffectsResult = { imported: 0, skipped: 0, validated: 0 };
-  if (!fs.existsSync(ledgerPath) || !fs.existsSync(outPath)) return result;
+  if (!fs.existsSync(ledgerPath) || !fs.existsSync(outPath)) {
+    if (opts.strictGwsScope) throw new Error('operator GWS ledger or outbound database is missing or inaccessible');
+    return result;
+  }
 
   const text = fs.readFileSync(ledgerPath, 'utf8');
   if (opts.requireCompleteLedger) {
@@ -584,6 +689,17 @@ export function importHostSideEffects(opts: {
           gwsPublicKey: opts.gwsPublicKey,
           statSize: (p: string) => (fs.existsSync(p) ? fs.statSync(p).size : null),
         });
+        const strictGwsScope = opts.strictGwsScope && isGwsShapedRecord(raw) ? opts.strictGwsScope : null;
+        if (strictGwsScope) {
+          requireExactRawGwsScope(
+            raw,
+            strictGwsScope,
+            `operator GWS ledger record ${typeof raw.audit_id === 'string' ? raw.audit_id : '(missing outer audit id)'}`,
+          );
+          if (!validated) {
+            throw new Error('operator GWS ledger record is unresolved: unclassifiable after exact-scope validation');
+          }
+        }
         if (!validated) {
           result.skipped++;
           continue;
@@ -591,17 +707,24 @@ export function importHostSideEffects(opts: {
         const existing = existingStmt.get(validated.id) as StoredSideEffectRow | undefined;
         if (existing) {
           if (!validated.validation.authoritative) {
-            result.skipped++;
-            continue;
-          }
-          const prior = revalidateStoredSideEffect(existing, opts);
-          if (
-            prior?.validation.authoritative &&
-            storedRowMatches(existing, prior) &&
-            storedRowMatches(existing, validated)
-          ) {
-            result.skipped++;
-            continue;
+            if (!strictGwsScope) {
+              result.skipped++;
+              continue;
+            }
+            // Persist the exact-scope diagnostic so root-audit discovery may
+            // replace it by id. Finalization still fails unless the resulting
+            // stored row re-verifies as authoritative.
+          } else {
+            const prior = revalidateStoredSideEffect(existing, opts);
+            if (
+              prior?.validation.authoritative &&
+              storedRowMatches(existing, prior) &&
+              storedRowMatches(existing, validated)
+            ) {
+              if (strictGwsScope) result.validated++;
+              else result.skipped++;
+              continue;
+            }
           }
         }
         persistStmt.run({

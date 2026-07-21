@@ -3,6 +3,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import {
+  assertHostGwsSideEffectsReconciled,
   discoverGwsCrashWindowDrafts,
   ensureSchema,
   importHostSideEffects,
@@ -194,11 +195,18 @@ export function finalizeOperatorGwsSession(opts: {
     throw new Error('operator GWS session cannot be finalized until the container is confirmed stopped');
   }
   const stoppedAt = canonicalTimestamp(opts.stoppedAt ?? new Date().toISOString(), 'stoppedAt');
+  const strictGwsScope = {
+    inputId: opts.operator.inputId,
+    routeKey: opts.operator.routeKey,
+    notBefore: opts.operator.acceptedAt,
+    notAfter: stoppedAt,
+  };
   const result = importHostSideEffects({
     sessionDir: opts.operator.root,
     containerStopped: true,
     gwsPublicKey: opts.gwsPublicKey,
     requireCompleteLedger: true,
+    strictGwsScope,
   });
   const auditResult = discoverGwsCrashWindowDrafts({
     sessionDir: opts.operator.root,
@@ -215,20 +223,13 @@ export function finalizeOperatorGwsSession(opts: {
   });
 
   // Both the container ledger and root audit have now flowed through Task 3's
-  // single verifier/import path. Any GWS row still non-authoritative is
-  // unresolved evidence, so retain the lease and exact correlation for retry.
+  // single verifier/import path. Re-verify every GWS-shaped stored row from its
+  // immutable signed bytes and duplicated bindings. The operator mounts this
+  // DB writable, so validation_json and all container-written columns are
+  // untrusted until this host-only check succeeds.
   const outDb = openOutboundDb(opts.operator.outboundDbPath);
   try {
-    const rows = outDb
-      .prepare(
-        `SELECT id, validation_json FROM side_effect_ledger
-          WHERE source = 'gws' AND input_id = ? AND route_key = ?`,
-      )
-      .all(opts.operator.inputId, opts.operator.routeKey) as Array<{ id: string; validation_json: string }>;
-    for (const row of rows) {
-      const authoritative = (JSON.parse(row.validation_json) as { authoritative?: unknown }).authoritative === true;
-      if (!authoritative) throw new Error(`operator GWS evidence remains unresolved (${row.id})`);
-    }
+    assertHostGwsSideEffectsReconciled(outDb, { ...strictGwsScope, gwsPublicKey: opts.gwsPublicKey });
   } finally {
     outDb.close();
   }

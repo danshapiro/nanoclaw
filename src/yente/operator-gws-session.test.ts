@@ -355,4 +355,154 @@ describe('operator-owned GWS session lifecycle', () => {
       db.close();
     }
   });
+
+  it.each([
+    ['forged preseed', 'forged'],
+    ['tampered duplicated binding', 'tampered'],
+    ['valid but out-of-scope preseed', 'out-of-scope'],
+  ])('re-verifies stored GWS evidence instead of trusting %s validation metadata', (_label, mode) => {
+    const base = tempRoot(`nanoclaw-operator-db-${mode}`);
+    const operator = startOperatorGwsSession({
+      root: path.join(base, 'operator-session'),
+      agentGroupId: 'ag-main',
+      groupFolder: 'main',
+      operatorId: `operator-db-${mode}`,
+      containerUid: process.getuid?.() ?? 0,
+      containerGid: process.getgid?.() ?? 0,
+      acceptedAt: '2026-07-21T18:00:00.000Z',
+      leaseId: `operator-lease-${mode}`,
+    });
+    const auditStorePath = path.join(base, 'gws-audit.jsonl');
+    fs.writeFileSync(auditStorePath, '');
+    const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+    const signed = {
+      schema_version: 2,
+      audit_id: `operator-db-${mode}-write`,
+      profile: 'nanoclaw',
+      account_label: 'glowforge',
+      account_email: 'dan@glowforge.com',
+      input_id: mode === 'out-of-scope' ? 'operator:different-operator' : operator.inputId,
+      route_key: mode === 'out-of-scope' ? 'operator|ag-other|different-operator' : operator.routeKey,
+      service: 'drive',
+      method: 'files.create',
+      request_class: 'api',
+      api_effect: true,
+      operation_succeeded: true,
+      occurred_at: '2026-07-21T18:00:05.000Z',
+      result_digest: `operator-db-${mode}-result`,
+    };
+    const payload = canonicalSideEffectPayload(signed);
+    const signature =
+      mode === 'forged'
+        ? 'forged-but-validation-json-claims-authoritative'
+        : crypto.sign(null, Buffer.from(payload), privateKey).toString('base64');
+    const db = new Database(operator.outboundDbPath);
+    try {
+      db.prepare(
+        `INSERT INTO side_effect_ledger
+           (id, source, kind, operation, payload_schema_version, profile, account_label, account_email,
+            input_id, route_key, signed_payload, signature, evidence_json, validation_json, replay_policy,
+            occurred_at, imported_at)
+         VALUES (?, 'gws', 'gws_mutation_completed', ?, 2, ?, ?, ?, ?, ?, ?, ?, '{}', ?,
+                 'no_duplicate_operation', ?, ?)`,
+      ).run(
+        signed.audit_id,
+        `${signed.service} ${signed.method}`,
+        signed.profile,
+        mode === 'tampered' ? 'personal' : signed.account_label,
+        mode === 'tampered' ? 'dan@danshapiro.com' : signed.account_email,
+        signed.input_id,
+        signed.route_key,
+        payload,
+        signature,
+        JSON.stringify({ authoritative: true, reason: 'container-controlled-claim' }),
+        signed.occurred_at,
+        signed.occurred_at,
+      );
+    } finally {
+      db.close();
+    }
+
+    expect(() =>
+      finalizeOperatorGwsSession({
+        operator,
+        containerStopped: true,
+        auditStorePath,
+        gwsPublicKey: publicKey.export({ format: 'pem', type: 'spki' }).toString(),
+        stoppedAt: '2026-07-21T18:00:10.000Z',
+      }),
+    ).toThrow(/unresolved|scope|binding|authoritative/i);
+    expect(fs.existsSync(operator.correlationPath)).toBe(true);
+    expect(fs.existsSync(operator.activeLeasePath)).toBe(true);
+    expect(fs.existsSync(operator.reconciliationReceiptPath)).toBe(false);
+  });
+
+  it('retains authority for signed completed-audit-failed evidence missing its outer audit id', () => {
+    const base = tempRoot('nanoclaw-operator-missing-outer-id');
+    const operator = startOperatorGwsSession({
+      root: path.join(base, 'operator-session'),
+      agentGroupId: 'ag-main',
+      groupFolder: 'main',
+      operatorId: 'operator-missing-outer-id',
+      containerUid: process.getuid?.() ?? 0,
+      containerGid: process.getgid?.() ?? 0,
+      acceptedAt: '2026-07-21T19:00:00.000Z',
+      leaseId: 'operator-lease-missing-outer-id',
+    });
+    const auditStorePath = path.join(base, 'gws-audit.jsonl');
+    fs.writeFileSync(auditStorePath, '');
+    const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+    const signed = {
+      schema_version: 2,
+      audit_id: 'signed-id-with-missing-outer-binding',
+      profile: 'nanoclaw',
+      account_label: 'personal',
+      account_email: 'dan@danshapiro.com',
+      input_id: operator.inputId,
+      route_key: operator.routeKey,
+      service: 'gmail',
+      method: 'users.drafts.create',
+      request_class: 'api',
+      api_effect: true,
+      operation_succeeded: true,
+      occurred_at: '2026-07-21T19:00:05.000Z',
+      result_digest: 'completed-but-global-audit-failed',
+    };
+    const payload = canonicalSideEffectPayload(signed);
+    fs.writeFileSync(
+      operator.ledgerPath,
+      `${JSON.stringify({
+        kind: 'gmail_draft_created',
+        payload_schema_version: 2,
+        profile: signed.profile,
+        account_label: signed.account_label,
+        account_email: signed.account_email,
+        input_id: signed.input_id,
+        route_key: signed.route_key,
+        operation: `${signed.service} ${signed.method}`,
+        occurred_at: signed.occurred_at,
+        response_input_id: signed.input_id,
+        response_route_key: signed.route_key,
+        response_service: signed.service,
+        response_method: signed.method,
+        signature: crypto.sign(null, Buffer.from(payload), privateKey).toString('base64'),
+        payload,
+        outcome: 'completed_audit_failed',
+        evidence: {},
+      })}\n`,
+    );
+
+    expect(() =>
+      finalizeOperatorGwsSession({
+        operator,
+        containerStopped: true,
+        auditStorePath,
+        gwsPublicKey: publicKey.export({ format: 'pem', type: 'spki' }).toString(),
+        stoppedAt: '2026-07-21T19:00:10.000Z',
+      }),
+    ).toThrow(/unresolved|missing|audit/i);
+    expect(fs.existsSync(operator.correlationPath)).toBe(true);
+    expect(fs.existsSync(operator.activeLeasePath)).toBe(true);
+    expect(fs.existsSync(operator.reconciliationReceiptPath)).toBe(false);
+  });
 });
