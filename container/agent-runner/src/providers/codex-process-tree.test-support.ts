@@ -48,12 +48,12 @@ export async function spawnCodexTestProcessTree(mode: CodexTestProcessTreeMode):
       : mode === 'graceful-unreaped'
         ? ['process.stdin.resume();', "process.stdin.on('end', () => process.exit(0));"]
         : mode === 'stubborn'
-        ? [
-            'process.stdin.resume();',
-            "process.stdin.on('end', () => {});",
-            "process.on('SIGTERM', () => process.exit(0));",
-          ]
-        : ['process.stdin.resume();', "process.stdin.on('end', () => {});", "process.on('SIGTERM', () => {});"];
+          ? [
+              'process.stdin.resume();',
+              "process.stdin.on('end', () => {});",
+              "process.on('SIGTERM', () => process.exit(0));",
+            ]
+          : ['process.stdin.resume();', "process.stdin.on('end', () => {});", "process.on('SIGTERM', () => {});"];
   const parentSource = [
     "const { spawn } = require('child_process');",
     `const descendant = spawn(process.execPath, ['-e', ${JSON.stringify(descendantSource)}], { stdio: 'ignore' });`,
