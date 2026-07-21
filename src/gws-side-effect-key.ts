@@ -5,9 +5,13 @@ import path from 'path';
 function validatePublicKey(value: string): string {
   const trimmed = value.trim();
   if (!trimmed) throw new Error('GWS side-effect public verification key is empty');
+  if (/-----BEGIN (?:ENCRYPTED )?PRIVATE KEY-----/.test(trimmed)) {
+    throw new Error('GWS side-effect public verification key must not contain private key material');
+  }
   let key;
   try {
     if (trimmed.includes('BEGIN')) {
+      if (!trimmed.startsWith('-----BEGIN PUBLIC KEY-----')) throw new Error('expected PUBLIC KEY PEM');
       key = createPublicKey({ key: trimmed, format: 'pem' });
     } else {
       const raw = Buffer.from(trimmed, 'base64');
@@ -21,7 +25,14 @@ function validatePublicKey(value: string): string {
   if (key.asymmetricKeyType !== 'ed25519') {
     throw new Error('GWS side-effect public verification key must be Ed25519');
   }
-  return trimmed;
+  const publicDer = key.export({ format: 'der', type: 'spki' });
+  const ed25519Prefix = Buffer.from('302a300506032b6570032100', 'hex');
+  if (publicDer.length !== 44 || !publicDer.subarray(0, ed25519Prefix.length).equals(ed25519Prefix)) {
+    throw new Error('GWS side-effect public verification key has an unexpected encoding');
+  }
+  // The only value allowed to cross into a container is the normalized raw
+  // public key. Never return caller-supplied PEM bytes.
+  return publicDer.subarray(ed25519Prefix.length).toString('base64');
 }
 
 interface TrustedStat {

@@ -1498,6 +1498,7 @@ describe('side-effect ledger container env', () => {
       expect(readSpawnEnvFile(args).env.get('NANOCLAW_HOST_CORRELATION_FILE')).toBe(
         '/workspace/.host-correlation/current.json',
       );
+      expect(readSpawnEnvFile(args).env.get('NANOCLAW_SESSION_ID')).toBe(harness.session.id);
     } finally {
       harness.close();
     }
@@ -1510,6 +1511,14 @@ describe('side-effect ledger container env', () => {
       const mounts = args.filter((arg) => arg.includes(':/workspace/'));
       expect(mounts.some((arg) => arg.endsWith(':/workspace/inbound.db:ro'))).toBe(true);
       expect(mounts.some((arg) => arg.endsWith(':/workspace/.host-correlation:ro'))).toBe(true);
+      expect(mounts.some((arg) => arg.endsWith(':/workspace/.gws-correlation-ipc'))).toBe(false);
+      expect(
+        mounts.some((arg) =>
+          arg.includes(
+            `/v2-gws-correlation-ipc/ag-1/${harness.session.id}/requests:/workspace/.gws-correlation-ipc/requests`,
+          ),
+        ),
+      ).toBe(true);
     } finally {
       harness.close();
     }
@@ -1654,6 +1663,26 @@ describe('side-effect ledger container env', () => {
       expect(readSpawnEnvFile(args).raw).not.toContain('GWS_SIDE_EFFECT_SIGN_KEY_FILE');
     } finally {
       delete process.env.GWS_SIDE_EFFECT_SIGN_KEY_FILE;
+      harness.close();
+    }
+  });
+
+  it('rejects a private PKCS8 PEM supplied as the verify key before any secret crosses the container boundary', async () => {
+    const harness = await loadContainerRunnerHarness();
+    const savedDirect = process.env.GWS_SIDE_EFFECT_VERIFY_KEY;
+    const savedFile = process.env.GWS_SIDE_EFFECT_VERIFY_KEY_FILE;
+    const privatePem = generateKeyPairSync('ed25519').privateKey.export({ format: 'pem', type: 'pkcs8' }).toString();
+    try {
+      delete process.env.GWS_SIDE_EFFECT_VERIFY_KEY_FILE;
+      process.env.GWS_SIDE_EFFECT_VERIFY_KEY = privatePem;
+      await expect(harness.containerRunner.wakeContainer(harness.session)).rejects.toThrow(/public.*key/i);
+      expect(harness.spawnMock).not.toHaveBeenCalled();
+      expect(harness.envFileSnapshots.map((snapshot) => snapshot.content).join('\n')).not.toContain(privatePem);
+    } finally {
+      if (savedDirect === undefined) delete process.env.GWS_SIDE_EFFECT_VERIFY_KEY;
+      else process.env.GWS_SIDE_EFFECT_VERIFY_KEY = savedDirect;
+      if (savedFile === undefined) delete process.env.GWS_SIDE_EFFECT_VERIFY_KEY_FILE;
+      else process.env.GWS_SIDE_EFFECT_VERIFY_KEY_FILE = savedFile;
       harness.close();
     }
   });

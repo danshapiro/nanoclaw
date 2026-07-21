@@ -34,6 +34,7 @@ import {
 } from './container-runtime.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { resolveGwsSideEffectVerifyKey } from './gws-side-effect-key.js';
+import { clearAcceptedGwsCorrelation, hostGwsCorrelationIpcDir } from './gws-correlation-ipc.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable, isDbInitialized } from './db/connection.js';
 import { getSession } from './db/sessions.js';
@@ -390,6 +391,14 @@ function finalizeContainerProcess(sessionId: string, containerName: string, code
   }
   if (isDbInitialized()) {
     markContainerStopped(sessionId);
+    const session = getSession(sessionId);
+    if (session) {
+      try {
+        clearAcceptedGwsCorrelation(session.agent_group_id, session.id);
+      } catch (err) {
+        log.error('Failed to clear host GWS correlation after container exit', { sessionId, err });
+      }
+    }
   } else {
     log.warn('Container exited after DB shutdown; skipped session stopped marker', { sessionId, containerName });
   }
@@ -905,6 +914,18 @@ function buildMounts(
       containerPath: '/workspace/.host-correlation',
       readonly: true,
     });
+    const correlationIpcDir = hostGwsCorrelationIpcDir(agentGroup.id, session.id);
+    const correlationRequestDir = path.join(correlationIpcDir, 'requests');
+    fs.mkdirSync(correlationRequestDir, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(path.join(correlationIpcDir, 'errors'), { recursive: true, mode: 0o700 });
+    mounts.push({
+      // Expose only the request inbox. The parent and rejected-request
+      // directory stay host-only, so an agent cannot replace them with
+      // symlinks that redirect host filesystem operations.
+      hostPath: correlationRequestDir,
+      containerPath: '/workspace/.gws-correlation-ipc/requests',
+      readonly: false,
+    });
 
     // Agent group folder at /workspace/agent (RW for working files + CLAUDE.local.md)
     mounts.push({ hostPath: groupDir, containerPath: '/workspace/agent', readonly: false });
@@ -1271,14 +1292,12 @@ async function buildContainerArgs(
   args.push('-e', `TZ=${TIMEZONE}`);
   args.push('-e', `PATH=${AGENT_CONTAINER_PATH}`);
 
-  // Side-effect ledger: the static staging path the GWS shim and summarize-dnd
-  // append validated-side-effect evidence to. Per-input correlation is NOT an
-  // env var (a long-lived child can't see follow-up updates); it is the
-  // /workspace/.active-input.json file the poll loop writes on each
-  // input-accepted. We only need /workspace writable by the poll loop and
-  // readable by tools, which the workspace mount already provides.
+  // Side-effect ledger plus the host-owned accepted-input correlation pointer.
+  // The pointer is updated through host IPC and observed through a read-only
+  // directory bind, so long-lived containers see atomic follow-up changes.
   args.push('-e', 'NANOCLAW_SIDE_EFFECT_LEDGER=/workspace/side-effects.jsonl');
   args.push('-e', 'NANOCLAW_HOST_CORRELATION_FILE=/workspace/.host-correlation/current.json');
+  args.push('-e', `NANOCLAW_SESSION_ID=${sessionId}`);
   args.push('-e', `NANOCLAW_AGENT_GROUP_ID=${agentGroup.id}`);
   args.push('-e', `NANOCLAW_AGENT_GROUP_FOLDER=${agentGroup.folder}`);
 

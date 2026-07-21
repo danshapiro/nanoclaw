@@ -31,6 +31,10 @@ export interface MessageInRow {
   host_input_id: string | null;
   host_route_key: string | null;
   host_received_at: string | null;
+  host_accepted_input_id: string | null;
+  host_accepted_route_key: string | null;
+  host_accepted_at: string | null;
+  host_acceptance_ended_at: string | null;
   content: string;
 }
 

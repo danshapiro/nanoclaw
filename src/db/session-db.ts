@@ -672,9 +672,18 @@ export function discoverGwsCrashWindowDrafts(opts: {
     );
   }
   const result: DiscoverCrashWindowResult = { discovered: 0 };
-  // The audit store is global. Never inspect it without a host-authenticated
-  // route and lower time bound for this exact interrupted turn.
-  if (!opts.routeKey || !opts.notBefore || !Number.isFinite(Date.parse(opts.notBefore))) return result;
+  // The audit store is global. Never inspect it without an exact host-accepted
+  // input, route, and closed time interval for this interrupted turn.
+  const notBeforeMs = opts.notBefore ? Date.parse(opts.notBefore) : NaN;
+  const notAfterMs = opts.notAfter ? Date.parse(opts.notAfter) : NaN;
+  if (
+    !opts.inputId ||
+    !opts.routeKey ||
+    !Number.isFinite(notBeforeMs) ||
+    !Number.isFinite(notAfterMs) ||
+    notAfterMs < notBeforeMs
+  )
+    return result;
   // Gating: no audit store configured ⇒ discovery inactive.
   if (!opts.auditStorePath || !fs.existsSync(opts.auditStorePath)) return result;
   const outPath = path.join(opts.sessionDir, 'outbound.db');
@@ -717,10 +726,10 @@ export function discoverGwsCrashWindowDrafts(opts: {
       { gwsPublicKey: opts.gwsPublicKey },
     );
     if (!validated?.validation.authoritative) continue;
-    if (opts.inputId && validated.inputId !== opts.inputId) continue;
+    if (validated.inputId !== opts.inputId) continue;
     if (validated.routeKey !== opts.routeKey) continue;
-    if (!validated.occurredAt || validated.occurredAt < opts.notBefore) continue;
-    if (opts.notAfter && validated.occurredAt && validated.occurredAt > opts.notAfter) continue;
+    const occurredMs = validated.occurredAt ? Date.parse(validated.occurredAt) : NaN;
+    if (!Number.isFinite(occurredMs) || occurredMs < notBeforeMs || occurredMs > notAfterMs) continue;
     matches.push({ entry: e, validated });
   }
   if (matches.length === 0) return result;
@@ -957,5 +966,17 @@ export function migrateMessagesInTable(db: Database.Database): void {
   }
   if (!cols.has('host_received_at')) {
     db.prepare('ALTER TABLE messages_in ADD COLUMN host_received_at TEXT').run();
+  }
+  if (!cols.has('host_accepted_input_id')) {
+    db.prepare('ALTER TABLE messages_in ADD COLUMN host_accepted_input_id TEXT').run();
+  }
+  if (!cols.has('host_accepted_route_key')) {
+    db.prepare('ALTER TABLE messages_in ADD COLUMN host_accepted_route_key TEXT').run();
+  }
+  if (!cols.has('host_accepted_at')) {
+    db.prepare('ALTER TABLE messages_in ADD COLUMN host_accepted_at TEXT').run();
+  }
+  if (!cols.has('host_acceptance_ended_at')) {
+    db.prepare('ALTER TABLE messages_in ADD COLUMN host_acceptance_ended_at TEXT').run();
   }
 }

@@ -104,37 +104,6 @@ function hostRouteKey(
   return `${providerName}|${channelType ?? ''}|${platformId ?? ''}|${threadKey}`;
 }
 
-function writeHostCorrelation(
-  agentGroupId: string,
-  sessionId: string,
-  value: { inputId: string; routeKey: string; receivedAt: string },
-): void {
-  const dir = hostCorrelationDir(agentGroupId, sessionId);
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const dest = hostCorrelationPath(agentGroupId, sessionId);
-  const tmp = `${dest}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(value), { mode: 0o600 });
-  fs.renameSync(tmp, dest);
-}
-
-function mayAdvanceHostCorrelation(agentGroupId: string, sessionId: string): boolean {
-  const current = hostCorrelationPath(agentGroupId, sessionId);
-  const outPath = outboundDbPath(agentGroupId, sessionId);
-  if (!fs.existsSync(current) || !fs.existsSync(outPath)) return true;
-  let db: Database.Database | null = null;
-  try {
-    db = openOutboundDb(agentGroupId, sessionId);
-    const active = db.prepare("SELECT 1 FROM processing_ack WHERE status = 'processing' LIMIT 1").get();
-    return !active;
-  } catch {
-    // Preserve the already-authenticated active correlation when liveness
-    // cannot be proven. This can miss evidence, but cannot cross-attribute it.
-    return false;
-  } finally {
-    db?.close();
-  }
-}
-
 /**
  * Path to the per-session marker recording the managed-skill generation the
  * current container spawned with. Lives beside the heartbeat in the session
@@ -418,10 +387,6 @@ export function writeSessionMessage(
     });
   } finally {
     db.close();
-  }
-
-  if ((message.trigger ?? 1) === 1 && mayAdvanceHostCorrelation(agentGroupId, sessionId)) {
-    writeHostCorrelation(agentGroupId, sessionId, { inputId: hostInputId, routeKey, receivedAt: hostReceivedAt });
   }
 
   updateSession(sessionId, { last_active: new Date().toISOString() });

@@ -64,13 +64,6 @@ esac
 # edit that file and must not be able to forge recovery scope.
 host_correlation_file="${NANOCLAW_HOST_CORRELATION_FILE:-/workspace/.host-correlation/current.json}"
 
-# Staleness ceiling for the active-input correlation. The poll loop refreshes
-# `updatedAt` on every input-accepted; a normal in-turn tool call therefore sees
-# a fresh timestamp. We default to the absolute turn ceiling (6h) so a live turn
-# is NEVER wrongly treated stale, while an ancient file left by a long-dead turn
-# does not mis-correlate a fresh tool call. Env-overridable for tests/operators.
-host_correlation_max_age_ms="${NANOCLAW_HOST_CORRELATION_MAX_AGE_MS:-21600000}"
-
 tmp_headers="$(mktemp)"
 tmp_body="$(mktemp)"
 tmp_arg_plan="$(mktemp)"
@@ -232,21 +225,18 @@ fi
 # header (OneCLI injects it at the gateway).
 request_body="$(
   NODE_NO_WARNINGS=1 NANOCLAW_HOST_CORRELATION_FILE="$host_correlation_file" \
-  GWS_ARG_PLAN_FILE="$tmp_arg_plan" \
-  NANOCLAW_HOST_CORRELATION_MAX_AGE_MS="$host_correlation_max_age_ms" node -e '
+  GWS_ARG_PLAN_FILE="$tmp_arg_plan" node -e '
     const fs = require("fs");
     const plan = JSON.parse(fs.readFileSync(process.env.GWS_ARG_PLAN_FILE, "utf8"));
     const body = { args: plan.proxyArgs };
     if (plan.output) body.output = { mode: "return_file" };
     try {
       const ai = JSON.parse(fs.readFileSync(process.env.NANOCLAW_HOST_CORRELATION_FILE, "utf8"));
-      const maxAge = Number(process.env.NANOCLAW_HOST_CORRELATION_MAX_AGE_MS);
-      const updatedAt = ai && typeof ai.receivedAt === "string" ? Date.parse(ai.receivedAt) : NaN;
-      const stale =
-        !Number.isFinite(updatedAt) || (Number.isFinite(maxAge) && maxAge > 0 && Date.now() - updatedAt > maxAge);
-      if (ai && !stale) {
-        if (typeof ai.inputId === "string") body.input_id = ai.inputId;
-        if (typeof ai.routeKey === "string") body.route_key = ai.routeKey;
+      const acceptedAt = ai && typeof ai.acceptedAt === "string" ? Date.parse(ai.acceptedAt) : NaN;
+      const canonical = (value) => typeof value === "string" && /^[\x21-\x7e]{1,512}$/.test(value);
+      if (ai && ai.schemaVersion === 1 && Number.isFinite(acceptedAt) && canonical(ai.inputId) && canonical(ai.routeKey)) {
+        body.input_id = ai.inputId;
+        body.route_key = ai.routeKey;
       }
     } catch (e) { /* absent/unparseable ⇒ uncorrelated */ }
     process.stdout.write(JSON.stringify(body));
@@ -477,7 +467,6 @@ case "$http_code" in
           NC_RESPONSE_SERVICE="$response_service" NC_RESPONSE_METHOD="$response_method" \
           NC_RESPONSE_OCCURRED_AT="$response_occurred_at" \
           NANOCLAW_HOST_CORRELATION_FILE="$host_correlation_file" \
-          NANOCLAW_HOST_CORRELATION_MAX_AGE_MS="$host_correlation_max_age_ms" \
           node -e '
             const fs = require("fs");
             const args = process.argv.slice(1);
@@ -492,18 +481,15 @@ case "$http_code" in
                 i++;
               }
             }
-            let inputId = null, routeKey = null, receivedAt = null;
+            let inputId = null, routeKey = null, acceptedAt = null;
             try {
               const ai = JSON.parse(fs.readFileSync(process.env.NANOCLAW_HOST_CORRELATION_FILE, "utf8"));
-              const maxAge = Number(process.env.NANOCLAW_HOST_CORRELATION_MAX_AGE_MS);
-              const updatedAt = ai && typeof ai.receivedAt === "string" ? Date.parse(ai.receivedAt) : NaN;
-              const stale =
-                !Number.isFinite(updatedAt) ||
-                (Number.isFinite(maxAge) && maxAge > 0 && Date.now() - updatedAt > maxAge);
-              if (ai && !stale) {
-                if (typeof ai.inputId === "string") inputId = ai.inputId;
-                if (typeof ai.routeKey === "string") routeKey = ai.routeKey;
-                if (typeof ai.receivedAt === "string") receivedAt = ai.receivedAt;
+              const parsedAcceptedAt = ai && typeof ai.acceptedAt === "string" ? Date.parse(ai.acceptedAt) : NaN;
+              const canonical = (value) => typeof value === "string" && /^[\x21-\x7e]{1,512}$/.test(value);
+              if (ai && ai.schemaVersion === 1 && Number.isFinite(parsedAcceptedAt) && canonical(ai.inputId) && canonical(ai.routeKey)) {
+                inputId = ai.inputId;
+                routeKey = ai.routeKey;
+                acceptedAt = ai.acceptedAt;
               }
             } catch (e) { /* uncorrelated diagnostic */ }
             // Best-effort draft id from stdout (e.g. "Draft created: r-987654" or JSON id).
@@ -544,7 +530,7 @@ case "$http_code" in
               account_label: process.env.NC_RESPONSE_ACCOUNT_LABEL || null,
               account_email: process.env.NC_RESPONSE_ACCOUNT_EMAIL || null,
               request_class: process.env.NC_REQUEST_CLASS || null,
-              occurred_at: process.env.NC_RESPONSE_OCCURRED_AT || receivedAt || null,
+              occurred_at: process.env.NC_RESPONSE_OCCURRED_AT || acceptedAt || null,
               input_id: inputId,
               route_key: routeKey,
               operation: invokedService && invokedMethod ? `${invokedService} ${invokedMethod}` : null,

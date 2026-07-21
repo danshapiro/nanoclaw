@@ -44,6 +44,7 @@ import {
   type RoutingContext,
 } from './formatter.js';
 import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
+import { bindHostGwsCorrelation, releaseHostGwsCorrelation } from './gws-correlation.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
@@ -55,7 +56,8 @@ const STOP_IDLE_ACK = 'No active turn is running.';
 
 /**
  * Path to the per-input correlation file. Production uses the static
- * `/workspace/.active-input.json` (what the GWS shim and summarize-dnd read);
+ * `/workspace/.active-input.json` (legacy tools such as summarize-dnd read it;
+ * GWS uses the separate host-owned accepted-input pointer);
  * `NANOCLAW_ACTIVE_INPUT_PATH` overrides it only for tests pointing at a temp
  * dir. The default is unchanged when the env var is unset.
  */
@@ -406,7 +408,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     );
     // Generate a top-level inputId for this wake's prompt. Acceptance is tracked
     // when the provider emits input-accepted for this id.
-    const hostTrigger = triggerRows[triggerRows.length - 1];
+    const acceptedTriggerRows = activeMessages.filter((message) => message.trigger === 1);
+    const hostTrigger = acceptedTriggerRows[acceptedTriggerRows.length - 1];
     const topLevelInputId =
       hostTrigger.host_input_id &&
       hostTrigger.host_route_key === activeRouteKey &&
@@ -728,6 +731,7 @@ async function processQuery(
   // prompt is `accepted` only after the provider emits input-accepted for it,
   // and `resolved` only after a successful result resolves/supersedes it.
   const ledger = new Map<string, InputLedgerEntry>();
+  const boundGwsInputs = new Set<string>();
   ledger.set(ledgerCtx.topLevelInputId, {
     inputId: ledgerCtx.topLevelInputId,
     messageIds: [...initialBatchIds],
@@ -747,9 +751,15 @@ async function processQuery(
   function onInputAccepted(inputId: string): void {
     const entry = ledger.get(inputId);
     if (!entry) return;
+    // This synchronous host handshake blocks the event loop before any later
+    // tool event can run. The host validates the exact inbound batch and only
+    // then atomically publishes a read-only pointer visible to the GWS shim.
+    if (bindHostGwsCorrelation(inputId, ledgerCtx.activeRouteKey, entry.messageIds)) {
+      boundGwsInputs.add(inputId);
+    }
     entry.state = 'accepted';
-    // Stamp the current accepted input for tool-time side-effect correlation.
-    writeActiveInput(ledgerCtx.topLevelInputId, ledgerCtx.activeRouteKey);
+    // Legacy agent-writable correlation remains for non-GWS tools only.
+    writeActiveInput(inputId, ledgerCtx.activeRouteKey);
     // Resuming a prior interrupted turn: mark its recovery entries in_flight for
     // THIS top-level input. They are NOT consumed yet (mere acceptance never
     // resolves recovery — Invariant 140); resolution happens only on success.
@@ -793,6 +803,7 @@ async function processQuery(
       if (!entry || entry.state === 'resolved') continue;
       entry.state = 'resolved';
       idsToComplete.push(...entry.messageIds);
+      if (boundGwsInputs.delete(inputId)) releaseHostGwsCorrelation(inputId);
     }
     // A successful result that resolves the top-level input also resolves the
     // recovery entries this turn resumed (and completes their owned recovery rows).
@@ -878,7 +889,11 @@ async function processQuery(
     if (newMessages.length === 0) return;
 
     const newIds = newMessages.map((m) => m.id);
-    const followupInputId = generateInputId('followup');
+    const followupTrigger = newMessages.filter((message) => message.trigger === 1).at(-1);
+    const followupInputId =
+      followupTrigger?.host_input_id && followupTrigger.host_route_key === ledgerCtx.activeRouteKey
+        ? followupTrigger.host_input_id
+        : generateInputId('followup');
     const outboundVisibleReplyCountBefore = countOutboundVisibleReplyMessages(routing);
     markProcessing(newIds);
 
@@ -1224,6 +1239,21 @@ async function processQuery(
         entry.state = 'returned';
       }
     }
+    for (const inputId of boundGwsInputs) {
+      try {
+        releaseHostGwsCorrelation(inputId);
+      } catch (err) {
+        log(
+          JSON.stringify({
+            severity: 'error',
+            event: 'gws_correlation_release_failed',
+            input_id: inputId,
+            error: err instanceof Error ? err.message : String(err),
+          }),
+        );
+      }
+    }
+    boundGwsInputs.clear();
   }
 
   return { continuation: queryContinuation, clearContinuation: clearContinuationRequested };

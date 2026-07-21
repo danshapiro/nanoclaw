@@ -752,6 +752,7 @@ describe('discoverGwsCrashWindowDrafts (host-only)', () => {
       inputId: 'in-1',
       routeKey: 'opencode|discord|chan-1|dm:mg-1',
       notBefore: '2026-05-28T23:59:59.000Z',
+      notAfter: '2026-05-29T00:00:01.000Z',
       gwsPublicKey: publicKey,
     });
     expect(r1.discovered).toBe(1);
@@ -764,6 +765,7 @@ describe('discoverGwsCrashWindowDrafts (host-only)', () => {
       inputId: 'in-1',
       routeKey: 'opencode|discord|chan-1|dm:mg-1',
       notBefore: '2026-05-28T23:59:59.000Z',
+      notAfter: '2026-05-29T00:00:01.000Z',
       gwsPublicKey: publicKey,
     });
     expect(r2.discovered).toBe(0);
@@ -808,6 +810,10 @@ describe('discoverGwsCrashWindowDrafts (host-only)', () => {
         payload_schema_version: 2,
         ...auditEntry,
         operation: 'gmail users.drafts.create',
+        response_input_id: auditEntry.input_id,
+        response_route_key: auditEntry.route_key,
+        response_service: auditEntry.service,
+        response_method: auditEntry.method,
         evidence: { draft_id: 'r-1' },
       }) + '\n',
     );
@@ -819,6 +825,8 @@ describe('discoverGwsCrashWindowDrafts (host-only)', () => {
       auditStorePath: auditStore,
       inputId: 'in-1',
       routeKey: 'opencode|discord|chan-1|dm:mg-1',
+      notBefore: '2026-05-28T23:59:59.000Z',
+      notAfter: '2026-05-29T00:00:01.000Z',
       gwsPublicKey: publicKey,
     });
     expect(r.discovered).toBe(0);
@@ -844,6 +852,8 @@ describe('discoverGwsCrashWindowDrafts (host-only)', () => {
       auditStorePath: auditStore,
       inputId: 'in-1',
       routeKey: 'opencode|discord|chan-1|dm:mg-1',
+      notBefore: '2026-05-28T23:59:59.000Z',
+      notAfter: '2026-05-29T00:00:01.000Z',
       gwsPublicKey: publicKey,
     });
     expect(result.discovered).toBe(0);

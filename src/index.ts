@@ -16,6 +16,7 @@ import { startHostSweep, stopHostSweep } from './host-sweep.js';
 import { cleanupStaleContainerEnvFiles, drainAllContainers } from './container-runner.js';
 import { routeInbound } from './router.js';
 import { log } from './log.js';
+import { startGwsCorrelationIpcWatcher, stopGwsCorrelationIpcWatcher } from './gws-correlation-ipc.js';
 
 // Response + shutdown registries live in response-registry.ts to break the
 // circular import cycle: src/index.ts imports src/modules/index.js for side
@@ -64,6 +65,7 @@ async function main(): Promise<void> {
   const db = initDb(dbPath);
   runMigrations(db);
   log.info('Central DB ready', { path: dbPath });
+  startGwsCorrelationIpcWatcher();
 
   // 1b. One-time filesystem cutover — idempotent, no-op after first run.
   migrateGroupsToClaudeLocal();
@@ -208,6 +210,7 @@ export async function runShutdown(signal: string, exit: (code: number) => void =
   // 1. Stop pollers first so nothing re-wakes containers during the drain.
   stopDeliveryPolls();
   stopHostSweep();
+  stopGwsCorrelationIpcWatcher();
 
   // 2. Module shutdown callbacks.
   for (const cb of getShutdownCallbacks()) {

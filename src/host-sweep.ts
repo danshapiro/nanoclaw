@@ -625,47 +625,60 @@ export async function recoverInterruptedTurn(opts: {
  * orphan draft-create — never another session's/route's drafts from the shared
  * global audit store.
  *
- * Source: host-only columns on the exact inbound rows named by processing_ack.
- * The agent sees inbound.db through a nested read-only mount, and the legacy
- * agent-writable `.active-input.json` is never consulted. Every claimed row
- * must have a non-empty host route/input and finite host-received time; mixed
- * routes or missing state fail closed. `notBefore` is the earliest host receive
- * time, so older work on the same route cannot be imported.
- *
- * The minimum scope is `routeKey` + `notBefore`; we never leave the global audit
- * store fully unscoped.
+ * Source: host-only acceptance columns on the exact inbound rows named by
+ * processing_ack. The host stamps the entire accepted batch atomically after
+ * validating IPC against those immutable inbound rows. Every claim must have
+ * the same exact accepted input, route, and acceptance time; mixed inputs fail
+ * closed. The confirmed-stop time supplies a mandatory upper bound.
  */
 export function gwsDiscoveryScope(
   inDb: Database.Database,
   outDb: Database.Database,
-): { inputId?: string; routeKey?: string; notBefore?: string } {
-  const scope: { inputId?: string; routeKey?: string; notBefore?: string } = {};
+  stoppedAt = new Date().toISOString(),
+): { inputId?: string; routeKey?: string; notBefore?: string; notAfter?: string } {
+  const scope: { inputId?: string; routeKey?: string; notBefore?: string; notAfter?: string } = {};
   try {
+    const stoppedMs = Date.parse(stoppedAt);
+    if (!Number.isFinite(stoppedMs)) return {};
     const claims = getProcessingClaims(outDb);
     if (claims.length === 0) return scope;
-    const lookup = inDb.prepare('SELECT host_input_id, host_route_key, host_received_at FROM messages_in WHERE id = ?');
-    let earliest = Number.POSITIVE_INFINITY;
+    const lookup = inDb.prepare(
+      `SELECT host_accepted_input_id, host_accepted_route_key, host_accepted_at, host_acceptance_ended_at
+         FROM messages_in WHERE id = ?`,
+    );
+    let acceptedMs: number | undefined;
     let inputId: string | undefined;
     let routeKey: string | undefined;
+    let upperMs = stoppedMs;
     for (const claim of claims) {
       const row = lookup.get(claim.message_id) as
-        | { host_input_id: string | null; host_route_key: string | null; host_received_at: string | null }
+        | {
+            host_accepted_input_id: string | null;
+            host_accepted_route_key: string | null;
+            host_accepted_at: string | null;
+            host_acceptance_ended_at: string | null;
+          }
         | undefined;
-      if (!row?.host_input_id || !row.host_route_key || !row.host_received_at) return {};
-      const receivedMs = Date.parse(row.host_received_at);
-      if (!Number.isFinite(receivedMs)) return {};
-      if (routeKey && row.host_route_key !== routeKey) return {};
-      routeKey = row.host_route_key;
-      if (receivedMs < earliest) earliest = receivedMs;
-      // Claims in a batch share a route but can have distinct input ids. Scope
-      // by input only when there is exactly one unambiguous host input.
-      if (inputId === undefined) inputId = row.host_input_id;
-      else if (inputId !== row.host_input_id) inputId = '';
+      if (!row?.host_accepted_input_id || !row.host_accepted_route_key || !row.host_accepted_at) return {};
+      const rowAcceptedMs = Date.parse(row.host_accepted_at);
+      if (!Number.isFinite(rowAcceptedMs)) return {};
+      if (inputId && row.host_accepted_input_id !== inputId) return {};
+      if (routeKey && row.host_accepted_route_key !== routeKey) return {};
+      if (acceptedMs !== undefined && rowAcceptedMs !== acceptedMs) return {};
+      inputId = row.host_accepted_input_id;
+      routeKey = row.host_accepted_route_key;
+      acceptedMs = rowAcceptedMs;
+      if (row.host_acceptance_ended_at) {
+        const endedMs = Date.parse(row.host_acceptance_ended_at);
+        if (!Number.isFinite(endedMs)) return {};
+        upperMs = Math.min(upperMs, endedMs);
+      }
     }
-    if (!routeKey || !Number.isFinite(earliest)) return {};
+    if (!inputId || !routeKey || acceptedMs === undefined || upperMs < acceptedMs) return {};
+    scope.inputId = inputId;
     scope.routeKey = routeKey;
-    scope.notBefore = new Date(earliest).toISOString();
-    if (inputId) scope.inputId = inputId;
+    scope.notBefore = new Date(acceptedMs).toISOString();
+    scope.notAfter = new Date(upperMs).toISOString();
   } catch {
     return {};
   }
@@ -688,8 +701,9 @@ export function discoverGwsCrashWindowDraftsScoped(opts: {
   containerStopped: boolean;
   auditStorePath: string | undefined;
   gwsPublicKey?: string;
+  stoppedAt?: string;
 }): ReturnType<typeof discoverGwsCrashWindowDrafts> {
-  const scope = gwsDiscoveryScope(opts.inDb, opts.outDb);
+  const scope = gwsDiscoveryScope(opts.inDb, opts.outDb, opts.stoppedAt);
   return discoverGwsCrashWindowDrafts({
     sessionDir: opts.sessionDir,
     containerStopped: opts.containerStopped,
@@ -697,6 +711,7 @@ export function discoverGwsCrashWindowDraftsScoped(opts: {
     inputId: scope.inputId,
     routeKey: scope.routeKey,
     notBefore: scope.notBefore,
+    notAfter: scope.notAfter,
     gwsPublicKey: opts.gwsPublicKey,
   });
 }
@@ -720,7 +735,7 @@ export function writeHostInterruptedRecovery(opts: {
   gwsPublicKey?: string;
 }): string | null {
   const scope = gwsDiscoveryScope(opts.inDb, opts.outDb);
-  if (!scope.routeKey || !scope.notBefore) return null;
+  if (!scope.inputId || !scope.routeKey || !scope.notBefore || !scope.notAfter) return null;
   const claims = getProcessingClaims(opts.outDb);
   if (claims.length === 0) return null;
 
@@ -729,14 +744,9 @@ export function writeHostInterruptedRecovery(opts: {
     .update(`${scope.routeKey}\0${ids.join('\0')}`)
     .digest('hex')
     .slice(0, 24)}`;
-  const rowStmt = opts.inDb.prepare('SELECT id, timestamp, content, host_input_id FROM messages_in WHERE id = ?');
+  const rowStmt = opts.inDb.prepare('SELECT id, timestamp, content FROM messages_in WHERE id = ?');
   const rows = claims
-    .map(
-      (claim) =>
-        rowStmt.get(claim.message_id) as
-          | { id: string; timestamp: string; content: string; host_input_id: string | null }
-          | undefined,
-    )
+    .map((claim) => rowStmt.get(claim.message_id) as { id: string; timestamp: string; content: string } | undefined)
     .filter((row): row is NonNullable<typeof row> => Boolean(row));
   if (rows.length !== claims.length) return null;
 
@@ -759,11 +769,13 @@ export function writeHostInterruptedRecovery(opts: {
       text: inboundTaskText(row.content),
       timestamp: row.timestamp,
     })),
-    acceptedUnresolvedInputs: rows.map((row) => ({
-      inputId: row.host_input_id!,
-      messageIds: [row.id],
-      prompt: inboundTaskText(row.content),
-    })),
+    acceptedUnresolvedInputs: [
+      {
+        inputId: scope.inputId,
+        messageIds: rows.map((row) => row.id),
+        prompt: rows.map((row) => inboundTaskText(row.content)).join('\n'),
+      },
+    ],
     pendingFollowups: [],
     priorProgress: [],
     observations: [`host_stop_reason: ${opts.reason}`],

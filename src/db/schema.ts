@@ -305,12 +305,17 @@ CREATE TABLE IF NOT EXISTS messages_in (
   -- failure mode of a missing value is a missed merge, never a cross-route leak.
   messaging_group_id TEXT,
   is_group       INTEGER,
-  -- Host-authenticated correlation. These values are written only by the host
-  -- and are also mirrored into a separately-mounted read-only correlation
-  -- directory for tools that cannot safely trust the agent-writable workspace.
+  -- Host-authenticated receipt identity. These values are written only by the
+  -- host; acceptance is separately stamped below at the host IPC boundary.
   host_input_id  TEXT,
   host_route_key TEXT,
   host_received_at TEXT,
+  -- Host-owned acceptance binding. The container requests acceptance over
+  -- IPC; only the host writes these fields, atomically for the exact batch.
+  host_accepted_input_id TEXT,
+  host_accepted_route_key TEXT,
+  host_accepted_at TEXT,
+  host_acceptance_ended_at TEXT,
   content        TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_in_series ON messages_in(series_id);

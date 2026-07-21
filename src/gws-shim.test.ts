@@ -699,9 +699,8 @@ function readLedger(p: string): Array<Record<string, unknown>> {
     .map((l) => JSON.parse(l) as Record<string, unknown>);
 }
 
-// A fresh host correlation timestamp. The shim drops correlation when it is
-// stale (older than NANOCLAW_HOST_CORRELATION_MAX_AGE_MS, default 6h), so tests that assert the
-// CORRELATED path must stamp a current timestamp.
+// A host acceptance timestamp. Receipt time may be arbitrarily old; the
+// host-owned current pointer exists only while this exact input is accepted.
 function freshUpdatedAt(): string {
   return new Date().toISOString();
 }
@@ -763,7 +762,10 @@ describe('gws proxy shim — side-effect ledger', () => {
     tmp = freshTmp();
     const ledger = path.join(tmp, 'side-effects.jsonl');
     const active = path.join(tmp, 'host-correlation.json');
-    fs.writeFileSync(active, JSON.stringify({ inputId: 'in-9', routeKey: 'discord:7', receivedAt: freshUpdatedAt() }));
+    fs.writeFileSync(
+      active,
+      JSON.stringify({ schemaVersion: 1, inputId: 'in-9', routeKey: 'discord:7', acceptedAt: freshUpdatedAt() }),
+    );
     const sig = 'BASE64SIGNATURE==';
     const payload = '{"audit_id":"aud-1","service":"gmail","method":"users.drafts.create"}';
     const proxy = await withProxy(apiEffectSuccessProxy('Draft created: r-987654', sig, payload));
@@ -821,7 +823,12 @@ describe('gws proxy shim — side-effect ledger', () => {
     const correlation = path.join(tmp, 'host-correlation.json');
     fs.writeFileSync(
       correlation,
-      JSON.stringify({ inputId: signed.input_id, routeKey: signed.route_key, receivedAt: freshUpdatedAt() }),
+      JSON.stringify({
+        schemaVersion: 1,
+        inputId: signed.input_id,
+        routeKey: signed.route_key,
+        acceptedAt: freshUpdatedAt(),
+      }),
     );
     const result = await runShim(['drive', 'files', 'create', '--json', '{"name":"x"}'], {
       GWS_PROXY_URL: proxy.url,
@@ -867,7 +874,12 @@ describe('gws proxy shim — side-effect ledger', () => {
     const correlation = path.join(tmp, 'host-correlation.json');
     fs.writeFileSync(
       correlation,
-      JSON.stringify({ inputId: signed.input_id, routeKey: signed.route_key, receivedAt: freshUpdatedAt() }),
+      JSON.stringify({
+        schemaVersion: 1,
+        inputId: signed.input_id,
+        routeKey: signed.route_key,
+        acceptedAt: freshUpdatedAt(),
+      }),
     );
     const proxy = await withProxy(apiEffectSuccessProxy('{"id":"file-1"}', signature, payload, signed.audit_id));
 
@@ -933,7 +945,12 @@ describe('gws proxy shim — side-effect ledger', () => {
     const correlation = path.join(tmp, 'host-correlation.json');
     fs.writeFileSync(
       correlation,
-      JSON.stringify({ inputId: signed.input_id, routeKey: signed.route_key, receivedAt: freshUpdatedAt() }),
+      JSON.stringify({
+        schemaVersion: 1,
+        inputId: signed.input_id,
+        routeKey: signed.route_key,
+        acceptedAt: freshUpdatedAt(),
+      }),
     );
     const result = await runShim(['gmail', 'users', 'drafts', 'create'], {
       GWS_PROXY_URL: proxy.url,
@@ -955,7 +972,10 @@ describe('gws proxy shim — side-effect ledger', () => {
     tmp = freshTmp();
     const ledger = path.join(tmp, 'side-effects.jsonl');
     const active = path.join(tmp, 'host-correlation.json');
-    fs.writeFileSync(active, JSON.stringify({ inputId: 'in-9', routeKey: 'discord:7', receivedAt: freshUpdatedAt() }));
+    fs.writeFileSync(
+      active,
+      JSON.stringify({ schemaVersion: 1, inputId: 'in-9', routeKey: 'discord:7', acceptedAt: freshUpdatedAt() }),
+    );
     const attackerControlled = path.join(tmp, 'active-input.json');
     fs.writeFileSync(
       attackerControlled,
@@ -1088,14 +1108,18 @@ describe('gws proxy shim — side-effect ledger', () => {
     expect(result.stderr).not.toContain('SECRETBODY');
   });
 
-  it('correlates with fresh host state but drops correlation when it is stale-by-timestamp', async () => {
-    // Fresh updatedAt ⇒ correlated (input_id/route_key stamped).
+  it('keeps exact host acceptance correlation even when message receipt was more than six hours earlier', async () => {
     tmp = freshTmp();
     const freshLedger = path.join(tmp, 'fresh.jsonl');
     const freshActive = path.join(tmp, 'fresh-active.json');
     fs.writeFileSync(
       freshActive,
-      JSON.stringify({ inputId: 'in-fresh', routeKey: 'discord:1', receivedAt: freshUpdatedAt() }),
+      JSON.stringify({
+        schemaVersion: 1,
+        inputId: 'in-fresh',
+        routeKey: 'discord:1',
+        acceptedAt: freshUpdatedAt(),
+      }),
     );
     const proxyFresh = await withProxy(apiEffectSuccessProxy('Draft created: r-1', 'SIG', '{"audit_id":"aud-1"}'));
     await runShim(['gmail', 'users', 'drafts', 'create', '--to', 'a@x.com', '--body', 'b'], {
@@ -1108,14 +1132,19 @@ describe('gws proxy shim — side-effect ledger', () => {
     expect(freshRows[0].input_id).toBe('in-fresh');
     expect(freshRows[0].route_key).toBe('discord:1');
 
-    // Very old updatedAt ⇒ stale ⇒ uncorrelated (null input_id/route_key),
-    // even though the file is present and parseable. A stale-but-present hint
-    // from a long-dead turn must never mis-stamp a fresh tool call.
+    // Receipt age is irrelevant once the host has atomically accepted this
+    // exact input. This catches the former six-hour fail-open/drop behavior.
     const staleLedger = path.join(tmp, 'stale.jsonl');
     const staleActive = path.join(tmp, 'stale-active.json');
     fs.writeFileSync(
       staleActive,
-      JSON.stringify({ inputId: 'in-old', routeKey: 'discord:9', receivedAt: '2020-01-01T00:00:00.000Z' }),
+      JSON.stringify({
+        schemaVersion: 1,
+        inputId: 'in-old',
+        routeKey: 'discord:9',
+        receivedAt: '2020-01-01T00:00:00.000Z',
+        acceptedAt: freshUpdatedAt(),
+      }),
     );
     let captured = '';
     const proxyStale = await withProxy((_req, res, body) => {
@@ -1138,13 +1167,11 @@ describe('gws proxy shim — side-effect ledger', () => {
     });
     const staleRows = readLedger(staleLedger);
     expect(staleRows.length).toBe(1);
-    // Stale ⇒ uncorrelated diagnostic record (no input/route correlation)…
-    expect(staleRows[0].input_id ?? null).toBeNull();
-    expect(staleRows[0].route_key ?? null).toBeNull();
-    // …and the stale correlation is not forwarded to the proxy audit store either.
+    expect(staleRows[0].input_id).toBe('in-old');
+    expect(staleRows[0].route_key).toBe('discord:9');
     const parsed = JSON.parse(captured) as { input_id?: string; route_key?: string };
-    expect(parsed.input_id ?? null).toBeNull();
-    expect(parsed.route_key ?? null).toBeNull();
+    expect(parsed.input_id).toBe('in-old');
+    expect(parsed.route_key).toBe('discord:9');
   });
 
   it('routes a record-builder failure through the exit-75 partial-success path (audit id, no body)', async () => {

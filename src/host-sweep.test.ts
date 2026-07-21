@@ -25,6 +25,7 @@ import {
   decideStuckAction,
   discoverGwsCrashWindowDraftsScoped,
   effectiveCeilingMs,
+  gwsDiscoveryScope,
   parseSqliteUtc,
   recoverInterruptedTurn,
   resetStuckProcessingRows,
@@ -735,7 +736,9 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
     inbound.exec(`CREATE TABLE messages_in (
       id TEXT PRIMARY KEY, status TEXT DEFAULT 'pending', tries INTEGER DEFAULT 0,
       process_after TEXT, timestamp TEXT, content TEXT,
-      host_input_id TEXT, host_route_key TEXT, host_received_at TEXT
+      host_input_id TEXT, host_route_key TEXT, host_received_at TEXT,
+      host_accepted_input_id TEXT, host_accepted_route_key TEXT,
+      host_accepted_at TEXT, host_acceptance_ended_at TEXT
     )`);
     inbound.close();
     const out = new Database(outPath);
@@ -789,9 +792,22 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
     const inbound = new Database(inPath);
     inbound
       .prepare(
-        'INSERT INTO messages_in (id, timestamp, content, host_input_id, host_route_key, host_received_at) VALUES (?, ?, ?, ?, ?, ?)',
+        `INSERT INTO messages_in
+           (id, timestamp, content, host_input_id, host_route_key, host_received_at,
+            host_accepted_input_id, host_accepted_route_key, host_accepted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run('m-this', turnStart, '{"text":"create the draft"}', 'in-this', thisRoute, turnStart);
+      .run(
+        'm-this',
+        turnStart,
+        '{"text":"create the draft"}',
+        'receipt-this',
+        thisRoute,
+        turnStart,
+        'in-this',
+        thisRoute,
+        turnStart,
+      );
     inbound.close();
     // Agent-writable legacy correlation is malicious and must be ignored.
     fs.writeFileSync(
@@ -829,6 +845,21 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
         routeKey: thisRoute,
         occurredAt: '2026-05-29T11:00:00.000Z',
       }),
+      // NON-MATCHING cross-turn input on the SAME route and inside the time
+      // window: exact accepted input binding must still exclude it.
+      signedAuditEntry(key, {
+        auditId: 'draft-other-input-same-route',
+        inputId: 'in-other-turn',
+        routeKey: thisRoute,
+        occurredAt: '2026-05-29T12:00:06.000Z',
+      }),
+      // Matching input/route but AFTER confirmed stop: excluded by notAfter.
+      signedAuditEntry(key, {
+        auditId: 'draft-after-stop',
+        inputId: 'in-this',
+        routeKey: thisRoute,
+        occurredAt: '2026-05-29T12:00:11.000Z',
+      }),
     ]);
 
     const writableOutDb = new Database(outPath);
@@ -850,6 +881,7 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
         containerStopped: true,
         auditStorePath: auditStore,
         gwsPublicKey,
+        stoppedAt: '2026-05-29T12:00:10.000Z',
       });
       expect(r.discovered).toBe(1);
     } finally {
@@ -937,6 +969,88 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
     expect(rows.map((x) => x.id)).toEqual([]);
   });
 
+  it('returns no recovery scope for mixed accepted input ids on one route', () => {
+    const { sessionPath, inPath, outPath } = setupSession();
+    const routeKey = 'opencode|discord|chan-1|dm:mg-1';
+    const key = generateKeyPairSync('ed25519');
+    const gwsPublicKey = key.publicKey.export({ format: 'pem', type: 'spki' }).toString();
+    const auditStore = path.join(tmpRoot, 'mixed-gws-audit.jsonl');
+    writeAuditStore(auditStore, [
+      signedAuditEntry(key, {
+        auditId: 'mixed-first',
+        inputId: 'in-first',
+        routeKey,
+        occurredAt: '2026-05-29T12:00:02.000Z',
+      }),
+      signedAuditEntry(key, {
+        auditId: 'mixed-second',
+        inputId: 'in-second',
+        routeKey,
+        occurredAt: '2026-05-29T12:01:02.000Z',
+      }),
+    ]);
+    const inDb = new Database(inPath);
+    inDb
+      .prepare(
+        `INSERT INTO messages_in
+           (id, timestamp, content, host_input_id, host_route_key, host_received_at,
+            host_accepted_input_id, host_accepted_route_key, host_accepted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        'm-first',
+        '2026-05-29T12:00:00.000Z',
+        '{}',
+        'receipt-first',
+        routeKey,
+        '2026-05-29T12:00:00.000Z',
+        'in-first',
+        routeKey,
+        '2026-05-29T12:00:01.000Z',
+      );
+    inDb
+      .prepare(
+        `INSERT INTO messages_in
+           (id, timestamp, content, host_input_id, host_route_key, host_received_at,
+            host_accepted_input_id, host_accepted_route_key, host_accepted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        'm-second',
+        '2026-05-29T12:01:00.000Z',
+        '{}',
+        'receipt-second',
+        routeKey,
+        '2026-05-29T12:01:00.000Z',
+        'in-second',
+        routeKey,
+        '2026-05-29T12:01:01.000Z',
+      );
+    const outDb = new Database(outPath);
+    outDb
+      .prepare('INSERT INTO processing_ack (message_id, status, status_changed) VALUES (?, ?, ?)')
+      .run('m-first', 'processing', '2026-05-29 12:00:00');
+    outDb
+      .prepare('INSERT INTO processing_ack (message_id, status, status_changed) VALUES (?, ?, ?)')
+      .run('m-second', 'processing', '2026-05-29 12:01:00');
+
+    expect(gwsDiscoveryScope(inDb, outDb)).toEqual({});
+    expect(
+      discoverGwsCrashWindowDraftsScoped({
+        sessionDir: sessionPath,
+        inDb,
+        outDb,
+        containerStopped: true,
+        auditStorePath: auditStore,
+        gwsPublicKey,
+        stoppedAt: '2026-05-29T12:02:00.000Z',
+      }).discovered,
+    ).toBe(0);
+    expect((outDb.prepare('SELECT COUNT(*) AS n FROM side_effect_ledger').get() as { n: number }).n).toBe(0);
+    inDb.close();
+    outDb.close();
+  });
+
   it('persists discovered completed work into durable recovery before reset so retry cannot blindly repeat it', () => {
     const { sessionPath, inPath, outPath } = setupSession();
     const auditStore = path.join(tmpRoot, 'gws-audit.jsonl');
@@ -956,9 +1070,22 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
     const inDb = new Database(inPath);
     inDb
       .prepare(
-        'INSERT INTO messages_in (id, timestamp, content, host_input_id, host_route_key, host_received_at) VALUES (?, ?, ?, ?, ?, ?)',
+        `INSERT INTO messages_in
+           (id, timestamp, content, host_input_id, host_route_key, host_received_at,
+            host_accepted_input_id, host_accepted_route_key, host_accepted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run('m-this', turnStart, '{"text":"create the draft"}', 'in-this', routeKey, turnStart);
+      .run(
+        'm-this',
+        turnStart,
+        '{"text":"create the draft"}',
+        'receipt-this',
+        routeKey,
+        turnStart,
+        'in-this',
+        routeKey,
+        turnStart,
+      );
     const outDb = new Database(outPath);
     outDb
       .prepare('INSERT INTO processing_ack (message_id, status, status_changed) VALUES (?, ?, ?)')

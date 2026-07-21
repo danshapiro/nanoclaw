@@ -686,7 +686,12 @@ function startGwsBoundary(signWith: 'ephemeral' | 'forged' | 'unsigned' = 'ephem
         const hostCorrelation = `${activeInput}.host-correlation`;
         fs.writeFileSync(
           hostCorrelation,
-          JSON.stringify({ inputId: parsed.inputId, routeKey: parsed.routeKey, receivedAt: parsed.updatedAt }),
+          JSON.stringify({
+            schemaVersion: 1,
+            inputId: parsed.inputId,
+            routeKey: parsed.routeKey,
+            acceptedAt: parsed.updatedAt,
+          }),
         );
         shimEnv.NANOCLAW_HOST_CORRELATION_FILE = hostCorrelation;
         delete shimEnv.NANOCLAW_ACTIVE_INPUT_FILE;

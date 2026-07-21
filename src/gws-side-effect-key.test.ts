@@ -71,4 +71,16 @@ describe('GWS side-effect public key trust boundary', () => {
     const value = publicValue();
     expect(resolveGwsSideEffectVerifyKey({ GWS_SIDE_EFFECT_VERIFY_KEY: value })).toBe(value);
   });
+
+  it('rejects Ed25519 private PKCS8 PEM instead of returning secret-bearing input', () => {
+    const privatePem = generateKeyPairSync('ed25519').privateKey.export({ format: 'pem', type: 'pkcs8' }).toString();
+    expect(() => resolveGwsSideEffectVerifyKey({ GWS_SIDE_EFFECT_VERIFY_KEY: privatePem })).toThrow(/public.*key/i);
+  });
+
+  it('normalizes a public PEM to raw public-only base64', () => {
+    const publicPem = generateKeyPairSync('ed25519').publicKey.export({ format: 'pem', type: 'spki' }).toString();
+    const resolved = resolveGwsSideEffectVerifyKey({ GWS_SIDE_EFFECT_VERIFY_KEY: publicPem });
+    expect(resolved).toMatch(/^[A-Za-z0-9+/]{43}=$/);
+    expect(resolved).not.toContain('BEGIN');
+  });
 });
