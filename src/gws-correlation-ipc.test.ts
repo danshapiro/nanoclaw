@@ -1,6 +1,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import net, { type Socket } from 'net';
 import { createHmac } from 'crypto';
 
 import Database from 'better-sqlite3';
@@ -9,13 +10,115 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   bindAcceptedGwsCorrelation,
   canonicalGwsCorrelationAuthPayload,
+  expireAllStaleGwsCorrelations,
+  hostGwsCorrelationIpcDir,
   processAuthenticatedGwsCorrelationRequest,
   registerGwsCorrelationLaunchLease,
   unregisterGwsCorrelationLaunchLease,
   type AuthenticatedGwsCorrelationRequest,
   type GwsCorrelationLaunchControl,
 } from './gws-correlation-ipc.js';
+import { closeDb, createAgentGroup, createSession, initTestDb, runMigrations } from './db/index.js';
 import { INBOUND_SCHEMA, OUTBOUND_SCHEMA } from './db/schema.js';
+import { hostCorrelationPath, inboundDbPath, outboundDbPath, sessionDir } from './session-manager.js';
+
+function socketFrame(value: unknown): Buffer {
+  const payload = Buffer.from(JSON.stringify(value));
+  const result = Buffer.alloc(4 + payload.length);
+  result.writeUInt32BE(payload.length, 0);
+  payload.copy(result, 4);
+  return result;
+}
+
+async function connectSocket(socketPath: string): Promise<Socket> {
+  const deadline = Date.now() + 2_000;
+  for (;;) {
+    const socket = net.createConnection(socketPath);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        socket.once('connect', resolve);
+        socket.once('error', reject);
+      });
+      return socket;
+    } catch (err) {
+      socket.destroy();
+      if (Date.now() >= deadline) throw err;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+}
+
+async function authenticateSocket(control: GwsCorrelationLaunchControl): Promise<Socket> {
+  const socketPath = path.join(hostGwsCorrelationIpcDir(control.agentGroupId, control.sessionId), control.socketName);
+  const socket = await connectSocket(socketPath);
+  const mac = createHmac('sha256', Buffer.from(control.secret, 'base64url'))
+    .update(
+      JSON.stringify([
+        'nanoclaw-gws-correlation-v2',
+        'hello',
+        control.agentGroupId,
+        control.sessionId,
+        control.leaseId,
+      ]),
+    )
+    .digest('base64url');
+  socket.write(
+    socketFrame({
+      schemaVersion: 1,
+      action: 'hello',
+      agentGroupId: control.agentGroupId,
+      sessionId: control.sessionId,
+      leaseId: control.leaseId,
+      mac,
+    }),
+  );
+  const response = await readSocketFrame(socket);
+  expect(response).toMatchObject({ schemaVersion: 1, ok: true, action: 'hello' });
+  return socket;
+}
+
+async function readSocketFrame(socket: Socket): Promise<Record<string, unknown>> {
+  return new Promise<Record<string, unknown>>((resolve, reject) => {
+    let buffer = Buffer.alloc(0);
+    const cleanup = (): void => {
+      clearTimeout(timer);
+      socket.off('data', onData);
+      socket.off('error', onError);
+      socket.off('close', onClose);
+    };
+    const onError = (err: Error): void => {
+      cleanup();
+      reject(err);
+    };
+    const onClose = (): void => {
+      cleanup();
+      reject(new Error('socket closed before response'));
+    };
+    const onData = (chunk: Buffer): void => {
+      buffer = Buffer.concat([buffer, chunk]);
+      if (buffer.length < 4) return;
+      const length = buffer.readUInt32BE(0);
+      if (buffer.length < 4 + length) return;
+      cleanup();
+      resolve(JSON.parse(buffer.subarray(4, 4 + length).toString('utf8')) as Record<string, unknown>);
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error('socket response timed out'));
+    }, 1_000);
+    socket.on('data', onData);
+    socket.once('error', onError);
+    socket.once('close', onClose);
+  });
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error('condition did not become true before deadline');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
 
 describe('host-owned accepted GWS correlation', () => {
   let root: string;
@@ -289,5 +392,233 @@ describe('authenticated GWS correlation acceptance lease', () => {
     db.close();
 
     expect(() => process(release)).toThrow(/replay|sequence|consumed/i);
+  });
+});
+
+describe('bounded GWS correlation socket transport', () => {
+  const controls: GwsCorrelationLaunchControl[] = [];
+  const sockets: Socket[] = [];
+  const createdSessions: string[] = [];
+
+  afterEach(() => {
+    for (const socket of sockets.splice(0)) socket.destroy();
+    for (const control of controls.splice(0)) {
+      unregisterGwsCorrelationLaunchLease(control.agentGroupId, control.sessionId, control.leaseId);
+    }
+    closeDb();
+    for (const dir of createdSessions.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  function register(group: string, session: string): GwsCorrelationLaunchControl {
+    const control = registerGwsCorrelationLaunchLease({
+      agentGroupId: group,
+      sessionId: session,
+      providerName: 'opencode',
+      secret: Buffer.alloc(32, controls.length + 11),
+    });
+    controls.push(control);
+    return control;
+  }
+
+  it('isolates sessions under forged, oversize, and slow-client pressure without creating request files', async () => {
+    const flooded = register('ag-socket-a', 'sess-socket-a');
+    const healthy = register('ag-socket-b', 'sess-socket-b');
+    const floodedPath = path.join(
+      hostGwsCorrelationIpcDir(flooded.agentGroupId, flooded.sessionId),
+      flooded.socketName,
+    );
+
+    const forged = await connectSocket(floodedPath);
+    sockets.push(forged);
+    forged.write(socketFrame({ schemaVersion: 1, action: 'hello', mac: 'forged' }));
+
+    const oversize = await connectSocket(floodedPath);
+    sockets.push(oversize);
+    const header = Buffer.alloc(4);
+    header.writeUInt32BE(64 * 1024 + 1, 0);
+    oversize.write(header);
+
+    // Occupy the bounded pre-auth capacity with absolute-deadline slow clients.
+    for (let index = 0; index < 4; index++) {
+      try {
+        sockets.push(await connectSocket(floodedPath));
+      } catch {
+        // The bounded backlog may reject the last connection immediately.
+      }
+    }
+
+    const started = Date.now();
+    const healthySocket = await authenticateSocket(healthy);
+    sockets.push(healthySocket);
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(
+      fs.existsSync(path.join(hostGwsCorrelationIpcDir(healthy.agentGroupId, healthy.sessionId), healthy.socketName)),
+    ).toBe(false);
+
+    await new Promise((resolve) => setTimeout(resolve, 2_100));
+    const recovered = await authenticateSocket(flooded);
+    sockets.push(recovered);
+    const entries = fs.readdirSync(hostGwsCorrelationIpcDir(flooded.agentGroupId, flooded.sessionId));
+    expect(entries).toEqual([]);
+  }, 10_000);
+
+  it('accepts a legitimate authenticated bind over the persistent socket without an inbox file', async () => {
+    const groupId = `ag-socket-bind-${Date.now()}`;
+    const sessionId = 'sess-socket-bind';
+    const issuedAt = new Date(Date.now() - 100).toISOString();
+    const central = initTestDb();
+    runMigrations(central);
+    createAgentGroup({
+      id: groupId,
+      name: 'Socket Bind Agent',
+      folder: 'socket-bind-agent',
+      agent_provider: 'opencode',
+      created_at: issuedAt,
+    });
+    createSession({
+      id: sessionId,
+      agent_group_id: groupId,
+      messaging_group_id: null,
+      thread_id: null,
+      agent_provider: 'opencode',
+      status: 'active',
+      container_status: 'running',
+      last_active: issuedAt,
+      created_at: issuedAt,
+    });
+
+    const dir = sessionDir(groupId, sessionId);
+    createdSessions.push(dir);
+    fs.mkdirSync(dir, { recursive: true });
+    const inbound = new Database(inboundDbPath(groupId, sessionId));
+    inbound.exec(INBOUND_SCHEMA);
+    inbound
+      .prepare(
+        `INSERT INTO messages_in
+           (id, seq, kind, timestamp, content, trigger, host_input_id, host_route_key, host_received_at)
+         VALUES ('m-socket-bind', 1, 'chat', ?, '{}', 1, 'in-socket-bind', 'route-socket-bind', ?)`,
+      )
+      .run(issuedAt, issuedAt);
+    inbound.close();
+    const outbound = new Database(outboundDbPath(groupId, sessionId));
+    outbound.exec(OUTBOUND_SCHEMA);
+    outbound
+      .prepare(
+        "INSERT INTO processing_ack (message_id, status, status_changed, claim_token) VALUES ('m-socket-bind', 'processing', ?, 'claim-socket-bind')",
+      )
+      .run(issuedAt);
+    outbound.close();
+
+    const control = register(groupId, sessionId);
+    const socket = await authenticateSocket(control);
+    sockets.push(socket);
+    const acceptedAt = new Date().toISOString();
+    const request: AuthenticatedGwsCorrelationRequest = {
+      schemaVersion: 2,
+      action: 'bind',
+      requestId: '44444444-4444-4444-8444-444444444444',
+      agentGroupId: groupId,
+      sessionId,
+      providerName: control.providerName,
+      leaseId: control.leaseId,
+      claimToken: 'claim-socket-bind',
+      sequence: 1,
+      providerAcceptance: { event: 'input-accepted', scope: 'initial', acceptedAt },
+      originalAcceptedAt: acceptedAt,
+      inputId: 'in-socket-bind',
+      routeKey: 'route-socket-bind',
+      messageIds: ['m-socket-bind'],
+      mac: '',
+    };
+    request.mac = createHmac('sha256', Buffer.from(control.secret, 'base64url'))
+      .update(canonicalGwsCorrelationAuthPayload(request))
+      .digest('base64url');
+    socket.write(socketFrame(request));
+
+    await expect(readSocketFrame(socket)).resolves.toMatchObject({
+      schemaVersion: 1,
+      ok: true,
+      requestId: request.requestId,
+    });
+    expect(JSON.parse(fs.readFileSync(hostCorrelationPath(groupId, sessionId), 'utf8'))).toMatchObject({
+      inputId: request.inputId,
+      requestId: request.requestId,
+      leaseId: control.leaseId,
+    });
+    expect(fs.readdirSync(hostGwsCorrelationIpcDir(groupId, sessionId))).toEqual([]);
+
+    socket.destroy();
+    await new Promise<void>((resolve) => socket.once('close', resolve));
+    await waitFor(() => !fs.existsSync(hostCorrelationPath(groupId, sessionId)));
+    expect(fs.existsSync(hostCorrelationPath(groupId, sessionId))).toBe(false);
+    const ended = new Database(inboundDbPath(groupId, sessionId), { readonly: true });
+    expect(ended.prepare("SELECT host_acceptance_ended_at FROM messages_in WHERE id = 'm-socket-bind'").get()).toEqual({
+      host_acceptance_ended_at: expect.any(String),
+    });
+    ended.close();
+  });
+});
+
+describe('GWS acceptance lifecycle barriers', () => {
+  const createdSessions: string[] = [];
+
+  afterEach(() => {
+    for (const dir of createdSessions.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  function createAcceptedSession(groupId: string, sessionId: string, leaseId: string | null): string {
+    const dir = sessionDir(groupId, sessionId);
+    createdSessions.push(dir);
+    fs.mkdirSync(dir, { recursive: true });
+    const dbPath = inboundDbPath(groupId, sessionId);
+    const db = new Database(dbPath);
+    db.exec(INBOUND_SCHEMA);
+    db.prepare(
+      `INSERT INTO messages_in
+         (id, seq, kind, timestamp, content, trigger, host_input_id, host_route_key, host_received_at,
+          host_accepted_input_id, host_accepted_route_key, host_accepted_at, host_acceptance_lease_id)
+       VALUES ('m-life', 1, 'chat', ?, '{}', 1, 'in-life', 'route-life', ?,
+               'in-life', 'route-life', ?, ?)`,
+    ).run('2026-07-21T00:00:00.000Z', '2026-07-21T00:00:00.000Z', '2026-07-21T00:00:01.000Z', leaseId);
+    db.close();
+    return dbPath;
+  }
+
+  it('invalidates marker and pointer before expiring every row from a replaced lease', () => {
+    const groupId = `ag-life-${Date.now()}`;
+    const sessionId = 'sess-life';
+    const leaseId = 'lease-life-old';
+    const dbPath = createAcceptedSession(groupId, sessionId, leaseId);
+    const control = registerGwsCorrelationLaunchLease({
+      agentGroupId: groupId,
+      sessionId,
+      providerName: 'opencode',
+      leaseId,
+      secret: Buffer.alloc(32, 31),
+    });
+    const pointerPath = hostCorrelationPath(groupId, sessionId);
+    fs.writeFileSync(pointerPath, JSON.stringify({ schemaVersion: 1, inputId: 'in-life', leaseId }));
+
+    expect(unregisterGwsCorrelationLaunchLease(groupId, sessionId, control.leaseId)).toBe(true);
+    expect(fs.existsSync(pointerPath)).toBe(false);
+    expect(fs.existsSync(path.join(path.dirname(pointerPath), 'active-lease.json'))).toBe(false);
+    const db = new Database(dbPath, { readonly: true });
+    const row = db.prepare("SELECT host_acceptance_ended_at FROM messages_in WHERE id = 'm-life'").get() as {
+      host_acceptance_ended_at: string | null;
+    };
+    expect(row.host_acceptance_ended_at).not.toBeNull();
+    db.close();
+  });
+
+  it('startup expiry ends legacy/null-lease rows even when the pointer is missing', () => {
+    const groupId = `ag-restart-${Date.now()}`;
+    const sessionId = 'sess-restart';
+    const dbPath = createAcceptedSession(groupId, sessionId, null);
+    expireAllStaleGwsCorrelations('2026-07-21T00:00:02.000Z');
+    const db = new Database(dbPath, { readonly: true });
+    expect(db.prepare("SELECT host_acceptance_ended_at FROM messages_in WHERE id = 'm-life'").get()).toEqual({
+      host_acceptance_ended_at: '2026-07-21T00:00:02.000Z',
+    });
+    db.close();
   });
 });

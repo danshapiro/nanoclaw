@@ -5,8 +5,16 @@ import { getUndeliveredMessages } from './db/messages-out.js';
 import { getPendingMessages } from './db/messages-in.js';
 import { normalizeRoute } from './formatter.js';
 import { MockProvider } from './providers/mock.js';
-import { runPollLoop } from './poll-loop.js';
+import { runPollLoop as runProductionPollLoop, type PollLoopConfig } from './poll-loop.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, QueryInput, QueryTurnInput } from './providers/types.js';
+
+function runPollLoop(config: PollLoopConfig): Promise<void> {
+  return runProductionPollLoop({
+    ...config,
+    bindGwsCorrelation: async () => {},
+    releaseGwsCorrelation: async () => {},
+  });
+}
 
 beforeEach(() => {
   initTestSessionDb();
@@ -168,6 +176,7 @@ describe('poll loop integration', () => {
       query(input: QueryInput): AgentQuery {
         capturedInputId = input.inputId;
         const events: AsyncIterable<ProviderEvent> = (async function* () {
+          await input.acceptInput();
           yield { type: 'init', continuation: 'resolve-session' };
           yield { type: 'input-accepted', inputId: input.inputId, scope: 'initial' };
           yield {
@@ -195,6 +204,33 @@ describe('poll loop integration', () => {
     expect(typeof capturedInputId).toBe('string');
     expect(getPendingMessages()).toHaveLength(0);
 
+    await loopPromise.catch(() => {});
+  });
+
+  it('cancels before model output and backs off when trusted input binding fails', async () => {
+    insertMessage('m-bind-fail', { sender: 'Alice', text: 'must not reach the model' });
+    const provider = new MockProvider({}, () => '<message to="discord-test">must not be emitted</message>');
+    const controller = new AbortController();
+    let bindAttempts = 0;
+    const loopPromise = runProductionPollLoop({
+      provider,
+      providerName: 'mock',
+      cwd: '/tmp',
+      signal: controller.signal,
+      bindGwsCorrelation: async () => {
+        bindAttempts += 1;
+        throw new Error('host bind unavailable');
+      },
+      releaseGwsCorrelation: async () => {},
+    });
+
+    await waitFor(() => bindAttempts === 1, 500);
+    await sleep(100);
+    expect(bindAttempts).toBe(1);
+    expect(getUndeliveredMessages()).toHaveLength(0);
+    expect(getPendingMessages().map((message) => message.id)).toContain('m-bind-fail');
+
+    controller.abort();
     await loopPromise.catch(() => {});
   });
 });

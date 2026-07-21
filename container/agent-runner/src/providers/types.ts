@@ -61,6 +61,14 @@ export interface QueryTurnInput {
    */
   inputId: string;
 
+  /**
+   * Exact trusted acceptance barrier for THIS queued turn/batch. Providers
+   * must await it before exposing the prompt to model-controlled execution.
+   * It is intentionally attached per turn because accumulated batches may
+   * reuse one inputId while carrying different host claim tokens/message IDs.
+   */
+  acceptInput: () => Promise<void>;
+
   /** Initial prompt (already formatted by agent-runner). */
   prompt: string;
 
@@ -199,7 +207,13 @@ export function normalizeQueryTurnInput(input: string | QueryTurnInput): QueryTu
   // poll loop, so it gets a synthetic inputId. The poll loop always passes a
   // structured QueryTurnInput with its own ledger inputId.
   return typeof input === 'string'
-    ? { inputId: `synthetic-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, prompt: input }
+    ? {
+        inputId: `synthetic-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        prompt: input,
+        acceptInput: async () => {
+          throw new Error('legacy string provider input has no trusted acceptance gate');
+        },
+      }
     : input;
 }
 

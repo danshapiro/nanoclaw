@@ -26,7 +26,7 @@ export class MockProvider implements AgentProvider {
   }
 
   query(input: QueryInput): AgentQuery {
-    const pending: Array<{ inputId?: string; prompt: string }> = [];
+    const pending: Array<{ inputId: string; prompt: string; acceptInput: () => Promise<void> }> = [];
     let waiting: (() => void) | null = null;
     let ended = false;
     let aborted = false;
@@ -39,6 +39,7 @@ export class MockProvider implements AgentProvider {
 
         // Process initial prompt — accept synchronously, then resolve it.
         if (input.inputId) {
+          await input.acceptInput();
           yield { type: 'input-accepted', inputId: input.inputId, scope: 'initial' };
         }
         yield { type: 'activity' };
@@ -54,6 +55,7 @@ export class MockProvider implements AgentProvider {
           if (pending.length > 0) {
             const msg = pending.shift()!;
             if (msg.inputId) {
+              await msg.acceptInput();
               yield { type: 'input-accepted', inputId: msg.inputId, scope: 'followup' };
             }
             yield {
@@ -75,6 +77,7 @@ export class MockProvider implements AgentProvider {
         while (pending.length > 0) {
           const msg = pending.shift()!;
           if (msg.inputId) {
+            await msg.acceptInput();
             yield { type: 'input-accepted', inputId: msg.inputId, scope: 'followup' };
           }
           yield {
@@ -90,7 +93,7 @@ export class MockProvider implements AgentProvider {
     return {
       push(message) {
         const turn = normalizeQueryTurnInput(message);
-        pending.push({ inputId: turn.inputId, prompt: turn.prompt });
+        pending.push({ inputId: turn.inputId, prompt: turn.prompt, acceptInput: turn.acceptInput });
         waiting?.();
       },
       end() {

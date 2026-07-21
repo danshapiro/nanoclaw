@@ -84,6 +84,7 @@ function startFakeTurn(server: AppServer): { started: Promise<void>; events: Pro
     () => true,
     () => {},
     {
+      acceptInput: async () => {},
       startTurn: async () => {
         started.resolve();
       },
@@ -97,7 +98,7 @@ function findResult(events: ProviderEvent[]): ResultEvent | undefined {
 }
 
 describe('runOneTurn provider-error surfacing', () => {
-  it('does not emit input acceptance when turn/start rejects', async () => {
+  it('binds before turn/start and preserves the accepted event when turn/start rejects', async () => {
     const { server } = makeFakeAppServer();
     const seen: ProviderEvent[] = [];
     const gen = runOneTurn(
@@ -110,6 +111,7 @@ describe('runOneTurn provider-error surfacing', () => {
       () => true,
       () => {},
       {
+        acceptInput: async () => {},
         startTurn: async () => {
           throw new Error('turn/start rejected');
         },
@@ -120,7 +122,63 @@ describe('runOneTurn provider-error surfacing', () => {
         for await (const event of gen) seen.push(event);
       })(),
     ).rejects.toThrow('turn/start rejected');
-    expect(seen.some((event) => event.type === 'input-accepted')).toBe(false);
+    expect(seen.some((event) => event.type === 'input-accepted')).toBe(true);
+  });
+
+  it('does not call turn/start before the exact acceptance gate resolves', async () => {
+    const { server } = makeFakeAppServer();
+    const gate = makeDeferred<void>();
+    let startCalls = 0;
+    const gen = runOneTurn(
+      server,
+      'thread-abc',
+      'do work',
+      'gpt-5.5',
+      '/workspace/agent',
+      'input-gated',
+      () => true,
+      () => {},
+      {
+        acceptInput: () => gate.promise,
+        startTurn: async () => {
+          startCalls++;
+          throw new Error('stop after proof');
+        },
+      },
+    );
+    const first = gen.next();
+    await Promise.resolve();
+    expect(startCalls).toBe(0);
+    gate.resolve();
+    await expect(first).resolves.toMatchObject({ value: { type: 'input-accepted', inputId: 'input-gated' } });
+    const second = gen.next();
+    await expect(second).rejects.toThrow('stop after proof');
+    expect(startCalls).toBe(1);
+  });
+
+  it('cancels the Codex turn when the trusted acceptance gate rejects', async () => {
+    const { server } = makeFakeAppServer();
+    let startCalls = 0;
+    const gen = runOneTurn(
+      server,
+      'thread-abc',
+      'do work',
+      'gpt-5.5',
+      '/workspace/agent',
+      'input-rejected-gate',
+      () => true,
+      () => {},
+      {
+        acceptInput: async () => {
+          throw new Error('host bind rejected');
+        },
+        startTurn: async () => {
+          startCalls++;
+        },
+      },
+    );
+    await expect(gen.next()).rejects.toThrow('host bind rejected');
+    expect(startCalls).toBe(0);
   });
 
   it('carries a top-level error notification verbatim on an empty turn', async () => {

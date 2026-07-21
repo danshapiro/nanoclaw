@@ -35,7 +35,6 @@ import {
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { resolveGwsSideEffectVerifyKey } from './gws-side-effect-key.js';
 import {
-  clearAcceptedGwsCorrelation,
   hostGwsCorrelationIpcDir,
   registerGwsCorrelationLaunchLease,
   unregisterGwsCorrelationLaunchLease,
@@ -95,7 +94,7 @@ const ONECLI_GATEWAY_PROXY_ENV_KEYS = [
 ] as const;
 
 /** Active containers tracked by session ID. */
-type ActiveContainer = { process: ChildProcess; containerName: string; startedAtMs: number };
+type ActiveContainer = { process: ChildProcess; containerName: string; leaseId: string; startedAtMs: number };
 const activeContainers = new Map<string, ActiveContainer>();
 const activeMcpBridges = new Map<string, AgentMcpBridge[]>();
 const containerExitWaiters = new Map<string, Set<() => void>>();
@@ -341,7 +340,7 @@ async function spawnContainer(session: Session): Promise<void> {
     if (!container.stdin) throw new Error('container runtime did not expose the launch-control stdin pipe');
     container.stdin.end(`${JSON.stringify(launchControl)}\n`);
   } catch (err) {
-    unregisterGwsCorrelationLaunchLease(agentGroup.id, session.id);
+    unregisterGwsCorrelationLaunchLease(agentGroup.id, session.id, launchControl.leaseId);
     removeContainerEnvFile(envFilePath);
     cleanupTempSkillRoot(managedSkillsRoot);
     await stopAgentMcpBridges(bridges);
@@ -358,7 +357,12 @@ async function spawnContainer(session: Session): Promise<void> {
   container.once('close', removeEnvFile);
   container.once('error', removeEnvFile);
 
-  activeContainers.set(session.id, { process: container, containerName, startedAtMs: Date.now() });
+  activeContainers.set(session.id, {
+    process: container,
+    containerName,
+    leaseId: launchControl.leaseId,
+    startedAtMs: Date.now(),
+  });
   if (bridges.length > 0) {
     activeMcpBridges.set(session.id, bridges);
   }
@@ -383,14 +387,12 @@ async function spawnContainer(session: Session): Promise<void> {
   // on a wall-clock timer.
 
   container.on('close', (code) => {
-    unregisterGwsCorrelationLaunchLease(agentGroup.id, session.id);
-    finalizeContainerProcess(session.id, containerName, code);
+    finalizeContainerProcess(session.id, containerName, launchControl.leaseId, code);
     cleanupTempSkillRoot(managedSkillsRoot);
   });
 
   container.on('error', (err) => {
-    unregisterGwsCorrelationLaunchLease(agentGroup.id, session.id);
-    finalizeContainerProcess(session.id, containerName, null);
+    finalizeContainerProcess(session.id, containerName, launchControl.leaseId, null);
     cleanupTempSkillRoot(managedSkillsRoot);
     log.error('Container spawn error', { sessionId: session.id, err });
   });
@@ -405,7 +407,14 @@ function cleanupTempSkillRoot(root: string): void {
   }
 }
 
-function finalizeContainerProcess(sessionId: string, containerName: string, code: number | null): void {
+function finalizeContainerProcess(
+  sessionId: string,
+  containerName: string,
+  leaseId: string,
+  code: number | null,
+): void {
+  const current = activeContainers.get(sessionId);
+  if (!current || current.containerName !== containerName || current.leaseId !== leaseId) return;
   const wasActive = activeContainers.delete(sessionId);
   void stopAgentMcpBridges(activeMcpBridges.get(sessionId) ?? []);
   activeMcpBridges.delete(sessionId);
@@ -417,12 +426,7 @@ function finalizeContainerProcess(sessionId: string, containerName: string, code
     markContainerStopped(sessionId);
     const session = getSession(sessionId);
     if (session) {
-      try {
-        clearAcceptedGwsCorrelation(session.agent_group_id, session.id);
-      } catch (err) {
-        log.error('Failed to clear host GWS correlation after container exit', { sessionId, err });
-      }
-      unregisterGwsCorrelationLaunchLease(session.agent_group_id, session.id);
+      unregisterGwsCorrelationLaunchLease(session.agent_group_id, session.id, leaseId);
     }
   } else {
     log.warn('Container exited after DB shutdown; skipped session stopped marker', { sessionId, containerName });
@@ -546,7 +550,7 @@ async function verifyContainerProcessExited(sessionId: string, entry: ActiveCont
       reason,
       containerName: entry.containerName,
     });
-    finalizeContainerProcess(sessionId, entry.containerName, null);
+    finalizeContainerProcess(sessionId, entry.containerName, entry.leaseId, null);
     return;
   }
 
@@ -558,7 +562,7 @@ async function verifyContainerProcessExited(sessionId: string, entry: ActiveCont
       reason,
       containerName: entry.containerName,
     });
-    finalizeContainerProcess(sessionId, entry.containerName, null);
+    finalizeContainerProcess(sessionId, entry.containerName, entry.leaseId, null);
     return;
   }
 
@@ -940,16 +944,14 @@ function buildMounts(
       readonly: true,
     });
     const correlationIpcDir = hostGwsCorrelationIpcDir(agentGroup.id, session.id);
-    const correlationRequestDir = path.join(correlationIpcDir, 'requests');
-    fs.mkdirSync(correlationRequestDir, { recursive: true, mode: 0o700 });
-    fs.mkdirSync(path.join(correlationIpcDir, 'errors'), { recursive: true, mode: 0o700 });
+    fs.mkdirSync(correlationIpcDir, { recursive: true, mode: 0o755 });
     mounts.push({
-      // Expose only the request inbox. The parent and rejected-request
-      // directory stay host-only, so an agent cannot replace them with
-      // symlinks that redirect host filesystem operations.
-      hostPath: correlationRequestDir,
-      containerPath: '/workspace/.gws-correlation-ipc/requests',
-      readonly: false,
+      // The node user can connect through this read-only mount, but cannot
+      // create filesystem requests or error artifacts. The host unlinks the
+      // listener immediately after the runner authenticates its persistent fd.
+      hostPath: correlationIpcDir,
+      containerPath: '/run/nanoclaw-gws-control',
+      readonly: true,
     });
 
     // Agent group folder at /workspace/agent (RW for working files + CLAUDE.local.md)

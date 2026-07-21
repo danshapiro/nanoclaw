@@ -132,6 +132,7 @@ function startFakeTurn(
     () => true,
     () => {},
     {
+      acceptInput: async () => {},
       abortSignal,
       startTurn: async () => {
         started.resolve();

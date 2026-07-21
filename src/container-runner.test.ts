@@ -1510,7 +1510,28 @@ describe('side-effect ledger container env', () => {
     }
   });
 
-  it('delivers the GWS acceptance capability only over consumed stdin, never argv, env, or a mount', async () => {
+  it('ignores a delayed duplicate close from an old lease after the session respawns', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      harness.oneCliRelease.resolve();
+      await harness.containerRunner.wakeContainer(harness.session);
+      const oldProcess = harness.spawnedProcesses[0];
+      oldProcess.emit('close', 0);
+      expect(harness.containerRunner.getActiveContainerCount()).toBe(0);
+
+      await harness.containerRunner.wakeContainer(harness.session);
+      expect(harness.spawnedProcesses).toHaveLength(2);
+      expect(harness.containerRunner.getActiveContainerCount()).toBe(1);
+
+      oldProcess.emit('close', 0);
+      expect(harness.containerRunner.getActiveContainerCount()).toBe(1);
+      harness.spawnedProcesses[1].emit('close', 0);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('delivers the GWS secret only over consumed stdin, never argv, env, or a mount', async () => {
     const harness = await loadContainerRunnerHarness();
     try {
       const args = await buildArgs(harness);
@@ -1523,10 +1544,16 @@ describe('side-effect ledger container env', () => {
       const child = harness.spawnedProcesses[0];
       expect(child.stdin.end).toHaveBeenCalledTimes(1);
       const frame = String(child.stdin.end.mock.calls[0][0]);
-      const control = JSON.parse(frame) as { secret: string; leaseId: string; providerName: string };
+      const control = JSON.parse(frame) as {
+        secret: string;
+        leaseId: string;
+        providerName: string;
+        socketName: string;
+      };
       expect(control.secret).toMatch(/^[A-Za-z0-9_-]{43}$/);
       expect(control.leaseId).toMatch(/^[A-Za-z0-9_-]+$/);
       expect(control.providerName).toBe('claude');
+      expect(control.socketName).toMatch(/^[a-f0-9]{16}\.sock$/);
       expect(JSON.stringify(args)).not.toContain(control.secret);
       expect(harness.envFileSnapshots.map((snapshot) => snapshot.content).join('\n')).not.toContain(control.secret);
       expect(args.filter((arg) => arg.includes(':/workspace/')).join('\n')).not.toContain(control.secret);
@@ -1543,13 +1570,9 @@ describe('side-effect ledger container env', () => {
       expect(mounts.some((arg) => arg.endsWith(':/workspace/inbound.db:ro'))).toBe(true);
       expect(mounts.some((arg) => arg.endsWith(':/workspace/.host-correlation:ro'))).toBe(true);
       expect(mounts.some((arg) => arg.endsWith(':/workspace/.gws-correlation-ipc'))).toBe(false);
-      expect(
-        mounts.some((arg) =>
-          arg.includes(
-            `/v2-gws-correlation-ipc/ag-1/${harness.session.id}/requests:/workspace/.gws-correlation-ipc/requests`,
-          ),
-        ),
-      ).toBe(true);
+      const controlMounts = args.filter((arg) => arg.includes(':/run/nanoclaw-gws-control'));
+      expect(controlMounts).toHaveLength(1);
+      expect(controlMounts[0]).toMatch(/^\/tmp\/ncgws-[a-f0-9]+\/[a-f0-9]+:\/run\/nanoclaw-gws-control:ro$/);
     } finally {
       harness.close();
     }

@@ -1,14 +1,13 @@
 import { createHmac, randomUUID } from 'crypto';
 import fs from 'fs';
-import path from 'path';
+import net, { type Socket } from 'net';
 
 const AUTH_PROTOCOL = 'nanoclaw-gws-correlation-v2';
-const DEFAULT_IPC_ROOT = '/workspace/.gws-correlation-ipc';
+const DEFAULT_IPC_ROOT = '/run/nanoclaw-gws-control';
 const DEFAULT_CURRENT = '/workspace/.host-correlation/current.json';
-const WAIT_MS = 25;
 const TIMEOUT_MS = 10_000;
+const MAX_FRAME_BYTES = 64 * 1024;
 const MAX_CONTROL_BYTES = 4096;
-const waitCell = new Int32Array(new SharedArrayBuffer(4));
 
 export interface GwsCorrelationLaunchControl {
   schemaVersion: 1;
@@ -18,6 +17,7 @@ export interface GwsCorrelationLaunchControl {
   leaseId: string;
   issuedAt: string;
   secret: string;
+  socketName: string;
 }
 
 interface ProviderAcceptanceProof {
@@ -62,6 +62,10 @@ interface RuntimeLease {
   secret: Buffer;
   nextSequence: number;
   acceptedInputs: Map<string, AcceptedInput>;
+  socketName: string;
+  socket: Socket | null;
+  requestTail: Promise<void>;
+  responseWaiters: Map<string, { resolve: (value: ControlResponse) => void; reject: (reason: unknown) => void }>;
 }
 
 let runtimeLease: RuntimeLease | null = null;
@@ -74,6 +78,15 @@ interface CurrentCorrelation {
   routeKey?: unknown;
   acceptedAt?: unknown;
   messageIds?: unknown;
+  leaseId?: unknown;
+}
+
+interface ControlResponse {
+  schemaVersion?: unknown;
+  ok?: unknown;
+  action?: unknown;
+  requestId?: unknown;
+  error?: unknown;
 }
 
 function canonicalString(value: unknown, name: string): string {
@@ -139,6 +152,10 @@ export function initializeGwsCorrelationLaunchControl(control: GwsCorrelationLau
     secret,
     nextSequence: 1,
     acceptedInputs: new Map(),
+    socketName: canonicalString(control.socketName, 'socketName'),
+    socket: null,
+    requestTail: Promise.resolve(),
+    responseWaiters: new Map(),
   };
 }
 
@@ -176,24 +193,6 @@ function currentPath(): string {
   return process.env.NANOCLAW_HOST_CORRELATION_FILE || DEFAULT_CURRENT;
 }
 
-function receiptPath(): string {
-  return path.join(path.dirname(currentPath()), 'last-request.json');
-}
-
-function requestDir(): string {
-  return path.join(process.env.NANOCLAW_GWS_CORRELATION_IPC_ROOT || DEFAULT_IPC_ROOT, 'requests');
-}
-
-function writeRequest(value: AuthenticatedRequest): string {
-  const dir = requestDir();
-  fs.mkdirSync(dir, { recursive: true });
-  const dest = path.join(dir, `${value.requestId}.json`);
-  const tmp = `${dest}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, `${JSON.stringify(value)}\n`, { flag: 'wx', mode: 0o600 });
-  fs.renameSync(tmp, dest);
-  return dest;
-}
-
 function readCurrent(): CurrentCorrelation | null {
   try {
     return JSON.parse(fs.readFileSync(currentPath(), 'utf8')) as CurrentCorrelation;
@@ -202,21 +201,121 @@ function readCurrent(): CurrentCorrelation | null {
   }
 }
 
-function readReceipt(): { schemaVersion?: unknown; requestId?: unknown; action?: unknown; inputId?: unknown } | null {
-  try {
-    return JSON.parse(fs.readFileSync(receiptPath(), 'utf8')) as {
-      schemaVersion?: unknown;
-      requestId?: unknown;
-      action?: unknown;
-      inputId?: unknown;
-    };
-  } catch {
-    return null;
-  }
+function encodeFrame(value: unknown): Buffer {
+  const payload = Buffer.from(JSON.stringify(value));
+  if (payload.length > MAX_FRAME_BYTES) throw new Error('GWS control frame exceeds size limit');
+  const out = Buffer.allocUnsafe(4 + payload.length);
+  out.writeUInt32BE(payload.length, 0);
+  payload.copy(out, 4);
+  return out;
 }
 
-function pause(): void {
-  Atomics.wait(waitCell, 0, 0, WAIT_MS);
+function installResponseReader(lease: RuntimeLease, socket: Socket): void {
+  let buffer = Buffer.alloc(0);
+  socket.on('data', (chunk) => {
+    buffer = Buffer.concat([buffer, chunk]);
+    if (buffer.length > MAX_FRAME_BYTES + 4) {
+      socket.destroy(new Error('GWS control response exceeds size limit'));
+      return;
+    }
+    while (buffer.length >= 4) {
+      const length = buffer.readUInt32BE(0);
+      if (length < 2 || length > MAX_FRAME_BYTES) {
+        socket.destroy(new Error('invalid GWS control response length'));
+        return;
+      }
+      if (buffer.length < length + 4) return;
+      const payload = buffer.subarray(4, 4 + length);
+      buffer = buffer.subarray(4 + length);
+      let response: ControlResponse;
+      try {
+        response = JSON.parse(payload.toString('utf8')) as ControlResponse;
+      } catch {
+        socket.destroy(new Error('invalid GWS control response JSON'));
+        return;
+      }
+      const key = response.action === 'hello' ? 'hello' : String(response.requestId ?? '');
+      const waiter = lease.responseWaiters.get(key);
+      if (waiter) {
+        lease.responseWaiters.delete(key);
+        waiter.resolve(response);
+      }
+    }
+  });
+  const rejectAll = (reason: unknown): void => {
+    for (const waiter of lease.responseWaiters.values()) waiter.reject(reason);
+    lease.responseWaiters.clear();
+    if (lease.socket === socket) lease.socket = null;
+  };
+  socket.on('error', rejectAll);
+  socket.on('close', () => rejectAll(new Error('GWS control socket closed')));
+}
+
+async function sendControlFrame(lease: RuntimeLease, key: string, value: unknown): Promise<ControlResponse> {
+  const socket = lease.socket;
+  if (!socket || socket.destroyed) throw new Error('trusted host GWS control socket is unavailable');
+  const response = new Promise<ControlResponse>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      lease.responseWaiters.delete(key);
+      lease.socket?.destroy(new Error('trusted host GWS control response deadline exceeded'));
+      reject(new Error('trusted host GWS control response deadline exceeded'));
+    }, TIMEOUT_MS);
+    timer.unref();
+    const originalResolve = resolve;
+    lease.responseWaiters.set(key, {
+      resolve: (value) => {
+        clearTimeout(timer);
+        originalResolve(value);
+      },
+      reject: (reason) => {
+        clearTimeout(timer);
+        reject(reason);
+      },
+    });
+  });
+  socket.write(encodeFrame(value));
+  const result = await response;
+  if (result.schemaVersion !== 1 || result.ok !== true) {
+    throw new Error(typeof result.error === 'string' ? result.error : 'host rejected GWS correlation request');
+  }
+  return result;
+}
+
+/** Authenticate the single persistent host control channel before providers load. */
+export async function connectGwsCorrelationControlSocket(): Promise<void> {
+  const lease = runtimeLease;
+  if (!lease) throw new Error('GWS correlation launch control was not initialized');
+  const socketPath = `${process.env.NANOCLAW_GWS_CORRELATION_IPC_ROOT || DEFAULT_IPC_ROOT}/${lease.socketName}`;
+  const deadline = Date.now() + TIMEOUT_MS;
+  let lastError: unknown;
+  while (Date.now() < deadline) {
+    const socket = net.createConnection(socketPath);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        socket.once('connect', resolve);
+        socket.once('error', reject);
+      });
+      lease.socket = socket;
+      installResponseReader(lease, socket);
+      const hello = {
+        schemaVersion: 1,
+        action: 'hello',
+        agentGroupId: lease.agentGroupId,
+        sessionId: lease.sessionId,
+        leaseId: lease.leaseId,
+        mac: createHmac('sha256', lease.secret)
+          .update(JSON.stringify([AUTH_PROTOCOL, 'hello', lease.agentGroupId, lease.sessionId, lease.leaseId]))
+          .digest('base64url'),
+      };
+      await sendControlFrame(lease, 'hello', hello);
+      return;
+    } catch (err) {
+      lastError = err;
+      socket.destroy();
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  }
+  throw new Error('could not authenticate trusted host GWS control socket', { cause: lastError });
 }
 
 function sign(request: AuthenticatedRequest, lease: RuntimeLease): AuthenticatedRequest {
@@ -227,15 +326,15 @@ function sign(request: AuthenticatedRequest, lease: RuntimeLease): Authenticated
 }
 
 /** Bind an exact provider-accepted processing claim before any subsequent tool event can run. */
-export function bindHostGwsCorrelation(
+export async function bindHostGwsCorrelation(
   inputId: string,
   routeKey: string,
   messageIds: string[],
   claimToken: string,
   scope: 'initial' | 'followup',
-): boolean {
+): Promise<void> {
   const lease = runtimeLease;
-  if (!lease) return false;
+  if (!lease) throw new Error('trusted host GWS launch lease is unavailable');
   const expectedIds = [...new Set(messageIds)].sort();
   const existing = lease.acceptedInputs.get(inputId);
   const acceptedAt = new Date().toISOString();
@@ -260,10 +359,9 @@ export function bindHostGwsCorrelation(
     },
     lease,
   );
-  const requestPath = writeRequest(request);
   const combinedIds = [...new Set([...(existing?.messageIds ?? []), ...expectedIds])].sort();
-  const deadline = Date.now() + TIMEOUT_MS;
-  while (Date.now() < deadline) {
+  const operation = lease.requestTail.then(async () => {
+    await sendControlFrame(lease, request.requestId, request);
     const current = readCurrent();
     const currentIds = Array.isArray(current?.messageIds) ? [...current.messageIds].sort() : [];
     if (
@@ -273,6 +371,7 @@ export function bindHostGwsCorrelation(
       current.inputId === inputId &&
       current.routeKey === routeKey &&
       current.acceptedAt === request.originalAcceptedAt &&
+      current.leaseId === lease.leaseId &&
       JSON.stringify(currentIds) === JSON.stringify(combinedIds)
     ) {
       lease.acceptedInputs.set(inputId, {
@@ -283,23 +382,23 @@ export function bindHostGwsCorrelation(
         lastProviderAcceptance: proof,
       });
       lease.nextSequence++;
-      return true;
+      return;
     }
-    pause();
-  }
-  try {
-    fs.unlinkSync(requestPath);
-  } catch {
-    // Host may already have consumed it.
-  }
-  throw new Error(`host did not bind exact GWS correlation for input ${inputId}`);
+    const err = new Error(`host did not publish exact GWS correlation for input ${inputId}`);
+    // The host may already have committed the bind. Dropping the authenticated
+    // authority fd makes the host synchronously revoke that partial success.
+    lease.socket?.destroy(err);
+    throw err;
+  });
+  lease.requestTail = operation.catch(() => undefined);
+  return operation;
 }
 
 /** End an accepted input and wait until its exact host-owned pointer is gone/replaced. */
-export function releaseHostGwsCorrelation(inputId: string): boolean {
+export async function releaseHostGwsCorrelation(inputId: string): Promise<void> {
   const lease = runtimeLease;
   const accepted = lease?.acceptedInputs.get(inputId);
-  if (!lease || !accepted) return false;
+  if (!lease || !accepted) return;
   const request = sign(
     {
       schemaVersion: 2,
@@ -321,26 +420,17 @@ export function releaseHostGwsCorrelation(inputId: string): boolean {
     },
     lease,
   );
-  const requestPath = writeRequest(request);
-  const deadline = Date.now() + TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    const receipt = readReceipt();
-    if (
-      receipt?.schemaVersion === 1 &&
-      receipt.requestId === request.requestId &&
-      receipt.action === 'release' &&
-      receipt.inputId === inputId
-    ) {
-      lease.acceptedInputs.delete(inputId);
-      lease.nextSequence++;
-      return true;
+  const operation = lease.requestTail.then(async () => {
+    await sendControlFrame(lease, request.requestId, request);
+    const current = readCurrent();
+    if (current?.inputId === inputId && current.leaseId === lease.leaseId) {
+      const err = new Error(`host did not invalidate GWS correlation for input ${inputId}`);
+      lease.socket?.destroy(err);
+      throw err;
     }
-    pause();
-  }
-  try {
-    fs.unlinkSync(requestPath);
-  } catch {
-    // Host may already have consumed it.
-  }
-  throw new Error(`host did not release GWS correlation for input ${inputId}`);
+    lease.acceptedInputs.delete(inputId);
+    lease.nextSequence++;
+  });
+  lease.requestTail = operation.catch(() => undefined);
+  return operation;
 }

@@ -30,6 +30,7 @@ import {
   stopContainerAsync,
   ensureContainerRuntimeRunning,
   cleanupOrphans,
+  cleanupOrphansVerified,
 } from './container-runtime.js';
 import { CONTAINER_INSTALL_LABEL } from './config.js';
 import { log } from './log.js';
@@ -219,6 +220,20 @@ describe('ensureContainerRuntimeRunning', () => {
 // --- cleanupOrphans ---
 
 describe('cleanupOrphans', () => {
+  it('verified startup cleanup confirms a second empty runtime listing', () => {
+    mockExecSync.mockReturnValueOnce('nanoclaw-old-1\n').mockReturnValueOnce('').mockReturnValueOnce('');
+    cleanupOrphansVerified();
+    expect(mockExecSync).toHaveBeenCalledTimes(3);
+  });
+
+  it('verified startup cleanup fails closed when a container remains', () => {
+    mockExecSync
+      .mockReturnValueOnce('nanoclaw-old-1\n')
+      .mockReturnValueOnce('')
+      .mockReturnValueOnce('nanoclaw-old-1\n');
+    expect(() => cleanupOrphansVerified()).toThrow(/remain after cleanup/i);
+  });
+
   it('filters ps by the install label so peers are not reaped', () => {
     mockExecSync.mockReturnValueOnce('');
 

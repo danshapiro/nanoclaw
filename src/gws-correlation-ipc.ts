@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
-import { createHmac, randomBytes, timingSafeEqual } from 'crypto';
+import net, { type Server, type Socket } from 'net';
+import { createHash, createHmac, randomBytes, timingSafeEqual } from 'crypto';
 
 import { DATA_DIR } from './config.js';
 import { getAgentGroup } from './db/agent-groups.js';
@@ -9,8 +10,10 @@ import { getSession } from './db/sessions.js';
 import { log } from './log.js';
 import { hostCorrelationPath, inboundDbPath, outboundDbPath } from './session-manager.js';
 
-const IPC_POLL_INTERVAL_MS = 50;
 const AUTH_PROTOCOL = 'nanoclaw-gws-correlation-v2';
+const MAX_FRAME_BYTES = 64 * 1024;
+const HANDSHAKE_DEADLINE_MS = 2_000;
+const SOCKET_BACKLOG = 4;
 const REQUEST_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export interface GwsCorrelationLaunchControl {
@@ -22,6 +25,8 @@ export interface GwsCorrelationLaunchControl {
   issuedAt: string;
   /** Base64url launch secret, delivered once over runner stdin only. */
   secret: string;
+  /** Filename inside the fixed read-only /run/nanoclaw-gws-control mount. */
+  socketName: string;
 }
 
 interface ProviderAcceptanceProof {
@@ -87,6 +92,10 @@ interface GwsCorrelationLeaseState {
   containerName?: string;
   nextSequence: number;
   acceptedInputs: Map<string, AcceptedLeaseInput>;
+  server?: Server;
+  socket?: Socket;
+  socketPath?: string;
+  mutationTail: Promise<void>;
 }
 
 const launchLeases = new Map<string, GwsCorrelationLeaseState>();
@@ -96,7 +105,13 @@ function launchLeaseKey(agentGroupId: string, sessionId: string): string {
 }
 
 export function hostGwsCorrelationIpcDir(agentGroupId: string, sessionId: string): string {
-  return path.join(DATA_DIR, 'v2-gws-correlation-ipc', agentGroupId, sessionId);
+  const install = createHash('sha256').update(DATA_DIR).digest('hex').slice(0, 12);
+  const session = createHash('sha256').update(`${agentGroupId}\0${sessionId}`).digest('hex').slice(0, 16);
+  return path.join('/tmp', `ncgws-${install}`, session);
+}
+
+function activeLeasePath(agentGroupId: string, sessionId: string): string {
+  return path.join(path.dirname(hostCorrelationPath(agentGroupId, sessionId)), 'active-lease.json');
 }
 
 interface AcceptedRow {
@@ -159,6 +174,203 @@ export function canonicalGwsCorrelationAuthPayload(request: AuthenticatedGwsCorr
   );
 }
 
+function unlinkIfPresent(filePath: string): void {
+  try {
+    fs.unlinkSync(filePath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+  }
+}
+
+function writeJsonAtomic(filePath: string, value: unknown): void {
+  const dir = path.dirname(filePath);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const tmp = path.join(dir, `.lease.${process.pid}.${Date.now()}.tmp`);
+  try {
+    fs.writeFileSync(tmp, `${JSON.stringify(value)}\n`, { flag: 'wx', mode: 0o600 });
+    fs.renameSync(tmp, filePath);
+  } finally {
+    unlinkIfPresent(tmp);
+  }
+}
+
+function expireAcceptedRows(
+  agentGroupId: string,
+  sessionId: string,
+  leaseId?: string,
+  endedAt = new Date().toISOString(),
+): void {
+  const dbPath = inboundDbPath(agentGroupId, sessionId);
+  if (!fs.existsSync(dbPath)) return;
+  const db = openInboundDb(dbPath);
+  try {
+    if (leaseId) {
+      db.prepare(
+        `UPDATE messages_in SET host_acceptance_ended_at = ?
+          WHERE host_acceptance_ended_at IS NULL AND host_acceptance_lease_id = ?`,
+      ).run(endedAt, leaseId);
+    } else {
+      db.prepare(`UPDATE messages_in SET host_acceptance_ended_at = ? WHERE host_acceptance_ended_at IS NULL`).run(
+        endedAt,
+      );
+    }
+  } finally {
+    db.close();
+  }
+}
+
+function invalidateCorrelationPointers(agentGroupId: string, sessionId: string): void {
+  unlinkIfPresent(activeLeasePath(agentGroupId, sessionId));
+  unlinkIfPresent(hostCorrelationPath(agentGroupId, sessionId));
+}
+
+function frame(value: unknown): Buffer {
+  const payload = Buffer.from(JSON.stringify(value));
+  if (payload.length > MAX_FRAME_BYTES) throw new Error('GWS correlation IPC frame exceeds size limit');
+  const out = Buffer.allocUnsafe(4 + payload.length);
+  out.writeUInt32BE(payload.length, 0);
+  payload.copy(out, 4);
+  return out;
+}
+
+function helloPayload(control: Pick<GwsCorrelationLaunchControl, 'agentGroupId' | 'sessionId' | 'leaseId'>): string {
+  return JSON.stringify([AUTH_PROTOCOL, 'hello', control.agentGroupId, control.sessionId, control.leaseId]);
+}
+
+function closeLeaseTransport(state: GwsCorrelationLeaseState): void {
+  state.socket?.destroy();
+  try {
+    state.server?.close();
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ERR_SERVER_NOT_RUNNING') throw err;
+  }
+  if (state.socketPath) unlinkIfPresent(state.socketPath);
+  state.socket = undefined;
+  state.server = undefined;
+  state.socketPath = undefined;
+}
+
+function startLeaseSocket(control: GwsCorrelationLaunchControl, state: GwsCorrelationLeaseState): void {
+  const socketDir = hostGwsCorrelationIpcDir(control.agentGroupId, control.sessionId);
+  fs.mkdirSync(socketDir, { recursive: true, mode: 0o755 });
+  fs.chmodSync(socketDir, 0o755);
+  const socketPath = path.join(socketDir, control.socketName);
+  if (Buffer.byteLength(socketPath) >= 104)
+    throw new Error(`GWS control socket path is too long (${socketPath.length})`);
+  unlinkIfPresent(socketPath);
+  state.socketPath = socketPath;
+  const server = net.createServer((socket) => {
+    if (state.socket) {
+      socket.destroy();
+      return;
+    }
+    let buffer = Buffer.alloc(0);
+    let authenticated = false;
+    const deadline = setTimeout(
+      () => socket.destroy(new Error('GWS control handshake deadline exceeded')),
+      HANDSHAKE_DEADLINE_MS,
+    );
+    let frameDeadline: NodeJS.Timeout | null = null;
+    deadline.unref();
+
+    const send = (value: unknown): void => {
+      if (!socket.destroyed) socket.write(frame(value));
+    };
+    socket.on('data', (chunk) => {
+      if (authenticated && !frameDeadline) {
+        frameDeadline = setTimeout(
+          () => socket.destroy(new Error('GWS control frame read deadline exceeded')),
+          HANDSHAKE_DEADLINE_MS,
+        );
+        frameDeadline.unref();
+      }
+      buffer = Buffer.concat([buffer, chunk]);
+      if (buffer.length > MAX_FRAME_BYTES + 4) {
+        socket.destroy(new Error('GWS control frame exceeds size limit'));
+        return;
+      }
+      while (buffer.length >= 4) {
+        const length = buffer.readUInt32BE(0);
+        if (length < 2 || length > MAX_FRAME_BYTES) {
+          socket.destroy(new Error('invalid GWS control frame length'));
+          return;
+        }
+        if (buffer.length < 4 + length) return;
+        const payload = buffer.subarray(4, 4 + length);
+        buffer = buffer.subarray(4 + length);
+        let value: any;
+        try {
+          value = JSON.parse(payload.toString('utf8'));
+        } catch {
+          socket.destroy(new Error('invalid GWS control JSON'));
+          return;
+        }
+        if (!authenticated) {
+          const supplied = typeof value?.mac === 'string' ? Buffer.from(value.mac, 'base64url') : Buffer.alloc(0);
+          const expected = createHmac('sha256', state.secret).update(helloPayload(control)).digest();
+          if (
+            value?.schemaVersion !== 1 ||
+            value?.action !== 'hello' ||
+            value?.agentGroupId !== control.agentGroupId ||
+            value?.sessionId !== control.sessionId ||
+            value?.leaseId !== control.leaseId ||
+            supplied.length !== expected.length ||
+            !timingSafeEqual(supplied, expected)
+          ) {
+            socket.destroy(new Error('GWS control handshake authentication failed'));
+            return;
+          }
+          authenticated = true;
+          clearTimeout(deadline);
+          state.socket = socket;
+          server.close();
+          unlinkIfPresent(socketPath);
+          send({ schemaVersion: 1, ok: true, action: 'hello' });
+          continue;
+        }
+        state.mutationTail = state.mutationTail.then(async () => {
+          try {
+            processGwsCorrelationRequest(control.agentGroupId, control.sessionId, value);
+            send({ schemaVersion: 1, ok: true, requestId: value?.requestId });
+          } catch (err) {
+            send({
+              schemaVersion: 1,
+              ok: false,
+              requestId: value?.requestId,
+              error: (err instanceof Error ? err.message : String(err)).slice(0, 512),
+            });
+          }
+        });
+      }
+      if (authenticated && buffer.length === 0 && frameDeadline) {
+        clearTimeout(frameDeadline);
+        frameDeadline = null;
+      }
+    });
+    socket.on('error', () => undefined);
+    socket.on('close', () => {
+      clearTimeout(deadline);
+      if (frameDeadline) clearTimeout(frameDeadline);
+      if (state.socket === socket) {
+        // The persistent authenticated fd is the lifetime of this authority.
+        // Revoke synchronously on disconnect so no stale pointer survives
+        // while the later container-exit callback is still pending.
+        unregisterGwsCorrelationLaunchLease(control.agentGroupId, control.sessionId, control.leaseId);
+      }
+    });
+  });
+  server.maxConnections = SOCKET_BACKLOG;
+  server.on('error', (err) => log.error('GWS correlation socket error', { err }));
+  server.listen({ path: socketPath, backlog: SOCKET_BACKLOG }, () => {
+    try {
+      fs.chmodSync(socketPath, 0o666);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    }
+  });
+  state.server = server;
+}
+
 export function registerGwsCorrelationLaunchLease(opts: {
   agentGroupId: string;
   sessionId: string;
@@ -176,7 +388,8 @@ export function registerGwsCorrelationLaunchLease(opts: {
   if (secret.length !== 32) throw new Error('GWS correlation launch secret must be 32 bytes');
   const leaseId = canonicalCorrelation(opts.leaseId ?? randomBytes(24).toString('base64url'), 'leaseId');
   unregisterGwsCorrelationLaunchLease(agentGroupId, sessionId);
-  launchLeases.set(launchLeaseKey(agentGroupId, sessionId), {
+  const socketName = `${createHash('sha256').update(leaseId).digest('hex').slice(0, 16)}.sock`;
+  const state: GwsCorrelationLeaseState = {
     secret,
     providerName,
     leaseId,
@@ -184,8 +397,9 @@ export function registerGwsCorrelationLaunchLease(opts: {
     containerName: opts.containerName,
     nextSequence: 1,
     acceptedInputs: new Map(),
-  });
-  return {
+    mutationTail: Promise.resolve(),
+  };
+  const control: GwsCorrelationLaunchControl = {
     schemaVersion: 1,
     agentGroupId,
     sessionId,
@@ -193,14 +407,35 @@ export function registerGwsCorrelationLaunchLease(opts: {
     leaseId,
     issuedAt,
     secret: secret.toString('base64url'),
+    socketName,
   };
+  launchLeases.set(launchLeaseKey(agentGroupId, sessionId), state);
+  writeJsonAtomic(activeLeasePath(agentGroupId, sessionId), {
+    schemaVersion: 1,
+    agentGroupId,
+    sessionId,
+    leaseId,
+    issuedAt,
+  });
+  startLeaseSocket(control, state);
+  return control;
 }
 
-export function unregisterGwsCorrelationLaunchLease(agentGroupId: string, sessionId: string): void {
+export function unregisterGwsCorrelationLaunchLease(
+  agentGroupId: string,
+  sessionId: string,
+  expectedLeaseId?: string,
+): boolean {
   const key = launchLeaseKey(agentGroupId, sessionId);
   const prior = launchLeases.get(key);
-  prior?.secret.fill(0);
+  if (expectedLeaseId && prior?.leaseId !== expectedLeaseId) return false;
+  // Fail closed before ending rows: no old pointer or transport remains usable.
   launchLeases.delete(key);
+  invalidateCorrelationPointers(agentGroupId, sessionId);
+  if (prior) expireAcceptedRows(agentGroupId, sessionId, prior.leaseId);
+  if (prior) closeLeaseTransport(prior);
+  prior?.secret.fill(0);
+  return true;
 }
 
 function canonicalCorrelation(value: string, name: string): string {
@@ -216,9 +451,9 @@ function canonicalTimestamp(value: string, name: string): string {
   return new Date(parsed).toISOString();
 }
 
-function readCurrent(correlationPath: string): { inputId?: unknown } | null {
+function readCurrent(correlationPath: string): { inputId?: unknown; leaseId?: unknown } | null {
   try {
-    return JSON.parse(fs.readFileSync(correlationPath, 'utf8')) as { inputId?: unknown };
+    return JSON.parse(fs.readFileSync(correlationPath, 'utf8')) as { inputId?: unknown; leaseId?: unknown };
   } catch {
     return null;
   }
@@ -233,6 +468,7 @@ function writeCurrentAtomic(
     acceptedAt: string;
     messageIds: string[];
     requestId?: string;
+    leaseId?: string;
   },
 ): void {
   const dir = path.dirname(correlationPath);
@@ -282,10 +518,14 @@ export function bindAcceptedGwsCorrelation(opts: BindAcceptedGwsCorrelationOptio
   const messageIds = [...new Set(opts.messageIds)];
   if (messageIds.length === 0 || messageIds.some((id) => !id)) throw new Error('messageIds must name an exact batch');
 
+  const priorCurrent = readCurrent(opts.correlationPath);
+  // Pointer absence is the only fail-closed state available across the DB/file
+  // boundary. Invalidate before ending the old interval or stamping the new one.
+  unlinkIfPresent(opts.correlationPath);
   const db = openInboundDb(opts.dbPath);
   try {
     db.transaction(() => {
-      const currentInput = readCurrent(opts.correlationPath)?.inputId;
+      const currentInput = priorCurrent?.inputId;
       if (typeof currentInput === 'string' && currentInput !== inputId) {
         db.prepare(
           `UPDATE messages_in
@@ -365,6 +605,7 @@ export function bindAcceptedGwsCorrelation(opts: BindAcceptedGwsCorrelationOptio
     acceptedAt,
     messageIds: [...messageIds].sort(),
     requestId: opts.requestId,
+    leaseId: opts.leaseId,
   });
 }
 
@@ -377,6 +618,7 @@ export function releaseAcceptedGwsCorrelation(opts: {
 }): void {
   const inputId = canonicalCorrelation(opts.inputId, 'inputId');
   const endedAt = canonicalTimestamp(opts.endedAt ?? new Date().toISOString(), 'endedAt');
+  if (readCurrent(opts.correlationPath)?.inputId === inputId) unlinkIfPresent(opts.correlationPath);
   const db = openInboundDb(opts.dbPath);
   try {
     db.prepare(
@@ -385,13 +627,6 @@ export function releaseAcceptedGwsCorrelation(opts: {
     ).run(endedAt, inputId);
   } finally {
     db.close();
-  }
-  if (readCurrent(opts.correlationPath)?.inputId === inputId) {
-    try {
-      fs.unlinkSync(opts.correlationPath);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
-    }
   }
   if (opts.requestId) {
     writeRequestReceiptAtomic(opts.correlationPath, { requestId: opts.requestId, action: 'release', inputId });
@@ -403,26 +638,8 @@ export function clearAcceptedGwsCorrelation(
   sessionId: string,
   endedAt = new Date().toISOString(),
 ): void {
-  const dbPath = inboundDbPath(agentGroupId, sessionId);
-  if (!fs.existsSync(dbPath)) return;
-  const currentPath = hostCorrelationPath(agentGroupId, sessionId);
-  const current = readCurrent(currentPath);
-  if (typeof current?.inputId === 'string') {
-    releaseAcceptedGwsCorrelation({ dbPath, correlationPath: currentPath, inputId: current.inputId, endedAt });
-  }
-}
-
-function readRequestNoFollow(requestPath: string): unknown {
-  const fd = fs.openSync(requestPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
-  try {
-    const stat = fs.fstatSync(fd);
-    if (!stat.isFile() || stat.nlink !== 1 || stat.size > 64 * 1024) {
-      throw new Error('GWS correlation request must be a small single-link regular file');
-    }
-    return JSON.parse(fs.readFileSync(fd, 'utf8')) as unknown;
-  } finally {
-    fs.closeSync(fd);
-  }
+  invalidateCorrelationPointers(agentGroupId, sessionId);
+  expireAcceptedRows(agentGroupId, sessionId, undefined, endedAt);
 }
 
 function authenticatedRequest(value: unknown): AuthenticatedGwsCorrelationRequest {
@@ -552,6 +769,17 @@ export function processAuthenticatedGwsCorrelationRequest(opts: {
   ) {
     throw new Error('GWS correlation request has no matching active host lease');
   }
+  let activeMarker: { leaseId?: unknown } | null = null;
+  try {
+    activeMarker = JSON.parse(fs.readFileSync(activeLeasePath(opts.agentGroupId, opts.mountedSessionId), 'utf8')) as {
+      leaseId?: unknown;
+    };
+  } catch (err) {
+    throw new Error('GWS correlation request has no active host lease marker', { cause: err });
+  }
+  if (activeMarker.leaseId !== state.leaseId) {
+    throw new Error('GWS correlation request lease marker does not match the active host lease');
+  }
   verifyRequestMac(state, request);
   if (request.sequence !== state.nextSequence) {
     throw new Error('GWS correlation request sequence was replayed, consumed, or out of order');
@@ -638,74 +866,35 @@ export function processGwsCorrelationRequest(agentGroupId: string, mountedSessio
   });
 }
 
-let watcherRunning = false;
-let timer: NodeJS.Timeout | null = null;
-
-function scanRequests(): void {
-  const ipcBase = path.join(DATA_DIR, 'v2-gws-correlation-ipc');
-  fs.mkdirSync(ipcBase, { recursive: true });
-  for (const groupEntry of fs.readdirSync(ipcBase, { withFileTypes: true })) {
-    if (!groupEntry.isDirectory()) continue;
-    const groupDir = path.join(ipcBase, groupEntry.name);
-    for (const sessionEntry of fs.readdirSync(groupDir, { withFileTypes: true })) {
-      if (!sessionEntry.isDirectory()) continue;
-      const sessionIpcDir = hostGwsCorrelationIpcDir(groupEntry.name, sessionEntry.name);
-      const requestDir = path.join(sessionIpcDir, 'requests');
-      if (!fs.existsSync(requestDir)) continue;
-      for (const file of fs
-        .readdirSync(requestDir)
-        .filter((name) => /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.json$/i.test(name))
-        .slice(0, 256)) {
-        const requestPath = path.join(requestDir, file);
-        try {
-          const request = authenticatedRequest(readRequestNoFollow(requestPath));
-          if (`${request.requestId}.json` !== file) throw new Error('GWS correlation request filename mismatch');
-          processGwsCorrelationRequest(groupEntry.name, sessionEntry.name, request);
-          fs.unlinkSync(requestPath);
-        } catch (err) {
-          log.error('GWS correlation IPC request rejected', {
-            agentGroupId: groupEntry.name,
-            sessionId: sessionEntry.name,
-            file,
-            err,
-          });
-          const errorDir = path.join(sessionIpcDir, 'errors');
-          fs.mkdirSync(errorDir, { recursive: true });
-          try {
-            fs.renameSync(requestPath, path.join(errorDir, `${Date.now()}-${path.basename(file)}`));
-          } catch {
-            // Another tick/process handled it.
-          }
-        }
-      }
-    }
-  }
-}
-
-function scheduleNext(): void {
-  if (!watcherRunning) return;
-  timer = setTimeout(() => {
-    try {
-      scanRequests();
-    } catch (err) {
-      log.error('GWS correlation IPC watcher error', { err });
-    } finally {
-      scheduleNext();
-    }
-  }, IPC_POLL_INTERVAL_MS);
-  timer.unref();
-}
-
 export function startGwsCorrelationIpcWatcher(): void {
-  if (watcherRunning) return;
-  watcherRunning = true;
-  scanRequests();
-  scheduleNext();
-  log.info('GWS correlation IPC watcher started');
+  log.info('GWS correlation bounded socket control ready');
 }
 
 export function stopGwsCorrelationIpcWatcher(): void {
-  watcherRunning = false;
-  if (timer) clearTimeout(timer);
-  timer = null;
+  for (const key of [...launchLeases.keys()]) {
+    const [agentGroupId, sessionId] = key.split('\0');
+    unregisterGwsCorrelationLaunchLease(agentGroupId, sessionId);
+  }
+}
+
+/**
+ * Startup barrier: call only after orphan containers are confirmed stopped.
+ * It expires every stale interval (including legacy/null lease rows) and
+ * removes every pointer/marker before any channel can wake a session.
+ */
+export function expireAllStaleGwsCorrelations(endedAt = new Date().toISOString()): void {
+  const sessionsRoot = path.join(DATA_DIR, 'v2-sessions');
+  if (fs.existsSync(sessionsRoot)) {
+    for (const group of fs.readdirSync(sessionsRoot, { withFileTypes: true })) {
+      if (!group.isDirectory()) continue;
+      const groupDir = path.join(sessionsRoot, group.name);
+      for (const session of fs.readdirSync(groupDir, { withFileTypes: true })) {
+        if (!session.isDirectory()) continue;
+        invalidateCorrelationPointers(group.name, session.name);
+        expireAcceptedRows(group.name, session.name, undefined, endedAt);
+      }
+    }
+  }
+  const socketInstallRoot = path.dirname(hostGwsCorrelationIpcDir('_', '_'));
+  fs.rmSync(socketInstallRoot, { recursive: true, force: true });
 }

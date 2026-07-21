@@ -4,6 +4,16 @@ import { CodexProvider } from './codex.js';
 import { MockProvider } from './mock.js';
 import type { ProviderEvent } from './types.js';
 
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 /**
  * Pull the next event of a given type off a single, persistent provider event
  * iterator. Awaiting forces the generator body to run, which is exactly what
@@ -23,7 +33,7 @@ async function nextEvent(iter: AsyncIterator<ProviderEvent>, type: ProviderEvent
 describe('provider input-accepted/result contract', () => {
   it('mock provider echoes inputId on input-accepted and resolves it on result', async () => {
     const provider = new MockProvider({}, (prompt) => `seen: ${prompt}`);
-    const query = provider.query({ inputId: 'initial-1', prompt: 'hello', cwd: '/tmp' });
+    const query = provider.query({ inputId: 'initial-1', acceptInput: async () => {}, prompt: 'hello', cwd: '/tmp' });
     const iter = query.events[Symbol.asyncIterator]();
 
     await expect(nextEvent(iter, 'input-accepted')).resolves.toMatchObject({
@@ -39,7 +49,7 @@ describe('provider input-accepted/result contract', () => {
       resolvedInputIds: ['initial-1'],
     });
 
-    query.push({ inputId: 'followup-1', prompt: 'later' });
+    query.push({ inputId: 'followup-1', acceptInput: async () => {}, prompt: 'later' });
     await expect(nextEvent(iter, 'input-accepted')).resolves.toMatchObject({
       type: 'input-accepted',
       inputId: 'followup-1',
@@ -71,7 +81,12 @@ describe('provider input-accepted/result contract', () => {
 
     const { ClaudeProvider } = await import('./claude.js');
     const provider = new ClaudeProvider();
-    const query = provider.query({ inputId: 'claude-initial', prompt: 'hello', cwd: '/tmp' });
+    const query = provider.query({
+      inputId: 'claude-initial',
+      acceptInput: async () => {},
+      prompt: 'hello',
+      cwd: '/tmp',
+    });
     const iter = query.events[Symbol.asyncIterator]();
 
     const accepted = await nextEvent(iter, 'input-accepted');
@@ -87,7 +102,12 @@ describe('provider input-accepted/result contract', () => {
         })(),
     }));
     const { ClaudeProvider } = await import('./claude.js');
-    const query = new ClaudeProvider().query({ inputId: 'claude-unconsumed', prompt: 'hello', cwd: '/tmp' });
+    const query = new ClaudeProvider().query({
+      inputId: 'claude-unconsumed',
+      acceptInput: async () => {},
+      prompt: 'hello',
+      cwd: '/tmp',
+    });
     const events: ProviderEvent[] = [];
     for await (const event of query.events) events.push(event);
     expect(events.some((event) => event.type === 'input-accepted')).toBe(false);
@@ -107,7 +127,12 @@ describe('provider input-accepted/result contract', () => {
 
     const { ClaudeProvider } = await import('./claude.js');
     const provider = new ClaudeProvider();
-    const query = provider.query({ inputId: 'claude-compact', prompt: 'hello', cwd: '/tmp' });
+    const query = provider.query({
+      inputId: 'claude-compact',
+      acceptInput: async () => {},
+      prompt: 'hello',
+      cwd: '/tmp',
+    });
     const iter = query.events[Symbol.asyncIterator]();
 
     await expect(nextEvent(iter, 'input-accepted')).resolves.toMatchObject({
@@ -127,15 +152,140 @@ describe('provider input-accepted/result contract', () => {
     });
     query.end();
   });
+
+  it('claude blocks prompt consumption and PreToolUse until the exact host gate acknowledges', async () => {
+    let sdkOptions: any;
+    let promptConsumed = false;
+    mock.module('@anthropic-ai/claude-agent-sdk', () => ({
+      query: ({ prompt, options }: { prompt: AsyncIterable<unknown>; options: unknown }) => {
+        sdkOptions = options;
+        return (async function* () {
+          for await (const _message of prompt) {
+            promptConsumed = true;
+            yield { type: 'result', result: 'ok' };
+            return;
+          }
+        })();
+      },
+    }));
+    const gate = deferred<void>();
+    const { ClaudeProvider } = await import('./claude.js');
+    const query = new ClaudeProvider().query({
+      inputId: 'claude-gated',
+      acceptInput: () => gate.promise,
+      prompt: 'do work',
+      cwd: '/tmp',
+    });
+    const iter = query.events[Symbol.asyncIterator]();
+    const accepted = nextEvent(iter, 'input-accepted');
+    await Promise.resolve();
+    const preTool = sdkOptions.hooks.PreToolUse[0].hooks[0];
+    let toolContinued = false;
+    const tool = preTool(
+      { tool_name: 'Bash', tool_input: {}, tool_use_id: 'tool-before-first-event' },
+      'tool-before-first-event',
+      { signal: new AbortController().signal },
+    ).then((value: unknown) => {
+      toolContinued = true;
+      return value;
+    });
+    await Promise.resolve();
+    expect(promptConsumed).toBe(false);
+    expect(toolContinued).toBe(false);
+
+    gate.resolve();
+    await expect(accepted).resolves.toMatchObject({ type: 'input-accepted', inputId: 'claude-gated' });
+    await expect(tool).resolves.toMatchObject({ continue: true });
+    query.abort();
+  });
+
+  it('claude does not replace an accepted pointer while an older tool lease is active', async () => {
+    let sdkOptions: any;
+    mock.module('@anthropic-ai/claude-agent-sdk', () => ({
+      query: ({ prompt, options }: { prompt: AsyncIterable<unknown>; options: unknown }) => {
+        sdkOptions = options;
+        return (async function* () {
+          for await (const _message of prompt) yield { type: 'assistant', message: { content: [] } };
+        })();
+      },
+    }));
+    const { ClaudeProvider } = await import('./claude.js');
+    const query = new ClaudeProvider().query({
+      inputId: 'claude-old',
+      acceptInput: async () => {},
+      prompt: 'first',
+      cwd: '/tmp',
+    });
+    const iter = query.events[Symbol.asyncIterator]();
+    await nextEvent(iter, 'input-accepted');
+    const preTool = sdkOptions.hooks.PreToolUse[0].hooks[0];
+    const postTool = sdkOptions.hooks.PostToolUse[0].hooks[0];
+    await preTool({ tool_name: 'Bash', tool_input: {}, tool_use_id: 'old-tool' }, 'old-tool', {
+      signal: new AbortController().signal,
+    });
+    let followupGateCalled = false;
+    query.push({
+      inputId: 'claude-new',
+      acceptInput: async () => {
+        followupGateCalled = true;
+      },
+      prompt: 'second',
+    });
+    const followupAccepted = nextEvent(iter, 'input-accepted');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(followupGateCalled).toBe(false);
+
+    await postTool({ tool_name: 'Bash', tool_input: {}, tool_use_id: 'old-tool' }, 'old-tool', {
+      signal: new AbortController().signal,
+    });
+    await expect(followupAccepted).resolves.toMatchObject({ inputId: 'claude-new', scope: 'followup' });
+    expect(followupGateCalled).toBe(true);
+    query.abort();
+  });
+
+  it('claude cancels prompt consumption when the trusted bind fails', async () => {
+    let promptConsumed = false;
+    mock.module('@anthropic-ai/claude-agent-sdk', () => ({
+      query: ({ prompt }: { prompt: AsyncIterable<unknown> }) =>
+        (async function* () {
+          for await (const _message of prompt) {
+            promptConsumed = true;
+            yield { type: 'result', result: 'must not run' };
+          }
+        })(),
+    }));
+    const { ClaudeProvider } = await import('./claude.js');
+    const query = new ClaudeProvider().query({
+      inputId: 'claude-rejected',
+      acceptInput: async () => {
+        throw new Error('host bind rejected');
+      },
+      prompt: 'do not run',
+      cwd: '/tmp',
+    });
+    await expect(nextEvent(query.events[Symbol.asyncIterator](), 'input-accepted')).rejects.toThrow(
+      'host bind rejected',
+    );
+    expect(promptConsumed).toBe(false);
+  });
 });
 
 describe('provider push attachment compatibility', () => {
   it('mock provider accepts structured follow-up turns and ignores attachments', async () => {
     const provider = new MockProvider({}, (prompt) => `seen: ${prompt}`);
-    const query = provider.query({ prompt: 'first', cwd: '/tmp' });
+    const query = provider.query({ inputId: 'mock-first', acceptInput: async () => {}, prompt: 'first', cwd: '/tmp' });
     const results: Array<string | null> = [];
 
-    setTimeout(() => query.push({ prompt: 'second', attachments: [fixtureAttachment()] }), 10);
+    setTimeout(
+      () =>
+        query.push({
+          inputId: 'mock-second',
+          acceptInput: async () => {},
+          prompt: 'second',
+          attachments: [fixtureAttachment()],
+        }),
+      10,
+    );
     setTimeout(() => query.end(), 20);
 
     for await (const event of query.events) {
@@ -147,9 +297,16 @@ describe('provider push attachment compatibility', () => {
 
   it('codex provider accepts structured follow-up turns before its event stream starts', () => {
     const provider = new CodexProvider();
-    const query = provider.query({ prompt: 'first', cwd: '/tmp' });
+    const query = provider.query({ inputId: 'codex-first', acceptInput: async () => {}, prompt: 'first', cwd: '/tmp' });
 
-    expect(() => query.push({ prompt: 'second', attachments: [fixtureAttachment()] })).not.toThrow();
+    expect(() =>
+      query.push({
+        inputId: 'codex-second',
+        acceptInput: async () => {},
+        prompt: 'second',
+        attachments: [fixtureAttachment()],
+      }),
+    ).not.toThrow();
     query.abort();
   });
 
@@ -167,14 +324,24 @@ describe('provider push attachment compatibility', () => {
 
     const { ClaudeProvider } = await import('./claude.js');
     const provider = new ClaudeProvider();
-    const query = provider.query({ prompt: 'first', cwd: '/tmp' });
+    const query = provider.query({
+      inputId: 'claude-first',
+      acceptInput: async () => {},
+      prompt: 'first',
+      cwd: '/tmp',
+    });
     const drain = (async () => {
       for await (const _event of query.events) {
         // Drain until the mocked SDK returns.
       }
     })();
 
-    query.push({ prompt: 'second', attachments: [fixtureAttachment()] });
+    query.push({
+      inputId: 'claude-second',
+      acceptInput: async () => {},
+      prompt: 'second',
+      attachments: [fixtureAttachment()],
+    });
     await drain;
 
     expect(pushed).toEqual(['first', 'second']);

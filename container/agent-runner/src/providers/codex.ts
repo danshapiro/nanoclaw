@@ -321,6 +321,7 @@ export class CodexProvider implements AgentProvider {
     pending.push({
       prompt: input.prompt,
       inputId: input.inputId,
+      acceptInput: input.acceptInput,
       messages: input.messages,
       visibleDestinationName: input.visibleDestinationName,
     });
@@ -386,8 +387,8 @@ export class CodexProvider implements AgentProvider {
             visibleDestinationName = turn.visibleDestinationName;
           }
 
-          // Acceptance is emitted inside the provider operation, only after
-          // turn/start (or thread/compact/start) succeeds.
+          // The trusted acceptance gate runs inside the provider boundary
+          // before turn/start (or thread/compact/start) can reach the model.
           const scope: ProviderInputScope = relay ? 'relay' : turnIndex === 0 ? 'initial' : 'followup';
           turnIndex += 1;
 
@@ -397,9 +398,21 @@ export class CodexProvider implements AgentProvider {
           // If the call fails we gracefully fall through to a normal turn so the
           // user still gets *some* response rather than a silent drop.
           if (scope !== 'relay' && isCompactCommand(turn.messages)) {
+            // Bind outside the fallback catch. A rejected trusted bind cancels
+            // the turn; only a failure from Codex's compact operation may fall
+            // through to a normal model turn under the already-accepted gate.
+            await turn.acceptInput();
             let compactFulfilled = false;
             try {
-              yield* compactCodexThread(server, threadId!, turnInputId, visibleDestinationName, REAL_CLOCK, scope);
+              yield* compactCodexThread(
+                server,
+                threadId!,
+                turnInputId,
+                visibleDestinationName,
+                REAL_CLOCK,
+                scope,
+                async () => {},
+              );
               compactFulfilled = true;
             } catch (err) {
               warnStructured('codex_compact_failed', {
@@ -426,7 +439,7 @@ export class CodexProvider implements AgentProvider {
             () => {
               initYielded = true;
             },
-            { abortSignal, acceptanceScope: scope },
+            { abortSignal, acceptanceScope: scope, acceptInput: turn.acceptInput },
           );
           // A terminal interruption (timeout / turn failure) ENDS the whole
           // query stream — mirrors opencode-container.ts:1238-1240. Without this
@@ -485,6 +498,7 @@ export async function* runOneTurn(
     interruptTurn?: typeof interruptCodexTurn;
     abortSignal?: CodexAbortSignal;
     acceptanceScope?: ProviderInputScope;
+    acceptInput?: () => Promise<void>;
   } = {},
 ): AsyncGenerator<ProviderEvent, boolean> {
   const runDeps = {
@@ -704,10 +718,12 @@ export async function* runOneTurn(
       buffer.push({ type: 'init', continuation: threadId });
     }
 
-    await runDeps.startTurn(server, { threadId, inputText, model, cwd });
     if (turnInputId) {
+      if (!deps.acceptInput) throw new Error('Codex turn has no trusted acceptance gate');
+      await deps.acceptInput();
       yield { type: 'input-accepted', inputId: turnInputId, scope: deps.acceptanceScope ?? 'initial' };
     }
+    await runDeps.startTurn(server, { threadId, inputText, model, cwd });
 
     while (true) {
       while (buffer.length > 0) {
@@ -796,15 +812,19 @@ export async function* compactCodexThread(
   destinationName: string | undefined,
   clock: CodexTimingClock,
   acceptanceScope: ProviderInputScope = 'initial',
+  acceptInput?: () => Promise<void>,
 ): AsyncGenerator<ProviderEvent> {
+  if (inputId) {
+    if (!acceptInput) throw new Error('Codex compact turn has no trusted acceptance gate');
+    await acceptInput();
+    yield { type: 'input-accepted', inputId, scope: acceptanceScope };
+  }
   yield { type: 'activity' };
   const startedAt = clock.now();
   const resp = await sendCodexRequest(server, 'thread/compact/start', { threadId }, COMPACT_REQUEST_TIMEOUT_MS);
   if (resp.error) {
     throw new Error(`thread/compact/start failed: ${resp.error.message}`);
   }
-  if (inputId) yield { type: 'input-accepted', inputId, scope: acceptanceScope };
-
   const remainingNotificationMs = Math.max(0, COMPACT_NOTIFICATION_TIMEOUT_MS - (clock.now() - startedAt));
   // Wait for the canonical v2 compaction signal. If it never arrives we throw
   // so the outer loop can fall back to a normal model turn instead of falsely

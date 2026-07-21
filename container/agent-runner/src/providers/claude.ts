@@ -81,6 +81,68 @@ interface QueuedSDKUserMessage {
   message: SDKUserMessage;
   inputId?: string;
   scope: ProviderInputScope;
+  acceptInput: () => Promise<void>;
+}
+
+/**
+ * Serializes accepted-input transitions against Claude tool execution. A new
+ * batch cannot replace the host pointer until every tool admitted under the
+ * prior acceptance has finished. PreToolUse obtains a shared tool lease only
+ * after the current exact acceptance promise succeeds.
+ */
+class ClaudeExecutionBarrier {
+  private currentAcceptance: Promise<void> | null = null;
+  private activeTools = new Set<string>();
+  private toolsDrainedWaiters: Array<() => void> = [];
+  private transitionTail: Promise<void> = Promise.resolve();
+  private transitionPending: Promise<void> | null = null;
+
+  transition(acceptInput: () => Promise<void>): Promise<void> {
+    let publishTransitionComplete!: () => void;
+    const transitionIntent = new Promise<void>((resolve) => {
+      publishTransitionComplete = resolve;
+    });
+    // Publish intent synchronously so no PreToolUse can acquire the old
+    // generation between prompt consumption and the serialized transition.
+    this.transitionPending = transitionIntent;
+    const transition = this.transitionTail.then(async () => {
+      if (this.activeTools.size > 0) {
+        await new Promise<void>((resolve) => this.toolsDrainedWaiters.push(resolve));
+      }
+      const acceptance = acceptInput();
+      this.currentAcceptance = acceptance;
+      await acceptance;
+    });
+    this.transitionTail = transition.catch(() => {});
+    return transition.finally(() => {
+      if (this.transitionPending === transitionIntent) this.transitionPending = null;
+      publishTransitionComplete();
+    });
+  }
+
+  async acquireTool(toolUseId: string): Promise<void> {
+    for (;;) {
+      const pending = this.transitionPending;
+      if (pending) {
+        await pending;
+        continue;
+      }
+      const acceptance = this.currentAcceptance;
+      if (!acceptance) throw new Error('Claude attempted a tool before any trusted input acceptance');
+      await acceptance;
+      if (acceptance !== this.currentAcceptance || this.transitionPending) continue;
+      if (this.activeTools.has(toolUseId)) throw new Error(`duplicate Claude tool lease ${toolUseId}`);
+      this.activeTools.add(toolUseId);
+      return;
+    }
+  }
+
+  releaseTool(toolUseId: string): void {
+    if (!this.activeTools.delete(toolUseId)) return;
+    if (this.activeTools.size === 0) {
+      for (const resolve of this.toolsDrainedWaiters.splice(0)) resolve();
+    }
+  }
 }
 
 /**
@@ -90,13 +152,14 @@ class MessageStream {
   private queue: QueuedSDKUserMessage[] = [];
   private waiting: (() => void) | null = null;
   private done = false;
+  constructor(private readonly executionBarrier: ClaudeExecutionBarrier) {}
 
   /**
    * Fired only when the SDK consumes a queued prompt from the async iterator.
    */
   onAccept: ((inputId: string, scope: ProviderInputScope) => void) | null = null;
 
-  push(text: string, inputId?: string, scope: ProviderInputScope = 'followup'): void {
+  push(text: string, inputId: string | undefined, scope: ProviderInputScope, acceptInput: () => Promise<void>): void {
     this.queue.push({
       message: {
         type: 'user',
@@ -106,6 +169,7 @@ class MessageStream {
       },
       inputId,
       scope,
+      acceptInput,
     });
     this.waiting?.();
   }
@@ -119,7 +183,10 @@ class MessageStream {
     while (true) {
       while (this.queue.length > 0) {
         const queued = this.queue.shift()!;
-        if (queued.inputId) this.onAccept?.(queued.inputId, queued.scope);
+        if (queued.inputId) {
+          await this.executionBarrier.transition(queued.acceptInput);
+          this.onAccept?.(queued.inputId, queued.scope);
+        }
         yield queued.message;
       }
       if (this.done) return;
@@ -188,26 +255,43 @@ function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | nu
  * script. Defense-in-depth: if SDK_DISALLOWED_TOOLS slips through somehow,
  * block the call here instead of letting the agent hang.
  */
-const preToolUseHook: HookCallback = async (input) => {
-  const i = input as { tool_name?: string; tool_input?: Record<string, unknown> };
-  const toolName = i.tool_name ?? '';
-  if (SDK_DISALLOWED_TOOLS.includes(toolName)) {
-    return {
-      decision: 'block',
-      stopReason: `Tool '${toolName}' is not available in this environment — use the nanoclaw equivalent.`,
-    } as unknown as ReturnType<HookCallback>;
-  }
-  // Bash exposes its timeout via the tool_input.timeout field (ms). Any other
-  // tool: no declared timeout.
-  const declaredTimeoutMs =
-    toolName === 'Bash' && typeof i.tool_input?.timeout === 'number' ? (i.tool_input.timeout as number) : null;
-  try {
-    setContainerToolInFlight(toolName, declaredTimeoutMs);
-  } catch (err) {
-    log(`PreToolUse: failed to record container_state: ${err instanceof Error ? err.message : String(err)}`);
-  }
-  return { continue: true };
-};
+function createPreToolUseHook(executionBarrier: ClaudeExecutionBarrier): HookCallback {
+  return async (input, toolUseId) => {
+    const i = input as { tool_name?: string; tool_input?: Record<string, unknown>; tool_use_id?: string };
+    const toolName = i.tool_name ?? '';
+    if (SDK_DISALLOWED_TOOLS.includes(toolName)) {
+      return {
+        decision: 'block',
+        stopReason: `Tool '${toolName}' is not available in this environment — use the nanoclaw equivalent.`,
+      } as unknown as ReturnType<HookCallback>;
+    }
+    const leaseId = toolUseId ?? i.tool_use_id;
+    if (!leaseId) {
+      return {
+        decision: 'block',
+        stopReason: 'Claude tool call omitted its tool-use identity.',
+      } as unknown as ReturnType<HookCallback>;
+    }
+    try {
+      await executionBarrier.acquireTool(leaseId);
+    } catch (err) {
+      return {
+        decision: 'block',
+        stopReason: `Trusted input acceptance failed: ${err instanceof Error ? err.message : String(err)}`,
+      } as unknown as ReturnType<HookCallback>;
+    }
+    // Bash exposes its timeout via the tool_input.timeout field (ms). Any other
+    // tool: no declared timeout.
+    const declaredTimeoutMs =
+      toolName === 'Bash' && typeof i.tool_input?.timeout === 'number' ? (i.tool_input.timeout as number) : null;
+    try {
+      setContainerToolInFlight(toolName, declaredTimeoutMs);
+    } catch (err) {
+      log(`PreToolUse: failed to record container_state: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return { continue: true };
+  };
+}
 
 /** Clear in-flight tool on PostToolUse / PostToolUseFailure. */
 const postToolUseHook: HookCallback = async () => {
@@ -218,6 +302,15 @@ const postToolUseHook: HookCallback = async () => {
   }
   return { continue: true };
 };
+
+function createPostToolUseHook(executionBarrier: ClaudeExecutionBarrier): HookCallback {
+  return async (input, toolUseId, options) => {
+    const i = input as { tool_use_id?: string };
+    const leaseId = toolUseId ?? i.tool_use_id;
+    if (leaseId) executionBarrier.releaseTool(leaseId);
+    return postToolUseHook(input, toolUseId, options);
+  };
+}
 
 function createPreCompactHook(assistantName?: string): HookCallback {
   return async (input) => {
@@ -410,7 +503,8 @@ export class ClaudeProvider implements AgentProvider {
   }
 
   query(input: QueryInput): AgentQuery {
-    const stream = new MessageStream();
+    const executionBarrier = new ClaudeExecutionBarrier();
+    const stream = new MessageStream(executionBarrier);
 
     // input-accepted events are produced on the same async channel as SDK
     // events. The translate loop interleaves them so the poll loop sees an
@@ -424,7 +518,7 @@ export class ClaudeProvider implements AgentProvider {
     };
 
     const initialInputId = input.inputId;
-    stream.push(input.prompt, initialInputId, 'initial');
+    stream.push(input.prompt, initialInputId, 'initial', input.acceptInput);
 
     const instructions = input.systemContext?.instructions;
 
@@ -446,9 +540,9 @@ export class ClaudeProvider implements AgentProvider {
         settingSources: ['project', 'user'],
         mcpServers: this.mcpServers,
         hooks: {
-          PreToolUse: [{ hooks: [preToolUseHook] }],
-          PostToolUse: [{ hooks: [postToolUseHook] }],
-          PostToolUseFailure: [{ hooks: [postToolUseHook] }],
+          PreToolUse: [{ hooks: [createPreToolUseHook(executionBarrier)] }],
+          PostToolUse: [{ hooks: [createPostToolUseHook(executionBarrier)] }],
+          PostToolUseFailure: [{ hooks: [createPostToolUseHook(executionBarrier)] }],
           PreCompact: [{ hooks: [createPreCompactHook(this.assistantName)] }],
         },
       },
@@ -557,7 +651,7 @@ export class ClaudeProvider implements AgentProvider {
             }),
           );
         }
-        stream.push(turn.prompt, turn.inputId, 'followup');
+        stream.push(turn.prompt, turn.inputId, 'followup', turn.acceptInput);
       },
       end: () => stream.end(),
       events: translateEvents(),

@@ -30,7 +30,7 @@ import { loadConfig } from './config.js';
 import { clearStaleContainerToolState } from './db/connection.js';
 import { buildSystemPromptAddendum } from './destinations.js';
 import { createProvider, type ProviderName } from './providers/factory.js';
-import { consumeGwsCorrelationLaunchControlFromStdin } from './gws-correlation.js';
+import { connectGwsCorrelationControlSocket, consumeGwsCorrelationLaunchControlFromStdin } from './gws-correlation.js';
 import { runPollLoop } from './poll-loop.js';
 import { makeRunnerProcessNonDumpable } from './process-isolation.js';
 import { ensureAgentRunnerPath, suppressUndiciProxyWarning } from './runtime-path.js';
@@ -45,6 +45,7 @@ async function main(): Promise<void> {
   // Fail closed before consuming the one-shot secret or loading provider code.
   makeRunnerProcessNonDumpable();
   consumeGwsCorrelationLaunchControlFromStdin();
+  await connectGwsCorrelationControlSocket();
   // Providers barrel — each enabled provider self-registers on import.
   await import('./providers/index.js');
   ensureAgentRunnerPath();

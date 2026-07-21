@@ -22,6 +22,12 @@ vi.mock('./db/migrations/index.js', () => ({ runMigrations: vi.fn() }));
 vi.mock('./container-runtime.js', () => ({
   ensureContainerRuntimeRunning: vi.fn(),
   cleanupOrphans: vi.fn(),
+  cleanupOrphansVerified: vi.fn(),
+}));
+vi.mock('./gws-correlation-ipc.js', () => ({
+  expireAllStaleGwsCorrelations: vi.fn(),
+  startGwsCorrelationIpcWatcher: vi.fn(),
+  stopGwsCorrelationIpcWatcher: vi.fn(),
 }));
 vi.mock('./delivery.js', () => ({
   startActiveDeliveryPoll: vi.fn(),

@@ -19,6 +19,9 @@ type RequestRecord = {
 
 const shimPath = path.join(process.cwd(), 'container', 'shim', 'gws');
 const servers: http.Server[] = [];
+const correlationFixtureDirs: string[] = [];
+const DEFAULT_TEST_INPUT = 'test-host-input';
+const DEFAULT_TEST_ROUTE = 'test-host-route';
 
 function headerValue(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value.join(', ') : value;
@@ -56,13 +59,37 @@ async function runShim(args: string[], env: NodeJS.ProcessEnv = {}, cwd = proces
     NO_PROXY: undefined,
     no_proxy: undefined,
   };
+  const effectiveEnv = { ...env };
+  const localOnly =
+    args[0] === '--version' || args[0] === '--help' || args[0] === '-h' || (args[0] === 'auth' && args[1] === 'status');
+  const explicitCorrelation = Object.prototype.hasOwnProperty.call(env, 'NANOCLAW_HOST_CORRELATION_FILE');
+  const requestedCorrelation = effectiveEnv.NANOCLAW_HOST_CORRELATION_FILE;
+  if (!localOnly && (!explicitCorrelation || (requestedCorrelation && fs.existsSync(requestedCorrelation)))) {
+    const fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-shim-correlation-'));
+    correlationFixtureDirs.push(fixtureDir);
+    const correlationPath = requestedCorrelation || path.join(fixtureDir, 'current.json');
+    const existing = fs.existsSync(correlationPath)
+      ? (JSON.parse(fs.readFileSync(correlationPath, 'utf8')) as Record<string, unknown>)
+      : {
+          schemaVersion: 1,
+          inputId: DEFAULT_TEST_INPUT,
+          routeKey: DEFAULT_TEST_ROUTE,
+          acceptedAt: new Date().toISOString(),
+        };
+    const leaseId = typeof existing.leaseId === 'string' ? existing.leaseId : 'test-active-lease';
+    fs.writeFileSync(correlationPath, JSON.stringify({ ...existing, leaseId }));
+    const markerPath = path.join(fixtureDir, 'active-lease.json');
+    fs.writeFileSync(markerPath, JSON.stringify({ schemaVersion: 1, leaseId }));
+    effectiveEnv.NANOCLAW_HOST_CORRELATION_FILE = correlationPath;
+    effectiveEnv.NANOCLAW_HOST_LEASE_FILE = markerPath;
+  }
   return await new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve, reject) => {
     const child = spawn('sh', [shim, ...args], {
       cwd,
       env: {
         ...process.env,
         ...cleanProxyEnv,
-        ...env,
+        ...effectiveEnv,
         GWS_PROXY_KEY: undefined,
       },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -110,6 +137,7 @@ function writeOutputProxyResponse(res: http.ServerResponse, bytes: Buffer | stri
 
 afterEach(async () => {
   await Promise.all(servers.splice(0).map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
+  for (const dir of correlationFixtureDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
 describe('gws proxy shim', () => {
@@ -187,7 +215,11 @@ describe('gws proxy shim', () => {
         url: '/exec',
         authorization: undefined,
         contentType: 'application/json',
-        body: JSON.stringify({ args: ['gmail', '+triage', '--max', '5'] }),
+        body: JSON.stringify({
+          args: ['gmail', '+triage', '--max', '5'],
+          input_id: DEFAULT_TEST_INPUT,
+          route_key: DEFAULT_TEST_ROUTE,
+        }),
       },
     ]);
   });
@@ -214,7 +246,11 @@ describe('gws proxy shim', () => {
     expect(result.stderr).toBe('');
     expect(records).toEqual([
       expect.objectContaining({
-        body: JSON.stringify({ args: ['gmail', 'messages', 'list', '--query', '-older_than:7d'] }),
+        body: JSON.stringify({
+          args: ['gmail', 'messages', 'list', '--query', '-older_than:7d'],
+          input_id: DEFAULT_TEST_INPUT,
+          route_key: DEFAULT_TEST_ROUTE,
+        }),
       }),
     ]);
   });
@@ -246,7 +282,11 @@ describe('gws proxy shim', () => {
         url: 'http://yente-gws-proxy.local:8083/exec',
         authorization: undefined,
         contentType: 'application/json',
-        body: JSON.stringify({ args: ['gmail', '+triage'] }),
+        body: JSON.stringify({
+          args: ['gmail', '+triage'],
+          input_id: DEFAULT_TEST_INPUT,
+          route_key: DEFAULT_TEST_ROUTE,
+        }),
       },
     ]);
   });
@@ -280,7 +320,11 @@ describe('gws proxy shim', () => {
         url: 'http://yente-gws-proxy.local:8083/exec',
         authorization: undefined,
         contentType: 'application/json',
-        body: JSON.stringify({ args: ['gmail', '+triage'] }),
+        body: JSON.stringify({
+          args: ['gmail', '+triage'],
+          input_id: DEFAULT_TEST_INPUT,
+          route_key: DEFAULT_TEST_ROUTE,
+        }),
       },
     ]);
   });
@@ -314,7 +358,11 @@ describe('gws proxy shim', () => {
         url: 'http://yente-gws-proxy.local:8083/exec',
         authorization: undefined,
         contentType: 'application/json',
-        body: JSON.stringify({ args: ['gmail', '+triage'] }),
+        body: JSON.stringify({
+          args: ['gmail', '+triage'],
+          input_id: DEFAULT_TEST_INPUT,
+          route_key: DEFAULT_TEST_ROUTE,
+        }),
       },
     ]);
   });
@@ -1006,24 +1054,21 @@ describe('gws proxy shim — side-effect ledger', () => {
     expect(parsed.route_key).toBe('discord:7');
   });
 
-  it('writes an uncorrelated diagnostic record when host correlation is absent', async () => {
+  it('fails before curl when host correlation is absent', async () => {
     tmp = freshTmp();
     const ledger = path.join(tmp, 'side-effects.jsonl');
     const active = path.join(tmp, 'missing-active-input.json'); // does not exist
     const proxy = await withProxy(apiEffectSuccessProxy('Draft created: r-1', 'SIG', '{"audit_id":"aud-1"}'));
 
-    await runShim(['gmail', 'users', 'drafts', 'create', '--to', 'dan@x.com', '--body', 'b'], {
+    const result = await runShim(['gmail', 'users', 'drafts', 'create', '--to', 'dan@x.com', '--body', 'b'], {
       GWS_PROXY_URL: proxy.url,
       NANOCLAW_SIDE_EFFECT_LEDGER: ledger,
       NANOCLAW_HOST_CORRELATION_FILE: active,
     });
 
-    const rows = readLedger(ledger);
-    expect(rows.length).toBe(1);
-    // Absent active-input ⇒ no input correlation (uncorrelated diagnostic record).
-    expect(rows[0].input_id ?? null).toBeNull();
-    expect(rows[0].kind).toBe('gws_mutation_completed');
-    expect(rows[0].payload_schema_version).toBe(1);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('refusing GWS request without an exact active host correlation');
+    expect(readLedger(ledger)).toEqual([]);
   });
 
   it('appends NO record for a non-api-effect (help/schema) response', async () => {

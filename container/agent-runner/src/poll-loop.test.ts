@@ -33,9 +33,59 @@ import {
   type ProviderRecoveryScope,
 } from './db/session-state.js';
 import { formatMessages, extractRouting, normalizeRoute } from './formatter.js';
-import { decideProviderStatusAction, runPollLoop } from './poll-loop.js';
+import { decideProviderStatusAction, runPollLoop as runProductionPollLoop, type PollLoopConfig } from './poll-loop.js';
 import { MockProvider } from './providers/mock.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, QueryInput, QueryTurnInput } from './providers/types.js';
+
+function runPollLoop(config: PollLoopConfig): Promise<void> {
+  const provider = config.provider;
+  const gatedProvider: AgentProvider = {
+    ...provider,
+    supportsNativeSlashCommands: provider.supportsNativeSlashCommands,
+    continuationScope: provider.continuationScope,
+    isSessionInvalid: provider.isSessionInvalid.bind(provider),
+    query(input) {
+      const query = provider.query(input);
+      const queuedTurns: Array<{ turn: QueryTurnInput; gated: boolean }> = [{ turn: input, gated: false }];
+      return {
+        push(turn) {
+          const normalized =
+            typeof turn === 'string'
+              ? { inputId: `legacy-${Date.now()}`, acceptInput: async () => {}, prompt: turn }
+              : turn;
+          queuedTurns.push({ turn: normalized, gated: false });
+          query.push(turn);
+        },
+        end: () => query.end(),
+        abort: () => query.abort(),
+        events: {
+          async *[Symbol.asyncIterator]() {
+            await input.acceptInput();
+            queuedTurns[0].gated = true;
+            for await (const event of query.events) {
+              if (event.type === 'input-accepted') {
+                const exact = queuedTurns.find(
+                  (candidate) => !candidate.gated && candidate.turn.inputId === event.inputId,
+                );
+                if (exact) {
+                  await exact.turn.acceptInput();
+                  exact.gated = true;
+                }
+              }
+              yield event;
+            }
+          },
+        },
+      };
+    },
+  };
+  return runProductionPollLoop({
+    ...config,
+    provider: gatedProvider,
+    bindGwsCorrelation: config.bindGwsCorrelation ?? (async () => {}),
+    releaseGwsCorrelation: config.releaseGwsCorrelation ?? (async () => {}),
+  });
+}
 
 beforeEach(() => {
   initTestSessionDb();
@@ -128,7 +178,13 @@ class ScriptedProvider implements AgentProvider {
     const adapted: AsyncIterable<ProviderEvent> = {
       async *[Symbol.asyncIterator]() {
         let acceptedEmitted = false;
+        await input.acceptInput();
         for await (const ev of eventFactory(input)) {
+          if (ev.type === 'input-accepted') {
+            acceptedEmitted = true;
+            yield ev;
+            continue;
+          }
           if (ev.type === 'init' && !acceptedEmitted) {
             yield ev;
             yield { type: 'input-accepted', inputId: input.inputId, scope: 'initial' };
@@ -336,13 +392,15 @@ describe('mock provider', () => {
   it('should handle push() during active query', async () => {
     const provider = new MockProvider({}, (prompt) => `Re: ${prompt}`);
     const query = provider.query({
+      inputId: 'mock-push-initial',
+      acceptInput: async () => {},
       prompt: 'First',
       cwd: '/tmp',
     });
 
     const events: Array<{ type: string; text?: string }> = [];
 
-    setTimeout(() => query.push('Second'), 30);
+    setTimeout(() => query.push({ inputId: 'mock-push-followup', acceptInput: async () => {}, prompt: 'Second' }), 30);
     setTimeout(() => query.end(), 60);
 
     for await (const event of query.events) {
@@ -371,6 +429,8 @@ describe('end-to-end with mock provider', () => {
     // Create mock provider and run query
     const provider = new MockProvider({}, () => 'The answer is 4');
     const query = provider.query({
+      inputId: 'mock-e2e',
+      acceptInput: async () => {},
       prompt,
       cwd: '/tmp',
     });
@@ -2171,6 +2231,7 @@ describe('poll-loop final host-backed input selection', () => {
 
     const initialAccepted = deferred();
     const followupPushed = deferred();
+    const binds: Array<{ inputId: string; messageIds: string[]; claimToken: string }> = [];
     let pushedInputId: string | undefined;
     const provider: AgentProvider = {
       supportsNativeSlashCommands: false,
@@ -2194,7 +2255,15 @@ describe('poll-loop final host-backed input selection', () => {
       },
     };
     const controller = new AbortController();
-    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+    const loopPromise = runPollLoop({
+      provider,
+      providerName: 'test',
+      cwd: '/tmp',
+      signal: controller.signal,
+      bindGwsCorrelation: async (inputId, _routeKey, messageIds, claimToken) => {
+        binds.push({ inputId, messageIds: [...messageIds], claimToken });
+      },
+    });
 
     try {
       await initialAccepted.promise;
@@ -2214,6 +2283,10 @@ describe('poll-loop final host-backed input selection', () => {
       await followupPushed.promise;
       expect(pushedInputId).toBe('in-host-active');
       await waitFor(() => getAckStatus('accumulated-followup') === 'completed', 1500);
+      expect(binds).toHaveLength(2);
+      expect(binds.map((bind) => bind.inputId)).toEqual(['in-host-active', 'in-host-active']);
+      expect(binds.map((bind) => bind.messageIds)).toEqual([['active-trigger'], ['accumulated-followup']]);
+      expect(new Set(binds.map((bind) => bind.claimToken)).size).toBe(2);
       expect(getUndeliveredMessages().some((message) => JSON.parse(message.content).text?.startsWith('Error:'))).toBe(
         false,
       );

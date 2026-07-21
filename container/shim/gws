@@ -63,6 +63,7 @@ esac
 # agent-writable workspace. Never fall back to .active-input.json: the agent can
 # edit that file and must not be able to forge recovery scope.
 host_correlation_file="${NANOCLAW_HOST_CORRELATION_FILE:-/workspace/.host-correlation/current.json}"
+host_lease_file="${NANOCLAW_HOST_LEASE_FILE:-/workspace/.host-correlation/active-lease.json}"
 
 tmp_headers="$(mktemp)"
 tmp_body="$(mktemp)"
@@ -225,20 +226,35 @@ fi
 # header (OneCLI injects it at the gateway).
 request_body="$(
   NODE_NO_WARNINGS=1 NANOCLAW_HOST_CORRELATION_FILE="$host_correlation_file" \
+  NANOCLAW_HOST_LEASE_FILE="$host_lease_file" \
   GWS_ARG_PLAN_FILE="$tmp_arg_plan" node -e '
     const fs = require("fs");
     const plan = JSON.parse(fs.readFileSync(process.env.GWS_ARG_PLAN_FILE, "utf8"));
     const body = { args: plan.proxyArgs };
     if (plan.output) body.output = { mode: "return_file" };
     try {
+      const markerBefore = JSON.parse(fs.readFileSync(process.env.NANOCLAW_HOST_LEASE_FILE, "utf8"));
       const ai = JSON.parse(fs.readFileSync(process.env.NANOCLAW_HOST_CORRELATION_FILE, "utf8"));
+      const markerAfter = JSON.parse(fs.readFileSync(process.env.NANOCLAW_HOST_LEASE_FILE, "utf8"));
       const acceptedAt = ai && typeof ai.acceptedAt === "string" ? Date.parse(ai.acceptedAt) : NaN;
       const canonical = (value) => typeof value === "string" && /^[\x21-\x7e]{1,512}$/.test(value);
-      if (ai && ai.schemaVersion === 1 && Number.isFinite(acceptedAt) && canonical(ai.inputId) && canonical(ai.routeKey)) {
+      if (
+        !markerBefore || markerBefore.schemaVersion !== 1 ||
+        !markerAfter || JSON.stringify(markerBefore) !== JSON.stringify(markerAfter) ||
+        !canonical(markerBefore.leaseId) ||
+        !ai || ai.schemaVersion !== 1 || ai.leaseId !== markerBefore.leaseId ||
+        !Number.isFinite(acceptedAt) || !canonical(ai.inputId) || !canonical(ai.routeKey)
+      ) {
+        throw new Error("host correlation pointer is absent, malformed, or outside the active lease");
+      }
+      {
         body.input_id = ai.inputId;
         body.route_key = ai.routeKey;
       }
-    } catch (e) { /* absent/unparseable ⇒ uncorrelated */ }
+    } catch (e) {
+      process.stderr.write(`Error: refusing GWS request without an exact active host correlation: ${e.message}\n`);
+      process.exit(3);
+    }
     process.stdout.write(JSON.stringify(body));
   ' -- "$@"
 )"

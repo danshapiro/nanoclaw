@@ -127,7 +127,15 @@ describe('compactCodexThread', () => {
   it('emits progress + result after item/completed with a contextCompaction item', async () => {
     const { server, requests, dispatchNotification, resolveAll } = makeFakeAppServer();
     const clock = { now: () => Date.now() };
-    const gen = compactCodexThread(server, 'thread-abc', 'input-xyz', 'discord-current', clock);
+    const gen = compactCodexThread(
+      server,
+      'thread-abc',
+      'input-xyz',
+      'discord-current',
+      clock,
+      'initial',
+      async () => {},
+    );
     const collectPromise = drainCompactGenerator(gen);
 
     await new Promise((r) => setTimeout(r, 10));
@@ -145,8 +153,8 @@ describe('compactCodexThread', () => {
 
     const events = await collectPromise;
     expect(events).toEqual([
-      { type: 'activity' },
       { type: 'input-accepted', inputId: 'input-xyz', scope: 'initial' },
+      { type: 'activity' },
       { type: 'progress', inputId: 'input-xyz', message: COMPACT_RESULT_TEXT },
       {
         type: 'result',
@@ -160,7 +168,15 @@ describe('compactCodexThread', () => {
   it('emits progress + result after turn/completed containing a contextCompaction item', async () => {
     const { server, requests, dispatchNotification, resolveAll } = makeFakeAppServer();
     const clock = { now: () => Date.now() };
-    const gen = compactCodexThread(server, 'thread-abc', 'input-xyz', 'discord-current', clock);
+    const gen = compactCodexThread(
+      server,
+      'thread-abc',
+      'input-xyz',
+      'discord-current',
+      clock,
+      'initial',
+      async () => {},
+    );
     const collectPromise = drainCompactGenerator(gen);
 
     await new Promise((r) => setTimeout(r, 10));
@@ -176,8 +192,8 @@ describe('compactCodexThread', () => {
 
     const events = await collectPromise;
     expect(events).toEqual([
-      { type: 'activity' },
       { type: 'input-accepted', inputId: 'input-xyz', scope: 'initial' },
+      { type: 'activity' },
       { type: 'progress', inputId: 'input-xyz', message: COMPACT_RESULT_TEXT },
       {
         type: 'result',
@@ -191,7 +207,7 @@ describe('compactCodexThread', () => {
   it('still accepts the legacy thread/compacted notification', async () => {
     const { server, requests, dispatchNotification, resolveAll } = makeFakeAppServer();
     const clock = { now: () => Date.now() };
-    const gen = compactCodexThread(server, 'thread-legacy', 'input-uvw', undefined, clock);
+    const gen = compactCodexThread(server, 'thread-legacy', 'input-uvw', undefined, clock, 'initial', async () => {});
     const collectPromise = drainCompactGenerator(gen);
 
     await new Promise((r) => setTimeout(r, 10));
@@ -201,8 +217,8 @@ describe('compactCodexThread', () => {
 
     const events = await collectPromise;
     expect(events).toEqual([
-      { type: 'activity' },
       { type: 'input-accepted', inputId: 'input-uvw', scope: 'initial' },
+      { type: 'activity' },
       { type: 'progress', inputId: 'input-uvw', message: COMPACT_RESULT_TEXT },
       {
         type: 'result',
@@ -225,7 +241,7 @@ describe('compactCodexThread', () => {
         return clockCalls === 1 ? start + 100 : start + 70_000;
       },
     };
-    const gen = compactCodexThread(server, 'thread-def', 'input-uvw', undefined, fastClock);
+    const gen = compactCodexThread(server, 'thread-def', 'input-uvw', undefined, fastClock, 'initial', async () => {});
     const collectPromise = drainCompactGenerator(gen);
 
     await new Promise((r) => setTimeout(r, 10));
@@ -238,7 +254,15 @@ describe('compactCodexThread', () => {
   it('throws when Codex reports an explicit error notification', async () => {
     const { server, requests, dispatchNotification, resolveAll } = makeFakeAppServer();
     const clock = { now: () => Date.now() };
-    const gen = compactCodexThread(server, 'thread-err', 'input-err', 'discord-current', clock);
+    const gen = compactCodexThread(
+      server,
+      'thread-err',
+      'input-err',
+      'discord-current',
+      clock,
+      'initial',
+      async () => {},
+    );
     const collectPromise = drainCompactGenerator(gen);
 
     await new Promise((r) => setTimeout(r, 10));

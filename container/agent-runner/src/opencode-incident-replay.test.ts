@@ -55,7 +55,7 @@ import {
 } from './db/session-state.js';
 import { getAuthoritativeSideEffects, getSideEffectHints } from './db/side-effects.js';
 import { normalizeRoute } from './formatter.js';
-import { runPollLoop } from './poll-loop.js';
+import { runPollLoop as runProductionPollLoop, type PollLoopConfig } from './poll-loop.js';
 import {
   OpenCodeProvider,
   type OpenCodeControllerClient,
@@ -64,6 +64,14 @@ import {
   type OpenCodeRelayRuntimeFactory,
 } from './providers/opencode.js';
 import type { OpenCodePumpClock } from './providers/opencode-events.js';
+
+function runPollLoop(config: PollLoopConfig): Promise<void> {
+  return runProductionPollLoop({
+    ...config,
+    bindGwsCorrelation: async () => {},
+    releaseGwsCorrelation: async () => {},
+  });
+}
 
 // ── Evidence boundaries (Steps 2 + 5) ───────────────────────────────────────
 //
@@ -699,6 +707,16 @@ function startGwsBoundary(signWith: 'ephemeral' | 'forged' | 'unsigned' = 'ephem
           updatedAt: string;
         };
         const hostCorrelation = `${activeInput}.host-correlation`;
+        const hostLease = `${activeInput}.host-lease`;
+        const leaseId = `test-lease-${parsed.inputId}`;
+        const marker = {
+          schemaVersion: 1,
+          agentGroupId: 'incident-replay',
+          sessionId: 'incident-replay',
+          leaseId,
+          issuedAt: parsed.updatedAt,
+        };
+        fs.writeFileSync(hostLease, JSON.stringify(marker));
         fs.writeFileSync(
           hostCorrelation,
           JSON.stringify({
@@ -706,9 +724,11 @@ function startGwsBoundary(signWith: 'ephemeral' | 'forged' | 'unsigned' = 'ephem
             inputId: parsed.inputId,
             routeKey: parsed.routeKey,
             acceptedAt: parsed.updatedAt,
+            leaseId,
           }),
         );
         shimEnv.NANOCLAW_HOST_CORRELATION_FILE = hostCorrelation;
+        shimEnv.NANOCLAW_HOST_LEASE_FILE = hostLease;
         delete shimEnv.NANOCLAW_ACTIVE_INPUT_FILE;
       }
       const proc = Bun.spawn(['sh', SHIM_PATH, ...args], {

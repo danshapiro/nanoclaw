@@ -10,13 +10,17 @@ import { DATA_DIR } from './config.js';
 import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
 import { initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
-import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
+import { ensureContainerRuntimeRunning, cleanupOrphansVerified } from './container-runtime.js';
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
 import { cleanupStaleContainerEnvFiles, drainAllContainers } from './container-runner.js';
 import { routeInbound } from './router.js';
 import { log } from './log.js';
-import { startGwsCorrelationIpcWatcher, stopGwsCorrelationIpcWatcher } from './gws-correlation-ipc.js';
+import {
+  expireAllStaleGwsCorrelations,
+  startGwsCorrelationIpcWatcher,
+  stopGwsCorrelationIpcWatcher,
+} from './gws-correlation-ipc.js';
 
 // Response + shutdown registries live in response-registry.ts to break the
 // circular import cycle: src/index.ts imports src/modules/index.js for side
@@ -65,14 +69,14 @@ async function main(): Promise<void> {
   const db = initDb(dbPath);
   runMigrations(db);
   log.info('Central DB ready', { path: dbPath });
-  startGwsCorrelationIpcWatcher();
-
   // 1b. One-time filesystem cutover — idempotent, no-op after first run.
   migrateGroupsToClaudeLocal();
 
   // 2. Container runtime
   ensureContainerRuntimeRunning();
-  cleanupOrphans();
+  cleanupOrphansVerified();
+  expireAllStaleGwsCorrelations();
+  startGwsCorrelationIpcWatcher();
   // Sweep per-container --env-file leftovers from a previous crash — they hold
   // secret-bearing env values and must not accumulate.
   cleanupStaleContainerEnvFiles();

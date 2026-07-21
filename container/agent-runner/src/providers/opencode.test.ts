@@ -590,6 +590,7 @@ const TEST_SESSION = 'ses_test_runtime';
 
 class FakeController implements OpenCodeRuntimeController {
   destroyed: string[] = [];
+  promptCalls = 0;
   deniedPermissions: Array<{ sessionId: string; permissionId: string }> = [];
   permissionReplies: Array<{ permissionID: string; response: string }> = [];
   sessionExistsResult = true;
@@ -604,6 +605,7 @@ class FakeController implements OpenCodeRuntimeController {
           return { data: { id: TEST_SESSION }, error: undefined } as never;
         },
         async promptAsync() {
+          self.promptCalls++;
           return { data: true, error: undefined } as never;
         },
         async get() {
@@ -656,10 +658,60 @@ function makeProvider(opts: {
 }
 
 describe('OpenCodeProvider runtime controller (event-driven)', () => {
+  it('does not submit the prompt before the exact acceptance gate resolves', async () => {
+    const stream = new FakeStream();
+    const { provider, controller } = makeProvider({ stream });
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    const query = provider.query({
+      inputId: 'in-gated',
+      acceptInput: () => gate,
+      prompt: 'do not submit early',
+      cwd: '/workspace/agent',
+    });
+    const iter = query.events[Symbol.asyncIterator]();
+    const first = iter.next();
+    await Promise.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(controller.promptCalls).toBe(0);
+
+    releaseGate();
+    await expect(first).resolves.toMatchObject({ value: { type: 'input-accepted', inputId: 'in-gated' } });
+    expect(controller.promptCalls).toBe(0);
+    const second = iter.next();
+    await Promise.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(controller.promptCalls).toBe(1);
+    query.abort();
+    await second;
+  });
+
+  it('cancels the OpenCode turn when the trusted acceptance gate rejects', async () => {
+    const stream = new FakeStream();
+    const { provider, controller } = makeProvider({ stream });
+    const query = provider.query({
+      inputId: 'in-rejected-gate',
+      acceptInput: async () => {
+        throw new Error('host bind rejected');
+      },
+      prompt: 'do not submit',
+      cwd: '/workspace/agent',
+    });
+    await expect(query.events[Symbol.asyncIterator]().next()).rejects.toThrow('host bind rejected');
+    expect(controller.promptCalls).toBe(0);
+  });
+
   it('emits input-accepted after prompt() returns, then result on session.idle', async () => {
     const stream = new FakeStream();
     const { provider } = makeProvider({ stream });
-    const query = provider.query({ inputId: 'in-1', prompt: 'hello', cwd: '/workspace/agent' });
+    const query = provider.query({
+      inputId: 'in-1',
+      acceptInput: async () => {},
+      prompt: 'hello',
+      cwd: '/workspace/agent',
+    });
 
     const events: ProviderEvent[] = [];
     const reader = (async () => {
@@ -691,7 +743,12 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
   it('denies a native question via reject and emits clear-continuation + a recovery interruption naming the question', async () => {
     const stream = new FakeStream();
     const { provider, controller } = makeProvider({ stream });
-    const query = provider.query({ inputId: 'in-q', prompt: 'draft an email', cwd: '/workspace/agent' });
+    const query = provider.query({
+      inputId: 'in-q',
+      acceptInput: async () => {},
+      prompt: 'draft an email',
+      cwd: '/workspace/agent',
+    });
 
     const events: ProviderEvent[] = [];
     const reader = (async () => {
@@ -739,7 +796,12 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
   it('auto-approves a non-question permission with always', async () => {
     const stream = new FakeStream();
     const { provider, controller } = makeProvider({ stream });
-    const query = provider.query({ inputId: 'in-p', prompt: 'do a thing', cwd: '/workspace/agent' });
+    const query = provider.query({
+      inputId: 'in-p',
+      acceptInput: async () => {},
+      prompt: 'do a thing',
+      cwd: '/workspace/agent',
+    });
     const reader = (async () => {
       for await (const e of query.events) {
         if (e.type === 'result') break;
@@ -757,6 +819,7 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     const { provider } = makeProvider({ stream });
     const query = provider.query({
       inputId: 'in-e',
+      acceptInput: async () => {},
       prompt: 'work',
       cwd: '/workspace/agent',
       continuation: TEST_SESSION,
@@ -791,7 +854,12 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
   it('captures a completed tool as a side-effect reference event before result', async () => {
     const stream = new FakeStream();
     const { provider } = makeProvider({ stream });
-    const query = provider.query({ inputId: 'in-s', prompt: 'run tool', cwd: '/workspace/agent' });
+    const query = provider.query({
+      inputId: 'in-s',
+      acceptInput: async () => {},
+      prompt: 'run tool',
+      cwd: '/workspace/agent',
+    });
     const events: ProviderEvent[] = [];
     const reader = (async () => {
       for await (const e of query.events) {
@@ -824,7 +892,12 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     const stream = new FakeStream();
     const persisted: Array<{ tool: string; declaredTimeoutMs: number | null } | null> = [];
     const { provider } = makeProvider({ stream, persistActiveTool: (t) => persisted.push(t) });
-    const query = provider.query({ inputId: 'in-t', prompt: 'long tool', cwd: '/workspace/agent' });
+    const query = provider.query({
+      inputId: 'in-t',
+      acceptInput: async () => {},
+      prompt: 'long tool',
+      cwd: '/workspace/agent',
+    });
     const reader = (async () => {
       for await (const e of query.events) {
         if (e.type === 'result') break;
@@ -866,7 +939,12 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     const stream = new FakeStream();
     const persisted: Array<{ tool: string; declaredTimeoutMs: number | null } | null> = [];
     const { provider } = makeProvider({ stream, persistActiveTool: (t) => persisted.push(t) });
-    const query = provider.query({ inputId: 'in-overlap', prompt: 'two tools', cwd: '/workspace/agent' });
+    const query = provider.query({
+      inputId: 'in-overlap',
+      acceptInput: async () => {},
+      prompt: 'two tools',
+      cwd: '/workspace/agent',
+    });
     const reader = (async () => {
       for await (const e of query.events) {
         if (e.type === 'result') break;
@@ -944,7 +1022,12 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     // any declared tool caps to <= 0 and must be treated as "no active tool".
     process.env.OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS = '30000';
     const { provider } = makeProvider({ stream, persistActiveTool: (t) => persisted.push(t) });
-    const query = provider.query({ inputId: 'in-cap0', prompt: 'long tool', cwd: '/workspace/agent' });
+    const query = provider.query({
+      inputId: 'in-cap0',
+      acceptInput: async () => {},
+      prompt: 'long tool',
+      cwd: '/workspace/agent',
+    });
     const reader = (async () => {
       for await (const e of query.events) {
         if (e.type === 'result') break;
@@ -983,7 +1066,12 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     // under the virtual clock.
     process.env.OPENCODE_WAIT_TICK_MS = '1200000';
     const { provider } = makeProvider({ clock, stream });
-    const query = provider.query({ inputId: 'in-n', prompt: 'long work', cwd: '/workspace/agent' });
+    const query = provider.query({
+      inputId: 'in-n',
+      acceptInput: async () => {},
+      prompt: 'long work',
+      cwd: '/workspace/agent',
+    });
     const events: ProviderEvent[] = [];
     let stop = false;
     const reader = (async () => {
@@ -1006,7 +1094,13 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     delete process.env.OPENCODE_WAIT_TICK_MS;
     expect(stop).toBe(true);
     const notice = events.find((e) => e.type === 'notice') as
-      | { classification: string; inputId: string; fallbackUserMessage: string; agentMessage?: string; relayRecommended?: boolean }
+      | {
+          classification: string;
+          inputId: string;
+          fallbackUserMessage: string;
+          agentMessage?: string;
+          relayRecommended?: boolean;
+        }
       | undefined;
     expect(notice).toBeDefined();
     expect(notice!.classification).toBe('inactivity');
@@ -1034,6 +1128,7 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     const { provider } = makeProvider({ clock, stream, persistActiveTool: (t) => persisted.push(t) });
     const query = provider.query({
       inputId: 'in-tt',
+      acceptInput: async () => {},
       prompt: 'no sse work',
       cwd: '/workspace/agent',
       continuation: TEST_SESSION,
@@ -1092,6 +1187,7 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     controller.sessionExistsResult = false;
     const query = provider.query({
       inputId: 'in-clr',
+      acceptInput: async () => {},
       prompt: 'no sse work',
       cwd: '/workspace/agent',
       continuation: TEST_SESSION,
@@ -1138,6 +1234,7 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     };
     const query = provider.query({
       inputId: 'in-incon',
+      acceptInput: async () => {},
       prompt: 'no sse work',
       cwd: '/workspace/agent',
       continuation: TEST_SESSION,
@@ -1185,7 +1282,12 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     );
 
     // Start the original (normal) turn but keep it open.
-    const mainQuery = provider.query({ inputId: 'in-main', prompt: 'long', cwd: '/workspace/agent' });
+    const mainQuery = provider.query({
+      inputId: 'in-main',
+      acceptInput: async () => {},
+      prompt: 'long',
+      cwd: '/workspace/agent',
+    });
     let mainResult = false;
     const mainReader = (async () => {
       for await (const e of mainQuery.events) {
@@ -1201,6 +1303,7 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     // controller and must use its own relay controller.
     const relayQuery = provider.query({
       inputId: 'in-relay',
+      acceptInput: async () => {},
       prompt: 'status',
       cwd: '/workspace/agent',
       relayMode: true,
@@ -1257,7 +1360,12 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
         ],
       },
     );
-    const query = provider.query({ inputId: 'in-imp', prompt: 'summarize', cwd: '/workspace/agent' });
+    const query = provider.query({
+      inputId: 'in-imp',
+      acceptInput: async () => {},
+      prompt: 'summarize',
+      cwd: '/workspace/agent',
+    });
     const events: ProviderEvent[] = [];
     const reader = (async () => {
       for await (const e of query.events) {

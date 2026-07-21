@@ -132,23 +132,36 @@ export function cleanupOrphans(): void {
   try {
     const output = execSync(
       `${CONTAINER_RUNTIME_BIN} ps --filter label=${CONTAINER_INSTALL_LABEL} --format '{{.Names}}'`,
-      {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        encoding: 'utf-8',
-      },
+      { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8' },
     );
     const orphans = output.trim().split('\n').filter(Boolean);
     for (const name of orphans) {
       try {
         stopContainer(name);
       } catch {
-        /* already stopped */
+        // Best-effort compatibility path; startup uses the verified variant.
       }
     }
-    if (orphans.length > 0) {
-      log.info('Stopped orphaned containers', { count: orphans.length, names: orphans });
-    }
+    if (orphans.length > 0) log.info('Stopped orphaned containers', { count: orphans.length, names: orphans });
   } catch (err) {
     log.warn('Failed to clean up orphaned containers', { err });
   }
+}
+
+/** Startup-safe orphan cleanup. It returns only after a second listing proves empty. */
+export function cleanupOrphansVerified(): void {
+  const list = (): string[] => {
+    const output = execSync(
+      `${CONTAINER_RUNTIME_BIN} ps --filter label=${CONTAINER_INSTALL_LABEL} --format '{{.Names}}'`,
+      { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8' },
+    );
+    return output.trim().split('\n').filter(Boolean);
+  };
+  const orphans = list();
+  for (const name of orphans) stopContainer(name);
+  const survivors = list();
+  if (survivors.length > 0) {
+    throw new Error(`orphaned NanoClaw containers remain after cleanup: ${survivors.join(', ')}`);
+  }
+  if (orphans.length > 0) log.info('Stopped orphaned containers', { count: orphans.length, names: orphans });
 }

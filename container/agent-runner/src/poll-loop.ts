@@ -282,6 +282,9 @@ export interface PollLoopConfig {
    * provider error.
    */
   runPreTaskScripts?: (messages: MessageInRow[]) => Promise<{ keep: MessageInRow[]; skipped: string[] }>;
+  /** Internal deterministic seams; production uses authenticated host IPC. */
+  bindGwsCorrelation?: typeof bindHostGwsCorrelation;
+  releaseGwsCorrelation?: typeof releaseHostGwsCorrelation;
   signal?: AbortSignal;
 }
 
@@ -413,6 +416,13 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     let processingIds: string[] = [];
     let claimToken = '';
     let topLevelInputId = '';
+    const acceptanceContext: InputAcceptanceContext = {
+      tail: Promise.resolve(),
+      boundGwsInputs: new Set(),
+      bind: config.bindGwsCorrelation ?? bindHostGwsCorrelation,
+      release: config.releaseGwsCorrelation ?? releaseHostGwsCorrelation,
+    };
+    let initialClaim: InputClaimBatch | undefined;
     let routing: RoutingContext = extractRouting(activeMessages);
     let originalTasks: ProviderRecoveryEntry['originalTasks'] = [];
     try {
@@ -490,11 +500,21 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       const visibleDestination = findByRouting(routing.channelType, routing.platformId);
       const visibleDestinationName = visibleDestination?.name;
 
+      initialClaim = createInputClaim(acceptanceContext, {
+        inputId: topLevelInputId,
+        routeKey: activeRouteKey,
+        messageIds: processingIds,
+        claimToken,
+        prompt: originalTasks.map((task) => task.text).join('\n') || '(initial turn)',
+        scope: 'initial',
+      });
+
       // Provider startup / session creation. A synchronous throw here (the
       // OpenCode server failing to spawn, session creation rejecting) is a
       // pre-acceptance failure: no input has been accepted, so it is recoverable.
       query = config.provider.query({
         inputId: topLevelInputId,
+        acceptInput: initialClaim.acceptInput,
         prompt,
         attachments,
         messages: keep,
@@ -550,6 +570,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       }),
     };
     try {
+      if (!initialClaim) throw new Error('missing exact initial input claim');
       const result = await processQuery(
         query,
         routing,
@@ -558,7 +579,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         replyAccounting,
         {
           topLevelInputId,
-          initialClaimToken: claimToken,
+          initialClaim,
+          acceptanceContext,
           activeRouteKey,
           activeRouteScope,
           originalTasks,
@@ -582,6 +604,22 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       log(`Query error: ${errMsg}`);
+
+      if (err instanceof TrustedInputAcceptanceError) {
+        log(
+          JSON.stringify({
+            severity: 'warn',
+            event: 'trusted_input_acceptance_failed_returned_to_pending',
+            route_key: activeRouteKey,
+            message_ids: processingIds,
+            error: errMsg,
+          }),
+        );
+        // The row is intentionally retryable, but a missing/broken host IPC
+        // channel must not turn that retry into a microtask-only busy loop.
+        await sleep(POLL_INTERVAL_MS, config.signal);
+        continue;
+      }
 
       // Stale/corrupt continuation recovery: ask the provider whether
       // this error means the stored continuation is unusable, and clear
@@ -678,7 +716,72 @@ interface InputClaimBatch {
   claimToken: string;
   messageIds: string[];
   prompt: string;
-  state: 'queued' | 'accepted' | 'resolved' | 'returned' | 'recovery_owned';
+  scope: 'initial' | 'followup';
+  state: 'queued' | 'binding' | 'accepted' | 'resolved' | 'returned' | 'recovery_owned';
+  acceptanceObserved: boolean;
+  /** Exact, memoized host-acceptance gate captured for this claim. */
+  acceptInput: () => Promise<void>;
+}
+
+interface InputAcceptanceContext {
+  tail: Promise<void>;
+  boundGwsInputs: Set<string>;
+  bind: typeof bindHostGwsCorrelation;
+  release: typeof releaseHostGwsCorrelation;
+}
+
+class TrustedInputAcceptanceError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'TrustedInputAcceptanceError';
+  }
+}
+
+function createInputClaim(
+  ctx: InputAcceptanceContext,
+  opts: {
+    inputId: string;
+    routeKey: string;
+    messageIds: string[];
+    claimToken: string;
+    prompt: string;
+    scope: 'initial' | 'followup';
+  },
+): InputClaimBatch {
+  let acceptance: Promise<void> | undefined;
+  const claim: InputClaimBatch = {
+    claimToken: opts.claimToken,
+    messageIds: [...opts.messageIds],
+    prompt: opts.prompt,
+    scope: opts.scope,
+    state: 'queued',
+    acceptanceObserved: false,
+    acceptInput: () => {
+      if (acceptance) return acceptance;
+      const operation = ctx.tail.then(async () => {
+        if (claim.state !== 'queued') {
+          if (claim.state === 'accepted') return;
+          throw new TrustedInputAcceptanceError(`input claim cannot be accepted from state ${claim.state}`);
+        }
+        claim.state = 'binding';
+        try {
+          await ctx.bind(opts.inputId, opts.routeKey, claim.messageIds, claim.claimToken, claim.scope);
+          ctx.boundGwsInputs.add(opts.inputId);
+          claim.state = 'accepted';
+          // Legacy agent-writable correlation remains for non-GWS tools only.
+          writeActiveInput(opts.inputId, opts.routeKey);
+        } catch (err) {
+          claim.state = 'queued';
+          throw new TrustedInputAcceptanceError(`trusted host input bind failed for ${opts.inputId}`, { cause: err });
+        }
+      });
+      // A rejected bind must not poison later cleanup/retry bookkeeping.
+      ctx.tail = operation.catch(() => undefined);
+      acceptance = operation;
+      return operation;
+    },
+  };
+  return claim;
 }
 
 type ProviderStatusState = {
@@ -710,7 +813,8 @@ async function processQuery(
   replyAccounting: ReplyAccounting,
   ledgerCtx: {
     topLevelInputId: string;
-    initialClaimToken: string;
+    initialClaim: InputClaimBatch;
+    acceptanceContext: InputAcceptanceContext;
     activeRouteKey: string;
     activeRouteScope: ProviderRecoveryScope;
     originalTasks: ProviderRecoveryEntry['originalTasks'];
@@ -753,7 +857,7 @@ async function processQuery(
   // prompt is `accepted` only after the provider emits input-accepted for it,
   // and `resolved` only after a successful result resolves/supersedes it.
   const ledger = new Map<string, InputLedgerEntry>();
-  const boundGwsInputs = new Set<string>();
+  const boundGwsInputs = ledgerCtx.acceptanceContext.boundGwsInputs;
   ledger.set(ledgerCtx.topLevelInputId, {
     inputId: ledgerCtx.topLevelInputId,
     messageIds: [...initialBatchIds],
@@ -762,14 +866,7 @@ async function processQuery(
     prompt: ledgerCtx.originalTasks.map((t) => t.text).join('\n') || '(initial turn)',
     requiresUserVisibleReply: replyAccounting.initialRequiresUserVisibleReply,
     outboundVisibleReplyCountBefore: replyAccounting.outboundVisibleReplyCountBefore,
-    claims: [
-      {
-        claimToken: ledgerCtx.initialClaimToken,
-        messageIds: [...initialBatchIds],
-        prompt: ledgerCtx.originalTasks.map((t) => t.text).join('\n') || '(initial turn)',
-        state: 'queued',
-      },
-    ],
+    claims: [ledgerCtx.initialClaim],
   });
 
   if (signal?.aborted) {
@@ -780,19 +877,19 @@ async function processQuery(
 
   function onInputAccepted(inputId: string, scope: 'initial' | 'followup'): void {
     const entry = ledger.get(inputId);
-    if (!entry) return;
-    const claim = entry.claims.find((candidate) => candidate.state === 'queued');
-    if (!claim) return;
-    // This synchronous host handshake blocks the event loop before any later
-    // tool event can run. The host validates the exact inbound batch and only
-    // then atomically publishes a read-only pointer visible to the GWS shim.
-    if (bindHostGwsCorrelation(inputId, ledgerCtx.activeRouteKey, claim.messageIds, claim.claimToken, scope)) {
-      boundGwsInputs.add(inputId);
+    if (!entry) throw new Error(`provider accepted unknown input ${inputId}`);
+    const claim = entry.claims.find(
+      (candidate) => candidate.state === 'accepted' && !candidate.acceptanceObserved && candidate.scope === scope,
+    );
+    if (!claim) {
+      // A retry/nudge may reuse an already-accepted exact gate. Providers that
+      // echo another observational event for that reused gate do not mutate or
+      // advance host acceptance a second time.
+      if (entry.claims.some((candidate) => candidate.state === 'accepted' && candidate.acceptanceObserved)) return;
+      throw new Error(`provider acceptance event preceded trusted bind for ${inputId}`);
     }
-    claim.state = 'accepted';
+    claim.acceptanceObserved = true;
     entry.state = 'accepted';
-    // Legacy agent-writable correlation remains for non-GWS tools only.
-    writeActiveInput(inputId, ledgerCtx.activeRouteKey);
     // Resuming a prior interrupted turn: mark its recovery entries in_flight for
     // THIS top-level input. They are NOT consumed yet (mere acceptance never
     // resolves recovery — Invariant 140); resolution happens only on success.
@@ -841,12 +938,6 @@ async function processQuery(
         idsToComplete.push(...claim.messageIds);
       }
       entry.state = entry.claims.every((claim) => claim.state === 'resolved') ? 'resolved' : 'queued';
-      if (
-        !entry.claims.some((claim) => claim.state === 'queued' || claim.state === 'accepted') &&
-        boundGwsInputs.delete(inputId)
-      ) {
-        releaseHostGwsCorrelation(inputId);
-      }
     }
     // A successful result that resolves the top-level input also resolves the
     // recovery entries this turn resumed (and completes their owned recovery rows).
@@ -988,7 +1079,14 @@ async function processQuery(
     });
     const followupDestination = findByRouting(routing.channelType, routing.platformId);
     const claimToken = randomUUID();
-    const claim: InputClaimBatch = { claimToken, messageIds: newIds, prompt, state: 'queued' };
+    const claim = createInputClaim(ledgerCtx.acceptanceContext, {
+      inputId: followupInputId,
+      routeKey: ledgerCtx.activeRouteKey,
+      messageIds: newIds,
+      claimToken,
+      prompt,
+      scope: 'followup',
+    });
     markProcessing(newIds, claimToken);
     entry.claims.push(claim);
     entry.messageIds.push(...newIds);
@@ -1001,6 +1099,7 @@ async function processQuery(
       pendingUnwrappedOutputText = null;
       query.push({
         inputId: followupInputId,
+        acceptInput: claim.acceptInput,
         prompt,
         attachments,
         messages: newMessages,
@@ -1179,7 +1278,14 @@ async function processQuery(
           ) {
             unwrappedOutputNudged = true;
             pendingUnwrappedOutputText = event.text;
-            query.push({ inputId: resolved[0], prompt: buildUnwrappedOutputNudge(routing, event.text) });
+            const resolvedEntry = ledger.get(resolved[0]);
+            const acceptedClaim = resolvedEntry?.claims.find((claim) => claim.state === 'accepted');
+            if (!acceptedClaim) throw new Error(`cannot nudge unresolved input without accepted claim ${resolved[0]}`);
+            query.push({
+              inputId: resolved[0],
+              acceptInput: acceptedClaim.acceptInput,
+              prompt: buildUnwrappedOutputNudge(routing, event.text),
+            });
             continue;
           }
         }
@@ -1344,7 +1450,7 @@ async function processQuery(
     }
     for (const inputId of boundGwsInputs) {
       try {
-        releaseHostGwsCorrelation(inputId);
+        await ledgerCtx.acceptanceContext.release(inputId);
       } catch (err) {
         log(
           JSON.stringify({

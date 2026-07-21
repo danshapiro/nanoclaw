@@ -899,6 +899,16 @@ export class OpenCodeProvider implements AgentProvider {
               run_id: extractRunId(turn.prompt),
             }),
           );
+          const turnScope: ProviderInputScope = relayMode ? 'relay' : turnIndex === 0 ? 'initial' : 'followup';
+          turnIndex += 1;
+          if (turnInputId) {
+            if (!turn.acceptInput) throw new Error('OpenCode turn has no trusted acceptance gate');
+            await turn.acceptInput();
+            // Yield while still before promptAsync: the consumer observes the
+            // host bind receipt before this generator can resume into model
+            // execution or any MCP/tool request.
+            yield { type: 'input-accepted', inputId: turnInputId, scope: turnScope };
+          }
           const prompted = await promptSession(
             client.session,
             getActiveSession(),
@@ -911,13 +921,6 @@ export class OpenCodeProvider implements AgentProvider {
           if (!initYielded || prompted.recoveredFromStale) {
             yield { type: 'init', continuation: sessionId };
             initYielded = true;
-          }
-
-          // The prompt() returned for this exact inputId — emit input-accepted.
-          const turnScope: ProviderInputScope = relayMode ? 'relay' : turnIndex === 0 ? 'initial' : 'followup';
-          turnIndex += 1;
-          if (turnInputId) {
-            yield { type: 'input-accepted', inputId: turnInputId, scope: turnScope };
           }
 
           const partTextByMessageId = new Map<string, string>();
