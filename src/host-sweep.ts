@@ -474,7 +474,7 @@ async function enforceRunningContainerSla(
       currentGeneration: recycle.currentGeneration,
       spawnGeneration: recycle.spawnGeneration,
     });
-    killContainer(session.id, 'skills-stale');
+    await killContainer(session.id, 'skills-stale');
   }
 }
 

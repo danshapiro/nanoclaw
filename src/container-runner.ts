@@ -29,7 +29,6 @@ import {
   readonlyMountArgs,
   isContainerRunningAsync,
   isContainerWithLabelRunningAsync,
-  stopContainer,
   stopContainerAsync,
 } from './container-runtime.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
@@ -96,6 +95,8 @@ type ActiveContainer = {
   leaseId: string;
   revokeGwsAfterConfirmedStop: () => boolean;
   startedAtMs: number;
+  managedSkillsRoot: string;
+  finalization?: Promise<boolean>;
 };
 const activeContainers = new Map<string, ActiveContainer>();
 const activeMcpBridges = new Map<string, AgentMcpBridge[]>();
@@ -180,10 +181,9 @@ export function waitForContainerExit(sessionId: string, timeoutMs = 30000): Prom
 /**
  * Drain every tracked container on shutdown: `docker stop` with a real grace
  * period so agent work can finish, then wait for the host-side `docker run`
- * client process to exit so nothing is left in the service cgroup. Failures
- * are logged, never thrown — shutdown must proceed regardless. Bookkeeping
- * (activeContainers cleanup, session markers) happens in
- * finalizeContainerProcess via the process 'close' event.
+ * client process to exit so nothing is left in the service cgroup. A docker
+ * client exit is not stop proof: ownership is removed only after both exact
+ * daemon probes (container name and session label) report no writer.
  */
 export async function drainAllContainers(graceSeconds = 30): Promise<void> {
   if (activeContainers.size === 0) return;
@@ -199,6 +199,7 @@ export async function drainAllContainers(graceSeconds = 30): Promise<void> {
     entries.map(async ([sessionId, entry]) => {
       try {
         await stopContainerAsync(entry.containerName, graceSeconds);
+        await verifyContainerProcessExited(sessionId, entry, 'shutdown-drain');
       } catch (err) {
         log.warn('Failed to stop container during drain', {
           sessionId,
@@ -206,19 +207,10 @@ export async function drainAllContainers(graceSeconds = 30): Promise<void> {
           err,
         });
       }
-      try {
-        const exited = await waitForContainerExit(sessionId, (graceSeconds + 10) * 1000);
-        if (!exited) {
-          log.warn('Container process did not exit within drain window', {
-            sessionId,
-            containerName: entry.containerName,
-          });
-        }
-      } catch (err) {
-        log.warn('Failed waiting for container exit during drain', {
+      if (activeContainers.get(sessionId) === entry) {
+        log.warn('Container ownership retained after unverified shutdown drain', {
           sessionId,
           containerName: entry.containerName,
-          err,
         });
       }
     }),
@@ -384,6 +376,7 @@ async function spawnContainer(session: Session): Promise<void> {
     leaseId: launchControl.leaseId,
     revokeGwsAfterConfirmedStop: launchControl.revokeAfterConfirmedStop,
     startedAtMs: Date.now(),
+    managedSkillsRoot,
   });
   if (bridges.length > 0) {
     activeMcpBridges.set(session.id, bridges);
@@ -409,8 +402,15 @@ async function spawnContainer(session: Session): Promise<void> {
   // on a wall-clock timer.
 
   container.on('close', (code) => {
-    finalizeContainerProcess(session.id, containerName, launchControl.leaseId, code);
-    cleanupTempSkillRoot(managedSkillsRoot);
+    void finalizeContainerProcess(session.id, containerName, launchControl.leaseId, code, 'docker-client-close').catch(
+      (err) => {
+        log.error('Failed to verify container stop after docker client close', {
+          sessionId: session.id,
+          containerName,
+          err,
+        });
+      },
+    );
   });
 
   container.on('error', (err) => {
@@ -430,32 +430,75 @@ function cleanupTempSkillRoot(root: string): void {
   }
 }
 
-function finalizeContainerProcess(
+async function finalizeContainerProcess(
   sessionId: string,
   containerName: string,
   leaseId: string,
   code: number | null,
-): void {
+  reason: string,
+): Promise<boolean> {
   const current = activeContainers.get(sessionId);
-  if (!current || current.containerName !== containerName || current.leaseId !== leaseId) return;
-  const wasActive = activeContainers.delete(sessionId);
-  void stopAgentMcpBridges(activeMcpBridges.get(sessionId) ?? []);
+  if (!current || current.containerName !== containerName || current.leaseId !== leaseId) return false;
+  if (current.finalization) {
+    const inFlight = current.finalization;
+    const finalized = await inFlight;
+    if (finalized || activeContainers.get(sessionId) !== current) return finalized;
+    // A docker-client close may have probed while the daemon still reported a
+    // writer, just before an explicit stop completed. A verified-stop caller
+    // joining that in-flight negative probe must get a fresh name+label check,
+    // not mistake the earlier retained result for its own stop proof.
+    if (current.finalization === inFlight) current.finalization = undefined;
+    return await finalizeContainerProcess(sessionId, containerName, leaseId, code, reason);
+  }
+  const operation = finalizeVerifiedContainerStop(sessionId, current, code, reason);
+  current.finalization = operation;
+  try {
+    return await operation;
+  } finally {
+    if (activeContainers.get(sessionId) === current && current.finalization === operation) {
+      current.finalization = undefined;
+    }
+  }
+}
+
+async function finalizeVerifiedContainerStop(
+  sessionId: string,
+  current: ActiveContainer,
+  code: number | null,
+  reason: string,
+): Promise<boolean> {
+  if (!(await runtimeReportsSessionStopped(sessionId, current, reason))) {
+    log.warn('Retaining active container ownership without daemon stop proof', {
+      sessionId,
+      containerName: current.containerName,
+      reason,
+    });
+    return false;
+  }
+  if (activeContainers.get(sessionId) !== current) return false;
+  await stopAgentMcpBridges(activeMcpBridges.get(sessionId) ?? []);
   activeMcpBridges.delete(sessionId);
+  const wasActive = activeContainers.delete(sessionId);
   if (!wasActive) {
     notifyContainerExit(sessionId);
-    return;
+    return false;
   }
   if (isDbInitialized()) {
     markContainerStopped(sessionId);
   } else {
-    log.warn('Container exited after DB shutdown; skipped session stopped marker', { sessionId, containerName });
+    log.warn('Container exited after DB shutdown; skipped session stopped marker', {
+      sessionId,
+      containerName: current.containerName,
+    });
   }
   // Process close or a successful runtime name+label verification is the stop
   // proof. Revoke only now, before notifying waiters that may wake a successor.
   current.revokeGwsAfterConfirmedStop();
+  cleanupTempSkillRoot(current.managedSkillsRoot);
   stopTypingRefresh(sessionId);
   notifyContainerExit(sessionId);
-  log.info('Container exited', { sessionId, code, containerName });
+  log.info('Container exited', { sessionId, code, containerName: current.containerName });
+  return true;
 }
 
 function notifyContainerExit(sessionId: string): void {
@@ -468,16 +511,8 @@ function notifyContainerExit(sessionId: string): void {
 }
 
 /** Kill a container for a session. */
-export function killContainer(sessionId: string, reason: string): void {
-  const entry = activeContainers.get(sessionId);
-  if (!entry) return;
-
-  log.info('Killing container', { sessionId, reason, containerName: entry.containerName });
-  try {
-    stopContainer(entry.containerName);
-  } catch {
-    entry.process.kill('SIGKILL');
-  }
+export async function killContainer(sessionId: string, reason: string): Promise<void> {
+  await stopContainerAndVerify(sessionId, reason);
 }
 
 function processAppearsAlive(proc: ChildProcess): boolean {
@@ -572,7 +607,7 @@ async function verifyContainerProcessExited(sessionId: string, entry: ActiveCont
       reason,
       containerName: entry.containerName,
     });
-    finalizeContainerProcess(sessionId, entry.containerName, entry.leaseId, null);
+    await finalizeContainerProcess(sessionId, entry.containerName, entry.leaseId, null, reason);
     return;
   }
 
@@ -584,7 +619,7 @@ async function verifyContainerProcessExited(sessionId: string, entry: ActiveCont
       reason,
       containerName: entry.containerName,
     });
-    finalizeContainerProcess(sessionId, entry.containerName, entry.leaseId, null);
+    await finalizeContainerProcess(sessionId, entry.containerName, entry.leaseId, null, reason);
     return;
   }
 
@@ -596,19 +631,19 @@ async function runtimeReportsSessionStopped(
   entry: Pick<ActiveContainer, 'containerName'>,
   reason: string,
 ): Promise<boolean> {
-  const runningByName = await isContainerRunningAsync(entry.containerName).catch((err) => {
-    log.warn('Failed to inspect stopped container by name', {
-      sessionId,
-      reason,
-      containerName: entry.containerName,
-      err,
-    });
-    return true;
-  });
-  if (runningByName) return false;
-
-  const runningByLabel = await isContainerWithLabelRunningAsync(`${SESSION_CONTAINER_LABEL_KEY}=${sessionId}`).catch(
-    (err) => {
+  // Always execute BOTH independent daemon probes. A docker-client close, one
+  // negative probe, or an inspection error is never sufficient stop proof.
+  const [runningByName, runningByLabel] = await Promise.all([
+    isContainerRunningAsync(entry.containerName).catch((err) => {
+      log.warn('Failed to inspect stopped container by name', {
+        sessionId,
+        reason,
+        containerName: entry.containerName,
+        err,
+      });
+      return true;
+    }),
+    isContainerWithLabelRunningAsync(`${SESSION_CONTAINER_LABEL_KEY}=${sessionId}`).catch((err) => {
       log.warn('Failed to inspect stopped container by label', {
         sessionId,
         reason,
@@ -616,9 +651,9 @@ async function runtimeReportsSessionStopped(
         err,
       });
       return true;
-    },
-  );
-  return !runningByLabel;
+    }),
+  ]);
+  return !runningByName && !runningByLabel;
 }
 
 export async function isSessionOutboundWriterRunning(session: Session): Promise<boolean> {

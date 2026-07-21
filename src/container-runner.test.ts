@@ -1519,6 +1519,7 @@ describe('side-effect ledger container env', () => {
       await harness.containerRunner.wakeContainer(harness.session);
       const oldProcess = harness.spawnedProcesses[0];
       oldProcess.emit('close', 0);
+      await new Promise<void>((resolve) => setImmediate(resolve));
       expect(harness.containerRunner.getActiveContainerCount()).toBe(0);
 
       await harness.containerRunner.wakeContainer(harness.session);
@@ -1528,6 +1529,7 @@ describe('side-effect ledger container env', () => {
       oldProcess.emit('close', 0);
       expect(harness.containerRunner.getActiveContainerCount()).toBe(1);
       harness.spawnedProcesses[1].emit('close', 0);
+      await new Promise<void>((resolve) => setImmediate(resolve));
     } finally {
       harness.close();
     }
@@ -1653,6 +1655,123 @@ describe('side-effect ledger container env', () => {
         .get() as { host_acceptance_ended_at: string };
       expect(Date.parse(ended.host_acceptance_ended_at)).toBeGreaterThanOrEqual(Date.parse(completedInFlightAt));
       afterStop.close();
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('retains active ownership when the docker client closes but both daemon probes still report a writer', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      harness.oneCliRelease.resolve();
+      await harness.containerRunner.wakeContainer(harness.session);
+      const child = harness.spawnedProcesses[0];
+      const hostDir = path.join(harness.dataDir, 'v2-host-correlation', 'ag-1', harness.session.id);
+      const markerPath = path.join(hostDir, 'active-lease.json');
+      const pointerPath = path.join(hostDir, 'current.json');
+      const control = JSON.parse(String(child.stdin.end.mock.calls[0][0])) as { leaseId: string };
+      fs.writeFileSync(
+        pointerPath,
+        JSON.stringify({
+          schemaVersion: 1,
+          inputId: 'in-client-close',
+          routeKey: 'route-client-close',
+          leaseId: control.leaseId,
+        }),
+      );
+
+      const probes: string[][] = [];
+      harness.execFileMock.mockImplementation((_file, args: string[], _options, cb) => {
+        if (args[0] === 'ps') {
+          probes.push(args);
+          cb(null, 'nanoclaw-v2-agent-still-live\n', '');
+          return;
+        }
+        cb(null, '', '');
+      });
+
+      child.emit('close', 0);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      expect(probes).toHaveLength(2);
+      expect(probes.some((args) => args.join(' ').includes('name='))).toBe(true);
+      expect(probes.some((args) => args.join(' ').includes('label=nanoclaw-session='))).toBe(true);
+      expect(harness.containerRunner.getActiveContainerCount()).toBe(1);
+      expect(fs.existsSync(markerPath)).toBe(true);
+      expect(fs.existsSync(pointerPath)).toBe(true);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('retains active ownership when daemon stop inspection is unknown', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      harness.oneCliRelease.resolve();
+      await harness.containerRunner.wakeContainer(harness.session);
+      const child = harness.spawnedProcesses[0];
+      const probes: string[][] = [];
+      harness.execFileMock.mockImplementation((_file, args: string[], _options, cb) => {
+        if (args[0] === 'ps') {
+          probes.push(args);
+          cb(new Error('docker daemon unavailable'), '', '');
+          return;
+        }
+        cb(null, '', '');
+      });
+
+      child.emit('close', 0);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      expect(probes).toHaveLength(2);
+      expect(probes.some((args) => args.join(' ').includes('name='))).toBe(true);
+      expect(probes.some((args) => args.join(' ').includes('label=nanoclaw-session='))).toBe(true);
+      expect(harness.containerRunner.getActiveContainerCount()).toBe(1);
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('re-probes after an in-flight client-close check races a confirmed explicit stop', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      harness.oneCliRelease.resolve();
+      await harness.containerRunner.wakeContainer(harness.session);
+      const child = harness.spawnedProcesses[0];
+      const staleProbeCallbacks: Array<(err: null, stdout: string, stderr: string) => void> = [];
+      const explicitStopProbed = deferred();
+      let probeCount = 0;
+      harness.execFileMock.mockImplementation((_file, args: string[], _options, cb) => {
+        if (args[0] === 'stop') {
+          cb(null, '', '');
+          return;
+        }
+        if (args[0] === 'ps') {
+          probeCount++;
+          if (probeCount <= 2) {
+            staleProbeCallbacks.push(cb);
+          } else {
+            cb(null, '', '');
+            if (probeCount >= 4) explicitStopProbed.resolve();
+          }
+          return;
+        }
+        cb(null, '', '');
+      });
+
+      child.emit('close', 0);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(staleProbeCallbacks).toHaveLength(2);
+
+      const stopping = harness.containerRunner.stopContainerAndVerify(harness.session.id, 'close-stop-race');
+      await explicitStopProbed.promise;
+      // Complete the older close probes with their stale "still live" view.
+      // The explicit stop waiter must then run a fresh pair of probes.
+      for (const callback of staleProbeCallbacks) callback(null, 'still-live\n', '');
+
+      await stopping;
+      expect(probeCount).toBe(7);
+      expect(harness.containerRunner.getActiveContainerCount()).toBe(0);
     } finally {
       harness.close();
     }
