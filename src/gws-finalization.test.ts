@@ -60,6 +60,7 @@ describe('sealAndDrainGwsCorrelation', () => {
     ).toEqual({
       socketPath: '/srv/gws-proxy/control/control.sock',
       tokenFile: '/run/credentials/nanoclaw.service/gws-finalize-token',
+      credentialDirectory: '/run/credentials/nanoclaw.service',
     });
   });
 
@@ -84,6 +85,39 @@ describe('sealAndDrainGwsCorrelation', () => {
         tokenFile: control.tokenPath,
       }),
     ).resolves.toEqual({ inputId, routeKey, sealed: true, drained: true });
+  });
+
+  it('accepts systemd credential mode 0440 only from its protected credential directory', async () => {
+    const inputId = 'in-systemd-finalize';
+    const routeKey = 'codex|discord|chan-systemd|dm:mg-systemd';
+    const control = await controlServer((_request, response) => {
+      response.writeHead(200, { 'Content-Type': 'application/json' });
+      response.end(JSON.stringify({ input_id: inputId, route_key: routeKey, sealed: true, drained: true }));
+    });
+    const credentialDirectory = path.join(path.dirname(control.tokenPath), 'credentials');
+    fs.mkdirSync(credentialDirectory, { mode: 0o750 });
+    const systemdTokenPath = path.join(credentialDirectory, 'gws-finalize-token');
+    fs.renameSync(control.tokenPath, systemdTokenPath);
+    fs.chmodSync(systemdTokenPath, 0o440);
+
+    await expect(
+      sealAndDrainGwsCorrelation({
+        inputId,
+        routeKey,
+        socketPath: control.socketPath,
+        tokenFile: systemdTokenPath,
+        credentialDirectory,
+      }),
+    ).resolves.toEqual({ inputId, routeKey, sealed: true, drained: true });
+
+    await expect(
+      sealAndDrainGwsCorrelation({
+        inputId,
+        routeKey,
+        socketPath: control.socketPath,
+        tokenFile: systemdTokenPath,
+      }),
+    ).rejects.toThrow(/credential|permission|mode/i);
   });
 
   it.each([

@@ -1349,7 +1349,13 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
     outDb
       .prepare('INSERT INTO processing_ack (message_id, status, status_changed) VALUES (?, ?, ?)')
       .run('not-accepted-for-drain', 'processing', '2026-05-29 12:00:00');
-    const calls: Array<{ inputId: string; routeKey: string; socketPath: string; tokenFile: string }> = [];
+    const calls: Array<{
+      inputId: string;
+      routeKey: string;
+      socketPath: string;
+      tokenFile: string;
+      credentialDirectory?: string;
+    }> = [];
 
     const receipts = await sealAndDrainAcceptedGwsClaims({
       inDb,
@@ -1371,6 +1377,7 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
         routeKey: accepted.routeKey,
         socketPath: '/srv/gws-proxy/control/control.sock',
         tokenFile: '/run/credentials/nanoclaw.service/gws-finalize-token',
+        credentialDirectory: undefined,
       },
     ]);
     expect(receipts).toEqual([{ inputId: accepted.inputId, routeKey: accepted.routeKey, sealed: true, drained: true }]);

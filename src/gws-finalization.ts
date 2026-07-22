@@ -27,13 +27,33 @@ function absolutePath(value: string, label: string): string {
   return value;
 }
 
-function readCredential(tokenFile: string): string {
+function isProtectedSystemdCredential(
+  resolved: string,
+  stat: fs.Stats,
+  credentialDirectory: string | undefined,
+): boolean {
+  if (!credentialDirectory || (stat.mode & 0o777) !== 0o440) return false;
+  const directory = absolutePath(credentialDirectory, 'credential directory');
+  if (path.dirname(resolved) !== directory || fs.realpathSync(directory) !== directory) return false;
+  const directoryStat = fs.lstatSync(directory);
+  return (
+    directoryStat.isDirectory() &&
+    !directoryStat.isSymbolicLink() &&
+    trustedOwner(directoryStat.uid) &&
+    directoryStat.uid === stat.uid &&
+    directoryStat.gid === stat.gid &&
+    (directoryStat.mode & 0o050) === 0o050 &&
+    (directoryStat.mode & 0o027) === 0
+  );
+}
+
+function readCredential(tokenFile: string, credentialDirectory?: string): string {
   const resolved = absolutePath(tokenFile, 'credential file');
   const stat = fs.lstatSync(resolved);
   if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
     throw new Error('GWS finalization credential must be a single-link regular file, not a symlink');
   }
-  if ((stat.mode & 0o077) !== 0) {
+  if ((stat.mode & 0o077) !== 0 && !isProtectedSystemdCredential(resolved, stat, credentialDirectory)) {
     throw new Error('GWS finalization credential permissions must deny group and other access');
   }
   if (!trustedOwner(stat.uid)) {
@@ -78,15 +98,22 @@ function validateSocket(socketPath: string): string {
 export function resolveGwsFinalizationConfig(env: NodeJS.ProcessEnv = process.env): {
   socketPath: string;
   tokenFile: string;
+  credentialDirectory?: string;
 } {
   const socketPath = env.GWS_CONTROL_SOCKET ?? '';
-  const credentialFallback = env.CREDENTIALS_DIRECTORY
-    ? path.join(env.CREDENTIALS_DIRECTORY, 'gws-finalize-token')
-    : '';
+  const credentialDirectory = env.CREDENTIALS_DIRECTORY?.trim();
+  const credentialFallback = credentialDirectory ? path.join(credentialDirectory, 'gws-finalize-token') : '';
   const tokenFile = env.GWS_FINALIZE_TOKEN_FILE ?? credentialFallback;
+  const resolvedTokenFile = absolutePath(tokenFile, 'credential file');
+  const resolvedCredentialDirectory = credentialDirectory
+    ? absolutePath(credentialDirectory, 'credential directory')
+    : undefined;
   return {
     socketPath: absolutePath(socketPath, 'control socket'),
-    tokenFile: absolutePath(tokenFile, 'credential file'),
+    tokenFile: resolvedTokenFile,
+    ...(resolvedCredentialDirectory && path.dirname(resolvedTokenFile) === resolvedCredentialDirectory
+      ? { credentialDirectory: resolvedCredentialDirectory }
+      : {}),
   };
 }
 
@@ -95,12 +122,13 @@ export async function sealAndDrainGwsCorrelation(opts: {
   routeKey: string;
   socketPath: string;
   tokenFile: string;
+  credentialDirectory?: string;
   timeoutMs?: number;
 }): Promise<GwsFinalizationReceipt> {
   const inputId = canonicalCorrelation(opts.inputId, 'input_id');
   const routeKey = canonicalCorrelation(opts.routeKey, 'route_key');
   const socketPath = validateSocket(opts.socketPath);
-  const token = readCredential(opts.tokenFile);
+  const token = readCredential(opts.tokenFile, opts.credentialDirectory);
   const body = Buffer.from(JSON.stringify({ input_id: inputId, route_key: routeKey }));
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > 60_000) {

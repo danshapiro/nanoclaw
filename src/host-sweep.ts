@@ -802,6 +802,7 @@ export async function sealAndDrainAcceptedGwsClaims(opts: {
         routeKey: partition.scope.routeKey,
         socketPath: config.socketPath,
         tokenFile: config.tokenFile,
+        credentialDirectory: config.credentialDirectory,
       }),
     );
   }
