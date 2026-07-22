@@ -402,6 +402,77 @@ describe('gws proxy shim', () => {
     expect(result.stdout).toBe('line one\nline two\n\n');
   });
 
+  it('preserves the proxy manual-reconciliation sentinel as exit 75 without printing its response body', async () => {
+    const proxy = await withProxy((_req, res, requestBody) => {
+      const request = JSON.parse(requestBody) as { account: string; input_id: string; route_key: string };
+      res.writeHead(502, {
+        'Content-Type': 'application/json',
+        'X-Exit-Code': '75',
+        'X-GWS-Account': request.account,
+        'X-GWS-Audit-Id': 'ambiguous-audit-1',
+        'X-GWS-Input-Id': request.input_id,
+        'X-GWS-Route-Key': request.route_key,
+        'X-GWS-Service': 'drive',
+        'X-GWS-Method': 'files.update',
+        'X-GWS-Outcome': 'outcome_unknown',
+        'X-GWS-Upstream-Outcome': 'outcome_unknown',
+        'X-GWS-Reconciliation-Recorded': 'true',
+      });
+      res.end(
+        JSON.stringify({
+          outcome: 'outcome_unknown',
+          audit_id: 'ambiguous-audit-1',
+          operator_reconciliation: true,
+          reconciliation_recorded: true,
+          retry: 'manual_only',
+          private_upstream_detail: 'must-not-print',
+        }),
+      );
+    });
+
+    const result = await runShimRaw(['--account', 'personal', 'drive', 'files', 'update'], {
+      GWS_PROXY_URL: proxy.url,
+    });
+
+    expect(result.status).toBe(75);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('outcome is unknown');
+    expect(result.stderr).toContain('ambiguous-audit-1');
+    expect(result.stderr).toContain('Do not retry automatically');
+    expect(result.stderr).not.toContain('must-not-print');
+  });
+
+  it.each([
+    ['ordinary 502', {}],
+    ['spoofed exit 75', { 'X-Exit-Code': '75' }],
+    [
+      'incomplete reconciliation sentinel',
+      {
+        'X-Exit-Code': '75',
+        'X-GWS-Outcome': 'outcome_unknown',
+        'X-GWS-Upstream-Outcome': 'outcome_unknown',
+      },
+    ],
+  ])('keeps an %s on the generic failure path', async (_label, extraHeaders) => {
+    const proxy = await withProxy((_req, res, requestBody) => {
+      const request = JSON.parse(requestBody) as { account: string };
+      res.writeHead(502, {
+        'Content-Type': 'application/json',
+        'X-GWS-Account': request.account,
+        ...extraHeaders,
+      });
+      res.end('{"error":"ordinary upstream failure"}');
+    });
+
+    const result = await runShimRaw(['--account', 'personal', 'drive', 'files', 'get'], {
+      GWS_PROXY_URL: proxy.url,
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('GWS proxy returned HTTP 502');
+    expect(result.stderr).not.toContain('Do not retry automatically');
+  });
+
   it.each([
     ['missing', undefined],
     ['mismatched', 'glowforge'],

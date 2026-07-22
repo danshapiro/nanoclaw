@@ -488,6 +488,59 @@ if [ -z "$output_resolved_path" ] || [ "$http_code" != "200" ]; then
   body="$(cat "$curl_body_target" 2>/dev/null || true)"
 fi
 
+# A proxy-side ambiguous mutation is not an ordinary HTTP failure. Preserve
+# the canonical 502 + exit-75 + manual_only receipt so the provider cannot
+# mistake an unknown write outcome for a safe retry. Authenticate the complete
+# structured sentinel against the exact host input/route request first; an
+# isolated X-Exit-Code header is never enough to enter this path.
+if [ "$http_code" = "502" ] && [ "$exit_code" = "75" ]; then
+  sentinel_outcome="$(header_value 'X-GWS-Outcome')"
+  sentinel_upstream_outcome="$(header_value 'X-GWS-Upstream-Outcome')"
+  sentinel_recorded="$(header_value 'X-GWS-Reconciliation-Recorded')"
+  sentinel_audit_id="$(header_value 'X-GWS-Audit-Id')"
+  sentinel_input_id="$(header_value 'X-GWS-Input-Id')"
+  sentinel_route_key="$(header_value 'X-GWS-Route-Key')"
+  sentinel_service="$(header_value 'X-GWS-Service')"
+  sentinel_method="$(header_value 'X-GWS-Method')"
+  sentinel_status=0
+  NODE_NO_WARNINGS=1 \
+    NC_SENTINEL_BODY_FILE="$curl_body_target" NC_REQUEST_BODY="$request_body" \
+    NC_SENTINEL_OUTCOME="$sentinel_outcome" NC_SENTINEL_UPSTREAM_OUTCOME="$sentinel_upstream_outcome" \
+    NC_SENTINEL_RECORDED="$sentinel_recorded" NC_SENTINEL_AUDIT_ID="$sentinel_audit_id" \
+    NC_SENTINEL_INPUT_ID="$sentinel_input_id" NC_SENTINEL_ROUTE_KEY="$sentinel_route_key" \
+    NC_SENTINEL_SERVICE="$sentinel_service" NC_SENTINEL_METHOD="$sentinel_method" \
+    node -e '
+      const fs = require("fs");
+      const fail = () => process.exit(1);
+      try {
+        const request = JSON.parse(process.env.NC_REQUEST_BODY || "");
+        const response = JSON.parse(fs.readFileSync(process.env.NC_SENTINEL_BODY_FILE, "utf8"));
+        const recorded = process.env.NC_SENTINEL_RECORDED;
+        const auditId = process.env.NC_SENTINEL_AUDIT_ID || "";
+        if (process.env.NC_SENTINEL_OUTCOME !== "outcome_unknown" ||
+            process.env.NC_SENTINEL_UPSTREAM_OUTCOME !== "outcome_unknown" ||
+            (recorded !== "true" && recorded !== "false") ||
+            !/^[\x21-\x7e]{1,256}$/.test(auditId) ||
+            process.env.NC_SENTINEL_INPUT_ID !== request.input_id ||
+            process.env.NC_SENTINEL_ROUTE_KEY !== request.route_key ||
+            !(process.env.NC_SENTINEL_SERVICE || "") ||
+            !(process.env.NC_SENTINEL_METHOD || "") ||
+            !response || response.outcome !== "outcome_unknown" ||
+            response.audit_id !== auditId || response.operator_reconciliation !== true ||
+            response.reconciliation_recorded !== (recorded === "true") ||
+            response.retry !== "manual_only") fail();
+      } catch (_) { fail(); }
+    ' 2>/dev/null || sentinel_status=$?
+  if [ "$sentinel_status" -eq 0 ]; then
+    if [ "$sentinel_recorded" = "true" ]; then
+      printf 'Error: GWS write outcome is unknown (audit_id=%s); durable manual reconciliation is required. Do not retry automatically.\n' "$sentinel_audit_id" >&2
+    else
+      printf 'Error: GWS write outcome is unknown (audit_id=%s), and its durable reconciliation record failed. Manual reconciliation is required. Do not retry automatically.\n' "$sentinel_audit_id" >&2
+    fi
+    exit 75
+  fi
+fi
+
 case "$http_code" in
   200)
     if [ -n "$output_resolved_path" ]; then
