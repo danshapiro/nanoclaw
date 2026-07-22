@@ -10,7 +10,7 @@ import { getSession } from './db/sessions.js';
 import { log } from './log.js';
 import { hostCorrelationPath, inboundDbPath, outboundDbPath } from './session-manager.js';
 
-const AUTH_PROTOCOL = 'nanoclaw-gws-correlation-v2';
+const AUTH_PROTOCOL = 'nanoclaw-gws-correlation-v2'; // gitleaks:allow -- public protocol label, never a credential
 const MAX_FRAME_BYTES = 64 * 1024;
 const HANDSHAKE_DEADLINE_MS = 2_000;
 const SOCKET_BACKLOG = 4;

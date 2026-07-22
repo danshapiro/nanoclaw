@@ -17,6 +17,8 @@ gws - Google Workspace CLI (proxied)
 Usage:
   gws --account personal auth status
   gws --account glowforge auth status
+  gws --account personal --confirmed calendar +insert [flags]
+  gws --account glowforge --target-parent FOLDER docs documents create [flags]
   gws --account personal <service> <resource-or-shortcut> [method] [flags]
   gws --account glowforge <service> <resource-or-shortcut> [method] [flags]
 
@@ -43,6 +45,30 @@ case "$account" in
 esac
 shift 2
 
+proxy_confirmed=false
+proxy_target_parent=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --confirmed)
+      if [ "$proxy_confirmed" = true ]; then
+        echo "Error: --confirmed may be supplied only once, immediately after --account LABEL." >&2
+        exit 2
+      fi
+      proxy_confirmed=true
+      shift
+      ;;
+    --target-parent)
+      if [ -n "$proxy_target_parent" ] || [ "$#" -lt 2 ] || [ -z "$2" ]; then
+        echo "Error: --target-parent requires one nonempty value immediately after --account LABEL." >&2
+        exit 2
+      fi
+      proxy_target_parent="$2"
+      shift 2
+      ;;
+    *) break ;;
+  esac
+done
+
 if [ "$#" -eq 0 ]; then
   echo "Error: a GWS command is required after --account $account." >&2
   exit 2
@@ -51,6 +77,10 @@ for arg in "$@"; do
   case "$arg" in
     --account|--account=*)
       echo "Error: --account is accepted exactly once, as the first two arguments." >&2
+      exit 2
+      ;;
+    --confirmed|--confirmed=*|--target-parent|--target-parent=*)
+      echo "Error: proxy-only --confirmed/--target-parent flags must appear immediately after --account LABEL." >&2
       exit 2
       ;;
   esac
@@ -79,9 +109,13 @@ curl_with_configured_proxy() {
 tmp_headers="$(mktemp)"
 tmp_body="$(mktemp)"
 tmp_arg_plan="$(mktemp)"
+tmp_input_dir="$(mktemp -d)"
 tmp_output_body=""
 cleanup() {
   rm -f "$tmp_headers" "$tmp_body" "$tmp_arg_plan"
+  if [ -n "$tmp_input_dir" ]; then
+    rm -rf "$tmp_input_dir"
+  fi
   if [ -n "$tmp_output_body" ]; then
     rm -f "$tmp_output_body"
   fi
@@ -151,143 +185,15 @@ host_lease_file="${NANOCLAW_HOST_LEASE_FILE:-/workspace/.host-correlation/active
 
 parse_status=0
 readonly_output_roots="/workspace/agent:/workspace/outbox"
-GWS_ARG_PLAN_FILE="$tmp_arg_plan" \
-  NODE_NO_WARNINGS=1 \
-  GWS_SHIM_READONLY_OUTPUT_ROOTS="$readonly_output_roots" \
-  node -e '
-    const fs = require("fs");
-    const path = require("path");
-
-    const args = process.argv.slice(1);
-    const roots = (process.env.GWS_SHIM_READONLY_OUTPUT_ROOTS || "/workspace/agent:/workspace/outbox")
-      .split(":")
-      .filter(Boolean)
-      .map((root) => {
-        try {
-          return fs.realpathSync(root);
-        } catch {
-          return path.resolve(root);
-        }
-      });
-
-    function fail(message) {
-      process.stderr.write(`Error: ${message}\n`);
-      process.exit(2);
-    }
-
-    function insideRoot(candidate, root) {
-      const rel = path.relative(root, candidate);
-      return rel === "" || (!!rel && !rel.startsWith("..") && !path.isAbsolute(rel));
-    }
-
-	    let outputArg = null;
-	    const proxyArgs = [];
-	    const valueFlags = new Set([
-	      "--params",
-	      "--json",
-	      "--format",
-	      "--fields",
-	      "--filter",
-	      "--query",
-	      "--q",
-	      "--userId",
-	      "--user-id",
-	      "--fileId",
-	      "--file-id",
-	      "--documentId",
-	      "--document-id",
-	      "--spreadsheetId",
-	      "--spreadsheet-id",
-	      "--presentationId",
-	      "--presentation-id",
-	      "--calendarId",
-	      "--calendar-id",
-	      "--eventId",
-	      "--event-id",
-	      "--mimeType",
-	      "--mime-type",
-	      "--pageToken",
-	      "--page-token",
-	      "--pageSize",
-	      "--page-size",
-	    ]);
-	    let parseOptions = true;
-	    for (let i = 0; i < args.length; i++) {
-	      const arg = args[i];
-	      let value = null;
-	      if (!parseOptions) {
-	        proxyArgs.push(arg);
-	        continue;
-	      }
-	      if (arg === "--") {
-	        parseOptions = false;
-	        proxyArgs.push(arg);
-	        continue;
-	      }
-	      if (valueFlags.has(arg)) {
-	        proxyArgs.push(arg);
-	        if (i + 1 < args.length) proxyArgs.push(args[++i]);
-	        continue;
-	      }
-	      if (arg === "-o" || arg === "--output") {
-	        if (i + 1 >= args.length) fail(`${arg} requires a path value`);
-	        value = args[++i];
-      } else if (arg.startsWith("--output=")) {
-        value = arg.slice("--output=".length);
-      } else if (arg.startsWith("-o=")) {
-        value = arg.slice("-o=".length);
-      } else if (arg.startsWith("-o") && arg.length > 2) {
-        fail("attached -oPATH output syntax is not supported; use -o PATH or --output PATH");
-      }
-
-      if (value !== null) {
-        if (outputArg !== null) fail("multiple output paths were provided");
-        if (value === "") fail("output path must not be empty");
-        outputArg = value;
-        continue;
-      }
-
-      proxyArgs.push(arg);
-    }
-
-    const plan = { proxyArgs, output: null, roots };
-    if (outputArg !== null) {
-      const lexicalResolved = path.resolve(process.cwd(), outputArg);
-      const parent = path.dirname(lexicalResolved);
-      const base = path.basename(lexicalResolved);
-      if (base === "." || base === ".." || base === "") fail("output path must name a file");
-      let stat;
-      let parentReal;
-      try {
-        stat = fs.statSync(parent);
-        parentReal = fs.realpathSync(parent);
-      } catch {
-        fail(`output parent directory does not exist: ${parent}`);
-      }
-      if (!stat.isDirectory()) {
-        fail(`output parent path is not a directory: ${parent}`);
-      }
-      if (!roots.some((root) => insideRoot(parentReal, root))) {
-        fail(`output path ${lexicalResolved} is outside allowed output roots: ${roots.join(":")}`);
-      }
-      const resolved = path.join(parentReal, base);
-      try {
-        const targetStat = fs.lstatSync(resolved);
-        if (targetStat.isSymbolicLink()) fail(`output target is a symlink: ${resolved}`);
-        fail(`output target already exists: ${resolved}`);
-      } catch (e) {
-        if (e && e.code !== "ENOENT") throw e;
-      }
-      plan.output = {
-        requestedPath: outputArg,
-        resolvedPath: resolved,
-        parent: parentReal,
-        basename: base,
-      };
-    }
-
-    fs.writeFileSync(process.env.GWS_ARG_PLAN_FILE, JSON.stringify(plan));
-  ' -- "$@" || parse_status=$?
+readonly_input_roots="/workspace/agent:/workspace/outbox"
+readonly_write_operations_file="/usr/local/share/nanoclaw/gws-v0.18.1-write-operations.json"
+readonly_request_helper="/usr/local/lib/nanoclaw/gws-request.mjs"
+NODE_NO_WARNINGS=1 \
+  GWS_ACCOUNT="$account" GWS_PROXY_CONFIRMED="$proxy_confirmed" GWS_PROXY_TARGET_PARENT="$proxy_target_parent" \
+  NANOCLAW_HOST_CORRELATION_FILE="$host_correlation_file" NANOCLAW_HOST_LEASE_FILE="$host_lease_file" \
+  GWS_SHIM_READONLY_OUTPUT_ROOTS="$readonly_output_roots" GWS_SHIM_READONLY_INPUT_ROOTS="$readonly_input_roots" \
+  GWS_SHIM_WRITE_OPERATIONS_FILE="$readonly_write_operations_file" \
+  node "$readonly_request_helper" "$tmp_arg_plan" "$tmp_input_dir" "$@" || parse_status=$?
 if [ "$parse_status" -ne 0 ]; then
   exit "$parse_status"
 fi
@@ -297,39 +203,16 @@ fi
 # kill happens before the JSONL append. The shim NEVER adds an Authorization
 # header (OneCLI injects it at the gateway).
 request_body="$(
-  NODE_NO_WARNINGS=1 GWS_ACCOUNT="$account" NANOCLAW_HOST_CORRELATION_FILE="$host_correlation_file" \
-  NANOCLAW_HOST_LEASE_FILE="$host_lease_file" \
-  GWS_ARG_PLAN_FILE="$tmp_arg_plan" node -e '
+  NODE_NO_WARNINGS=1 GWS_ARG_PLAN_FILE="$tmp_arg_plan" node -e '
     const fs = require("fs");
     const plan = JSON.parse(fs.readFileSync(process.env.GWS_ARG_PLAN_FILE, "utf8"));
-    const body = { account: process.env.GWS_ACCOUNT, args: plan.proxyArgs };
-    if (plan.output) body.output = { mode: "return_file" };
-    try {
-      const markerBefore = JSON.parse(fs.readFileSync(process.env.NANOCLAW_HOST_LEASE_FILE, "utf8"));
-      const ai = JSON.parse(fs.readFileSync(process.env.NANOCLAW_HOST_CORRELATION_FILE, "utf8"));
-      const markerAfter = JSON.parse(fs.readFileSync(process.env.NANOCLAW_HOST_LEASE_FILE, "utf8"));
-      const acceptedAt = ai && typeof ai.acceptedAt === "string" ? Date.parse(ai.acceptedAt) : NaN;
-      const canonical = (value) => typeof value === "string" && /^[\x21-\x7e]{1,512}$/.test(value);
-      if (
-        !markerBefore || markerBefore.schemaVersion !== 1 ||
-        !markerAfter || JSON.stringify(markerBefore) !== JSON.stringify(markerAfter) ||
-        !canonical(markerBefore.leaseId) ||
-        !ai || ai.schemaVersion !== 1 || ai.leaseId !== markerBefore.leaseId ||
-        !Number.isFinite(acceptedAt) || !canonical(ai.inputId) || !canonical(ai.routeKey)
-      ) {
-        throw new Error("host correlation pointer is absent, malformed, or outside the active lease");
-      }
-      {
-        body.input_id = ai.inputId;
-        body.route_key = ai.routeKey;
-      }
-    } catch (e) {
-      process.stderr.write(`Error: refusing GWS request without an exact active host correlation: ${e.message}\n`);
-      process.exit(3);
-    }
-    process.stdout.write(JSON.stringify(body));
-  ' -- "$@"
+    process.stdout.write(JSON.stringify(plan.request));
+  '
 )"
+
+multipart_body="$(NODE_NO_WARNINGS=1 node -e 'const p=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.stdout.write(p.multipartBody||"")' "$tmp_arg_plan")"
+multipart_content_type="$(NODE_NO_WARNINGS=1 node -e 'const p=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.stdout.write(p.multipartContentType||"")' "$tmp_arg_plan")"
+request_is_write="$(NODE_NO_WARNINGS=1 node -e 'const p=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.stdout.write(p.isWrite?"true":"false")' "$tmp_arg_plan")"
 
 output_resolved_path="$(
   NODE_NO_WARNINGS=1 node -e '
@@ -352,16 +235,26 @@ if [ -n "$output_resolved_path" ]; then
 fi
 
 curl_status=0
-http_code="$(
-  curl_with_configured_proxy -sS -o "$curl_body_target" -D "$tmp_headers" -w "%{http_code}" \
-    -X POST \
-    -H "Content-Type: application/json" \
-    -d "$request_body" \
-    "$GWS_PROXY_URL/exec" 2>/dev/null
-)" || curl_status=$?
+if [ -n "$multipart_body" ]; then
+  http_code="$(
+    curl_with_configured_proxy -sS -o "$curl_body_target" -D "$tmp_headers" -w "%{http_code}" \
+      -X POST -H "Content-Type: $multipart_content_type" --data-binary "@$multipart_body" \
+      "$GWS_PROXY_URL/exec" 2>/dev/null
+  )" || curl_status=$?
+else
+  http_code="$(
+    curl_with_configured_proxy -sS -o "$curl_body_target" -D "$tmp_headers" -w "%{http_code}" \
+      -X POST -H "Content-Type: application/json" -d "$request_body" \
+      "$GWS_PROXY_URL/exec" 2>/dev/null
+  )" || curl_status=$?
+fi
 if [ "$curl_status" -ne 0 ]; then
   rm -f "$tmp_output_body"
   tmp_output_body=""
+  if [ "$request_is_write" = true ]; then
+    printf 'Error: the authenticated GWS write request was sent but the proxy response was lost. Manual reconciliation is required. Do not retry automatically.\n' >&2
+    exit 75
+  fi
   printf 'Error: GWS proxy transfer failed while receiving output bytes.\n' >&2
   exit 1
 fi

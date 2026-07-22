@@ -2,7 +2,7 @@ import { createHmac, randomUUID } from 'crypto';
 import fs from 'fs';
 import net, { type Socket } from 'net';
 
-const AUTH_PROTOCOL = 'nanoclaw-gws-correlation-v2';
+const AUTH_PROTOCOL = 'nanoclaw-gws-correlation-v2'; // gitleaks:allow -- public protocol label, never a credential
 const DEFAULT_IPC_ROOT = '/run/nanoclaw-gws-control';
 const DEFAULT_CURRENT = '/workspace/.host-correlation/current.json';
 const TIMEOUT_MS = 10_000;

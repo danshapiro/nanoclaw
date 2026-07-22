@@ -89,9 +89,19 @@ describe('agent container Dockerfile', () => {
 
     expect(dockerfile).toContain('COPY shim/gws /usr/local/bin/gws');
     expect(dockerfile).toContain('COPY shim/curl /usr/local/bin/curl');
+    expect(dockerfile).toContain('COPY shim/gws-request.mjs /usr/local/lib/nanoclaw/gws-request.mjs');
+    expect(dockerfile).toContain(
+      'COPY shim/gws-v0.18.1-write-operations.json /usr/local/share/nanoclaw/gws-v0.18.1-write-operations.json',
+    );
     expect(dockerfile).toContain('chmod +x /usr/local/bin/gws /usr/local/bin/curl');
     expect(dockerfile).not.toContain('GWS_CLI_VERSION');
     expect(dockerfile).not.toContain('@googleworkspace/cli');
+  });
+
+  it('keeps the shim write-loss classifier byte-identical to the host policy manifest', () => {
+    expect(fs.readFileSync(path.join(process.cwd(), 'container/shim/gws-v0.18.1-write-operations.json'))).toEqual(
+      fs.readFileSync(path.join(process.cwd(), 'src/db/gws-v0.18.1-write-operations.json')),
+    );
   });
 
   it('allows postinstall scripts for globally installed CLIs that need runtime binaries', () => {

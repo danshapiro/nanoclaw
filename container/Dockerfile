@@ -162,6 +162,8 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
 # authorization header for the configured GWS_PROXY_URL host.
 COPY shim/gws /usr/local/bin/gws
 COPY shim/curl /usr/local/bin/curl
+COPY shim/gws-request.mjs /usr/local/lib/nanoclaw/gws-request.mjs
+COPY shim/gws-v0.18.1-write-operations.json /usr/local/share/nanoclaw/gws-v0.18.1-write-operations.json
 RUN chmod +x /usr/local/bin/gws /usr/local/bin/curl
 
 # ---- Entrypoint --------------------------------------------------------------

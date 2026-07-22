@@ -18,6 +18,7 @@ type RequestRecord = {
 };
 
 const shimPath = path.join(process.cwd(), 'container', 'shim', 'gws');
+let runtimeShimPath: string | null = null;
 const servers: http.Server[] = [];
 const correlationFixtureDirs: string[] = [];
 const DEFAULT_TEST_INPUT = 'test-host-input';
@@ -39,6 +40,24 @@ async function withProxy(
     req.on('end', () => {
       handler(req, res, body);
     });
+  });
+  servers.push(server);
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('test proxy did not bind a TCP port');
+  return {
+    url: `http://127.0.0.1:${address.port}`,
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+  };
+}
+
+async function withBinaryProxy(
+  handler: (req: http.IncomingMessage, res: http.ServerResponse, body: Buffer) => void,
+): Promise<{ url: string; close: () => Promise<void> }> {
+  const server = http.createServer((req, res) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+    req.on('end', () => handler(req, res, Buffer.concat(chunks)));
   });
   servers.push(server);
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -107,6 +126,23 @@ async function runShim(
     effectiveEnv.NANOCLAW_HOST_CORRELATION_FILE = correlationPath;
     effectiveEnv.NANOCLAW_HOST_LEASE_FILE = markerPath;
   }
+  if (shim === shimPath) {
+    if (!runtimeShimPath) {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-shim-runtime-test-'));
+      runtimeShimPath = path.join(dir, 'gws');
+      let source = fs.readFileSync(shimPath, 'utf8');
+      source = source.replace(
+        'readonly_write_operations_file="/usr/local/share/nanoclaw/gws-v0.18.1-write-operations.json"',
+        `readonly_write_operations_file=${JSON.stringify(path.join(process.cwd(), 'src/db/gws-v0.18.1-write-operations.json'))}`,
+      );
+      source = source.replace(
+        'readonly_request_helper="/usr/local/lib/nanoclaw/gws-request.mjs"',
+        `readonly_request_helper=${JSON.stringify(path.join(process.cwd(), 'container/shim/gws-request.mjs'))}`,
+      );
+      fs.writeFileSync(runtimeShimPath, source, { mode: 0o755 });
+    }
+    shim = runtimeShimPath;
+  }
   return await new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve, reject) => {
     const child = spawn('sh', [shim, ...effectiveArgs], {
       cwd,
@@ -145,9 +181,61 @@ function shimWithOutputRootsForTest(roots: string[]): string {
     'readonly_output_roots="/workspace/agent:/workspace/outbox"',
     `readonly_output_roots=${JSON.stringify(roots.join(':'))}`,
   );
+  source = source.replace(
+    'readonly_write_operations_file="/usr/local/share/nanoclaw/gws-v0.18.1-write-operations.json"',
+    `readonly_write_operations_file=${JSON.stringify(path.join(process.cwd(), 'src/db/gws-v0.18.1-write-operations.json'))}`,
+  );
+  source = source.replace(
+    'readonly_request_helper="/usr/local/lib/nanoclaw/gws-request.mjs"',
+    `readonly_request_helper=${JSON.stringify(path.join(process.cwd(), 'container/shim/gws-request.mjs'))}`,
+  );
   if (!source.includes(roots.join(':'))) throw new Error('test shim root replacement failed');
   fs.writeFileSync(shim, source, { mode: 0o755 });
   return shim;
+}
+
+function shimWithInputRootsForTest(roots: string[]): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-shim-input-root-test-'));
+  const shim = path.join(dir, 'gws');
+  let source = fs.readFileSync(shimPath, 'utf8');
+  source = source.replace(
+    'readonly_input_roots="/workspace/agent:/workspace/outbox"',
+    `readonly_input_roots=${JSON.stringify(roots.join(':'))}`,
+  );
+  source = source.replace(
+    'readonly_request_helper="/usr/local/lib/nanoclaw/gws-request.mjs"',
+    `readonly_request_helper=${JSON.stringify(path.join(process.cwd(), 'container/shim/gws-request.mjs'))}`,
+  );
+  source = source.replace(
+    'readonly_write_operations_file="/usr/local/share/nanoclaw/gws-v0.18.1-write-operations.json"',
+    `readonly_write_operations_file=${JSON.stringify(path.join(process.cwd(), 'src/db/gws-v0.18.1-write-operations.json'))}`,
+  );
+  if (!source.includes(roots.join(':'))) throw new Error('test shim input-root replacement failed');
+  fs.writeFileSync(shim, source, { mode: 0o755 });
+  return shim;
+}
+
+function parseMultipart(
+  body: Buffer,
+  contentType: string | undefined,
+): Map<string, { filename?: string; body: Buffer }> {
+  const boundary = /boundary=([^;]+)/i.exec(contentType ?? '')?.[1]?.replace(/^"|"$/g, '');
+  if (!boundary) throw new Error(`missing multipart boundary: ${contentType}`);
+  const marker = Buffer.from(`--${boundary}`);
+  const parts = new Map<string, { filename?: string; body: Buffer }>();
+  let cursor = marker.length + 2;
+  while (cursor < body.length) {
+    const headerEnd = body.indexOf(Buffer.from('\r\n\r\n'), cursor);
+    if (headerEnd < 0) break;
+    const headers = body.subarray(cursor, headerEnd).toString('utf8');
+    const next = body.indexOf(marker, headerEnd + 4);
+    if (next < 0) break;
+    const name = /name="([^"]+)"/.exec(headers)?.[1];
+    const filename = /filename="([^"]+)"/.exec(headers)?.[1];
+    if (name) parts.set(name, { filename, body: body.subarray(headerEnd + 4, next - 2) });
+    cursor = next + marker.length + 2;
+  }
+  return parts;
 }
 
 function writeOutputProxyResponse(res: http.ServerResponse, bytes: Buffer | string): void {
@@ -387,6 +475,179 @@ describe('gws proxy shim', () => {
         }),
       },
     ]);
+  });
+
+  it('encodes fixed-position proxy confirmation and native-create target parent outside upstream argv', async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    const proxy = await withProxy((_req, res, body) => {
+      requests.push(JSON.parse(body) as Record<string, unknown>);
+      echoResolvedAccount(res, body);
+      res.writeHead(200, { 'Content-Type': 'application/json', 'X-Exit-Code': '0' });
+      res.end('{}');
+    });
+    const confirmed = await runShimRaw(
+      [
+        '--account',
+        'personal',
+        '--confirmed',
+        'calendar',
+        '+insert',
+        '--summary',
+        'Board',
+        '--start',
+        '2026-07-22T10:00:00Z',
+        '--end',
+        '2026-07-22T10:30:00Z',
+      ],
+      { GWS_PROXY_URL: proxy.url },
+    );
+    const contained = await runShimRaw(
+      [
+        '--account',
+        'glowforge',
+        '--target-parent',
+        'shared-root',
+        'docs',
+        'documents',
+        'create',
+        '--json',
+        '{"title":"Plan"}',
+      ],
+      { GWS_PROXY_URL: proxy.url },
+    );
+    expect(confirmed.status).toBe(0);
+    expect(contained.status).toBe(0);
+    expect(requests[0]).toMatchObject({ account: 'personal', confirmed: true });
+    expect(requests[0].args).toEqual([
+      'calendar',
+      '+insert',
+      '--summary',
+      'Board',
+      '--start',
+      '2026-07-22T10:00:00Z',
+      '--end',
+      '2026-07-22T10:30:00Z',
+    ]);
+    expect(requests[1]).toMatchObject({ account: 'glowforge', target_parent: 'shared-root' });
+    expect(requests[1].args).toEqual(['docs', 'documents', 'create', '--json', '{"title":"Plan"}']);
+  });
+
+  it('rejects malformed or misplaced proxy-only flags before network access', async () => {
+    const requests: string[] = [];
+    const proxy = await withProxy((_req, res, body) => {
+      requests.push(body);
+      res.writeHead(500);
+      res.end();
+    });
+    for (const args of [
+      ['--account', 'personal', '--target-parent', '', 'docs', 'documents', 'create'],
+      ['--account', 'personal', 'calendar', '+insert', '--confirmed'],
+      ['--account', 'personal', '--confirmed', '--confirmed', 'calendar', '+insert'],
+    ]) {
+      const result = await runShimRaw(args, { GWS_PROXY_URL: proxy.url });
+      expect(result.status).toBe(2);
+    }
+    expect(requests).toEqual([]);
+  });
+
+  it.each([
+    [
+      'drive helper',
+      ['drive', '+upload', '__FILE__', '--parent', 'folder-1'],
+      Buffer.from([0, 1, 2, 255, 10]),
+      'application/octet-stream',
+    ],
+    [
+      'gmail attachment',
+      ['gmail', '+send', '--to', 'a@example.com', '--subject', 'x', '--body', 'y', '--attach', '__FILE__'],
+      Buffer.from('attachment bytes\n'),
+      'application/octet-stream',
+    ],
+    [
+      'raw gmail upload',
+      ['gmail', 'users', 'messages', 'send', '--upload', '__FILE__', '--upload-content-type', 'message/rfc822'],
+      Buffer.from('To: a@example.com\r\n\r\nbody\0tail'),
+      'message/rfc822',
+    ],
+  ])(
+    'sends %s as account-bound multipart without changing file bytes',
+    async (_label, template, bytes, contentType) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-shim-upload-'));
+      const file = path.join(root, 'payload.bin');
+      fs.writeFileSync(file, bytes);
+      const shim = shimWithInputRootsForTest([root]);
+      const received: Array<{ metadata: any; file: Buffer }> = [];
+      const proxy = await withBinaryProxy((req, res, body) => {
+        const parts = parseMultipart(body, headerValue(req.headers['content-type']));
+        const metadata = JSON.parse(parts.get('request')!.body.toString('utf8'));
+        const input = metadata.inputs[0];
+        received.push({ metadata, file: Buffer.from(parts.get(`file-${input.arg_index}`)!.body) });
+        res.setHeader('X-GWS-Account', metadata.account);
+        res.writeHead(200, { 'Content-Type': 'application/json', 'X-Exit-Code': '0' });
+        res.end('{}');
+      });
+      const args = ['--account', 'glowforge', ...template.map((arg) => (arg === '__FILE__' ? file : arg))];
+      const result = await runShimRaw(args, { GWS_PROXY_URL: proxy.url }, root, shim);
+      expect(result.status).toBe(0);
+      expect(received).toHaveLength(1);
+      expect(received[0].metadata.account).toBe('glowforge');
+      expect(received[0].metadata.inputs[0]).toMatchObject({
+        content_type: contentType,
+        size: bytes.length,
+        sha256: crypto.createHash('sha256').update(bytes).digest('hex'),
+      });
+      expect(received[0].file.equals(bytes)).toBe(true);
+    },
+  );
+
+  it('rejects upload files outside fixed roots and symlinks without network access', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-shim-safe-upload-'));
+    const outside = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'gws-shim-outside-')), 'secret');
+    fs.writeFileSync(outside, 'secret');
+    const link = path.join(root, 'link');
+    fs.symlinkSync(outside, link);
+    const shim = shimWithInputRootsForTest([root]);
+    const requests: Buffer[] = [];
+    const proxy = await withBinaryProxy((_req, res, body) => {
+      requests.push(body);
+      res.writeHead(500);
+      res.end();
+    });
+    for (const file of [outside, link]) {
+      const result = await runShimRaw(
+        ['--account', 'personal', 'drive', '+upload', file, '--parent', 'folder-1'],
+        { GWS_PROXY_URL: proxy.url },
+        root,
+        shim,
+      );
+      expect(result.status).toBe(2);
+    }
+    expect(requests).toEqual([]);
+  });
+
+  it('treats transfer loss for an exact write as manual-only exit 75 while reads remain ordinary failures', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-shim-write-loss-'));
+    const shim = shimWithInputRootsForTest([root]);
+    const proxy = await withBinaryProxy((_req, res) => {
+      res.socket?.destroy();
+    });
+    const write = await runShimRaw(
+      ['--account', 'personal', 'tasks', 'tasklists', 'insert', '--json', '{"title":"Work"}'],
+      { GWS_PROXY_URL: proxy.url },
+      root,
+      shim,
+    );
+    const read = await runShimRaw(
+      ['--account', 'personal', 'gmail', 'users', 'getProfile'],
+      { GWS_PROXY_URL: proxy.url },
+      root,
+      shim,
+    );
+    expect(write.status).toBe(75);
+    expect(write.stderr).toContain('response was lost');
+    expect(write.stderr).toContain('Do not retry automatically');
+    expect(read.status).toBe(1);
+    expect(read.stderr).not.toContain('Do not retry automatically');
   });
 
   it('preserves successful upstream stdout bytes including trailing newlines', async () => {
