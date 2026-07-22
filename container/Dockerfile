@@ -156,6 +156,19 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
     codex app-server --help | grep -F -- '--strict-config' && \
     codex app-server --help | grep -F -- '--listen'
 
+# ---- YouTube media downloader ------------------------------------------------
+# Pin the official nightly zipimport executable: distro packages and stable
+# builds can lag behind YouTube changes. Node is already present in the image.
+ARG YT_DLP_VERSION=2026.07.20.234742
+ARG YT_DLP_SHA256=8a6c4c64fddb40bf383b8926abcf5ebfe72bb96c443ef94c1ba7cd9bc4107834
+RUN curl -fsSL --retry 3 \
+      "https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/download/${YT_DLP_VERSION}/yt-dlp" \
+      -o /usr/local/bin/yt-dlp && \
+    printf '%s  %s\n' "$YT_DLP_SHA256" /usr/local/bin/yt-dlp | sha256sum --check --strict && \
+    chmod 0755 /usr/local/bin/yt-dlp && \
+    printf '%s\n' '--js-runtimes node' > /etc/yt-dlp.conf && \
+    test "$(yt-dlp --version)" = "$YT_DLP_VERSION"
+
 # ---- GWS policy proxy shim ---------------------------------------------------
 # Agent containers must not include the real Google Workspace CLI or OAuth
 # files. This CLI-shaped shim forwards to gws-proxy; OneCLI injects the proxy

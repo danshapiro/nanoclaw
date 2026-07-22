@@ -76,6 +76,23 @@ describe('agent container Dockerfile', () => {
     expect(dockerfile).toContain('python3-jsonschema');
   });
 
+  it('installs a verified yt-dlp nightly with the Node JavaScript runtime enabled', () => {
+    const dockerfile = fs.readFileSync(path.join(process.cwd(), 'container', 'Dockerfile'), 'utf8');
+
+    const version = dockerfile.match(/^ARG YT_DLP_VERSION=(\S+)$/m)?.[1];
+    const checksum = dockerfile.match(/^ARG YT_DLP_SHA256=(\S+)$/m)?.[1];
+
+    expect(version).toMatch(/^\d{4}\.\d{2}\.\d{2}\.\d{6}$/);
+    expect(checksum).toMatch(/^[a-f0-9]{64}$/);
+    expect(dockerfile).toContain(
+      'https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/download/${YT_DLP_VERSION}/yt-dlp',
+    );
+    expect(dockerfile).toContain('sha256sum --check --strict');
+    expect(dockerfile).toContain("printf '%s\\n' '--js-runtimes node' > /etc/yt-dlp.conf");
+    expect(dockerfile).toContain('test "$(yt-dlp --version)" = "$YT_DLP_VERSION"');
+    expect(dockerfile).toMatch(/^\s*ffmpeg\s*(\\)?$/m);
+  });
+
   it('includes approved baseline Unix tools for agent workspace handling', () => {
     const dockerfile = fs.readFileSync(path.join(process.cwd(), 'container', 'Dockerfile'), 'utf8');
 
