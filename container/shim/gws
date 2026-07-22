@@ -97,6 +97,10 @@ header_value() {
   }' "$tmp_headers"
 }
 
+print_onecli_auth_error() {
+  printf 'Error: GWS proxy authentication failed. Confirm OneCLI grants the "Yente GWS Proxy" secret to this NanoClaw agent and injects Authorization for the GWS proxy host.\n' >&2
+}
+
 case "${1:-}" in
   auth)
     if [ "${2:-}" = "status" ] && [ "$#" -eq 2 ]; then
@@ -113,8 +117,19 @@ case "${1:-}" in
         exit 1
       fi
       response_account="$(header_value 'X-GWS-Account')"
+      if [ "$http_code" = "401" ] && [ -z "$response_account" ]; then
+        # The proxy authenticates before it resolves the requested account, so
+        # an authentication failure has no authoritative account to echo.
+        # Diagnose the credential path without trusting or inventing a label.
+        print_onecli_auth_error
+        exit 1
+      fi
       if [ "$response_account" != "$account" ]; then
         printf 'Error: GWS proxy response account did not match requested account %s.\n' "$account" >&2
+        exit 1
+      fi
+      if [ "$http_code" = "401" ]; then
+        print_onecli_auth_error
         exit 1
       fi
       if [ "$http_code" != "200" ]; then
@@ -451,8 +466,18 @@ print_output_success_json() {
 
 body=""
 # A non-200 response cannot carry completed-write recovery under the proxy
-# contract. Authenticate its account label before reading or printing any body,
-# including authentication, policy, and generic upstream error payloads.
+# contract. Except for the pre-resolution authentication case below,
+# authenticate its account label before reading or printing any body, including
+# policy and generic upstream error payloads.
+if [ "$http_code" = "401" ] && [ -z "$response_account" ]; then
+  # Authentication precedes account resolution. A headerless 401 is therefore
+  # an actionable OneCLI credential failure, not evidence of an account match
+  # or mismatch. Never expose the unauthenticated response body.
+  rm -f "$tmp_output_body"
+  tmp_output_body=""
+  print_onecli_auth_error
+  exit 1
+fi
 if [ "$http_code" != "200" ] && [ "$account_matches" != "true" ]; then
   rm -f "$tmp_output_body"
   tmp_output_body=""
@@ -728,7 +753,7 @@ case "$http_code" in
     ;;
   401|403)
     if [ "$http_code" = "401" ]; then
-      printf 'Error: GWS proxy authentication failed. Confirm OneCLI grants the "Yente GWS Proxy" secret to this NanoClaw agent and injects Authorization for the GWS proxy host.\n' >&2
+      print_onecli_auth_error
     fi
     printf '%s\n' "$body" >&2
     exit 1

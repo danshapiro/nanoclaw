@@ -37,15 +37,6 @@ async function withProxy(
       body += chunk;
     });
     req.on('end', () => {
-      try {
-        const parsed = JSON.parse(body) as { account?: unknown };
-        if (parsed.account === 'personal' || parsed.account === 'glowforge') {
-          res.setHeader('X-GWS-Account', parsed.account);
-        }
-      } catch (error) {
-        if (!(error instanceof SyntaxError)) throw error;
-        // Tests that exercise malformed or bodyless requests set headers explicitly.
-      }
       handler(req, res, body);
     });
   });
@@ -57,6 +48,15 @@ async function withProxy(
     url: `http://127.0.0.1:${address.port}`,
     close: () => new Promise<void>((resolve) => server.close(() => resolve())),
   };
+}
+
+function echoResolvedAccount(res: http.ServerResponse, body: string): 'personal' | 'glowforge' {
+  const parsed = JSON.parse(body) as { account?: unknown };
+  if (parsed.account !== 'personal' && parsed.account !== 'glowforge') {
+    throw new Error('test response cannot echo an unresolved GWS account');
+  }
+  res.setHeader('X-GWS-Account', parsed.account);
+  return parsed.account;
 }
 
 async function runShim(
@@ -193,6 +193,7 @@ describe('gws proxy shim', () => {
     const records: RequestRecord[] = [];
     const proxy = await withProxy((req, res, body) => {
       records.push({ method: req.method, url: req.url, body });
+      echoResolvedAccount(res, body);
       res.writeHead(200, { 'Content-Type': 'application/json', 'X-Exit-Code': '0' });
       res.end('{"ok":true}');
     });
@@ -255,6 +256,7 @@ describe('gws proxy shim', () => {
     const records: RequestRecord[] = [];
     const proxy = await withProxy((req, res, body) => {
       records.push({ method: req.method, url: req.url, body });
+      echoResolvedAccount(res, body);
       res.writeHead(200, { 'Content-Type': 'application/json', 'X-Exit-Code': '0' });
       res.end('{"ok":true}');
     });
@@ -277,7 +279,7 @@ describe('gws proxy shim', () => {
     const gatewayRecords: RequestRecord[] = [];
     const serviceRecords: Array<{ account: string; authorization?: string }> = [];
     const service = await withProxy((req, res, body) => {
-      const account = (JSON.parse(body) as { account: string }).account;
+      const account = echoResolvedAccount(res, body);
       serviceRecords.push({ account, authorization: req.headers.authorization });
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ account, email: account === 'personal' ? 'dan@danshapiro.com' : 'dan@glowforge.com' }));
@@ -363,6 +365,7 @@ describe('gws proxy shim', () => {
         contentType: headerValue(req.headers['content-type']),
         body,
       });
+      echoResolvedAccount(res, body);
       res.writeHead(200, { 'Content-Type': 'application/json', 'X-Exit-Code': '0' });
       res.end('{"ok":true}');
     });
@@ -387,7 +390,8 @@ describe('gws proxy shim', () => {
   });
 
   it('preserves successful upstream stdout bytes including trailing newlines', async () => {
-    const proxy = await withProxy((_req, res) => {
+    const proxy = await withProxy((_req, res, body) => {
+      echoResolvedAccount(res, body);
       res.writeHead(200, { 'Content-Type': 'text/plain', 'X-Exit-Code': '0' });
       res.end('line one\nline two\n\n');
     });
@@ -445,6 +449,54 @@ describe('gws proxy shim', () => {
     ['401', 401],
     ['403', 403],
     ['default error', 502],
+  ])('rejects a wrong-account %s /whoami response without leaking its body', async (_name, status) => {
+    const proxy = await withProxy((_req, res) => {
+      res.setHeader('X-GWS-Account', 'glowforge');
+      res.writeHead(status, { 'Content-Type': 'text/plain' });
+      res.end('private identity error must-not-print');
+    });
+
+    const result = await runShimRaw(['--account', 'personal', 'auth', 'status'], { GWS_PROXY_URL: proxy.url });
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('response account');
+    expect(result.stderr).not.toContain('private identity error');
+    expect(result.stderr).not.toContain('must-not-print');
+  });
+
+  it.each([
+    ['exec', '/exec', ['--account', 'personal', 'gmail', 'users', 'getProfile']],
+    ['whoami', '/whoami', ['--account', 'personal', 'auth', 'status']],
+  ])(
+    'reports a headerless authentication failure from /%s as a OneCLI configuration problem',
+    async (_name, path, args) => {
+      const seenPaths: Array<string | undefined> = [];
+      const proxy = await withProxy((req, res) => {
+        seenPaths.push(req.url);
+        // Authentication happens before account resolution, so a real proxy 401
+        // has no authoritative account label to echo.
+        res.removeHeader('X-GWS-Account');
+        res.writeHead(401, { 'Content-Type': 'text/plain' });
+        res.end('private gateway diagnostic must-not-print');
+      });
+
+      const result = await runShimRaw(args, { GWS_PROXY_URL: proxy.url });
+
+      expect(result.status).toBe(1);
+      expect(result.stdout).toBe('');
+      expect(seenPaths).toEqual([path]);
+      expect(result.stderr).toContain('GWS proxy authentication failed');
+      expect(result.stderr).toContain('OneCLI');
+      expect(result.stderr).not.toContain('response account');
+      expect(result.stderr).not.toContain('private gateway diagnostic');
+      expect(result.stderr).not.toContain('must-not-print');
+    },
+  );
+
+  it.each([
+    ['403', 403],
+    ['default error', 502],
   ])('rejects a missing-account %s /whoami response without leaking its body', async (_name, status) => {
     const proxy = await withProxy((_req, res) => {
       res.removeHeader('X-GWS-Account');
@@ -486,7 +538,7 @@ describe('gws proxy shim', () => {
     const gatewayRecords: Array<{ account: string; shimAuthorization?: string }> = [];
     const serviceRecords: Array<{ account: string; authorization?: string }> = [];
     const service = await withProxy((req, res, body) => {
-      const account = (JSON.parse(body) as { account: string }).account;
+      const account = echoResolvedAccount(res, body);
       serviceRecords.push({ account, authorization: req.headers.authorization });
       res.writeHead(200, { 'Content-Type': 'application/json', 'X-Exit-Code': '0' });
       res.end(JSON.stringify({ account, items: [] }));
@@ -549,6 +601,7 @@ describe('gws proxy shim', () => {
         contentType: headerValue(req.headers['content-type']),
         body,
       });
+      echoResolvedAccount(res, body);
       res.writeHead(200, { 'Content-Type': 'application/json', 'X-Exit-Code': '0' });
       res.end('{"ok":true}');
     });
@@ -581,6 +634,7 @@ describe('gws proxy shim', () => {
         contentType: headerValue(req.headers['content-type']),
         body,
       });
+      echoResolvedAccount(res, body);
       res.writeHead(200, { 'Content-Type': 'text/plain', 'X-Exit-Code': '0' });
       res.end('proxied-ok');
     });
@@ -618,6 +672,7 @@ describe('gws proxy shim', () => {
         contentType: headerValue(req.headers['content-type']),
         body,
       });
+      echoResolvedAccount(res, body);
       res.writeHead(200, { 'Content-Type': 'text/plain', 'X-Exit-Code': '0' });
       res.end('generic-onecli-proxy-ok');
     });
@@ -657,6 +712,7 @@ describe('gws proxy shim', () => {
         contentType: headerValue(req.headers['content-type']),
         body,
       });
+      echoResolvedAccount(res, body);
       res.writeHead(200, { 'Content-Type': 'text/plain', 'X-Exit-Code': '0' });
       res.end('proxied-despite-no-proxy');
     });
@@ -687,7 +743,8 @@ describe('gws proxy shim', () => {
   });
 
   it('surfaces proxy policy denials as clear command failures', async () => {
-    const proxy = await withProxy((_req, res) => {
+    const proxy = await withProxy((_req, res, body) => {
+      echoResolvedAccount(res, body);
       res.writeHead(403, { 'Content-Type': 'text/plain' });
       res.end('The admin has permitted gmail.send only to configured recipients');
     });
@@ -723,6 +780,7 @@ describe('gws proxy shim', () => {
         contentType: headerValue(req.headers['content-type']),
         body,
       });
+      echoResolvedAccount(res, body);
       writeOutputProxyResponse(res, 'drive file text\n');
     });
 
@@ -774,7 +832,8 @@ describe('gws proxy shim', () => {
     const outDir = path.join(workspace, 'tmp', 'gws_drive_probe');
     fs.mkdirSync(outDir, { recursive: true });
     const outputPath = path.join(outDir, 'current_probe.txt');
-    const proxy = await withProxy((_req, res) => {
+    const proxy = await withProxy((_req, res, body) => {
+      echoResolvedAccount(res, body);
       writeOutputProxyResponse(res, 'absolute text\n');
     });
 
@@ -810,7 +869,8 @@ describe('gws proxy shim', () => {
     const shim = shimWithOutputRootsForTest([workspace]);
     const outputPath = path.join(workspace, 'binary.bin');
     const bytes = Buffer.from([0x67, 0x77, 0x73, 0x0a, 0x00, 0xff, 0x41]);
-    const proxy = await withProxy((_req, res) => {
+    const proxy = await withProxy((_req, res, body) => {
+      echoResolvedAccount(res, body);
       writeOutputProxyResponse(res, bytes);
     });
 
@@ -931,7 +991,8 @@ describe('gws proxy shim', () => {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-shim-workspace-'));
     const shim = shimWithOutputRootsForTest([workspace]);
     const outputPath = path.join(workspace, 'out.txt');
-    const proxy = await withProxy((_req, res) => {
+    const proxy = await withProxy((_req, res, body) => {
+      echoResolvedAccount(res, body);
       res.writeHead(200, { 'Content-Type': 'text/plain', 'X-Exit-Code': '0' });
       res.end('{"status":"success","saved_file":"/app/out.txt"}');
     });
@@ -952,7 +1013,8 @@ describe('gws proxy shim', () => {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-shim-workspace-'));
     const shim = shimWithOutputRootsForTest([workspace]);
     const outputPath = path.join(workspace, 'out.txt');
-    const proxy = await withProxy((_req, res) => {
+    const proxy = await withProxy((_req, res, body) => {
+      echoResolvedAccount(res, body);
       res.writeHead(200, { 'Content-Type': 'text/plain', 'X-Exit-Code': '3' });
       res.end('Request had insufficient authentication scopes.\n');
     });
@@ -1029,7 +1091,8 @@ describe('gws proxy shim', () => {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-shim-workspace-'));
     const shim = shimWithOutputRootsForTest([workspace]);
     const outputPath = path.join(workspace, 'out.txt');
-    const proxy = await withProxy((_req, res) => {
+    const proxy = await withProxy((_req, res, body) => {
+      echoResolvedAccount(res, body);
       res.writeHead(200, {
         'Content-Type': 'application/octet-stream',
         'X-Exit-Code': '0',
@@ -1074,7 +1137,7 @@ function freshUpdatedAt(): string {
 }
 
 function apiEffectSuccessProxy(body: string, sig: string, payload: string, auditId = 'aud-1') {
-  return (_req: http.IncomingMessage, res: http.ServerResponse): void => {
+  return (_req: http.IncomingMessage, res: http.ServerResponse, requestBody: string): void => {
     let signed: Record<string, unknown> | null = null;
     try {
       const parsed = JSON.parse(payload) as Record<string, unknown>;
@@ -1082,6 +1145,7 @@ function apiEffectSuccessProxy(body: string, sig: string, payload: string, audit
     } catch {
       // Legacy payload.
     }
+    if (!signed) echoResolvedAccount(res, requestBody);
     res.writeHead(200, {
       'Content-Type': 'text/plain',
       'X-Exit-Code': '0',
@@ -1533,6 +1597,7 @@ describe('gws proxy shim — side-effect ledger', () => {
     let captured = '';
     const proxy = await withProxy((_req, res, body) => {
       captured = body;
+      echoResolvedAccount(res, body);
       res.writeHead(200, {
         'Content-Type': 'text/plain',
         'X-Exit-Code': '0',
@@ -1575,7 +1640,8 @@ describe('gws proxy shim — side-effect ledger', () => {
   it('appends NO record for a non-api-effect (help/schema) response', async () => {
     tmp = freshTmp();
     const ledger = path.join(tmp, 'side-effects.jsonl');
-    const proxy = await withProxy((_req, res) => {
+    const proxy = await withProxy((_req, res, body) => {
+      echoResolvedAccount(res, body);
       res.writeHead(200, {
         'Content-Type': 'text/plain',
         'X-Exit-Code': '0',
@@ -1597,7 +1663,8 @@ describe('gws proxy shim — side-effect ledger', () => {
   it('appends NO record for a denied (403) or failed command', async () => {
     tmp = freshTmp();
     const ledger = path.join(tmp, 'side-effects.jsonl');
-    const proxy = await withProxy((_req, res) => {
+    const proxy = await withProxy((_req, res, body) => {
+      echoResolvedAccount(res, body);
       res.writeHead(403, { 'Content-Type': 'text/plain' });
       res.end('The admin has restricted this');
     });
@@ -1695,6 +1762,7 @@ describe('gws proxy shim — side-effect ledger', () => {
     let captured = '';
     const proxyStale = await withProxy((_req, res, body) => {
       captured = body;
+      echoResolvedAccount(res, body);
       res.writeHead(200, {
         'Content-Type': 'text/plain',
         'X-Exit-Code': '0',
