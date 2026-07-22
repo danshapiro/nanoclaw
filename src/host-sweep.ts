@@ -35,6 +35,8 @@ import { getActiveSessions } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { withRuntimeLock } from './db/runtime-locks.js';
 import {
+  assertHostGwsSideEffectsReconciledForScopes,
+  assertNoUnresolvedGwsReconciliationRecords,
   countDueMessages,
   countDueMessagesExcludingRecovery,
   deleteOrphanProcessingClaims,
@@ -49,6 +51,7 @@ import {
   syncProcessingAcks,
   type ContainerState,
   type ProcessingClaim,
+  type ImportSideEffectsResult,
 } from './db/session-db.js';
 import { log } from './log.js';
 import { resolveGwsSideEffectVerifyKey } from './gws-side-effect-key.js';
@@ -717,6 +720,41 @@ function partitionGwsClaims(
   };
 }
 
+function strictAcceptedGwsRecoveryPlan(
+  inDb: Database.Database,
+  outDb: Database.Database,
+  stoppedAt: string,
+): { partitions: ExactGwsClaimPartition[]; unacceptedClaimIds: string[] } {
+  const plan = partitionGwsClaims(inDb, outDb, stoppedAt);
+  if (plan.unacceptedClaimIds.length > 0) {
+    throw new Error(
+      `interrupted turn has processing claims without complete host acceptance: ${plan.unacceptedClaimIds.join(', ')}`,
+    );
+  }
+  return plan;
+}
+
+/** Strict ledger import used by normal host-sweep crash recovery. */
+export function importInterruptedTurnSideEffects(opts: {
+  sessionDir: string;
+  inDb: Database.Database;
+  outDb: Database.Database;
+  containerStopped: boolean;
+  stoppedAt: string;
+  allowedArtifactRoots?: string[];
+  gwsPublicKey?: string;
+}): ImportSideEffectsResult {
+  const plan = strictAcceptedGwsRecoveryPlan(opts.inDb, opts.outDb, opts.stoppedAt);
+  return importHostSideEffects({
+    sessionDir: opts.sessionDir,
+    containerStopped: opts.containerStopped,
+    allowedArtifactRoots: opts.allowedArtifactRoots,
+    gwsPublicKey: opts.gwsPublicKey,
+    requireCompleteLedger: true,
+    strictGwsScopes: plan.partitions.map((partition) => partition.scope),
+  });
+}
+
 /**
  * Production crash-window discovery wiring: compute the active turn's scope from
  * the host session dir + outbound DB, then run the host-only GWS audit-store
@@ -734,6 +772,9 @@ export function discoverGwsCrashWindowDraftsScoped(opts: {
   gwsPublicKey?: string;
   stoppedAt?: string;
   scope?: { inputId: string; routeKey: string; notBefore: string; notAfter: string };
+  requireAuditAccess?: boolean;
+  requireCompleteAudit?: boolean;
+  failOnUnresolved?: boolean;
 }): ReturnType<typeof discoverGwsCrashWindowDrafts> {
   const scope = opts.scope ?? gwsDiscoveryScope(opts.inDb, opts.outDb, opts.stoppedAt);
   return discoverGwsCrashWindowDrafts({
@@ -745,6 +786,9 @@ export function discoverGwsCrashWindowDraftsScoped(opts: {
     notBefore: scope.notBefore,
     notAfter: scope.notAfter,
     gwsPublicKey: opts.gwsPublicKey,
+    requireAuditAccess: opts.requireAuditAccess,
+    requireCompleteAudit: opts.requireCompleteAudit,
+    failOnUnresolved: opts.failOnUnresolved,
   });
 }
 
@@ -838,9 +882,11 @@ export function writeHostInterruptedRecovery(opts: {
 }
 
 /**
- * Recover every independently authenticated accepted claim partition. Claims
- * that never crossed provider acceptance are returned to normal pending flow;
- * one missing audit match never suppresses recovery for another partition.
+ * Recover every independently authenticated accepted claim partition only
+ * after all three durable evidence sources prove complete: the session ledger
+ * (imported immediately before this function), the root mutation audit, and
+ * the proxy reconciliation journal. Any incomplete proof keeps every claim in
+ * processing and prevents automatic retry.
  */
 export function recoverGwsClaimPartitions(opts: {
   sessionDir: string;
@@ -850,35 +896,35 @@ export function recoverGwsClaimPartitions(opts: {
   containerStopped: boolean;
   stoppedAt?: string;
   auditStorePath: string | undefined;
+  reconciliationStorePath: string | undefined;
   gwsPublicKey?: string;
 }): { recoveryIds: string[]; returnedUnacceptedClaimIds: string[] } {
-  const plan = partitionGwsClaims(opts.inDb, opts.outDb, opts.stoppedAt ?? new Date().toISOString());
-  if (plan.unacceptedClaimIds.length > 0) {
-    const remove = opts.outDb.prepare("DELETE FROM processing_ack WHERE message_id = ? AND status = 'processing'");
-    opts.outDb.transaction(() => {
-      for (const id of plan.unacceptedClaimIds) remove.run(id);
-    })();
+  const plan = strictAcceptedGwsRecoveryPlan(opts.inDb, opts.outDb, opts.stoppedAt ?? new Date().toISOString());
+  const scopes = plan.partitions.map((partition) => partition.scope);
+
+  assertNoUnresolvedGwsReconciliationRecords({
+    reconciliationStorePath: opts.reconciliationStorePath,
+    scopes,
+  });
+
+  for (const partition of plan.partitions) {
+    discoverGwsCrashWindowDraftsScoped({
+      sessionDir: opts.sessionDir,
+      inDb: opts.inDb,
+      outDb: opts.outDb,
+      containerStopped: opts.containerStopped,
+      auditStorePath: opts.auditStorePath,
+      gwsPublicKey: opts.gwsPublicKey,
+      scope: partition.scope,
+      requireAuditAccess: true,
+      requireCompleteAudit: true,
+      failOnUnresolved: true,
+    });
   }
+  assertHostGwsSideEffectsReconciledForScopes(opts.outDb, { scopes, gwsPublicKey: opts.gwsPublicKey });
 
   const recoveryIds: string[] = [];
   for (const partition of plan.partitions) {
-    try {
-      discoverGwsCrashWindowDraftsScoped({
-        sessionDir: opts.sessionDir,
-        inDb: opts.inDb,
-        outDb: opts.outDb,
-        containerStopped: opts.containerStopped,
-        auditStorePath: opts.auditStorePath,
-        gwsPublicKey: opts.gwsPublicKey,
-        scope: partition.scope,
-      });
-    } catch (err) {
-      log.warn('GWS partition crash-window discovery failed; preserving partition recovery', {
-        inputId: partition.scope.inputId,
-        routeKey: partition.scope.routeKey,
-        err,
-      });
-    }
     const recoveryId = writeHostInterruptedRecovery({
       inDb: opts.inDb,
       outDb: opts.outDb,
@@ -887,9 +933,12 @@ export function recoverGwsClaimPartitions(opts: {
       scope: partition.scope,
       claims: partition.claims,
     });
-    if (recoveryId) recoveryIds.push(recoveryId);
+    if (!recoveryId) {
+      throw new Error(`failed to persist interrupted-turn recovery for accepted input ${partition.scope.inputId}`);
+    }
+    recoveryIds.push(recoveryId);
   }
-  return { recoveryIds, returnedUnacceptedClaimIds: plan.unacceptedClaimIds };
+  return { recoveryIds, returnedUnacceptedClaimIds: [] };
 }
 
 /**
@@ -903,6 +952,7 @@ export async function recoverAfterKill(inDb: Database.Database, session: Session
   // Confirm both the tracked process and runtime-label writer are gone BEFORE
   // opening outbound.db writable.
   await stopContainerAndVerify(session.id, `recovery-${reason}`);
+  const stoppedAt = new Date().toISOString();
   const writableOutDb = openOutboundDbRw(session.agent_group_id, session.id);
   let shouldWake = false;
   try {
@@ -917,11 +967,15 @@ export async function recoverAfterKill(inDb: Database.Database, session: Session
         const allowedArtifactRoots = process.env.NANOCLAW_ARTIFACT_ROOTS
           ? process.env.NANOCLAW_ARTIFACT_ROOTS.split(':').filter(Boolean)
           : undefined;
-        try {
-          importHostSideEffects({ sessionDir: dir, containerStopped, gwsPublicKey, allowedArtifactRoots });
-        } catch (err) {
-          log.warn('Side-effect import failed during recovery', { sessionId: session.id, err });
-        }
+        importInterruptedTurnSideEffects({
+          sessionDir: dir,
+          inDb,
+          outDb: writableOutDb,
+          containerStopped,
+          stoppedAt,
+          gwsPublicKey,
+          allowedArtifactRoots,
+        });
       },
       writeRecovery: () => {
         const recovered = recoverGwsClaimPartitions({
@@ -930,7 +984,9 @@ export async function recoverAfterKill(inDb: Database.Database, session: Session
           outDb: writableOutDb,
           reason,
           containerStopped: true,
+          stoppedAt,
           auditStorePath: process.env.GWS_AUDIT_STORE,
+          reconciliationStorePath: process.env.NANOCLAW_GWS_RECONCILIATION_STORE,
           gwsPublicKey,
         });
         log.info('Partitioned interrupted claims before reset', {

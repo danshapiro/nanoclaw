@@ -17,6 +17,12 @@ function tempRoot(name: string): string {
   return root;
 }
 
+function emptyReconciliationStoreFor(auditStorePath: string): string {
+  const reconciliationStorePath = `${auditStorePath}.reconciliation`;
+  if (!fs.existsSync(reconciliationStorePath)) fs.writeFileSync(reconciliationStorePath, '');
+  return reconciliationStorePath;
+}
+
 afterEach(() => {
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
@@ -107,6 +113,7 @@ describe('operator-owned GWS session lifecycle', () => {
         operator,
         containerStopped: false,
         auditStorePath,
+        reconciliationStorePath: emptyReconciliationStoreFor(auditStorePath),
         gwsPublicKey: undefined,
       }),
     ).toThrow('confirmed stopped');
@@ -117,6 +124,7 @@ describe('operator-owned GWS session lifecycle', () => {
       operator,
       containerStopped: true,
       auditStorePath,
+      reconciliationStorePath: emptyReconciliationStoreFor(auditStorePath),
       gwsPublicKey: publicKey.export({ format: 'pem', type: 'spki' }).toString(),
       stoppedAt: '2026-07-21T15:02:00.000Z',
     });
@@ -192,6 +200,7 @@ describe('operator-owned GWS session lifecycle', () => {
       operator,
       containerStopped: true,
       auditStorePath,
+      reconciliationStorePath: emptyReconciliationStoreFor(auditStorePath),
       gwsPublicKey: publicKey.export({ format: 'pem', type: 'spki' }).toString(),
       stoppedAt: '2026-07-21T16:00:10.000Z',
     });
@@ -242,6 +251,7 @@ describe('operator-owned GWS session lifecycle', () => {
         operator,
         containerStopped: true,
         auditStorePath,
+        reconciliationStorePath: emptyReconciliationStoreFor(auditStorePath),
         gwsPublicKey: publicKey,
         stoppedAt: '2026-07-21T17:00:10.000Z',
       }),
@@ -255,6 +265,7 @@ describe('operator-owned GWS session lifecycle', () => {
         operator,
         containerStopped: true,
         auditStorePath,
+        reconciliationStorePath: emptyReconciliationStoreFor(auditStorePath),
         gwsPublicKey: publicKey,
         stoppedAt: '2026-07-21T17:00:10.000Z',
       }),
@@ -268,6 +279,7 @@ describe('operator-owned GWS session lifecycle', () => {
         operator,
         containerStopped: true,
         auditStorePath,
+        reconciliationStorePath: emptyReconciliationStoreFor(auditStorePath),
         gwsPublicKey: publicKey,
         stoppedAt: '2026-07-21T17:00:10.000Z',
       }),
@@ -319,6 +331,7 @@ describe('operator-owned GWS session lifecycle', () => {
         operator,
         containerStopped: true,
         auditStorePath,
+        reconciliationStorePath: emptyReconciliationStoreFor(auditStorePath),
         gwsPublicKey: publicKey,
         stoppedAt: '2026-07-21T17:00:10.000Z',
       }),
@@ -338,6 +351,7 @@ describe('operator-owned GWS session lifecycle', () => {
         operator,
         containerStopped: true,
         auditStorePath,
+        reconciliationStorePath: emptyReconciliationStoreFor(auditStorePath),
         gwsPublicKey: publicKey,
         stoppedAt: '2026-07-21T17:00:10.000Z',
       }),
@@ -428,6 +442,7 @@ describe('operator-owned GWS session lifecycle', () => {
         operator,
         containerStopped: true,
         auditStorePath,
+        reconciliationStorePath: emptyReconciliationStoreFor(auditStorePath),
         gwsPublicKey: publicKey.export({ format: 'pem', type: 'spki' }).toString(),
         stoppedAt: '2026-07-21T18:00:10.000Z',
       }),
@@ -497,6 +512,7 @@ describe('operator-owned GWS session lifecycle', () => {
         operator,
         containerStopped: true,
         auditStorePath,
+        reconciliationStorePath: emptyReconciliationStoreFor(auditStorePath),
         gwsPublicKey: publicKey.export({ format: 'pem', type: 'spki' }).toString(),
         stoppedAt: '2026-07-21T19:00:10.000Z',
       }),
@@ -571,6 +587,7 @@ describe('operator-owned GWS session lifecycle', () => {
         operator,
         containerStopped: true,
         auditStorePath,
+        reconciliationStorePath: emptyReconciliationStoreFor(auditStorePath),
         gwsPublicKey: publicKey.export({ format: 'pem', type: 'spki' }).toString(),
         stoppedAt: '2026-07-21T20:00:10.000Z',
       });
@@ -586,5 +603,51 @@ describe('operator-owned GWS session lifecycle', () => {
       expect(fs.existsSync(operator.activeLeasePath)).toBe(false);
       expect(fs.existsSync(operator.reconciliationReceiptPath)).toBe(true);
     }
+  });
+
+  it('retains operator authority when the proxy recorded a manual-only ambiguous outcome', () => {
+    const base = tempRoot('nanoclaw-operator-ambiguous-reconciliation');
+    const operator = startOperatorGwsSession({
+      root: path.join(base, 'operator-session'),
+      agentGroupId: 'ag-main',
+      groupFolder: 'main',
+      operatorId: 'operator-ambiguous-reconciliation',
+      containerUid: process.getuid?.() ?? 0,
+      containerGid: process.getgid?.() ?? 0,
+      acceptedAt: '2026-07-21T21:00:00.000Z',
+      leaseId: 'operator-lease-ambiguous-reconciliation',
+    });
+    const auditStorePath = path.join(base, 'gws-audit.jsonl');
+    const reconciliationStorePath = path.join(base, 'gws-reconciliation.jsonl');
+    fs.writeFileSync(auditStorePath, '');
+    fs.writeFileSync(
+      reconciliationStorePath,
+      `${JSON.stringify({
+        schema_version: 2,
+        audit_id: 'operator-ambiguous-write',
+        outcome: 'outcome_unknown',
+        account: 'dan@glowforge.com',
+        input_id: operator.inputId,
+        route_key: operator.routeKey,
+        operation: 'drive files.update',
+        resource_type: 'gws mutation',
+        started_at: '2026-07-21T21:00:01.000Z',
+        ended_at: '2026-07-21T21:00:04.000Z',
+        search_hints: ['do not retry automatically'],
+      })}\n`,
+    );
+
+    expect(() =>
+      finalizeOperatorGwsSession({
+        operator,
+        containerStopped: true,
+        auditStorePath,
+        reconciliationStorePath,
+        stoppedAt: '2026-07-21T21:00:10.000Z',
+      }),
+    ).toThrow(/manual reconciliation|outcome_unknown/i);
+    expect(fs.existsSync(operator.correlationPath)).toBe(true);
+    expect(fs.existsSync(operator.activeLeasePath)).toBe(true);
+    expect(fs.existsSync(operator.reconciliationReceiptPath)).toBe(false);
   });
 });

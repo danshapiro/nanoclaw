@@ -26,6 +26,7 @@ import {
   discoverGwsCrashWindowDraftsScoped,
   effectiveCeilingMs,
   gwsDiscoveryScope,
+  importInterruptedTurnSideEffects,
   parseSqliteUtc,
   recoverGwsClaimPartitions,
   recoverInterruptedTurn,
@@ -632,6 +633,46 @@ describe('recoverInterruptedTurn (kill/reset ordering)', () => {
     inDb.close();
     outDb.close();
   });
+
+  it.each([
+    ['ledger import', 'import'],
+    ['evidence reconciliation', 'recovery'],
+  ])('keeps claims blocked and never wakes when %s fails', async (_label, failingStep) => {
+    const { inDb, outDb } = processingDbs();
+    const order: string[] = [];
+
+    await expect(
+      recoverInterruptedTurn({
+        inDb,
+        outDb,
+        session: fakeSession(),
+        reason: 'claim-stuck',
+        writableOutDb: outDb,
+        verifyContainerStopped: async () => true,
+        importSideEffects: () => {
+          order.push('import');
+          if (failingStep === 'import') throw new Error('incomplete ledger evidence');
+        },
+        writeRecovery: () => {
+          order.push('recovery');
+          if (failingStep === 'recovery') throw new Error('incomplete audit evidence');
+        },
+        wakeContainer: async () => {
+          order.push('wake');
+        },
+      }),
+    ).rejects.toThrow(/incomplete/);
+
+    expect(order).toEqual(failingStep === 'import' ? ['import'] : ['import', 'recovery']);
+    expect(getProcessingClaims(outDb)).toEqual([{ message_id: 'm-1', status_changed: '2026-04-20 11:00:00' }]);
+    expect(inDb.prepare('SELECT tries FROM messages_in WHERE id = ?').get('m-1')).toEqual({ tries: 0 });
+    expect(outDb.prepare('SELECT current_tool FROM container_state WHERE id = 1').get()).toEqual({
+      current_tool: 'opencode-long-tool',
+    });
+
+    inDb.close();
+    outDb.close();
+  });
 });
 
 describe('host wake/sync preserves recovery-owned acks', () => {
@@ -779,6 +820,309 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
       signature: edSign(null, Buffer.from(payload), key.privateKey).toString('base64'),
     };
   }
+
+  function addAcceptedClaim(
+    inDb: Database.Database,
+    outDb: Database.Database,
+    values: {
+      messageId?: string;
+      inputId?: string;
+      routeKey?: string;
+      acceptedAt?: string;
+    } = {},
+  ): { messageId: string; inputId: string; routeKey: string; acceptedAt: string } {
+    const messageId = values.messageId ?? 'm-strict';
+    const inputId = values.inputId ?? 'in-strict';
+    const routeKey = values.routeKey ?? 'opencode|discord|chan-strict|dm:mg-strict';
+    const acceptedAt = values.acceptedAt ?? '2026-05-29T12:00:00.000Z';
+    inDb
+      .prepare(
+        `INSERT INTO messages_in
+           (id, status, tries, timestamp, content, host_input_id, host_route_key, host_received_at,
+            host_accepted_input_id, host_accepted_route_key, host_accepted_at)
+         VALUES (?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        messageId,
+        acceptedAt,
+        '{"text":"perform strict recovery"}',
+        inputId,
+        routeKey,
+        acceptedAt,
+        inputId,
+        routeKey,
+        acceptedAt,
+      );
+    outDb
+      .prepare('INSERT INTO processing_ack (message_id, status, status_changed) VALUES (?, ?, ?)')
+      .run(messageId, 'processing', acceptedAt);
+    return { messageId, inputId, routeKey, acceptedAt };
+  }
+
+  it.each([
+    ['missing', null],
+    ['truncated', '{"kind":"gws_mutation_completed"'],
+    ['malformed', 'not-json\n'],
+  ])('keeps an interrupted turn blocked when its side-effect ledger is %s', (_label, ledgerContents) => {
+    const { sessionPath, inPath, outPath } = setupSession();
+    const inDb = new Database(inPath);
+    const outDb = new Database(outPath);
+    const accepted = addAcceptedClaim(inDb, outDb);
+    if (ledgerContents !== null) fs.writeFileSync(path.join(sessionPath, 'side-effects.jsonl'), ledgerContents);
+
+    expect(() =>
+      importInterruptedTurnSideEffects({
+        sessionDir: sessionPath,
+        inDb,
+        outDb,
+        containerStopped: true,
+        stoppedAt: '2026-05-29T12:00:10.000Z',
+      }),
+    ).toThrow(/ledger|unresolved|authoritative/i);
+    expect(getProcessingClaims(outDb).map((claim) => claim.message_id)).toEqual([accepted.messageId]);
+    expect(inDb.prepare('SELECT tries FROM messages_in WHERE id = ?').get(accepted.messageId)).toEqual({ tries: 0 });
+    inDb.close();
+    outDb.close();
+  });
+
+  it('keeps an interrupted turn blocked when current-turn ledger evidence remains unresolved after audit import', () => {
+    const { sessionPath, inPath, outPath } = setupSession();
+    const auditStore = path.join(tmpRoot, 'unresolved-ledger-audit.jsonl');
+    const reconciliationStore = path.join(tmpRoot, 'unresolved-ledger-reconciliation.jsonl');
+    fs.writeFileSync(
+      path.join(sessionPath, 'side-effects.jsonl'),
+      `${JSON.stringify({
+        kind: 'gws_mutation_completed',
+        audit_id: 'unsigned-current-turn',
+        input_id: 'in-strict',
+        route_key: 'opencode|discord|chan-strict|dm:mg-strict',
+        occurred_at: '2026-05-29T12:00:01.000Z',
+      })}\n`,
+    );
+    fs.writeFileSync(auditStore, '');
+    fs.writeFileSync(reconciliationStore, '');
+    const inDb = new Database(inPath);
+    const outDb = new Database(outPath);
+    addAcceptedClaim(inDb, outDb);
+
+    expect(
+      importInterruptedTurnSideEffects({
+        sessionDir: sessionPath,
+        inDb,
+        outDb,
+        containerStopped: true,
+        stoppedAt: '2026-05-29T12:00:10.000Z',
+      }),
+    ).toEqual({ imported: 1, skipped: 0, validated: 0 });
+    expect(() =>
+      recoverGwsClaimPartitions({
+        sessionDir: sessionPath,
+        inDb,
+        outDb,
+        reason: 'claim-stuck',
+        containerStopped: true,
+        stoppedAt: '2026-05-29T12:00:10.000Z',
+        auditStorePath: auditStore,
+        reconciliationStorePath: reconciliationStore,
+      }),
+    ).toThrow(/unresolved|authoritative/i);
+    expect(outDb.prepare("SELECT COUNT(*) AS n FROM session_state WHERE key LIKE 'recovery:%'").get()).toEqual({
+      n: 0,
+    });
+    inDb.close();
+    outDb.close();
+  });
+
+  it.each([
+    ['missing', null],
+    ['truncated', '{"audit_id":"cut-off"'],
+    ['malformed', 'not-json\n'],
+    [
+      'unresolved current-turn',
+      `${JSON.stringify({
+        schema_version: 2,
+        audit_id: 'unsigned-audit-current-turn',
+        input_id: 'in-strict',
+        route_key: 'opencode|discord|chan-strict|dm:mg-strict',
+        occurred_at: '2026-05-29T12:00:01.000Z',
+      })}\n`,
+    ],
+  ])('keeps an interrupted turn blocked when the root GWS audit is %s', (_label, auditContents) => {
+    const { sessionPath, inPath, outPath } = setupSession();
+    const auditStore = path.join(tmpRoot, 'strict-audit.jsonl');
+    const reconciliationStore = path.join(tmpRoot, 'strict-reconciliation.jsonl');
+    fs.writeFileSync(path.join(sessionPath, 'side-effects.jsonl'), '');
+    fs.writeFileSync(reconciliationStore, '');
+    if (auditContents !== null) fs.writeFileSync(auditStore, auditContents);
+    const inDb = new Database(inPath);
+    const outDb = new Database(outPath);
+    const accepted = addAcceptedClaim(inDb, outDb);
+
+    expect(() =>
+      recoverGwsClaimPartitions({
+        sessionDir: sessionPath,
+        inDb,
+        outDb,
+        reason: 'claim-stuck',
+        containerStopped: true,
+        stoppedAt: '2026-05-29T12:00:10.000Z',
+        auditStorePath: auditStore,
+        reconciliationStorePath: reconciliationStore,
+      }),
+    ).toThrow(/audit|unresolved|signature|authoritative/i);
+    expect(getProcessingClaims(outDb).map((claim) => claim.message_id)).toEqual([accepted.messageId]);
+    expect(outDb.prepare("SELECT COUNT(*) AS n FROM session_state WHERE key LIKE 'recovery:%'").get()).toEqual({
+      n: 0,
+    });
+    inDb.close();
+    outDb.close();
+  });
+
+  it.each([
+    ['missing', null],
+    ['truncated', '{"outcome":"outcome_unknown"'],
+    ['malformed', 'not-json\n'],
+  ])('keeps an interrupted turn blocked when the reconciliation evidence is %s', (_label, contents) => {
+    const { sessionPath, inPath, outPath } = setupSession();
+    const auditStore = path.join(tmpRoot, 'strict-audit.jsonl');
+    const reconciliationStore = path.join(tmpRoot, 'strict-reconciliation.jsonl');
+    fs.writeFileSync(path.join(sessionPath, 'side-effects.jsonl'), '');
+    fs.writeFileSync(auditStore, '');
+    if (contents !== null) fs.writeFileSync(reconciliationStore, contents);
+    const inDb = new Database(inPath);
+    const outDb = new Database(outPath);
+    const accepted = addAcceptedClaim(inDb, outDb);
+
+    expect(() =>
+      recoverGwsClaimPartitions({
+        sessionDir: sessionPath,
+        inDb,
+        outDb,
+        reason: 'claim-stuck',
+        containerStopped: true,
+        stoppedAt: '2026-05-29T12:00:10.000Z',
+        auditStorePath: auditStore,
+        reconciliationStorePath: reconciliationStore,
+      }),
+    ).toThrow(/reconciliation|incomplete|inaccessible/i);
+    expect(getProcessingClaims(outDb).map((claim) => claim.message_id)).toEqual([accepted.messageId]);
+    inDb.close();
+    outDb.close();
+  });
+
+  it('does not reset or wake after a crash with a durable manual-only outcome', async () => {
+    const { sessionPath, inPath, outPath } = setupSession();
+    const auditStore = path.join(tmpRoot, 'ambiguous-audit.jsonl');
+    const reconciliationStore = path.join(tmpRoot, 'ambiguous-reconciliation.jsonl');
+    fs.writeFileSync(path.join(sessionPath, 'side-effects.jsonl'), '');
+    fs.writeFileSync(auditStore, '');
+    const inDb = new Database(inPath);
+    const outDb = new Database(outPath);
+    const accepted = addAcceptedClaim(inDb, outDb);
+    fs.writeFileSync(
+      reconciliationStore,
+      `${JSON.stringify({
+        schema_version: 2,
+        audit_id: 'ambiguous-write-1',
+        outcome: 'outcome_unknown',
+        account: 'dan@danshapiro.com',
+        account_label: 'personal',
+        input_id: accepted.inputId,
+        route_key: accepted.routeKey,
+        service: 'drive',
+        method: 'files.update',
+        operation: 'drive files.update',
+        resource_type: 'gws mutation',
+        requested_title: '',
+        parent: '',
+        workspace: '',
+        started_at: '2026-05-29T12:00:01.000Z',
+        ended_at: '2026-05-29T12:00:04.000Z',
+        search_hints: ['do not retry automatically'],
+      })}\n`,
+    );
+    let woke = false;
+
+    await expect(
+      recoverInterruptedTurn({
+        inDb,
+        outDb,
+        session: fakeSession(),
+        reason: 'claim-stuck',
+        writableOutDb: outDb,
+        verifyContainerStopped: async () => true,
+        importSideEffects: ({ containerStopped }) => {
+          importInterruptedTurnSideEffects({
+            sessionDir: sessionPath,
+            inDb,
+            outDb,
+            containerStopped,
+            stoppedAt: '2026-05-29T12:00:10.000Z',
+          });
+        },
+        writeRecovery: () => {
+          recoverGwsClaimPartitions({
+            sessionDir: sessionPath,
+            inDb,
+            outDb,
+            reason: 'claim-stuck',
+            containerStopped: true,
+            stoppedAt: '2026-05-29T12:00:10.000Z',
+            auditStorePath: auditStore,
+            reconciliationStorePath: reconciliationStore,
+          });
+        },
+        wakeContainer: async () => {
+          woke = true;
+        },
+      }),
+    ).rejects.toThrow(/manual reconciliation|outcome unknown|outcome_unknown/i);
+
+    expect(woke).toBe(false);
+    expect(getProcessingClaims(outDb).map((claim) => claim.message_id)).toEqual([accepted.messageId]);
+    expect(inDb.prepare('SELECT tries FROM messages_in WHERE id = ?').get(accepted.messageId)).toEqual({ tries: 0 });
+    expect(outDb.prepare("SELECT COUNT(*) AS n FROM session_state WHERE key LIKE 'recovery:%'").get()).toEqual({
+      n: 0,
+    });
+    inDb.close();
+    outDb.close();
+  });
+
+  it('writes recovery only after complete empty ledger, audit, and reconciliation evidence', () => {
+    const { sessionPath, inPath, outPath } = setupSession();
+    const auditStore = path.join(tmpRoot, 'clean-audit.jsonl');
+    const reconciliationStore = path.join(tmpRoot, 'clean-reconciliation.jsonl');
+    fs.writeFileSync(path.join(sessionPath, 'side-effects.jsonl'), '');
+    fs.writeFileSync(auditStore, '');
+    fs.writeFileSync(reconciliationStore, '');
+    const inDb = new Database(inPath);
+    const outDb = new Database(outPath);
+    addAcceptedClaim(inDb, outDb);
+
+    expect(
+      importInterruptedTurnSideEffects({
+        sessionDir: sessionPath,
+        inDb,
+        outDb,
+        containerStopped: true,
+        stoppedAt: '2026-05-29T12:00:10.000Z',
+      }),
+    ).toEqual({ imported: 0, skipped: 0, validated: 0 });
+    const result = recoverGwsClaimPartitions({
+      sessionDir: sessionPath,
+      inDb,
+      outDb,
+      reason: 'claim-stuck',
+      containerStopped: true,
+      stoppedAt: '2026-05-29T12:00:10.000Z',
+      auditStorePath: auditStore,
+      reconciliationStorePath: reconciliationStore,
+    });
+    expect(result.recoveryIds).toHaveLength(1);
+    expect(result.returnedUnacceptedClaimIds).toEqual([]);
+    inDb.close();
+    outDb.close();
+  });
 
   it('imports ONLY this turn’s route/window draft, excluding other-session/route entries from the shared global store', () => {
     const { sessionPath, inPath, outPath } = setupSession();
@@ -1052,12 +1396,15 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
     outDb.close();
   });
 
-  it('recovers each exact accepted partition and returns coexisting unaccepted claims without aborting recovery', () => {
+  it('fails closed without writing recovery when any processing claim lacks host acceptance', () => {
     const { sessionPath, inPath, outPath } = setupSession();
     const routeKey = 'opencode|discord|chan-1|dm:mg-1';
     const key = generateKeyPairSync('ed25519');
     const gwsPublicKey = key.publicKey.export({ format: 'pem', type: 'spki' }).toString();
     const auditStore = path.join(tmpRoot, 'partitioned-gws-audit.jsonl');
+    const reconciliationStore = path.join(tmpRoot, 'partitioned-gws-reconciliation.jsonl');
+    fs.writeFileSync(path.join(sessionPath, 'side-effects.jsonl'), '');
+    fs.writeFileSync(reconciliationStore, '');
     writeAuditStore(auditStore, [
       signedAuditEntry(key, {
         auditId: 'partition-a-draft',
@@ -1113,41 +1460,26 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
     claim.run('accepted-b', 'processing', '2026-05-29 12:01:01');
     claim.run('queued-unaccepted', 'processing', '2026-05-29 12:02:01');
 
-    const result = recoverGwsClaimPartitions({
-      sessionDir: sessionPath,
-      inDb,
-      outDb,
-      reason: 'claim-stuck',
-      containerStopped: true,
-      stoppedAt: '2026-05-29T12:03:00.000Z',
-      auditStorePath: auditStore,
-      gwsPublicKey,
-    });
+    expect(() =>
+      recoverGwsClaimPartitions({
+        sessionDir: sessionPath,
+        inDb,
+        outDb,
+        reason: 'claim-stuck',
+        containerStopped: true,
+        stoppedAt: '2026-05-29T12:03:00.000Z',
+        auditStorePath: auditStore,
+        reconciliationStorePath: reconciliationStore,
+        gwsPublicKey,
+      }),
+    ).toThrow(/host acceptance|unaccepted/i);
 
-    expect(result.recoveryIds).toHaveLength(2);
-    expect(result.returnedUnacceptedClaimIds).toEqual(['queued-unaccepted']);
     expect(
       outDb.prepare("SELECT message_id FROM processing_ack WHERE status = 'processing' ORDER BY message_id").all(),
-    ).toEqual([{ message_id: 'accepted-a' }, { message_id: 'accepted-b' }]);
-    const state = outDb
-      .prepare('SELECT value FROM session_state WHERE key = ?')
-      .get(`recovery:opencode:${routeKey}`) as {
-      value: string;
-    };
-    const recoveries = JSON.parse(state.value) as Array<{
-      acceptedUnresolvedInputs: Array<{ inputId: string }>;
-      sideEffects: Array<{ inputId: string }>;
-    }>;
-    expect(recoveries.map((entry) => entry.acceptedUnresolvedInputs[0].inputId).sort()).toEqual([
-      'in-partition-a',
-      'in-partition-b',
-    ]);
-    expect(
-      recoveries.find((entry) => entry.acceptedUnresolvedInputs[0].inputId === 'in-partition-a')?.sideEffects,
-    ).toHaveLength(1);
-    expect(
-      recoveries.find((entry) => entry.acceptedUnresolvedInputs[0].inputId === 'in-partition-b')?.sideEffects,
-    ).toHaveLength(0);
+    ).toEqual([{ message_id: 'accepted-a' }, { message_id: 'accepted-b' }, { message_id: 'queued-unaccepted' }]);
+    expect(outDb.prepare("SELECT COUNT(*) AS n FROM session_state WHERE key LIKE 'recovery:%'").get()).toEqual({
+      n: 0,
+    });
     inDb.close();
     outDb.close();
   });

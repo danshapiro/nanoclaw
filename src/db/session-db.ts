@@ -553,6 +553,52 @@ export function assertHostGwsSideEffectsReconciled(
   return rows.length;
 }
 
+function matchingStrictGwsScope(
+  raw: RawSideEffectRecord,
+  scopes: StrictGwsSideEffectScope[],
+): StrictGwsSideEffectScope | null {
+  const signed = parseCanonicalGwsSideEffectPayload(raw.payload);
+  const candidates = scopes.filter((scope) => raw.input_id === scope.inputId || signed?.input_id === scope.inputId);
+  if (candidates.length === 0) return null;
+  const distinct = new Map(candidates.map((scope) => [`${scope.inputId}\0${scope.routeKey}`, scope]));
+  if (distinct.size !== 1) throw new Error('GWS evidence ambiguously matches multiple interrupted-turn scopes');
+  return [...distinct.values()][0];
+}
+
+/**
+ * Re-verify only rows associated with the accepted inputs being recovered.
+ * Normal sessions retain historical rows for the same route, so route alone
+ * must never make an older turn a candidate. The host-generated input id is
+ * unique to one accepted turn and is the fail-closed selection boundary.
+ */
+export function assertHostGwsSideEffectsReconciledForScopes(
+  outDb: Database.Database,
+  opts: { scopes: StrictGwsSideEffectScope[]; gwsPublicKey?: string },
+): number {
+  const rows = outDb
+    .prepare(
+      `SELECT * FROM side_effect_ledger
+        WHERE source = 'gws'
+           OR kind IN ('gmail_draft_created', 'gws_mutation_completed')
+           OR signed_payload IS NOT NULL
+           OR signature IS NOT NULL`,
+    )
+    .all() as StoredSideEffectRow[];
+  let reconciled = 0;
+  for (const row of rows) {
+    const raw = rawStoredSideEffect(row);
+    const scope = matchingStrictGwsScope(raw, opts.scopes);
+    if (!scope) continue;
+    const validated = revalidateStoredSideEffect(row, { gwsPublicKey: opts.gwsPublicKey });
+    requireExactAuthoritativeGwsEffect(validated, scope, `stored interrupted-turn GWS evidence ${row.id}`);
+    if (!storedRowMatches(row, validated)) {
+      throw new Error(`stored interrupted-turn GWS evidence ${row.id} has tampered duplicated bindings`);
+    }
+    reconciled++;
+  }
+  return reconciled;
+}
+
 export interface HostAuthoritativeSideEffect {
   id: string;
   inputId: string;
@@ -630,6 +676,8 @@ export function importHostSideEffects(opts: {
   requireCompleteLedger?: boolean;
   /** Operator-only fail-closed accounting for every GWS-shaped ledger row. */
   strictGwsScope?: StrictGwsSideEffectScope;
+  /** Normal recovery fail-closed accounting for the exact accepted inputs. */
+  strictGwsScopes?: StrictGwsSideEffectScope[];
 }): ImportSideEffectsResult {
   if (opts.containerStopped !== true) {
     throw new Error(
@@ -642,7 +690,9 @@ export function importHostSideEffects(opts: {
   const outPath = path.join(opts.sessionDir, 'outbound.db');
   const result: ImportSideEffectsResult = { imported: 0, skipped: 0, validated: 0 };
   if (!fs.existsSync(ledgerPath) || !fs.existsSync(outPath)) {
-    if (opts.strictGwsScope) throw new Error('operator GWS ledger or outbound database is missing or inaccessible');
+    if (opts.strictGwsScope || opts.strictGwsScopes?.length) {
+      throw new Error('strict GWS ledger or outbound database is missing or inaccessible');
+    }
     return result;
   }
 
@@ -690,7 +740,13 @@ export function importHostSideEffects(opts: {
           gwsPublicKey: opts.gwsPublicKey,
           statSize: (p: string) => (fs.existsSync(p) ? fs.statSync(p).size : null),
         });
-        const strictGwsScope = opts.strictGwsScope && isGwsShapedRecord(raw) ? opts.strictGwsScope : null;
+        const strictGwsScope = opts.strictGwsScope
+          ? isGwsShapedRecord(raw)
+            ? opts.strictGwsScope
+            : null
+          : opts.strictGwsScopes?.length && isGwsShapedRecord(raw)
+            ? matchingStrictGwsScope(raw, opts.strictGwsScopes)
+            : null;
         if (strictGwsScope) {
           requireExactRawGwsScope(
             raw,
@@ -771,6 +827,89 @@ interface GwsAuditStoreEntry {
   occurred_at?: string;
   payload?: string;
   signature?: string;
+}
+
+interface GwsReconciliationStoreEntry {
+  schema_version?: number;
+  audit_id?: string;
+  outcome?: string;
+  account?: string;
+  input_id?: string;
+  route_key?: string;
+  operation?: string;
+  resource_type?: string;
+  started_at?: string;
+  ended_at?: string;
+  search_hints?: unknown;
+}
+
+/**
+ * Consume the proxy's root-owned durable reconciliation journal before an
+ * interrupted accepted input can run again. Every current proxy record is a
+ * manual-reconciliation receipt; in particular outcome_unknown corresponds to
+ * the proxy response's retry=manual_only sentinel. Historical records are
+ * excluded by their unique host input id, never merely by the stable route.
+ */
+export function assertNoUnresolvedGwsReconciliationRecords(opts: {
+  reconciliationStorePath: string | undefined;
+  scopes: StrictGwsSideEffectScope[];
+}): void {
+  if (!opts.reconciliationStorePath || !fs.existsSync(opts.reconciliationStorePath)) {
+    throw new Error('GWS reconciliation store is missing or inaccessible');
+  }
+  const raw = fs.readFileSync(opts.reconciliationStorePath, 'utf8');
+  if (raw.length > 0 && !raw.endsWith('\n')) {
+    throw new Error('GWS reconciliation store has a truncated, incomplete tail');
+  }
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    let entry: GwsReconciliationStoreEntry;
+    try {
+      entry = JSON.parse(line) as GwsReconciliationStoreEntry;
+    } catch (error) {
+      throw new Error('GWS reconciliation store contains an invalid complete JSONL record', { cause: error });
+    }
+    if (!entry || typeof entry !== 'object') {
+      throw new Error('GWS reconciliation store contains an invalid complete JSONL record');
+    }
+    const scope = opts.scopes.find((candidate) => entry.input_id === candidate.inputId);
+    if (!scope) continue;
+    const startedMs = typeof entry.started_at === 'string' ? Date.parse(entry.started_at) : NaN;
+    const endedMs = typeof entry.ended_at === 'string' ? Date.parse(entry.ended_at) : NaN;
+    const notBeforeMs = Date.parse(scope.notBefore);
+    const notAfterMs = Date.parse(scope.notAfter);
+    const complete =
+      entry.schema_version === 2 &&
+      typeof entry.audit_id === 'string' &&
+      entry.audit_id.length > 0 &&
+      typeof entry.outcome === 'string' &&
+      entry.outcome.length > 0 &&
+      typeof entry.account === 'string' &&
+      entry.account.length > 0 &&
+      entry.route_key === scope.routeKey &&
+      typeof entry.operation === 'string' &&
+      entry.operation.length > 0 &&
+      typeof entry.resource_type === 'string' &&
+      entry.resource_type.length > 0 &&
+      Array.isArray(entry.search_hints) &&
+      entry.search_hints.length > 0 &&
+      Number.isFinite(startedMs) &&
+      Number.isFinite(endedMs) &&
+      Number.isFinite(notBeforeMs) &&
+      Number.isFinite(notAfterMs) &&
+      startedMs >= notBeforeMs &&
+      startedMs <= notAfterMs &&
+      endedMs >= startedMs;
+    if (!complete) {
+      throw new Error(
+        `GWS reconciliation evidence for accepted input ${scope.inputId} is malformed or outside its exact scope`,
+      );
+    }
+    throw new Error(
+      `GWS ${entry.outcome} requires manual reconciliation before accepted input ${scope.inputId} can resume; ` +
+        'do not retry automatically',
+    );
+  }
 }
 
 export interface DiscoverCrashWindowResult {
@@ -887,8 +1026,11 @@ export function discoverGwsCrashWindowDrafts(opts: {
       { gwsPublicKey: opts.gwsPublicKey },
     );
     const signed = parseCanonicalGwsSideEffectPayload(e.payload);
-    const outerIdentifierCandidate = e.input_id === opts.inputId || e.route_key === opts.routeKey;
-    const signedIdentifierCandidate = signed?.input_id === opts.inputId || signed?.route_key === opts.routeKey;
+    // Routes are intentionally stable across many normal turns. The
+    // host-generated accepted input id is unique, so it selects the current
+    // candidate while the exact route and time remain mandatory bindings below.
+    const outerIdentifierCandidate = e.input_id === opts.inputId;
+    const signedIdentifierCandidate = signed?.input_id === opts.inputId;
     const operatorCandidate = outerIdentifierCandidate || signedIdentifierCandidate;
     if (!operatorCandidate) continue;
     if (!validated?.validation.authoritative) {

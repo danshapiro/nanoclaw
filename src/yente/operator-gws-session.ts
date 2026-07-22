@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 
 import {
   assertHostGwsSideEffectsReconciled,
+  assertNoUnresolvedGwsReconciliationRecords,
   discoverGwsCrashWindowDrafts,
   ensureSchema,
   importHostSideEffects,
@@ -188,6 +189,7 @@ export function finalizeOperatorGwsSession(opts: {
   operator: OperatorGwsSession;
   containerStopped: boolean;
   auditStorePath: string | undefined;
+  reconciliationStorePath: string | undefined;
   gwsPublicKey?: string;
   stoppedAt?: string;
 }): ImportSideEffectsResult {
@@ -207,6 +209,10 @@ export function finalizeOperatorGwsSession(opts: {
     gwsPublicKey: opts.gwsPublicKey,
     requireCompleteLedger: true,
     strictGwsScope,
+  });
+  assertNoUnresolvedGwsReconciliationRecords({
+    reconciliationStorePath: opts.reconciliationStorePath,
+    scopes: [strictGwsScope],
   });
   const auditResult = discoverGwsCrashWindowDrafts({
     sessionDir: opts.operator.root,
