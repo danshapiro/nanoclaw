@@ -57,6 +57,11 @@ import {
 import { log } from './log.js';
 import { resolveGwsSideEffectVerifyKey } from './gws-side-effect-key.js';
 import {
+  resolveGwsFinalizationConfig,
+  sealAndDrainGwsCorrelation,
+  type GwsFinalizationReceipt,
+} from './gws-finalization.js';
+import {
   openInboundDb,
   openOutboundDb,
   openOutboundDbRw,
@@ -572,12 +577,14 @@ export function clearProviderToolState(outDb: Database.Database): void {
  *
  *   1. VERIFY the container is stopped. Refuse to do anything outbound-writable
  *      while the runner process might still be writing the outbound DB.
- *   2. IMPORT side effects from the host session path for /workspace/
+ *   2. SEAL + DRAIN every exact accepted GWS input at the proxy. This closes
+ *      the in-flight proxy race before any journal snapshot is trusted.
+ *   3. IMPORT side effects from the host session path for /workspace/
  *      side-effects.jsonl (opens outbound DB writable only after the verified
  *      stop) so recovery does not duplicate completed drafts/summaries.
- *   3. WRITE recovery/fallback for active processing rows.
- *   4. CLEAR stale provider-owned tool state, then RESET the processing rows.
- *   5. Only AFTER all of the above may a replacement container be woken.
+ *   4. WRITE recovery/fallback for active processing rows.
+ *   5. CLEAR stale provider-owned tool state, then RESET the processing rows.
+ *   6. Only AFTER all of the above may a replacement container be woken.
  *
  * The DB writes + side-effect import + recovery write are injected so callers
  * (and tests) can assert ordering and so production wires the real
@@ -592,6 +599,8 @@ export async function recoverInterruptedTurn(opts: {
   writableOutDb?: Database.Database;
   /** Proof the container is stopped; must resolve true before any write. */
   verifyContainerStopped: () => Promise<boolean>;
+  /** Seal exact accepted correlations and wait for proxy postflight durability. */
+  sealAndDrainAcceptedInputs: () => Promise<void>;
   /** Import staged side effects (must run before recovery is written). */
   importSideEffects: (args: { containerStopped: boolean }) => void;
   /** Write route-scoped recovery / fallback for the active processing rows. */
@@ -608,6 +617,11 @@ export async function recoverInterruptedTurn(opts: {
         'refusing to import side effects, write recovery, reset rows, or wake a replacement',
     );
   }
+
+  // The proxy is a second writer of durable evidence. Container quiescence is
+  // insufficient by itself: wait until every exact accepted correlation is
+  // sealed and every admitted handler has completed postflight fsync.
+  await opts.sealAndDrainAcceptedInputs();
 
   // Side effects first, so recovery facts include already-completed work.
   opts.importSideEffects({ containerStopped: true });
@@ -642,7 +656,7 @@ export function gwsDiscoveryScope(
   stoppedAt = new Date().toISOString(),
 ): { inputId?: string; routeKey?: string; notBefore?: string; notAfter?: string } {
   const plan = partitionGwsClaims(inDb, outDb, stoppedAt);
-  if (plan.unacceptedClaimIds.length > 0 || plan.partitions.length !== 1) return {};
+  if (plan.unacceptedClaimIds.length > 0 || plan.invalidClaimIds.length > 0 || plan.partitions.length !== 1) return {};
   return plan.partitions[0].scope;
 }
 
@@ -655,10 +669,17 @@ function partitionGwsClaims(
   inDb: Database.Database,
   outDb: Database.Database,
   stoppedAt: string,
-): { partitions: ExactGwsClaimPartition[]; unacceptedClaimIds: string[] } {
+): { partitions: ExactGwsClaimPartition[]; unacceptedClaimIds: string[]; invalidClaimIds: string[] } {
   const stoppedMs = Date.parse(stoppedAt);
-  if (!Number.isFinite(stoppedMs))
-    return { partitions: [], unacceptedClaimIds: getProcessingClaims(outDb).map((c) => c.message_id) };
+  if (!Number.isFinite(stoppedMs)) {
+    return {
+      partitions: [],
+      unacceptedClaimIds: [],
+      invalidClaimIds: getProcessingClaims(outDb)
+        .map((claim) => claim.message_id)
+        .sort(),
+    };
+  }
   const lookup = inDb.prepare(
     `SELECT host_accepted_input_id, host_accepted_route_key, host_accepted_at, host_acceptance_ended_at
        FROM messages_in WHERE id = ?`,
@@ -668,6 +689,7 @@ function partitionGwsClaims(
     { inputId: string; routeKey: string; acceptedAt: string; upperMs: number; claims: ProcessingClaim[] }
   >();
   const unacceptedClaimIds: string[] = [];
+  const invalidClaimIds: string[] = [];
   for (const claim of getProcessingClaims(outDb)) {
     const row = lookup.get(claim.message_id) as
       | {
@@ -677,29 +699,46 @@ function partitionGwsClaims(
           host_acceptance_ended_at: string | null;
         }
       | undefined;
-    const acceptedMs = row?.host_accepted_at ? Date.parse(row.host_accepted_at) : NaN;
-    if (!row?.host_accepted_input_id || !row.host_accepted_route_key || !Number.isFinite(acceptedMs)) {
+    if (!row) {
+      invalidClaimIds.push(claim.message_id);
+      continue;
+    }
+    const coreAcceptance = [row.host_accepted_input_id, row.host_accepted_route_key, row.host_accepted_at];
+    const hasAnyAcceptance = coreAcceptance.some((value) => value !== null) || row.host_acceptance_ended_at !== null;
+    if (!hasAnyAcceptance) {
       unacceptedClaimIds.push(claim.message_id);
+      continue;
+    }
+    if (coreAcceptance.some((value) => typeof value !== 'string' || value.length === 0)) {
+      invalidClaimIds.push(claim.message_id);
+      continue;
+    }
+    const inputId = row.host_accepted_input_id!;
+    const routeKey = row.host_accepted_route_key!;
+    const acceptedAt = row.host_accepted_at!;
+    const acceptedMs = Date.parse(acceptedAt);
+    if (!Number.isFinite(acceptedMs)) {
+      invalidClaimIds.push(claim.message_id);
       continue;
     }
     let upperMs = stoppedMs;
     if (row.host_acceptance_ended_at) {
       const endedMs = Date.parse(row.host_acceptance_ended_at);
       if (!Number.isFinite(endedMs)) {
-        unacceptedClaimIds.push(claim.message_id);
+        invalidClaimIds.push(claim.message_id);
         continue;
       }
       upperMs = Math.min(upperMs, endedMs);
     }
     if (upperMs < acceptedMs) {
-      unacceptedClaimIds.push(claim.message_id);
+      invalidClaimIds.push(claim.message_id);
       continue;
     }
-    const key = `${row.host_accepted_input_id}\0${row.host_accepted_route_key}\0${row.host_accepted_at}`;
+    const key = `${inputId}\0${routeKey}\0${acceptedAt}`;
     const partition = grouped.get(key) ?? {
-      inputId: row.host_accepted_input_id,
-      routeKey: row.host_accepted_route_key,
-      acceptedAt: row.host_accepted_at!,
+      inputId,
+      routeKey,
+      acceptedAt,
       upperMs,
       claims: [],
     };
@@ -718,6 +757,7 @@ function partitionGwsClaims(
       claims: partition.claims,
     })),
     unacceptedClaimIds: unacceptedClaimIds.sort(),
+    invalidClaimIds: invalidClaimIds.sort(),
   };
 }
 
@@ -725,14 +765,47 @@ function strictAcceptedGwsRecoveryPlan(
   inDb: Database.Database,
   outDb: Database.Database,
   stoppedAt: string,
-): { partitions: ExactGwsClaimPartition[]; unacceptedClaimIds: string[] } {
+): { partitions: ExactGwsClaimPartition[]; unacceptedClaimIds: string[]; invalidClaimIds: string[] } {
   const plan = partitionGwsClaims(inDb, outDb, stoppedAt);
-  if (plan.unacceptedClaimIds.length > 0) {
+  if (plan.invalidClaimIds.length > 0) {
     throw new Error(
-      `interrupted turn has processing claims without complete host acceptance: ${plan.unacceptedClaimIds.join(', ')}`,
+      `interrupted turn has malformed or only partially committed host acceptance: ${plan.invalidClaimIds.join(', ')}`,
     );
   }
   return plan;
+}
+
+/**
+ * Seal every host-authenticated accepted input and wait for proxy durability.
+ * Genuinely unaccepted claims need no barrier: the host never published a
+ * correlation for them, so the proxy could not admit a write for that input.
+ */
+export async function sealAndDrainAcceptedGwsClaims(opts: {
+  inDb: Database.Database;
+  outDb: Database.Database;
+  stoppedAt: string;
+  env?: NodeJS.ProcessEnv;
+  sealAndDrain?: typeof sealAndDrainGwsCorrelation;
+}): Promise<GwsFinalizationReceipt[]> {
+  const plan = strictAcceptedGwsRecoveryPlan(opts.inDb, opts.outDb, opts.stoppedAt);
+  const partitions = [...plan.partitions].sort((left, right) =>
+    `${left.scope.inputId}\0${left.scope.routeKey}`.localeCompare(`${right.scope.inputId}\0${right.scope.routeKey}`),
+  );
+  if (partitions.length === 0) return [];
+  const config = resolveGwsFinalizationConfig(opts.env);
+  const finalize = opts.sealAndDrain ?? sealAndDrainGwsCorrelation;
+  const receipts: GwsFinalizationReceipt[] = [];
+  for (const partition of partitions) {
+    receipts.push(
+      await finalize({
+        inputId: partition.scope.inputId,
+        routeKey: partition.scope.routeKey,
+        socketPath: config.socketPath,
+        tokenFile: config.tokenFile,
+      }),
+    );
+  }
+  return receipts;
 }
 
 /** Strict ledger import used by normal host-sweep crash recovery. */
@@ -746,6 +819,7 @@ export function importInterruptedTurnSideEffects(opts: {
   gwsPublicKey?: string;
 }): ImportSideEffectsResult {
   const plan = strictAcceptedGwsRecoveryPlan(opts.inDb, opts.outDb, opts.stoppedAt);
+  if (plan.partitions.length === 0) return { imported: 0, skipped: 0, validated: 0 };
   return importHostSideEffects({
     sessionDir: opts.sessionDir,
     containerStopped: opts.containerStopped,
@@ -928,6 +1002,19 @@ export function recoverGwsClaimPartitions(opts: {
   gwsPublicKey?: string;
 }): { recoveryIds: string[]; returnedUnacceptedClaimIds: string[] } {
   const plan = strictAcceptedGwsRecoveryPlan(opts.inDb, opts.outDb, opts.stoppedAt ?? new Date().toISOString());
+  if (plan.unacceptedClaimIds.length > 0) {
+    const remove = opts.outDb.prepare("DELETE FROM processing_ack WHERE message_id = ? AND status = 'processing'");
+    opts.outDb.transaction(() => {
+      for (const id of plan.unacceptedClaimIds) {
+        if (remove.run(id).changes !== 1) {
+          throw new Error(`failed to return genuinely unaccepted processing claim ${id} to pending`);
+        }
+      }
+    })();
+  }
+  if (plan.partitions.length === 0) {
+    return { recoveryIds: [], returnedUnacceptedClaimIds: plan.unacceptedClaimIds };
+  }
   const scopes = plan.partitions.map((partition) => partition.scope);
 
   const manualReconciliations = assertNoUnresolvedGwsReconciliationRecords({
@@ -970,7 +1057,7 @@ export function recoverGwsClaimPartitions(opts: {
     }
     recoveryIds.push(recoveryId);
   }
-  return { recoveryIds, returnedUnacceptedClaimIds: [] };
+  return { recoveryIds, returnedUnacceptedClaimIds: plan.unacceptedClaimIds };
 }
 
 /**
@@ -995,6 +1082,19 @@ export async function recoverAfterKill(inDb: Database.Database, session: Session
       reason,
       writableOutDb,
       verifyContainerStopped: async () => !isContainerRunning(session.id),
+      sealAndDrainAcceptedInputs: async () => {
+        const receipts = await sealAndDrainAcceptedGwsClaims({
+          inDb,
+          outDb: writableOutDb,
+          stoppedAt,
+        });
+        if (receipts.length > 0) {
+          log.info('Sealed and drained accepted GWS inputs before recovery snapshot', {
+            sessionId: session.id,
+            inputCount: receipts.length,
+          });
+        }
+      },
       importSideEffects: ({ containerStopped }) => {
         const allowedArtifactRoots = process.env.NANOCLAW_ARTIFACT_ROOTS
           ? process.env.NANOCLAW_ARTIFACT_ROOTS.split(':').filter(Boolean)

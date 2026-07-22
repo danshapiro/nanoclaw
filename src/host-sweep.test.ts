@@ -35,6 +35,7 @@ import {
   recoverGwsClaimPartitions,
   recoverInterruptedTurn,
   resetStuckProcessingRows,
+  sealAndDrainAcceptedGwsClaims,
   writeHostInterruptedRecovery,
 } from './host-sweep.js';
 import { readSpawnSkillGeneration, skillGenerationPath, writeSpawnSkillGeneration } from './session-manager.js';
@@ -558,6 +559,9 @@ describe('recoverInterruptedTurn (kill/reset ordering)', () => {
         order.push('verify-stopped');
         return true;
       },
+      sealAndDrainAcceptedInputs: async () => {
+        order.push('seal-and-drain');
+      },
       importSideEffects: ({ containerStopped }) => {
         // Must not import until the container is verified stopped.
         expect(containerStopped).toBe(true);
@@ -571,8 +575,8 @@ describe('recoverInterruptedTurn (kill/reset ordering)', () => {
       },
     });
 
-    // Ordering invariants: verify → import → recovery → (reset implied) → wake.
-    expect(order).toEqual(['verify-stopped', 'import-side-effects', 'write-recovery', 'wake']);
+    // Ordering invariants: verify → proxy drain → import → recovery → (reset implied) → wake.
+    expect(order).toEqual(['verify-stopped', 'seal-and-drain', 'import-side-effects', 'write-recovery', 'wake']);
     // Rows were reset and orphan claims cleared after recovery was written.
     expect(getProcessingClaims(outDb)).toEqual([]);
 
@@ -594,6 +598,9 @@ describe('recoverInterruptedTurn (kill/reset ordering)', () => {
         verifyContainerStopped: async () => {
           order.push('verify-stopped');
           return false; // container is NOT confirmed stopped
+        },
+        sealAndDrainAcceptedInputs: async () => {
+          order.push('seal-and-drain');
         },
         importSideEffects: () => {
           order.push('import-side-effects');
@@ -624,6 +631,7 @@ describe('recoverInterruptedTurn (kill/reset ordering)', () => {
       reason: 'absolute-ceiling',
       writableOutDb: outDb,
       verifyContainerStopped: async () => true,
+      sealAndDrainAcceptedInputs: async () => {},
       importSideEffects: () => {},
       writeRecovery: () => {},
       wakeContainer: async () => {},
@@ -653,6 +661,7 @@ describe('recoverInterruptedTurn (kill/reset ordering)', () => {
         reason: 'claim-stuck',
         writableOutDb: outDb,
         verifyContainerStopped: async () => true,
+        sealAndDrainAcceptedInputs: async () => {},
         importSideEffects: () => {
           order.push('import');
           if (failingStep === 'import') throw new Error('incomplete ledger evidence');
@@ -674,6 +683,78 @@ describe('recoverInterruptedTurn (kill/reset ordering)', () => {
       current_tool: 'opencode-long-tool',
     });
 
+    inDb.close();
+    outDb.close();
+  });
+
+  it('holds journal import, reset, and replacement wake until exact proxy drain completes', async () => {
+    const { inDb, outDb } = processingDbs();
+    const order: string[] = [];
+    let releaseDrain!: () => void;
+    const drain = new Promise<void>((resolve) => {
+      releaseDrain = resolve;
+    });
+
+    const recovery = recoverInterruptedTurn({
+      inDb,
+      outDb,
+      session: fakeSession(),
+      reason: 'claim-stuck',
+      writableOutDb: outDb,
+      verifyContainerStopped: async () => {
+        order.push('verify-stopped');
+        return true;
+      },
+      sealAndDrainAcceptedInputs: async () => {
+        order.push('drain-started');
+        await drain;
+        order.push('drain-complete');
+      },
+      importSideEffects: () => order.push('import'),
+      writeRecovery: () => order.push('recovery'),
+      wakeContainer: async () => {
+        order.push('wake');
+      },
+    });
+
+    await vi.waitFor(() => expect(order).toEqual(['verify-stopped', 'drain-started']));
+    expect(getProcessingClaims(outDb)).toHaveLength(1);
+    releaseDrain();
+    await recovery;
+
+    expect(order).toEqual(['verify-stopped', 'drain-started', 'drain-complete', 'import', 'recovery', 'wake']);
+    expect(getProcessingClaims(outDb)).toEqual([]);
+    inDb.close();
+    outDb.close();
+  });
+
+  it('fails closed without journal import, reset, or wake when proxy drain fails', async () => {
+    const { inDb, outDb } = processingDbs();
+    const order: string[] = [];
+
+    await expect(
+      recoverInterruptedTurn({
+        inDb,
+        outDb,
+        session: fakeSession(),
+        reason: 'claim-stuck',
+        writableOutDb: outDb,
+        verifyContainerStopped: async () => true,
+        sealAndDrainAcceptedInputs: async () => {
+          order.push('seal-and-drain');
+          throw new Error('proxy drain timed out');
+        },
+        importSideEffects: () => order.push('import'),
+        writeRecovery: () => order.push('recovery'),
+        wakeContainer: async () => {
+          order.push('wake');
+        },
+      }),
+    ).rejects.toThrow(/drain timed out/i);
+
+    expect(order).toEqual(['seal-and-drain']);
+    expect(getProcessingClaims(outDb)).toHaveLength(1);
+    expect(inDb.prepare('SELECT tries FROM messages_in WHERE id = ?').get('m-1')).toEqual({ tries: 0 });
     inDb.close();
     outDb.close();
   });
@@ -1055,6 +1136,7 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
         reason: 'claim-stuck',
         writableOutDb: outDb,
         verifyContainerStopped: async () => true,
+        sealAndDrainAcceptedInputs: async () => {},
         importSideEffects: ({ containerStopped }) => {
           importInterruptedTurnSideEffects({
             sessionDir: sessionPath,
@@ -1236,6 +1318,62 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
     });
     expect(result.recoveryIds).toHaveLength(1);
     expect(result.returnedUnacceptedClaimIds).toEqual([]);
+    inDb.close();
+    outDb.close();
+  });
+
+  it('passes each exact accepted input/route to the proxy barrier and ignores genuinely unaccepted claims', async () => {
+    const { inPath, outPath } = setupSession();
+    const inDb = new Database(inPath);
+    const outDb = new Database(outPath);
+    const accepted = addAcceptedClaim(inDb, outDb, {
+      messageId: 'accepted-for-drain',
+      inputId: 'in-exact-drain',
+      routeKey: 'codex|discord|chan-drain|dm:mg-drain',
+    });
+    inDb
+      .prepare(
+        `INSERT INTO messages_in
+           (id, timestamp, content, host_input_id, host_route_key, host_received_at,
+            host_accepted_input_id, host_accepted_route_key, host_accepted_at)
+         VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL)`,
+      )
+      .run(
+        'not-accepted-for-drain',
+        accepted.acceptedAt,
+        '{}',
+        'in-not-accepted',
+        accepted.routeKey,
+        accepted.acceptedAt,
+      );
+    outDb
+      .prepare('INSERT INTO processing_ack (message_id, status, status_changed) VALUES (?, ?, ?)')
+      .run('not-accepted-for-drain', 'processing', '2026-05-29 12:00:00');
+    const calls: Array<{ inputId: string; routeKey: string; socketPath: string; tokenFile: string }> = [];
+
+    const receipts = await sealAndDrainAcceptedGwsClaims({
+      inDb,
+      outDb,
+      stoppedAt: '2026-05-29T12:00:10.000Z',
+      env: {
+        GWS_CONTROL_SOCKET: '/srv/gws-proxy/control/control.sock',
+        GWS_FINALIZE_TOKEN_FILE: '/run/credentials/nanoclaw.service/gws-finalize-token',
+      },
+      sealAndDrain: async (request) => {
+        calls.push(request);
+        return { inputId: request.inputId, routeKey: request.routeKey, sealed: true, drained: true };
+      },
+    });
+
+    expect(calls).toEqual([
+      {
+        inputId: accepted.inputId,
+        routeKey: accepted.routeKey,
+        socketPath: '/srv/gws-proxy/control/control.sock',
+        tokenFile: '/run/credentials/nanoclaw.service/gws-finalize-token',
+      },
+    ]);
+    expect(receipts).toEqual([{ inputId: accepted.inputId, routeKey: accepted.routeKey, sealed: true, drained: true }]);
     inDb.close();
     outDb.close();
   });
@@ -1512,7 +1650,7 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
     outDb.close();
   });
 
-  it('fails closed without writing recovery when any processing claim lacks host acceptance', () => {
+  it('recovers accepted partitions while returning a genuinely unaccepted crash-window claim to pending', () => {
     const { sessionPath, inPath, outPath } = setupSession();
     const routeKey = 'opencode|discord|chan-1|dm:mg-1';
     const key = generateKeyPairSync('ed25519');
@@ -1576,26 +1714,124 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
     claim.run('accepted-b', 'processing', '2026-05-29 12:01:01');
     claim.run('queued-unaccepted', 'processing', '2026-05-29 12:02:01');
 
+    const result = recoverGwsClaimPartitions({
+      sessionDir: sessionPath,
+      inDb,
+      outDb,
+      reason: 'claim-stuck',
+      containerStopped: true,
+      stoppedAt: '2026-05-29T12:03:00.000Z',
+      auditStorePath: auditStore,
+      reconciliationStorePath: reconciliationStore,
+      gwsPublicKey,
+    });
+
+    expect(result.recoveryIds).toHaveLength(2);
+    expect(result.returnedUnacceptedClaimIds).toEqual(['queued-unaccepted']);
+    expect(
+      outDb.prepare("SELECT message_id FROM processing_ack WHERE status = 'processing' ORDER BY message_id").all(),
+    ).toEqual([{ message_id: 'accepted-a' }, { message_id: 'accepted-b' }]);
+    expect(outDb.prepare("SELECT COUNT(*) AS n FROM session_state WHERE key LIKE 'recovery:%'").get()).toEqual({
+      n: 1,
+    });
+    inDb.close();
+    outDb.close();
+  });
+
+  it('returns a pre-acceptance-only crashed claim without requiring GWS evidence files', () => {
+    const { sessionPath, inPath, outPath } = setupSession();
+    const routeKey = 'opencode|discord|chan-preaccept|dm:mg-preaccept';
+    const inDb = new Database(inPath);
+    inDb
+      .prepare(
+        `INSERT INTO messages_in
+           (id, timestamp, content, host_input_id, host_route_key, host_received_at,
+            host_accepted_input_id, host_accepted_route_key, host_accepted_at)
+         VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL)`,
+      )
+      .run(
+        'preaccept-only',
+        '2026-05-29T12:00:00.000Z',
+        '{"text":"not yet exposed to the provider"}',
+        'in-preaccept-only',
+        routeKey,
+        '2026-05-29T12:00:00.000Z',
+      );
+    const outDb = new Database(outPath);
+    outDb
+      .prepare('INSERT INTO processing_ack (message_id, status, status_changed) VALUES (?, ?, ?)')
+      .run('preaccept-only', 'processing', '2026-05-29 12:00:00');
+
+    expect(
+      importInterruptedTurnSideEffects({
+        sessionDir: sessionPath,
+        inDb,
+        outDb,
+        containerStopped: true,
+        stoppedAt: '2026-05-29T12:00:10.000Z',
+      }),
+    ).toEqual({ imported: 0, skipped: 0, validated: 0 });
+    expect(
+      recoverGwsClaimPartitions({
+        sessionDir: sessionPath,
+        inDb,
+        outDb,
+        reason: 'container not running',
+        containerStopped: true,
+        stoppedAt: '2026-05-29T12:00:10.000Z',
+        auditStorePath: undefined,
+        reconciliationStorePath: undefined,
+      }),
+    ).toEqual({ recoveryIds: [], returnedUnacceptedClaimIds: ['preaccept-only'] });
+    expect(getProcessingClaims(outDb)).toEqual([]);
+    expect(inDb.prepare('SELECT status, tries FROM messages_in WHERE id = ?').get('preaccept-only')).toEqual({
+      status: 'pending',
+      tries: 0,
+    });
+    expect(outDb.prepare("SELECT COUNT(*) AS n FROM session_state WHERE key LIKE 'recovery:%'").get()).toEqual({
+      n: 0,
+    });
+    inDb.close();
+    outDb.close();
+  });
+
+  it('fails closed when acceptance columns are only partially committed', () => {
+    const { sessionPath, inPath, outPath } = setupSession();
+    const inDb = new Database(inPath);
+    inDb
+      .prepare(
+        `INSERT INTO messages_in
+           (id, timestamp, content, host_input_id, host_route_key, host_received_at,
+            host_accepted_input_id, host_accepted_route_key, host_accepted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)`,
+      )
+      .run(
+        'partial-acceptance',
+        '2026-05-29T12:00:00.000Z',
+        '{}',
+        'in-partial',
+        'opencode|discord|partial|dm:partial',
+        '2026-05-29T12:00:00.000Z',
+        'in-partial',
+      );
+    const outDb = new Database(outPath);
+    outDb
+      .prepare('INSERT INTO processing_ack (message_id, status, status_changed) VALUES (?, ?, ?)')
+      .run('partial-acceptance', 'processing', '2026-05-29 12:00:00');
+
     expect(() =>
       recoverGwsClaimPartitions({
         sessionDir: sessionPath,
         inDb,
         outDb,
-        reason: 'claim-stuck',
+        reason: 'container not running',
         containerStopped: true,
-        stoppedAt: '2026-05-29T12:03:00.000Z',
-        auditStorePath: auditStore,
-        reconciliationStorePath: reconciliationStore,
-        gwsPublicKey,
+        stoppedAt: '2026-05-29T12:00:10.000Z',
+        auditStorePath: undefined,
+        reconciliationStorePath: undefined,
       }),
-    ).toThrow(/host acceptance|unaccepted/i);
-
-    expect(
-      outDb.prepare("SELECT message_id FROM processing_ack WHERE status = 'processing' ORDER BY message_id").all(),
-    ).toEqual([{ message_id: 'accepted-a' }, { message_id: 'accepted-b' }, { message_id: 'queued-unaccepted' }]);
-    expect(outDb.prepare("SELECT COUNT(*) AS n FROM session_state WHERE key LIKE 'recovery:%'").get()).toEqual({
-      n: 0,
-    });
+    ).toThrow(/partial|acceptance|malformed/i);
+    expect(getProcessingClaims(outDb).map((claim) => claim.message_id)).toEqual(['partial-acceptance']);
     inDb.close();
     outDb.close();
   });
