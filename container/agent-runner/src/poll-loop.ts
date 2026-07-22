@@ -48,7 +48,13 @@ import {
   stripInternalTags,
   type RoutingContext,
 } from './formatter.js';
-import { ProviderQuiescenceError, type AgentProvider, type AgentQuery, type ProviderEvent } from './providers/types.js';
+import {
+  ProviderContainerStopRequired,
+  ProviderQuiescenceError,
+  type AgentProvider,
+  type AgentQuery,
+  type ProviderEvent,
+} from './providers/types.js';
 import { bindHostGwsCorrelation, GwsCorrelationLifecycleFault, releaseHostGwsCorrelation } from './gws-correlation.js';
 
 const POLL_INTERVAL_MS = 1000;
@@ -1478,7 +1484,10 @@ async function processQuery(
     // A stream throw is itself a terminal provider boundary. Always drive the
     // provider's abort/quiescence path and await it below before releasing any
     // trusted correlation, even when the original stream error was untyped.
-    abortQuery();
+    // A clean-completion container-stop handoff already waited for observable
+    // SDK/tool callbacks. Calling abort would replace that intentional outcome
+    // with a generic cancellation failure; retain it for the host-stop path.
+    if (!(err instanceof ProviderContainerStopRequired)) abortQuery();
     throw err;
   } finally {
     done = true;

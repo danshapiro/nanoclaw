@@ -1,8 +1,10 @@
+import { spawn } from 'child_process';
+
 import { describe, expect, it, mock } from 'bun:test';
 
 import { CodexProvider } from './codex.js';
 import { MockProvider } from './mock.js';
-import { ProviderQuiescenceError, type ProviderEvent } from './types.js';
+import { ProviderContainerStopRequired, ProviderQuiescenceError, type ProviderEvent } from './types.js';
 
 function deferred<T = void>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -151,6 +153,66 @@ describe('provider input-accepted/result contract', () => {
       resolvedInputIds: ['claude-compact'],
     });
     query.end();
+  });
+
+  it('claude clean EOF requires whole-container stop while a detached descendant can remain alive', async () => {
+    let descendant: ReturnType<typeof spawn> | undefined;
+    const isAlive = (): boolean => {
+      if (!descendant?.pid) return false;
+      try {
+        process.kill(descendant.pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    mock.module('@anthropic-ai/claude-agent-sdk', () => ({
+      query: ({ prompt }: { prompt: AsyncIterable<unknown> }) =>
+        (async function* () {
+          for await (const _message of prompt) {
+            // Model the SDK/tool process starting a detached, session-escaping
+            // child just before reporting a successful result.
+            descendant = spawn(
+              process.execPath,
+              ['-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);"],
+              { detached: true, stdio: 'ignore' },
+            );
+            descendant.unref();
+            yield { type: 'result', result: 'completed reply' };
+            return;
+          }
+        })(),
+    }));
+
+    try {
+      const { ClaudeProvider } = await import('./claude.js');
+      const query = new ClaudeProvider().query({
+        inputId: 'claude-clean-eof-descendant',
+        acceptInput: async () => {},
+        prompt: 'start background work',
+        cwd: '/tmp',
+      });
+      const events: ProviderEvent[] = [];
+      const draining = (async () => {
+        for await (const event of query.events) events.push(event);
+      })();
+
+      await expect(draining).rejects.toBeInstanceOf(ProviderContainerStopRequired);
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: 'result',
+          text: 'completed reply',
+          resolvedInputIds: ['claude-clean-eof-descendant'],
+        }),
+      );
+      expect(isAlive()).toBe(true);
+    } finally {
+      try {
+        if (descendant?.pid && isAlive()) process.kill(descendant.pid, 'SIGKILL');
+      } catch {
+        // Best-effort cleanup of the test-only escaped descendant.
+      }
+    }
   });
 
   it('claude blocks prompt consumption and PreToolUse until the exact host gate acknowledges', async () => {
@@ -518,7 +580,7 @@ describe('provider push attachment compatibility', () => {
       prompt: 'second',
       attachments: [fixtureAttachment()],
     });
-    await drain;
+    await expect(drain).rejects.toBeInstanceOf(ProviderContainerStopRequired);
 
     expect(pushed).toEqual(['first', 'second']);
   });

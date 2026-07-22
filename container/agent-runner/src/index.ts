@@ -33,6 +33,7 @@ import { createProvider, type ProviderName } from './providers/factory.js';
 import { connectGwsCorrelationControlSocket, consumeGwsCorrelationLaunchControlFromStdin } from './gws-correlation.js';
 import { runPollLoop } from './poll-loop.js';
 import { makeRunnerProcessNonDumpable } from './process-isolation.js';
+import { ProviderContainerStopRequired } from './providers/types.js';
 import { ensureAgentRunnerPath, suppressUndiciProxyWarning } from './runtime-path.js';
 
 function log(msg: string): void {
@@ -120,6 +121,14 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
+  if (err instanceof ProviderContainerStopRequired) {
+    // The poll loop committed the reply and deliberately retained correlation.
+    // Exiting PID 1 stops every process in the container; the host confirms
+    // Docker name+label absence before revoking the lease or allowing a
+    // successor container.
+    log(`Completed turn requires whole-container recycle: ${err.message}`);
+    process.exit(0);
+  }
   log(`Fatal error: ${err instanceof Error ? err.message : String(err)}`);
   process.exit(1);
 });

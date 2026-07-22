@@ -5,7 +5,7 @@ import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '
 
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
 import { registerProvider } from './provider-registry.js';
-import { normalizeQueryTurnInput, ProviderQuiescenceError } from './types.js';
+import { normalizeQueryTurnInput, ProviderContainerStopRequired, ProviderQuiescenceError } from './types.js';
 import type {
   AgentProvider,
   AgentQuery,
@@ -657,6 +657,7 @@ export class ClaudeProvider implements AgentProvider {
 
     async function* translateEvents(): AsyncGenerator<ProviderEvent> {
       let messageCount = 0;
+      let sdkStreamCompleted = false;
       try {
         for await (const message of sdkResult) {
           if (aborted) return;
@@ -719,6 +720,7 @@ export class ClaudeProvider implements AgentProvider {
             yield { type: 'progress', message: tn.summary || 'Task notification' };
           }
         }
+        sdkStreamCompleted = true;
         // Flush any trailing acceptance events the SDK never interleaved.
         if (!aborted) {
           for (const ev of drainAccepted()) yield ev;
@@ -734,6 +736,19 @@ export class ClaudeProvider implements AgentProvider {
           await cancellation;
         } else {
           await waitForClaudeQuiescence(executionBarrier.waitForQuiescence());
+          // Clean SDK EOF proves that visible SDK callbacks and tool hooks
+          // finished, but not that a Bash/MCP tool did not daemonize a process
+          // into another session. Never let a later accepted input replace the
+          // mutable correlation pointer in this container. Hand the completed
+          // reply to the poll loop, retain correlation, and let PID 1 exit so
+          // the host can revoke only after Docker proves the entire container
+          // stopped. An exceptional SDK stream takes the existing abort/error
+          // path instead; only a genuinely clean EOF uses this lifecycle.
+          if (sdkStreamCompleted && acceptedAtLeastOneInput) {
+            throw new ProviderContainerStopRequired(
+              'Claude SDK completed, but whole process tree quiescence is unproven until host container stop',
+            );
+          }
         }
       }
       log(`Query completed after ${messageCount} SDK messages`);

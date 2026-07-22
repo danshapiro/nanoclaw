@@ -195,6 +195,21 @@ export class ProviderQuiescenceError extends Error {
   }
 }
 
+/**
+ * The provider finished the useful turn and all observable SDK/tool callbacks,
+ * but cannot prove that a daemonized descendant did not escape its process
+ * group. The runner must retain accepted correlation and exit successfully;
+ * the host revokes correlation only after Docker proves the whole container is
+ * stopped. Unlike a generic quiescence failure, this is an intentional clean
+ * lifecycle handoff and does not turn an already-resolved input into recovery.
+ */
+export class ProviderContainerStopRequired extends ProviderQuiescenceError {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'ProviderContainerStopRequired';
+  }
+}
+
 export interface AgentQuery {
   /** Push a follow-up message into the active query. */
   push(input: string | QueryTurnInput): void;

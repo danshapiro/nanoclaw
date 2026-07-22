@@ -40,6 +40,7 @@ import { MockProvider } from './providers/mock.js';
 import { terminateCodexAppServer } from './providers/codex-app-server.js';
 import { isProcessAlive, spawnCodexTestProcessTree } from './providers/codex-process-tree.test-support.js';
 import {
+  ProviderContainerStopRequired,
   ProviderQuiescenceError,
   type AgentProvider,
   type AgentQuery,
@@ -3986,6 +3987,78 @@ describe('poll-loop inactivity status and terminal recovery', () => {
 });
 
 describe('provider finalization barriers', () => {
+  it('keeps a completed Claude reply but retains correlation for clean whole-container recycle', async () => {
+    insertMessage(
+      'claude-normal-result-before-recycle',
+      'chat',
+      { sender: 'User', text: 'finish normally, then recycle safely' },
+      { platformId: 'chan-claude-recycle', channelType: 'discord', hostProviderName: 'claude' },
+    );
+    insertChannelDestination('discord-current', 'chan-claude-recycle');
+    let releaseCalls = 0;
+    let abortCalls = 0;
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: true,
+      isSessionInvalid: () => false,
+      query(input) {
+        return {
+          push() {},
+          end() {},
+          abort() {
+            abortCalls++;
+          },
+          events: (async function* () {
+            yield { type: 'init', continuation: 'claude-session-after-recycle' };
+            yield { type: 'input-accepted', inputId: input.inputId, scope: 'initial' };
+            yield {
+              type: 'result',
+              text: '<message to="discord-current">Finished safely.</message>',
+              resolvedInputIds: [input.inputId],
+            };
+            throw new ProviderContainerStopRequired(
+              'Claude clean completion requires host-confirmed whole-container stop',
+            );
+          })(),
+        };
+      },
+    };
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({
+      provider,
+      providerName: 'claude',
+      cwd: '/tmp',
+      signal: controller.signal,
+      releaseGwsCorrelation: async () => {
+        releaseCalls++;
+      },
+    });
+    void loopPromise.catch(() => {});
+
+    await waitFor(
+      () =>
+        getAckStatus('claude-normal-result-before-recycle') === 'completed' &&
+        getContinuation('claude') === 'claude-session-after-recycle',
+      1500,
+    );
+    await expect(loopPromise).rejects.toBeInstanceOf(ProviderContainerStopRequired);
+    expect(abortCalls).toBe(0);
+    expect(releaseCalls).toBe(0);
+    expect(getAckStatus('claude-normal-result-before-recycle')).toBe('completed');
+    expect(getUndeliveredMessages().map((row) => JSON.parse(row.content).text)).toContain('Finished safely.');
+    expect(
+      listRecoveryEntries({
+        providerName: 'claude',
+        routeKey: normalizeRoute('claude', {
+          platformId: 'chan-claude-recycle',
+          channelType: 'discord',
+          threadId: null,
+          messagingGroupId: null,
+          isGroup: null,
+        }).routeKey,
+      }),
+    ).toHaveLength(0);
+  });
+
   it('keeps a bound input live until the provider abort promise proves quiescence', async () => {
     insertMessage(
       'quiescence-init',
