@@ -1556,6 +1556,50 @@ describe('side-effect ledger container env', () => {
     }
   });
 
+  it('cleans prepared launch resources when another host process owns the session lease', async () => {
+    const stopSpies: ReturnType<typeof vi.fn>[] = [];
+    const harness = await loadContainerRunnerHarness({
+      mcpConfigForGroup: () => ({
+        allowedTools: ['mcp__granola__*'],
+        bridges: {
+          granola: {
+            type: 'mcp-remote-unix-socket',
+            remoteUrl: 'https://mcp.granola.ai/mcp',
+            callbackPort: 37947,
+            socketNamePrefix: 'granola',
+            required: true,
+          },
+        },
+      }),
+      startBridge: async (_opts, defaultResult) => {
+        stopSpies.push(defaultResult.stop);
+        return defaultResult;
+      },
+    });
+    try {
+      const leaseDir = path.join(harness.dataDir, 'v2-host-correlation', 'ag-1', harness.session.id);
+      const markerPath = path.join(leaseDir, 'active-lease.json');
+      fs.mkdirSync(leaseDir, { recursive: true });
+      const existingMarker = '{"leaseId":"owned-by-other-process"}\n';
+      fs.writeFileSync(markerPath, existingMarker, { mode: 0o600 });
+
+      const wake = harness.containerRunner.wakeContainer(harness.session);
+      await harness.oneCliStarted.promise;
+      harness.oneCliRelease.resolve();
+      await expect(wake).rejects.toThrow(/another host process|still active/i);
+
+      expect(harness.spawnMock).not.toHaveBeenCalled();
+      expect(fs.readFileSync(markerPath, 'utf8')).toBe(existingMarker);
+      expect(stopSpies).toHaveLength(1);
+      expect(stopSpies[0]).toHaveBeenCalledTimes(1);
+      const envDir = path.join(harness.dataDir, 'container-env');
+      expect(fs.existsSync(envDir) ? fs.readdirSync(envDir) : []).toEqual([]);
+      expect(fs.readdirSync(harness.dataDir).filter((name) => name.startsWith('.nanoclaw-skills-'))).toEqual([]);
+    } finally {
+      harness.close();
+    }
+  });
+
   it('ignores a delayed duplicate close from an old lease after the session respawns', async () => {
     const harness = await loadContainerRunnerHarness();
     try {
@@ -1869,7 +1913,7 @@ describe('side-effect ledger container env', () => {
       expect(controlMounts).toHaveLength(1);
       expect(controlMounts[0]).toMatch(
         new RegExp(
-          `^${path.join(harness.root, 'gws-ipc').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\/ncgws-[a-f0-9]+\/[a-f0-9]+:\/run\/nanoclaw-gws-control:ro$`,
+          `^${path.join(harness.root, 'gws-ipc').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/ncgws-[a-f0-9]+/[a-f0-9]+:/run/nanoclaw-gws-control:ro$`,
         ),
       );
     } finally {

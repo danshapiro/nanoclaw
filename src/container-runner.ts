@@ -315,20 +315,28 @@ async function spawnContainer(session: Session): Promise<void> {
     return;
   }
 
-  log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
-
   // Clear any orphan heartbeat from a previous container instance — the
   // sweep's ceiling check treats a missing file as "fresh spawn, give grace"
   // (host-sweep.ts line 87). Without this, the stale mtime can trigger an
   // immediate kill before the new container touches the file itself.
   fs.rmSync(heartbeatPath(agentGroup.id, session.id), { force: true });
 
-  const launchControl = registerGwsCorrelationLaunchLease({
-    agentGroupId: agentGroup.id,
-    sessionId: session.id,
-    providerName: provider,
-    containerName,
-  });
+  let launchControl: ReturnType<typeof registerGwsCorrelationLaunchLease>;
+  try {
+    launchControl = registerGwsCorrelationLaunchLease({
+      agentGroupId: agentGroup.id,
+      sessionId: session.id,
+      providerName: provider,
+      containerName,
+    });
+  } catch (err) {
+    removeContainerEnvFile(envFilePath);
+    cleanupTempSkillRoot(managedSkillsRoot);
+    await stopAgentMcpBridges(bridges);
+    throw err;
+  }
+
+  log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
   let container: ChildProcess | undefined;
   try {
     container = spawn(CONTAINER_RUNTIME_BIN, args, { stdio: ['pipe', 'pipe', 'pipe'] });

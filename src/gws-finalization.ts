@@ -109,11 +109,10 @@ export async function sealAndDrainGwsCorrelation(opts: {
 
   const response = await new Promise<{ status: number; contentType: string; body: Buffer }>((resolve, reject) => {
     let settled = false;
-    let deadline: NodeJS.Timeout | undefined;
     const finish = (): boolean => {
       if (settled) return false;
       settled = true;
-      if (deadline) clearTimeout(deadline);
+      clearTimeout(deadline);
       return true;
     };
     const request = http.request(
@@ -149,7 +148,7 @@ export async function sealAndDrainGwsCorrelation(opts: {
         });
       },
     );
-    deadline = setTimeout(() => {
+    const deadline = setTimeout(() => {
       request.destroy(new Error('GWS proxy seal-and-drain timed out'));
     }, timeoutMs);
     request.once('error', (error) => {

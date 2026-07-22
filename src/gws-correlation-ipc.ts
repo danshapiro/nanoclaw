@@ -206,15 +206,18 @@ function unlinkIfPresent(filePath: string): void {
   }
 }
 
-function writeJsonAtomic(filePath: string, value: unknown): void {
+function writeJsonExclusive(filePath: string, value: unknown): void {
   const dir = path.dirname(filePath);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const tmp = path.join(dir, `.lease.${process.pid}.${Date.now()}.tmp`);
   try {
-    fs.writeFileSync(tmp, `${JSON.stringify(value)}\n`, { flag: 'wx', mode: 0o600 });
-    fs.renameSync(tmp, filePath);
-  } finally {
-    unlinkIfPresent(tmp);
+    fs.writeFileSync(filePath, `${JSON.stringify(value)}\n`, { flag: 'wx', mode: 0o600 });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'EEXIST') {
+      throw new Error('GWS correlation lease is still active in another host process; confirm container stop first', {
+        cause: err,
+      });
+    }
+    throw err;
   }
 }
 
@@ -445,15 +448,24 @@ export function registerGwsCorrelationLaunchLease(opts: {
     enumerable: false,
     value: () => revokeGwsCorrelationLaunchLease(agentGroupId, sessionId, leaseId),
   });
-  launchLeases.set(key, state);
-  writeJsonAtomic(activeLeasePath(agentGroupId, sessionId), {
+  const markerPath = activeLeasePath(agentGroupId, sessionId);
+  writeJsonExclusive(markerPath, {
     schemaVersion: 1,
     agentGroupId,
     sessionId,
     leaseId,
     issuedAt,
   });
-  startLeaseSocket(control, state);
+  try {
+    launchLeases.set(key, state);
+    startLeaseSocket(control, state);
+  } catch (err) {
+    launchLeases.delete(key);
+    unlinkIfPresent(markerPath);
+    closeLeaseTransport(state);
+    secret.fill(0);
+    throw err;
+  }
   return control;
 }
 

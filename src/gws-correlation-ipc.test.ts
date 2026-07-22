@@ -644,4 +644,32 @@ describe('GWS acceptance lifecycle barriers', () => {
     });
     db.close();
   });
+
+  it('refuses to replace a lease marker owned by another host process', () => {
+    const groupId = `ag-cross-process-${Date.now()}`;
+    const sessionId = 'sess-cross-process';
+    const dir = sessionDir(groupId, sessionId);
+    createdSessions.push(dir);
+    const markerPath = path.join(path.dirname(hostCorrelationPath(groupId, sessionId)), 'active-lease.json');
+    fs.mkdirSync(path.dirname(markerPath), { recursive: true });
+    const existing = {
+      schemaVersion: 1,
+      agentGroupId: groupId,
+      sessionId,
+      leaseId: 'lease-other-process',
+      issuedAt: '2026-07-21T00:00:00.000Z',
+    };
+    fs.writeFileSync(markerPath, `${JSON.stringify(existing)}\n`, { mode: 0o600 });
+
+    expect(() =>
+      registerGwsCorrelationLaunchLease({
+        agentGroupId: groupId,
+        sessionId,
+        providerName: 'codex',
+        leaseId: 'lease-contending-process',
+        secret: Buffer.alloc(32, 41),
+      }),
+    ).toThrow(/another host process|still active/i);
+    expect(JSON.parse(fs.readFileSync(markerPath, 'utf8'))).toEqual(existing);
+  });
 });
