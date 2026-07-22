@@ -435,8 +435,8 @@ revalidate_output_destination() {
 }
 
 print_output_success_json() {
-  bytes="$(header_value 'X-GWS-Output-Bytes')"
-  sha256="$(header_value 'X-GWS-Output-SHA256')"
+  bytes="$(header_value 'X-GWS-Proxy-Output-Bytes')"
+  sha256="$(header_value 'X-GWS-Proxy-Output-SHA256')"
   NODE_NO_WARNINGS=1 \
     GWS_OUTPUT_PATH="$output_resolved_path" \
     GWS_OUTPUT_BYTES="${bytes:-0}" \
@@ -476,8 +476,8 @@ case "$http_code" in
         proxy_output_kind="$(header_value 'X-GWS-Proxy-Output')"
       fi
       if [ "$account_matches" = "true" ] && [ "$exit_code" = "0" ] && [ "$proxy_output_kind" = "file" ]; then
-        expected_bytes="$(header_value 'X-GWS-Output-Bytes')"
-        expected_sha256="$(header_value 'X-GWS-Output-SHA256')"
+        expected_bytes="$(header_value 'X-GWS-Proxy-Output-Bytes')"
+        expected_sha256="$(header_value 'X-GWS-Proxy-Output-SHA256')"
         actual_bytes="$(file_size_bytes "$tmp_output_body")"
         actual_sha256="$(file_sha256 "$tmp_output_body")"
         if [ -z "$expected_bytes" ] || [ -z "$expected_sha256" ] || \

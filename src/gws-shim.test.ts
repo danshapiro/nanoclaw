@@ -157,8 +157,8 @@ function writeOutputProxyResponse(res: http.ServerResponse, bytes: Buffer | stri
     'Content-Type': 'application/octet-stream',
     'X-Exit-Code': '0',
     'X-GWS-Proxy-Output': 'file',
-    'X-GWS-Output-Bytes': String(body.length),
-    'X-GWS-Output-SHA256': hash,
+    'X-GWS-Proxy-Output-Bytes': String(body.length),
+    'X-GWS-Proxy-Output-SHA256': hash,
   });
   res.end(body);
 }
@@ -805,7 +805,7 @@ describe('gws proxy shim', () => {
     });
   });
 
-  it('preserves binary output bytes that cannot round-trip through shell variables', async () => {
+  it('preserves binary output bytes using the proxy canonical integrity headers', async () => {
     const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-shim-workspace-'));
     const shim = shimWithOutputRootsForTest([workspace]);
     const outputPath = path.join(workspace, 'binary.bin');
@@ -1034,8 +1034,8 @@ describe('gws proxy shim', () => {
         'Content-Type': 'application/octet-stream',
         'X-Exit-Code': '0',
         'X-GWS-Proxy-Output': 'file',
-        'X-GWS-Output-Bytes': '100',
-        'X-GWS-Output-SHA256': crypto.createHash('sha256').update('different').digest('hex'),
+        'X-GWS-Proxy-Output-Bytes': '100',
+        'X-GWS-Proxy-Output-SHA256': crypto.createHash('sha256').update('different').digest('hex'),
       });
       res.end('short');
     });
