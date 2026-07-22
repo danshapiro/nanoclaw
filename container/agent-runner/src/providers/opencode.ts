@@ -1076,9 +1076,9 @@ export class OpenCodeProvider implements AgentProvider {
               if (res.kind === 'inactivity-notice') {
                 // Non-terminal liveness moment. Emit activity AND a provider
                 // `notice` with agent-facing wording + liveness metadata. The
-                // poll loop relays it through a separate restricted relay runtime
-                // (or one sanitized direct fallback). NEVER pushed into the busy
-                // turn; never clears continuation; never settles user rows.
+                // poll loop writes one sanitized direct status without starting a
+                // second agent turn. NEVER pushed into the busy turn; never clears
+                // continuation; never settles user rows.
                 yield { type: 'activity', source: 'provider_internal', inputId: turnInputId };
                 yield {
                   type: 'notice',

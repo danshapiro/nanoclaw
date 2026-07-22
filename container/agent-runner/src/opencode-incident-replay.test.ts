@@ -529,6 +529,7 @@ async function runWake(opts: {
 // side-effect event.
 
 interface GwsAuditRecord {
+  account: string;
   args: string[];
   inputId?: string;
   routeKey?: string;
@@ -633,13 +634,14 @@ function startGwsBoundary(signWith: 'ephemeral' | 'forged' | 'unsigned' = 'ephem
     async fetch(req) {
       const url = new URL(req.url);
       if (url.pathname === '/health') return new Response('ok');
-      const body = (await req.json()) as { args: string[]; input_id?: string; route_key?: string };
+      const body = (await req.json()) as { account: string; args: string[]; input_id?: string; route_key?: string };
+      const account = body.account;
       const args = body.args ?? [];
       const service = args[0] ?? '';
       const flagIndex = args.findIndex((arg, index) => index > 0 && arg.startsWith('-'));
       const method = args.slice(1, flagIndex < 0 ? args.length : flagIndex).join('.');
       const { cls, apiEffect } = classifyInvocation(args);
-      audits.push({ args, inputId: body.input_id, routeKey: body.route_key, requestClass: cls, apiEffect });
+      audits.push({ account, args, inputId: body.input_id, routeKey: body.route_key, requestClass: cls, apiEffect });
       const auditId = crypto.randomUUID().replace(/-/g, '');
       const headers: Record<string, string> = {
         'Content-Type': 'application/json',
@@ -647,6 +649,7 @@ function startGwsBoundary(signWith: 'ephemeral' | 'forged' | 'unsigned' = 'ephem
         'X-GWS-Request-Class': cls,
         'X-GWS-Api-Effect': String(apiEffect),
         'X-GWS-Operation-Succeeded': 'true',
+        'X-GWS-Account': account,
         'X-Exit-Code': '0',
       };
       const out = apiEffect ? 'Draft created: r-9988776655' : `gws ${service} ${method} ${cls} probe output`;
@@ -657,7 +660,7 @@ function startGwsBoundary(signWith: 'ephemeral' | 'forged' | 'unsigned' = 'ephem
           schema_version: 2,
           audit_id: auditId,
           profile: 'nanoclaw',
-          account_label: 'personal',
+          account_label: account,
           account_email: 'dan@danshapiro.com',
           input_id: body.input_id ?? '',
           route_key: body.route_key ?? '',
@@ -677,7 +680,7 @@ function startGwsBoundary(signWith: 'ephemeral' | 'forged' | 'unsigned' = 'ephem
           headers['X-GWS-Side-Effect-Payload'] = payload;
           headers['X-GWS-Side-Effect-Schema'] = '2';
           headers['X-GWS-Profile'] = 'nanoclaw';
-          headers['X-GWS-Account'] = 'personal';
+          headers['X-GWS-Account'] = account;
           headers['X-GWS-Account-Email'] = 'dan@danshapiro.com';
           headers['X-GWS-Input-Id'] = body.input_id ?? '';
           headers['X-GWS-Route-Key'] = body.route_key ?? '';
@@ -966,7 +969,7 @@ const DVORA_ROUTE = {
 };
 
 describe('Task 6 Steps 3-4 — Dvora 5/19 recording → summary replay', () => {
-  it('turn 1 (ses_1a1e72ac…): progress line is user-visible + harvestable; 16-min no-SSE relay (no host sweep); no raw timeout; terminal no-reuse → recovery harvests the exact progress line', async () => {
+  it('turn 1 (ses_1a1e72ac…): progress line is user-visible + harvestable; 16-min no-SSE direct status (no host sweep); no raw timeout; terminal no-reuse → recovery harvests the exact progress line', async () => {
     // Long no-SSE work must outlive the old 300s watchdog AND the observed 16 min.
     process.env.OPENCODE_INACTIVITY_NOTICE_MS = String(5 * 60 * 1000);
     process.env.OPENCODE_INACTIVITY_NOTICE_REPEAT_MS = String(60 * 60 * 1000);
@@ -980,12 +983,9 @@ describe('Task 6 Steps 3-4 — Dvora 5/19 recording → summary replay', () => {
     const streamA = new FakeStream();
     const streamB = new FakeStream();
     const controllers = [new FakeController(streamA, DVORA_SESSION_1), new FakeController(streamB, DVORA_SESSION_1)];
-    const relayStream = new FakeStream();
-    const relayController = new FakeController(relayStream, 'ses_relay_dvora');
     const { provider, relayCalls } = makeProvider({
       clock,
       controllerFor: (i) => controllers[Math.min(i, controllers.length - 1)],
-      relayControllerFor: () => relayController,
     });
     let recordingLeafSeen = false;
 
@@ -1026,8 +1026,8 @@ describe('Task 6 Steps 3-4 — Dvora 5/19 recording → summary replay', () => {
     // ── Wake B: the long no-SSE download continues on the warm session. We advance
     // the clock past the 5-min inactivity AND past the observed 16-min window with
     // NO meaningful SSE; the host must NOT sweep-kill and continuation must NOT be
-    // cleared by heuristic. The poll loop starts a Yente-authored relay through the
-    // SEPARATE relay runtime. Then a TERMINAL no-reuse interruption routes the
+    // cleared by heuristic. The poll loop writes one direct, sanitized status and
+    // does not start a second agent turn. Then a TERMINAL no-reuse interruption routes the
     // accepted-but-unresolved row into recovery, which harvests the wake-A progress.
     insertMessage('dvora-1b', 'keep going on the 5/19 download', DVORA_ROUTE);
     const ctl = new AbortController();
@@ -1036,21 +1036,10 @@ describe('Task 6 Steps 3-4 — Dvora 5/19 recording → summary replay', () => {
       // Wait for the wake-B turn to be accepted (the pump is now waiting on SSE).
       await waitFor(() => getAckStatus('dvora-1b') === 'processing', 4000);
       await sleep(40);
-      // 16 minutes of silence → inactivity notice → relay (separate runtime).
+      // 16 minutes of silence → one direct inactivity status (no relay turn).
       await clock.advance(16 * 60 * 1000);
-      relayStream.push({
-        type: 'message.updated',
-        properties: { info: { id: 'mr', role: 'assistant' }, sessionID: 'ses_relay_dvora' },
-      });
-      relayStream.push({
-        type: 'message.part.updated',
-        properties: {
-          sessionID: 'ses_relay_dvora',
-          part: { type: 'text', messageID: 'mr', text: "Still working on the 5/19 download — I'm on it." },
-        },
-      });
-      relayStream.push(sessionIdle('ses_relay_dvora'));
-      await waitFor(() => relayCalls.count >= 1, 4000);
+      await waitFor(() => outboundTexts().includes("I'm still working on your request."), 4000);
+      expect(relayCalls.count).toBe(0);
       // The original turn is STILL alive (no host sweep, no continuation clear).
       expect(controllers[1].destroyed).toHaveLength(0);
       expect(getContinuation('opencode')).toBe(DVORA_SESSION_1);
@@ -1278,13 +1267,14 @@ describe('Task 6 Step 6 — Fruma Gmail draft: help probe, native question, sign
         await waitFor(() => fs.existsSync(activeInput), 4000);
 
         // The observed help probe crosses the PRODUCTION shim/proxy boundary.
-        const help = await gws.runShim(['gmail', 'users', 'drafts', 'create', '--help'], {
+        const help = await gws.runShim(['--account', 'personal', 'gmail', 'users', 'drafts', 'create', '--help'], {
           NANOCLAW_SIDE_EFFECT_LEDGER: ledger,
           NANOCLAW_ACTIVE_INPUT_FILE: activeInput,
         });
         expect(help.status).toBe(0);
         // The resulting audit record is classified non-API help, NOT draft creation.
         const helpAudit = gws.audits.at(-1)!;
+        expect(helpAudit.account).toBe('personal');
         expect(helpAudit.requestClass).toBe('help');
         expect(helpAudit.apiEffect).toBe(false);
         // A help probe is NOT a draft creation: no gmail_draft_created JSONL staged.
@@ -1336,6 +1326,8 @@ describe('Task 6 Step 6 — Fruma Gmail draft: help probe, native question, sign
         // Cross the PRODUCTION shim/proxy boundary for the ACTUAL draft creation.
         const create = await gws.runShim(
           [
+            '--account',
+            'personal',
             'gmail',
             'users',
             'drafts',
@@ -1352,6 +1344,7 @@ describe('Task 6 Step 6 — Fruma Gmail draft: help probe, native question, sign
         expect(create.status).toBe(0);
         // The draft-create audit record is api_effect:true.
         const createAudit = gws.audits.at(-1)!;
+        expect(createAudit.account).toBe('personal');
         expect(createAudit.apiEffect).toBe(true);
         // The summarize-dnd-style tool COMPLETES → REAL provider imports the staged
         // JSONL → side_effect_ledger. The gmail_draft_created entry is authoritative
@@ -1464,12 +1457,26 @@ describe('Task 6 Step 7 — non-cancellable native question → clear-continuati
         await waitFor(() => fs.existsSync(activeInput), 4000);
         await sleep(40);
         await gws.runShim(
-          ['gmail', 'users', 'drafts', 'create', '--to', 'matt@example.com', '--subject', 'Update', '--body', 'body'],
+          [
+            '--account',
+            'personal',
+            'gmail',
+            'users',
+            'drafts',
+            'create',
+            '--to',
+            'matt@example.com',
+            '--subject',
+            'Update',
+            '--body',
+            'body',
+          ],
           {
             NANOCLAW_SIDE_EFFECT_LEDGER: ledger,
             NANOCLAW_ACTIVE_INPUT_FILE: activeInput,
           },
         );
+        expect(gws.audits.at(-1)?.account).toBe('personal');
         for (const e of toolCallLeaf('ses_fruma_restart2', 'gws-draft', 'bash')) streamB.push(e);
         await waitFor(() => getAuthoritativeSideEffects().some((s) => s.kind === 'gmail_draft_created'), 4000);
         for (const e of assistantText('ses_fruma_restart2', 'm-done', visibleAssistantText(FRUMA_DRAFT_DONE)))
@@ -1532,12 +1539,26 @@ describe('Task 6 Step 8 — terminal after side effect: no duplication, recovery
         await waitFor(() => fs.existsSync(activeInput), 4000);
         await sleep(40);
         await gws.runShim(
-          ['gmail', 'users', 'drafts', 'create', '--to', 'matt@example.com', '--subject', 'X', '--body', 'b'],
+          [
+            '--account',
+            'personal',
+            'gmail',
+            'users',
+            'drafts',
+            'create',
+            '--to',
+            'matt@example.com',
+            '--subject',
+            'X',
+            '--body',
+            'b',
+          ],
           {
             NANOCLAW_SIDE_EFFECT_LEDGER: ledger,
             NANOCLAW_ACTIVE_INPUT_FILE: activeInput,
           },
         );
+        expect(gws.audits.at(-1)?.account).toBe('personal');
         for (const e of toolCallLeaf('ses_se_draft', 'gws-draft', 'bash')) streamA.push(e);
         await waitFor(() => getAuthoritativeSideEffects().some((s) => s.kind === 'gmail_draft_created'), 4000);
         // Stream dies BEFORE any final assistant text.
