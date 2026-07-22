@@ -5,15 +5,17 @@ import net, { type Socket } from 'net';
 import { createHmac } from 'crypto';
 
 import Database from 'better-sqlite3';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   bindAcceptedGwsCorrelation,
   canonicalGwsCorrelationAuthPayload,
+  DEFAULT_GWS_CORRELATION_IPC_ROOT,
   expireAllStaleGwsCorrelations,
   hostGwsCorrelationIpcDir,
   processAuthenticatedGwsCorrelationRequest,
   registerGwsCorrelationLaunchLease,
+  setGwsCorrelationIpcRootForTests,
   type AuthenticatedGwsCorrelationRequest,
   type GwsCorrelationLaunchControl,
   type RegisteredGwsCorrelationLaunchControl,
@@ -21,6 +23,18 @@ import {
 import { closeDb, createAgentGroup, createSession, initTestDb, runMigrations } from './db/index.js';
 import { INBOUND_SCHEMA, OUTBOUND_SCHEMA } from './db/schema.js';
 import { hostCorrelationPath, inboundDbPath, outboundDbPath, sessionDir } from './session-manager.js';
+
+const testIpcRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-correlation-ipc-root-'));
+
+beforeAll(() => setGwsCorrelationIpcRootForTests(testIpcRoot));
+afterAll(() => {
+  setGwsCorrelationIpcRootForTests(DEFAULT_GWS_CORRELATION_IPC_ROOT);
+  fs.rmSync(testIpcRoot, { recursive: true, force: true });
+});
+
+it('keeps production sockets outside systemd PrivateTmp', () => {
+  expect(DEFAULT_GWS_CORRELATION_IPC_ROOT).toBe('/run/nanoclaw-gws-correlation');
+});
 
 function socketFrame(value: unknown): Buffer {
   const payload = Buffer.from(JSON.stringify(value));

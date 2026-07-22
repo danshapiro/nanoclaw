@@ -203,6 +203,7 @@ async function loadContainerRunnerHarness(
   });
   vi.doMock('./gws-correlation-ipc.js', async (importOriginal) => {
     const actual = await importOriginal<typeof import('./gws-correlation-ipc.js')>();
+    actual.setGwsCorrelationIpcRootForTests(path.join(root, 'gws-ipc'));
     return {
       ...actual,
       registerGwsCorrelationLaunchLease: (opts: Parameters<typeof actual.registerGwsCorrelationLaunchLease>[0]) =>
@@ -1866,7 +1867,11 @@ describe('side-effect ledger container env', () => {
       expect(mounts.some((arg) => arg.endsWith(':/workspace/.gws-correlation-ipc'))).toBe(false);
       const controlMounts = args.filter((arg) => arg.includes(':/run/nanoclaw-gws-control'));
       expect(controlMounts).toHaveLength(1);
-      expect(controlMounts[0]).toMatch(/^\/tmp\/ncgws-[a-f0-9]+\/[a-f0-9]+:\/run\/nanoclaw-gws-control:ro$/);
+      expect(controlMounts[0]).toMatch(
+        new RegExp(
+          `^${path.join(harness.root, 'gws-ipc').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\/ncgws-[a-f0-9]+\/[a-f0-9]+:\/run\/nanoclaw-gws-control:ro$`,
+        ),
+      );
     } finally {
       harness.close();
     }

@@ -15,6 +15,15 @@ const MAX_FRAME_BYTES = 64 * 1024;
 const HANDSHAKE_DEADLINE_MS = 2_000;
 const SOCKET_BACKLOG = 4;
 const REQUEST_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+export const DEFAULT_GWS_CORRELATION_IPC_ROOT = '/run/nanoclaw-gws-correlation';
+let gwsCorrelationIpcRoot = DEFAULT_GWS_CORRELATION_IPC_ROOT;
+
+/** Keep production fixed to systemd's host-visible RuntimeDirectory. */
+export function setGwsCorrelationIpcRootForTests(root: string): void {
+  if (!process.env.VITEST) throw new Error('GWS correlation IPC root override is test-only');
+  if (!path.isAbsolute(root)) throw new Error('test GWS correlation IPC root must be absolute');
+  gwsCorrelationIpcRoot = root;
+}
 
 export interface GwsCorrelationLaunchControl {
   schemaVersion: 1;
@@ -122,7 +131,7 @@ function launchLeaseKey(agentGroupId: string, sessionId: string): string {
 export function hostGwsCorrelationIpcDir(agentGroupId: string, sessionId: string): string {
   const install = createHash('sha256').update(DATA_DIR).digest('hex').slice(0, 12);
   const session = createHash('sha256').update(`${agentGroupId}\0${sessionId}`).digest('hex').slice(0, 16);
-  return path.join('/tmp', `ncgws-${install}`, session);
+  return path.join(gwsCorrelationIpcRoot, `ncgws-${install}`, session);
 }
 
 function activeLeasePath(agentGroupId: string, sessionId: string): string {
