@@ -237,9 +237,11 @@ function expireAcceptedRows(
           WHERE host_acceptance_ended_at IS NULL AND host_acceptance_lease_id = ?`,
       ).run(endedAt, leaseId);
     } else {
-      db.prepare(`UPDATE messages_in SET host_acceptance_ended_at = ? WHERE host_acceptance_ended_at IS NULL`).run(
-        endedAt,
-      );
+      db.prepare(
+        `UPDATE messages_in SET host_acceptance_ended_at = ?
+          WHERE host_acceptance_ended_at IS NULL
+            AND host_accepted_input_id IS NOT NULL`,
+      ).run(endedAt);
     }
   } finally {
     db.close();

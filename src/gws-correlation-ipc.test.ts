@@ -363,6 +363,28 @@ describe('authenticated GWS correlation acceptance lease', () => {
     });
   });
 
+  it('does not mark never-accepted rows as ended when a launch lease is revoked', () => {
+    control.revokeAfterConfirmedStop();
+
+    const db = new Database(dbPath, { readonly: true });
+    expect(
+      db
+        .prepare(
+          `SELECT host_accepted_input_id, host_accepted_route_key, host_accepted_at,
+                  host_acceptance_ended_at
+             FROM messages_in
+            WHERE id = ?`,
+        )
+        .get('m-active'),
+    ).toEqual({
+      host_accepted_input_id: null,
+      host_accepted_route_key: null,
+      host_accepted_at: null,
+      host_acceptance_ended_at: null,
+    });
+    db.close();
+  });
+
   it('accepts one legitimate queued batch exactly once and never rewrites original accepted_at on replay', () => {
     const legitimate = request();
     expect(canonicalGwsCorrelationAuthPayload(legitimate)).toBe(
@@ -603,6 +625,11 @@ describe('GWS acceptance lifecycle barriers', () => {
        VALUES ('m-life', 1, 'chat', ?, '{}', 1, 'in-life', 'route-life', ?,
                'in-life', 'route-life', ?, ?)`,
     ).run('2026-07-21T00:00:00.000Z', '2026-07-21T00:00:00.000Z', '2026-07-21T00:00:01.000Z', leaseId);
+    db.prepare(
+      `INSERT INTO messages_in
+         (id, seq, kind, timestamp, content, trigger, host_input_id, host_route_key, host_received_at)
+       VALUES ('m-never-accepted', 2, 'chat', ?, '{}', 1, 'in-never', 'route-life', ?)`,
+    ).run('2026-07-21T00:00:00.500Z', '2026-07-21T00:00:00.500Z');
     db.close();
     return dbPath;
   }
@@ -641,6 +668,9 @@ describe('GWS acceptance lifecycle barriers', () => {
     const db = new Database(dbPath, { readonly: true });
     expect(db.prepare("SELECT host_acceptance_ended_at FROM messages_in WHERE id = 'm-life'").get()).toEqual({
       host_acceptance_ended_at: '2026-07-21T00:00:02.000Z',
+    });
+    expect(db.prepare("SELECT host_acceptance_ended_at FROM messages_in WHERE id = 'm-never-accepted'").get()).toEqual({
+      host_acceptance_ended_at: null,
     });
     db.close();
   });
