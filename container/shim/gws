@@ -213,6 +213,11 @@ request_body="$(
 multipart_body="$(NODE_NO_WARNINGS=1 node -e 'const p=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.stdout.write(p.multipartBody||"")' "$tmp_arg_plan")"
 multipart_content_type="$(NODE_NO_WARNINGS=1 node -e 'const p=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.stdout.write(p.multipartContentType||"")' "$tmp_arg_plan")"
 request_is_write="$(NODE_NO_WARNINGS=1 node -e 'const p=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.stdout.write(p.isWrite?"true":"false")' "$tmp_arg_plan")"
+manual_reconciliation="$(NODE_NO_WARNINGS=1 node -e 'const p=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.stdout.write(p.manualReconciliation?JSON.stringify(p.manualReconciliation):"")' "$tmp_arg_plan")"
+if [ "$request_is_write" = true ] && [ -z "$manual_reconciliation" ]; then
+  echo "Error: write request is missing safe manual-reconciliation context." >&2
+  exit 2
+fi
 
 output_resolved_path="$(
   NODE_NO_WARNINGS=1 node -e '
@@ -253,6 +258,7 @@ if [ "$curl_status" -ne 0 ]; then
   tmp_output_body=""
   if [ "$request_is_write" = true ]; then
     printf 'Error: the authenticated GWS write request was sent but the proxy response was lost. Manual reconciliation is required. Do not retry automatically.\n' >&2
+    printf 'GWS_MANUAL_RECONCILIATION %s\n' "$manual_reconciliation" >&2
     exit 75
   fi
   printf 'Error: GWS proxy transfer failed while receiving output bytes.\n' >&2

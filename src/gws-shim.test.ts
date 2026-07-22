@@ -632,7 +632,17 @@ describe('gws proxy shim', () => {
       res.socket?.destroy();
     });
     const write = await runShimRaw(
-      ['--account', 'personal', 'tasks', 'tasklists', 'insert', '--json', '{"title":"Work"}'],
+      [
+        '--account',
+        'personal',
+        'tasks',
+        'tasklists',
+        'insert',
+        '--params',
+        '{"tasklist":"work-list","accessToken":"must-not-print-token"}',
+        '--json',
+        '{"title":"Work","notes":"must-not-print-body"}',
+      ],
       { GWS_PROXY_URL: proxy.url },
       root,
       shim,
@@ -646,8 +656,33 @@ describe('gws proxy shim', () => {
     expect(write.status).toBe(75);
     expect(write.stderr).toContain('response was lost');
     expect(write.stderr).toContain('Do not retry automatically');
+    const contextLine = write.stderr.split('\n').find((line) => line.startsWith('GWS_MANUAL_RECONCILIATION '));
+    expect(contextLine).toBeDefined();
+    const context = JSON.parse(contextLine!.slice('GWS_MANUAL_RECONCILIATION '.length));
+    expect(context).toMatchObject({
+      schema_version: 1,
+      event: 'gws_write_response_lost',
+      account: 'personal',
+      input_id: DEFAULT_TEST_INPUT,
+      route_key: DEFAULT_TEST_ROUTE,
+      operation: 'tasks tasklists insert',
+      resource_context: { tasklist: 'work-list', title: 'Work' },
+    });
+    expect(context.args_sha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(context.argument_shape).toEqual([
+      'tasks',
+      'tasklists',
+      'insert',
+      '--params',
+      '<value>',
+      '--json',
+      '<value>',
+    ]);
+    expect(write.stderr).not.toContain('must-not-print-token');
+    expect(write.stderr).not.toContain('must-not-print-body');
     expect(read.status).toBe(1);
     expect(read.stderr).not.toContain('Do not retry automatically');
+    expect(read.stderr).not.toContain('GWS_MANUAL_RECONCILIATION');
   });
 
   it('preserves successful upstream stdout bytes including trailing newlines', async () => {

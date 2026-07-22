@@ -326,8 +326,8 @@ function loadCorrelation() {
   }
 }
 
-function isExactWrite(proxyArgs) {
-  if (proxyArgs.some((arg) => ['--help', '-h', '--schema', '--version', '--dry-run'].includes(arg))) return false;
+function exactWriteOperation(proxyArgs) {
+  if (proxyArgs.some((arg) => ['--help', '-h', '--schema', '--version', '--dry-run'].includes(arg))) return null;
   let manifest;
   try {
     manifest = JSON.parse(fs.readFileSync(process.env.GWS_SHIM_WRITE_OPERATIONS_FILE, 'utf8'));
@@ -337,10 +337,124 @@ function isExactWrite(proxyArgs) {
   if (manifest?.schema_version !== 1 || manifest?.gws_version !== '0.18.1' || !Array.isArray(manifest.operations)) {
     fail('write-operation manifest has the wrong schema or GWS version');
   }
-  return manifest.operations.some((operation) => {
-    const words = operation.split(' ');
-    return words.every((word, index) => proxyArgs[index] === word);
-  });
+  return (
+    manifest.operations.find((operation) => {
+      const words = operation.split(' ');
+      return words.every((word, index) => proxyArgs[index] === word);
+    }) ?? null
+  );
+}
+
+const SAFE_RESOURCE_KEYS = new Map(
+  [
+    'id',
+    'fileId',
+    'documentId',
+    'spreadsheetId',
+    'presentationId',
+    'calendarId',
+    'eventId',
+    'messageId',
+    'threadId',
+    'draftId',
+    'taskId',
+    'tasklist',
+    'tasklistId',
+    'parent',
+    'parents',
+    'name',
+    'title',
+    'summary',
+    'subject',
+    'to',
+    'cc',
+    'bcc',
+  ].map((key) => [key.toLowerCase(), key]),
+);
+
+function safeResourceValue(value) {
+  if (typeof value === 'string') {
+    if (!value || value.length > 256 || !/^[\x20-\x7e]+$/.test(value)) return undefined;
+    return value;
+  }
+  if (typeof value === 'number' && Number.isSafeInteger(value)) return value;
+  if (typeof value === 'boolean') return value;
+  if (Array.isArray(value) && value.length <= 10) {
+    const safe = value.map(safeResourceValue);
+    if (safe.every((item) => item !== undefined)) return safe;
+  }
+  return undefined;
+}
+
+function collectSafeResourceFields(value, output, depth = 0) {
+  if (!value || typeof value !== 'object' || depth > 4) return;
+  if (Array.isArray(value)) {
+    for (const item of value.slice(0, 20)) collectSafeResourceFields(item, output, depth + 1);
+    return;
+  }
+  for (const [key, candidate] of Object.entries(value)) {
+    const canonicalKey = SAFE_RESOURCE_KEYS.get(key.toLowerCase());
+    const safe = canonicalKey ? safeResourceValue(candidate) : undefined;
+    if (canonicalKey && safe !== undefined && output[canonicalKey] === undefined) output[canonicalKey] = safe;
+    collectSafeResourceFields(candidate, output, depth + 1);
+  }
+}
+
+function manualResourceContext(proxyArgs, inputs) {
+  const context = {};
+  for (let index = 0; index < proxyArgs.length; index++) {
+    const arg = proxyArgs[index];
+    let name = '';
+    let value;
+    if (arg.startsWith('--') && arg.includes('=')) {
+      [name, value] = arg.slice(2).split(/=(.*)/s, 2);
+    } else if (arg.startsWith('--') && index + 1 < proxyArgs.length && !proxyArgs[index + 1].startsWith('-')) {
+      name = arg.slice(2);
+      value = proxyArgs[++index];
+    }
+    if (!name || value === undefined) continue;
+    if (name === 'params' || name === 'json') {
+      try {
+        collectSafeResourceFields(JSON.parse(value), context);
+      } catch {
+        // The proxy owns final argument validation; omit malformed context here.
+      }
+      continue;
+    }
+    const canonicalKey = SAFE_RESOURCE_KEYS.get(name.toLowerCase());
+    const safe = canonicalKey ? safeResourceValue(value) : undefined;
+    if (canonicalKey && safe !== undefined && context[canonicalKey] === undefined) context[canonicalKey] = safe;
+  }
+  if (process.env.GWS_PROXY_TARGET_PARENT) context.target_parent = process.env.GWS_PROXY_TARGET_PARENT;
+  if (inputs.length > 0) {
+    context.uploads = inputs.map((input) => ({
+      filename: input.filename,
+      size: input.size,
+      sha256: input.sha256,
+      content_type: input.content_type,
+    }));
+  }
+  return Object.fromEntries(Object.entries(context).sort(([left], [right]) => left.localeCompare(right)));
+}
+
+function argumentShape(proxyArgs, operation) {
+  const operationWords = operation.split(' ');
+  const shape = [...operationWords];
+  for (let index = operationWords.length; index < proxyArgs.length; index++) {
+    const arg = proxyArgs[index];
+    if (arg.startsWith('--') && arg.includes('=')) {
+      shape.push(`${arg.slice(0, arg.indexOf('='))}=<value>`);
+    } else if (arg.startsWith('-')) {
+      shape.push(arg);
+      if (index + 1 < proxyArgs.length && !proxyArgs[index + 1].startsWith('-')) {
+        shape.push('<value>');
+        index++;
+      }
+    } else {
+      shape.push('<positional>');
+    }
+  }
+  return shape;
 }
 
 function buildMultipart(request, inputs) {
@@ -395,6 +509,7 @@ const output = planOutput(outputArg);
 const slots = inputSlots(proxyArgs);
 const inputs = stageInputs(proxyArgs, slots);
 const correlation = loadCorrelation();
+const writeOperation = exactWriteOperation(proxyArgs);
 const request = {
   account: process.env.GWS_ACCOUNT,
   args: proxyArgs,
@@ -405,7 +520,29 @@ if (output) request.output = { mode: 'return_file' };
 if (process.env.GWS_PROXY_CONFIRMED === 'true') request.confirmed = true;
 if (process.env.GWS_PROXY_TARGET_PARENT) request.target_parent = process.env.GWS_PROXY_TARGET_PARENT;
 const multipart = buildMultipart(request, inputs);
+const manualReconciliation = writeOperation
+  ? {
+      schema_version: 1,
+      event: 'gws_write_response_lost',
+      account: process.env.GWS_ACCOUNT,
+      input_id: correlation.inputId,
+      route_key: correlation.routeKey,
+      operation: writeOperation,
+      service: proxyArgs[0],
+      argument_shape: argumentShape(proxyArgs, writeOperation),
+      args_sha256: crypto.createHash('sha256').update(JSON.stringify(proxyArgs)).digest('hex'),
+      resource_context: manualResourceContext(proxyArgs, inputs),
+    }
+  : null;
 fs.writeFileSync(
   planPath,
-  JSON.stringify({ proxyArgs, output, roots: outputRoots, request, isWrite: isExactWrite(proxyArgs), ...multipart }),
+  JSON.stringify({
+    proxyArgs,
+    output,
+    roots: outputRoots,
+    request,
+    isWrite: writeOperation !== null,
+    manualReconciliation,
+    ...multipart,
+  }),
 );
