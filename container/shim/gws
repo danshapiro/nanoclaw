@@ -497,7 +497,7 @@ case "$http_code" in
     # draft; legacy or non-Gmail evidence remains a generic GWS diagnostic. The
     # shim does NOT verify the signature (it cannot in POSIX sh and staged JSONL
     # is untrusted anyway) — it forwards sig+payload verbatim for the importer.
-    if [ "$api_effect" = "true" ] && [ "$op_succeeded" = "true" ]; then
+    if [ "$request_is_write" = true ] && [ "$api_effect" = "true" ] && [ "$op_succeeded" = "true" ]; then
       ledger_path="${NANOCLAW_SIDE_EFFECT_LEDGER:-/workspace/side-effects.jsonl}"
       audit_id="$(header_value 'X-GWS-Audit-Id')"
       request_class="$(header_value 'X-GWS-Request-Class')"

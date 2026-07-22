@@ -2027,6 +2027,31 @@ describe('gws proxy shim — side-effect ledger', () => {
     expect(readLedger(ledger)).toEqual([]);
   });
 
+  it('appends NO side-effect record for a successful API read', async () => {
+    tmp = freshTmp();
+    const ledger = path.join(tmp, 'side-effects.jsonl');
+    const proxy = await withProxy((_req, res, body) => {
+      echoResolvedAccount(res, body);
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'X-Exit-Code': '0',
+        'X-GWS-Audit-Id': 'aud-read-only',
+        'X-GWS-Request-Class': 'api',
+        'X-GWS-Api-Effect': 'true',
+        'X-GWS-Operation-Succeeded': 'true',
+      });
+      res.end('{"emailAddress":"dan@danshapiro.com"}');
+    });
+
+    const result = await runShim(['gmail', 'users', 'getProfile', '--params', '{"userId":"me"}'], {
+      GWS_PROXY_URL: proxy.url,
+      NANOCLAW_SIDE_EFFECT_LEDGER: ledger,
+    });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('dan@danshapiro.com');
+    expect(readLedger(ledger)).toEqual([]);
+  });
+
   it('appends NO record for a denied (403) or failed command', async () => {
     tmp = freshTmp();
     const ledger = path.join(tmp, 'side-effects.jsonl');
