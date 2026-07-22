@@ -831,16 +831,46 @@ interface GwsAuditStoreEntry {
 
 interface GwsReconciliationStoreEntry {
   schema_version?: number;
+  record_type?: string;
   audit_id?: string;
   outcome?: string;
   account?: string;
+  account_label?: string;
+  account_email?: string;
   input_id?: string;
   route_key?: string;
+  service?: string;
+  method?: string;
   operation?: string;
   resource_type?: string;
   started_at?: string;
   ended_at?: string;
   search_hints?: unknown;
+}
+
+interface GwsReconciliationResolutionEntry {
+  schema_version?: number;
+  record_type?: string;
+  audit_id?: string;
+  input_id?: string;
+  route_key?: string;
+  disposition?: string;
+  operator?: string;
+  note?: string;
+  resolved_at?: string;
+}
+
+export interface GwsManualReconciliation {
+  auditId: string;
+  inputId: string;
+  routeKey: string;
+  disposition: 'completed' | 'not_completed';
+  operator: string;
+  note: string;
+  resolvedAt: string;
+  operation: string;
+  accountLabel: string | null;
+  accountEmail: string;
 }
 
 /**
@@ -853,7 +883,7 @@ interface GwsReconciliationStoreEntry {
 export function assertNoUnresolvedGwsReconciliationRecords(opts: {
   reconciliationStorePath: string | undefined;
   scopes: StrictGwsSideEffectScope[];
-}): void {
+}): GwsManualReconciliation[] {
   if (!opts.reconciliationStorePath || !fs.existsSync(opts.reconciliationStorePath)) {
     throw new Error('GWS reconciliation store is missing or inaccessible');
   }
@@ -861,9 +891,53 @@ export function assertNoUnresolvedGwsReconciliationRecords(opts: {
   if (raw.length > 0 && !raw.endsWith('\n')) {
     throw new Error('GWS reconciliation store has a truncated, incomplete tail');
   }
+  const incidents = new Map<string, GwsReconciliationStoreEntry>();
+  const resolutions = new Map<string, GwsReconciliationResolutionEntry>();
+  const incidentFields = new Set([
+    'schema_version',
+    'audit_id',
+    'outcome',
+    'profile',
+    'account',
+    'account_label',
+    'account_email',
+    'input_id',
+    'route_key',
+    'service',
+    'method',
+    'operation',
+    'resource_type',
+    'requested_title',
+    'parent',
+    'workspace',
+    'started_at',
+    'ended_at',
+    'returned_id',
+    'search_hints',
+    'payload',
+    'signature',
+  ]);
+  const resolutionFields = new Set([
+    'schema_version',
+    'record_type',
+    'audit_id',
+    'input_id',
+    'route_key',
+    'disposition',
+    'operator',
+    'note',
+    'resolved_at',
+  ]);
+  const canonicalAscii = (value: unknown, maximum: number): value is string =>
+    typeof value === 'string' && value.length > 0 && value.length <= maximum && /^[\x20-\x7e]+$/.test(value);
+  const canonicalTimestamp = (value: unknown): value is string =>
+    typeof value === 'string' &&
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/.test(value) &&
+    Number.isFinite(Date.parse(value));
+
   for (const line of raw.split('\n')) {
     if (!line.trim()) continue;
-    let entry: GwsReconciliationStoreEntry;
+    let entry: GwsReconciliationStoreEntry | GwsReconciliationResolutionEntry;
     try {
       entry = JSON.parse(line) as GwsReconciliationStoreEntry;
     } catch (error) {
@@ -872,6 +946,63 @@ export function assertNoUnresolvedGwsReconciliationRecords(opts: {
     if (!entry || typeof entry !== 'object') {
       throw new Error('GWS reconciliation store contains an invalid complete JSONL record');
     }
+    if (entry.record_type === 'resolution') {
+      const resolution = entry as GwsReconciliationResolutionEntry;
+      if (Object.keys(resolution).some((key) => !resolutionFields.has(key))) {
+        throw new Error('GWS reconciliation resolution contains an unknown field');
+      }
+      const incident = typeof resolution.audit_id === 'string' ? incidents.get(resolution.audit_id) : undefined;
+      const resolvedMs = typeof resolution.resolved_at === 'string' ? Date.parse(resolution.resolved_at) : NaN;
+      const endedMs = typeof incident?.ended_at === 'string' ? Date.parse(incident.ended_at) : NaN;
+      if (
+        resolution.schema_version !== 2 ||
+        !incident ||
+        resolutions.has(resolution.audit_id!) ||
+        resolution.input_id !== incident.input_id ||
+        resolution.route_key !== incident.route_key ||
+        (resolution.disposition !== 'completed' && resolution.disposition !== 'not_completed') ||
+        !canonicalAscii(resolution.operator, 256) ||
+        !canonicalAscii(resolution.note, 2048) ||
+        !canonicalTimestamp(resolution.resolved_at) ||
+        !Number.isFinite(endedMs) ||
+        resolvedMs < endedMs
+      ) {
+        throw new Error('GWS reconciliation resolution is malformed or outside its exact incident binding');
+      }
+      resolutions.set(resolution.audit_id!, resolution);
+      continue;
+    }
+    if (entry.record_type !== undefined) {
+      throw new Error('GWS reconciliation store contains an unknown record type');
+    }
+    const incident = entry as GwsReconciliationStoreEntry;
+    if (Object.keys(incident).some((key) => !incidentFields.has(key))) {
+      throw new Error('GWS reconciliation incident contains an unknown field');
+    }
+    if (
+      incident.schema_version !== 2 ||
+      !canonicalAscii(incident.audit_id, 256) ||
+      incidents.has(incident.audit_id!) ||
+      !canonicalAscii(incident.outcome, 256) ||
+      !canonicalAscii(incident.account, 512) ||
+      !canonicalAscii(incident.input_id, 512) ||
+      !canonicalAscii(incident.route_key, 512) ||
+      !canonicalAscii(incident.operation, 512) ||
+      !canonicalAscii(incident.resource_type, 512) ||
+      !canonicalTimestamp(incident.started_at) ||
+      !canonicalTimestamp(incident.ended_at) ||
+      Date.parse(incident.ended_at!) < Date.parse(incident.started_at!) ||
+      !Array.isArray(incident.search_hints) ||
+      incident.search_hints.length === 0 ||
+      incident.search_hints.some((hint) => !canonicalAscii(hint, 2048))
+    ) {
+      throw new Error('GWS reconciliation incident is malformed or incomplete');
+    }
+    incidents.set(incident.audit_id!, incident);
+  }
+
+  const accepted: GwsManualReconciliation[] = [];
+  for (const entry of incidents.values()) {
     const scope = opts.scopes.find((candidate) => entry.input_id === candidate.inputId);
     if (!scope) continue;
     const startedMs = typeof entry.started_at === 'string' ? Date.parse(entry.started_at) : NaN;
@@ -905,11 +1036,27 @@ export function assertNoUnresolvedGwsReconciliationRecords(opts: {
         `GWS reconciliation evidence for accepted input ${scope.inputId} is malformed or outside its exact scope`,
       );
     }
-    throw new Error(
-      `GWS ${entry.outcome} requires manual reconciliation before accepted input ${scope.inputId} can resume; ` +
-        'do not retry automatically',
-    );
+    const resolution = resolutions.get(entry.audit_id!);
+    if (!resolution) {
+      throw new Error(
+        `GWS ${entry.outcome} requires manual reconciliation before accepted input ${scope.inputId} can resume; ` +
+          'do not retry automatically',
+      );
+    }
+    accepted.push({
+      auditId: entry.audit_id!,
+      inputId: entry.input_id!,
+      routeKey: entry.route_key!,
+      disposition: resolution.disposition as 'completed' | 'not_completed',
+      operator: resolution.operator!,
+      note: resolution.note!,
+      resolvedAt: resolution.resolved_at!,
+      operation: entry.operation!,
+      accountLabel: typeof entry.account_label === 'string' && entry.account_label ? entry.account_label : null,
+      accountEmail: entry.account!,
+    });
   }
+  return accepted;
 }
 
 export interface DiscoverCrashWindowResult {

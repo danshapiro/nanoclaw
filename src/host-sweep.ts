@@ -52,6 +52,7 @@ import {
   type ContainerState,
   type ProcessingClaim,
   type ImportSideEffectsResult,
+  type GwsManualReconciliation,
 } from './db/session-db.js';
 import { log } from './log.js';
 import { resolveGwsSideEffectVerifyKey } from './gws-side-effect-key.js';
@@ -811,6 +812,7 @@ export function writeHostInterruptedRecovery(opts: {
   gwsPublicKey?: string;
   scope?: { inputId: string; routeKey: string; notBefore: string; notAfter: string };
   claims?: ProcessingClaim[];
+  manualReconciliations?: GwsManualReconciliation[];
 }): string | null {
   const scope = opts.scope ?? gwsDiscoveryScope(opts.inDb, opts.outDb);
   if (!scope.inputId || !scope.routeKey || !scope.notBefore || !scope.notAfter) return null;
@@ -835,6 +837,26 @@ export function writeHostInterruptedRecovery(opts: {
     inputId: scope.inputId,
     gwsPublicKey: opts.gwsPublicKey,
   });
+  for (const resolution of opts.manualReconciliations ?? []) {
+    if (resolution.disposition !== 'completed') continue;
+    sideEffects.push({
+      id: `manual-reconciliation:${resolution.auditId}`,
+      inputId: resolution.inputId,
+      kind: 'gws_mutation_completed',
+      label: `${resolution.operation}${resolution.accountLabel ? ` (${resolution.accountLabel})` : ''} — manually confirmed completed`,
+      payloadSchemaVersion: 2,
+      accountLabel: resolution.accountLabel,
+      accountEmail: resolution.accountEmail,
+      evidence: {
+        manual_reconciliation: true,
+        audit_id: resolution.auditId,
+        disposition: resolution.disposition,
+        operator: resolution.operator,
+        note: resolution.note,
+      },
+      occurredAt: resolution.resolvedAt,
+    });
+  }
   const entry = {
     id: recoveryId,
     status: 'pending',
@@ -856,7 +878,13 @@ export function writeHostInterruptedRecovery(opts: {
     ],
     pendingFollowups: [],
     priorProgress: [],
-    observations: [`host_stop_reason: ${opts.reason}`],
+    observations: [
+      `host_stop_reason: ${opts.reason}`,
+      ...(opts.manualReconciliations ?? []).map(
+        (resolution) =>
+          `gws_manual_reconciliation audit=${resolution.auditId} disposition=${resolution.disposition} operator=${resolution.operator}: ${resolution.note}`,
+      ),
+    ],
     sideEffects,
     continuationPolicy: 'preserve',
     createdAt: now,
@@ -902,7 +930,7 @@ export function recoverGwsClaimPartitions(opts: {
   const plan = strictAcceptedGwsRecoveryPlan(opts.inDb, opts.outDb, opts.stoppedAt ?? new Date().toISOString());
   const scopes = plan.partitions.map((partition) => partition.scope);
 
-  assertNoUnresolvedGwsReconciliationRecords({
+  const manualReconciliations = assertNoUnresolvedGwsReconciliationRecords({
     reconciliationStorePath: opts.reconciliationStorePath,
     scopes,
   });
@@ -932,6 +960,10 @@ export function recoverGwsClaimPartitions(opts: {
       gwsPublicKey: opts.gwsPublicKey,
       scope: partition.scope,
       claims: partition.claims,
+      manualReconciliations: manualReconciliations.filter(
+        (resolution) =>
+          resolution.inputId === partition.scope.inputId && resolution.routeKey === partition.scope.routeKey,
+      ),
     });
     if (!recoveryId) {
       throw new Error(`failed to persist interrupted-turn recovery for accepted input ${partition.scope.inputId}`);

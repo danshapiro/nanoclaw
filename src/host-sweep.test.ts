@@ -11,7 +11,11 @@ import path from 'path';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { countDueMessagesExcludingRecovery, getProcessingClaims } from './db/session-db.js';
+import {
+  assertNoUnresolvedGwsReconciliationRecords,
+  countDueMessagesExcludingRecovery,
+  getProcessingClaims,
+} from './db/session-db.js';
 import { OUTBOUND_SCHEMA } from './db/schema.js';
 import { canonicalSideEffectPayload } from './db/side-effects-verify.js';
 import {
@@ -1088,6 +1092,118 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
     outDb.close();
   });
 
+  it.each(['completed', 'not_completed'] as const)(
+    'accepts one exact durable %s resolution and returns its recovery disposition',
+    (disposition) => {
+      const reconciliationStore = path.join(tmpRoot, `resolved-${disposition}.jsonl`);
+      const incident = {
+        schema_version: 2,
+        audit_id: 'manual-audit-1',
+        outcome: 'outcome_unknown',
+        profile: 'nanoclaw',
+        account: 'dan@danshapiro.com',
+        account_label: 'personal',
+        account_email: 'dan@danshapiro.com',
+        input_id: 'in-strict',
+        route_key: 'opencode|discord|chan-strict|dm:mg-strict',
+        service: 'drive',
+        method: 'files.update',
+        operation: 'drive files update',
+        resource_type: 'gws mutation',
+        requested_title: '',
+        parent: '',
+        workspace: '',
+        started_at: '2026-05-29T12:00:01.000Z',
+        ended_at: '2026-05-29T12:00:04.000Z',
+        search_hints: ['inspect Google directly'],
+      };
+      const resolution = {
+        schema_version: 2,
+        record_type: 'resolution',
+        audit_id: incident.audit_id,
+        input_id: incident.input_id,
+        route_key: incident.route_key,
+        disposition,
+        operator: 'dan',
+        note: 'inspected the exact account and resource',
+        resolved_at: '2026-05-29T12:10:00.000Z',
+      };
+      fs.writeFileSync(reconciliationStore, `${JSON.stringify(incident)}\n${JSON.stringify(resolution)}\n`);
+
+      expect(
+        assertNoUnresolvedGwsReconciliationRecords({
+          reconciliationStorePath: reconciliationStore,
+          scopes: [
+            {
+              inputId: incident.input_id,
+              routeKey: incident.route_key,
+              notBefore: '2026-05-29T12:00:00.000Z',
+              notAfter: '2026-05-29T12:00:10.000Z',
+            },
+          ],
+        }),
+      ).toEqual([
+        expect.objectContaining({
+          auditId: incident.audit_id,
+          inputId: incident.input_id,
+          routeKey: incident.route_key,
+          disposition,
+          operator: 'dan',
+          operation: incident.operation,
+        }),
+      ]);
+    },
+  );
+
+  it.each([
+    ['resolution before incident', [{ schema_version: 2, record_type: 'resolution', audit_id: 'a' }]],
+    [
+      'wrong exact binding',
+      [
+        {
+          schema_version: 2,
+          audit_id: 'a',
+          outcome: 'outcome_unknown',
+          account: 'dan@danshapiro.com',
+          input_id: 'in-strict',
+          route_key: 'opencode|discord|chan-strict|dm:mg-strict',
+          operation: 'drive files update',
+          resource_type: 'gws mutation',
+          started_at: '2026-05-29T12:00:01.000Z',
+          ended_at: '2026-05-29T12:00:04.000Z',
+          search_hints: ['inspect'],
+        },
+        {
+          schema_version: 2,
+          record_type: 'resolution',
+          audit_id: 'a',
+          input_id: 'other-input',
+          route_key: 'opencode|discord|chan-strict|dm:mg-strict',
+          disposition: 'completed',
+          operator: 'dan',
+          note: 'checked',
+          resolved_at: '2026-05-29T12:10:00.000Z',
+        },
+      ],
+    ],
+  ])('fails closed on malformed manual reconciliation: %s', (_label, entries) => {
+    const reconciliationStore = path.join(tmpRoot, 'malformed-resolution.jsonl');
+    fs.writeFileSync(reconciliationStore, `${entries.map((entry) => JSON.stringify(entry)).join('\n')}\n`);
+    expect(() =>
+      assertNoUnresolvedGwsReconciliationRecords({
+        reconciliationStorePath: reconciliationStore,
+        scopes: [
+          {
+            inputId: 'in-strict',
+            routeKey: 'opencode|discord|chan-strict|dm:mg-strict',
+            notBefore: '2026-05-29T12:00:00.000Z',
+            notAfter: '2026-05-29T12:00:10.000Z',
+          },
+        ],
+      }),
+    ).toThrow(/reconciliation|resolution|incident|binding/i);
+  });
+
   it('writes recovery only after complete empty ledger, audit, and reconciliation evidence', () => {
     const { sessionPath, inPath, outPath } = setupSession();
     const auditStore = path.join(tmpRoot, 'clean-audit.jsonl');
@@ -1551,6 +1667,75 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
         n: 1,
       },
     );
+    inDb.close();
+    outDb.close();
+  });
+
+  it('persists a root-owned completed manual reconciliation as completed work in recovery', () => {
+    const { inPath, outPath } = setupSession();
+    const routeKey = 'opencode|discord|chan-manual|dm:manual';
+    const inputId = 'in-manual';
+    const acceptedAt = '2026-05-29T12:00:00.000Z';
+    const inDb = new Database(inPath);
+    inDb
+      .prepare(
+        `INSERT INTO messages_in
+           (id, timestamp, content, host_input_id, host_route_key, host_received_at,
+            host_accepted_input_id, host_accepted_route_key, host_accepted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        'm-manual',
+        acceptedAt,
+        '{"text":"update the Drive file"}',
+        'receipt-manual',
+        routeKey,
+        acceptedAt,
+        inputId,
+        routeKey,
+        acceptedAt,
+      );
+    const outDb = new Database(outPath);
+    outDb
+      .prepare('INSERT INTO processing_ack (message_id, status, status_changed) VALUES (?, ?, ?)')
+      .run('m-manual', 'processing', '2026-05-29 12:00:00');
+
+    expect(
+      writeHostInterruptedRecovery({
+        inDb,
+        outDb,
+        reason: 'claim-stuck',
+        manualReconciliations: [
+          {
+            auditId: 'manual-audit-1',
+            inputId,
+            routeKey,
+            disposition: 'completed',
+            operator: 'dan',
+            note: 'verified the exact file state in Google',
+            resolvedAt: '2026-05-29T12:10:00.000Z',
+            operation: 'drive files update',
+            accountLabel: 'personal',
+            accountEmail: 'dan@danshapiro.com',
+          },
+        ],
+      }),
+    ).toMatch(/^rec-host-/);
+    const state = outDb.prepare("SELECT value FROM session_state WHERE key LIKE 'recovery:opencode:%'").get() as {
+      value: string;
+    };
+    const [entry] = JSON.parse(state.value) as Array<{
+      sideEffects: Array<{ id: string; kind: string; evidence: Record<string, unknown> }>;
+      observations: string[];
+    }>;
+    expect(entry.sideEffects).toEqual([
+      expect.objectContaining({
+        id: 'manual-reconciliation:manual-audit-1',
+        kind: 'gws_mutation_completed',
+        evidence: expect.objectContaining({ manual_reconciliation: true, disposition: 'completed' }),
+      }),
+    ]);
+    expect(entry.observations.join('\n')).toContain('disposition=completed');
     inDb.close();
     outDb.close();
   });
