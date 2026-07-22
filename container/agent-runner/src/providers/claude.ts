@@ -562,7 +562,9 @@ export class ClaudeProvider implements AgentProvider {
     // input-accepted before the matching result.
     const acceptedBuffer: ProviderEvent[] = [];
     let acceptWaker: (() => void) | null = null;
+    let acceptedAtLeastOneInput = false;
     stream.onAccept = (inputId, scope) => {
+      acceptedAtLeastOneInput = true;
       acceptedBuffer.push({ type: 'input-accepted', inputId, scope });
       acceptWaker?.();
       acceptWaker = null;
@@ -616,6 +618,19 @@ export class ClaudeProvider implements AgentProvider {
           }
         }
         await waitForClaudeQuiescence(executionBarrier.waitForQuiescence());
+        // The SDK owns the Claude executable and every process/tool it starts;
+        // it does not expose a cgroup or process-namespace emptiness proof.
+        // PostToolUse proves only that the SDK hook returned. A Bash/MCP tool
+        // can daemonize, setsid, or otherwise leave a descendant behind after
+        // that hook and after interrupt() resolves. Once any trusted input was
+        // submitted, therefore, cancellation must remain recovery-owned until
+        // the host stops the whole container. This is the same fail-closed
+        // boundary used by the Codex provider.
+        if (acceptedAtLeastOneInput) {
+          throw new ProviderQuiescenceError(
+            'Claude SDK interrupted, but whole process tree quiescence is unproven until host container stop',
+          );
+        }
       })();
       return cancellation;
     };

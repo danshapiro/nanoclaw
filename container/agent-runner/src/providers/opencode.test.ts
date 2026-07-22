@@ -1,7 +1,9 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { spawn } from 'child_process';
 import { EventEmitter } from 'events';
+import { createInterface } from 'readline';
 
 import { describe, it, expect, afterEach } from 'bun:test';
 
@@ -1511,7 +1513,10 @@ describe('RealOpenCodeRuntimeController.destroy ordering', () => {
       throw new Error('ESRCH (stubbed — no real signal)');
     };
     try {
-      await controller.destroy('test-ordering');
+      await expect(controller.destroy('test-ordering')).rejects.toMatchObject({
+        name: 'ProviderQuiescenceError',
+        message: expect.stringContaining('whole process tree'),
+      });
     } finally {
       (process as unknown as { kill: typeof realKill }).kill = realKill;
     }
@@ -1525,7 +1530,7 @@ describe('RealOpenCodeRuntimeController.destroy ordering', () => {
     expect(order.indexOf('stream.return')).toBeLessThan(killIdx);
   });
 
-  it('does not resolve until the real controller observes process exit', async () => {
+  it('does not settle until process exit, then fails closed because descendants remain unproven', async () => {
     const stream = {
       next: async () => ({ done: true as const, value: undefined }),
       return: async () => ({ done: true as const, value: undefined }),
@@ -1550,7 +1555,7 @@ describe('RealOpenCodeRuntimeController.destroy ordering', () => {
     (process as unknown as { kill: (pid: number, sig?: string | number) => boolean }).kill = () => true;
     try {
       let settled = false;
-      const destroying = controller.destroy('test-process-exit').then(() => {
+      const destroying = controller.destroy('test-process-exit').finally(() => {
         settled = true;
       });
       await new Promise((resolve) => setTimeout(resolve, 0));
@@ -1558,10 +1563,70 @@ describe('RealOpenCodeRuntimeController.destroy ordering', () => {
 
       proc.exitCode = 0;
       proc.emit('exit', 0, null);
-      await destroying;
+      await expect(destroying).rejects.toMatchObject({
+        name: 'ProviderQuiescenceError',
+        message: expect.stringContaining('whole process tree'),
+      });
       expect(settled).toBe(true);
     } finally {
       (process as unknown as { kill: typeof realKill }).kill = realKill;
+    }
+  });
+
+  it('fails closed after the process group exits while a setsid descendant remains alive', async () => {
+    const descendantSource = "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);";
+    const parentSource = [
+      "const { spawn } = require('child_process');",
+      `const descendant = spawn(process.execPath, ['-e', ${JSON.stringify(descendantSource)}], { detached: true, stdio: 'ignore' });`,
+      "process.stdout.write(String(descendant.pid) + '\\n');",
+      'setInterval(() => {}, 1000);',
+    ].join('\n');
+    const proc = spawn(process.execPath, ['-e', parentSource], {
+      detached: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const lines = createInterface({ input: proc.stdout! });
+    const descendantPid = await new Promise<number>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('timed out waiting for setsid descendant PID')), 2_000);
+      lines.once('line', (line) => {
+        clearTimeout(timer);
+        resolve(Number(line));
+      });
+      proc.once('error', reject);
+    });
+    const isAlive = (pid: number): boolean => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch (err) {
+        return (err as NodeJS.ErrnoException).code !== 'ESRCH';
+      }
+    };
+    const stream = {
+      next: async () => ({ done: true as const, value: undefined }),
+      return: async () => ({ done: true as const, value: undefined }),
+    } as unknown as AsyncGenerator<{ type: string; properties: Record<string, unknown> }, void, void>;
+    const client = { session: {}, async postSessionIdPermissionsPermissionId() {} } as never;
+    const controller = new RealOpenCodeRuntimeController(proc, client, stream);
+
+    try {
+      await expect(controller.destroy('setsid-descendant')).rejects.toMatchObject({
+        name: 'ProviderQuiescenceError',
+        message: expect.stringContaining('whole process tree'),
+      });
+      expect(isAlive(descendantPid)).toBe(true);
+    } finally {
+      try {
+        if (isAlive(descendantPid)) process.kill(descendantPid, 'SIGKILL');
+      } catch {
+        // Best-effort cleanup for the test-only escaped descendant.
+      }
+      try {
+        if (proc.pid && isAlive(proc.pid)) process.kill(-proc.pid, 'SIGKILL');
+      } catch {
+        // Best-effort cleanup for the test-only process group.
+      }
+      lines.close();
     }
   });
 

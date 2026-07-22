@@ -2,7 +2,7 @@ import { describe, expect, it, mock } from 'bun:test';
 
 import { CodexProvider } from './codex.js';
 import { MockProvider } from './mock.js';
-import type { ProviderEvent } from './types.js';
+import { ProviderQuiescenceError, type ProviderEvent } from './types.js';
 
 function deferred<T = void>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -196,7 +196,13 @@ describe('provider input-accepted/result contract', () => {
     gate.resolve();
     await expect(accepted).resolves.toMatchObject({ type: 'input-accepted', inputId: 'claude-gated' });
     await expect(tool).resolves.toMatchObject({ continue: true });
-    query.abort();
+    const postTool = sdkOptions.hooks.PostToolUse[0].hooks[0];
+    await postTool(
+      { tool_name: 'Bash', tool_input: {}, tool_use_id: 'tool-before-first-event' },
+      'tool-before-first-event',
+      { signal: new AbortController().signal },
+    );
+    await expect(query.abort()).rejects.toBeInstanceOf(ProviderQuiescenceError);
   });
 
   it('claude does not replace an accepted pointer while an older tool lease is active', async () => {
@@ -240,10 +246,10 @@ describe('provider input-accepted/result contract', () => {
     });
     await expect(followupAccepted).resolves.toMatchObject({ inputId: 'claude-new', scope: 'followup' });
     expect(followupGateCalled).toBe(true);
-    query.abort();
+    await expect(query.abort()).rejects.toBeInstanceOf(ProviderQuiescenceError);
   });
 
-  it('claude abort does not report quiescence until the active tool reaches PostToolUse', async () => {
+  it('claude abort waits for PostToolUse but still fails closed when whole-process quiescence is unproven', async () => {
     let sdkOptions: any;
     mock.module('@anthropic-ai/claude-agent-sdk', () => ({
       query: ({ prompt, options }: { prompt: AsyncIterable<unknown>; options: unknown }) => {
@@ -269,18 +275,21 @@ describe('provider input-accepted/result contract', () => {
       signal: new AbortController().signal,
     });
 
-    let quiescent = false;
-    const abort = Promise.resolve(query.abort()).then(() => {
-      quiescent = true;
+    let settled = false;
+    const abort = Promise.resolve(query.abort()).finally(() => {
+      settled = true;
     });
     await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(quiescent).toBe(false);
+    expect(settled).toBe(false);
 
     await postTool({ tool_name: 'mcp__nanoclaw__gws', tool_input: {}, tool_use_id: 'gws-paused' }, 'gws-paused', {
       signal: new AbortController().signal,
     });
-    await abort;
-    expect(quiescent).toBe(true);
+    await expect(abort).rejects.toMatchObject({
+      name: 'ProviderQuiescenceError',
+      message: expect.stringContaining('whole process tree'),
+    });
+    expect(settled).toBe(true);
   });
 
   it('claude cancels prompt consumption when the trusted bind fails', async () => {
@@ -345,10 +354,11 @@ describe('provider input-accepted/result contract', () => {
       signal: new AbortController().signal,
     });
 
-    query.abort();
+    const abort = query.abort();
     gate.resolve();
 
     await expect(first).resolves.toMatchObject({ done: true });
+    await expect(abort).resolves.toBeUndefined();
     await expect(tool).resolves.toMatchObject({ decision: 'block' });
     expect(promptConsumed).toBe(false);
     expect(interrupted).toBe(true);
@@ -417,14 +427,21 @@ describe('provider input-accepted/result contract', () => {
     const first = iter.next();
 
     await promptConsumed.promise;
-    query.abort();
+    const abort = query.abort();
+    // The cancellation promise may reject before the generator yields its
+    // buffered acceptance event; attach ownership immediately.
+    void abort.catch(() => {});
     finishSdkTurn.resolve();
 
     await expect(first).resolves.toMatchObject({
       done: false,
       value: { type: 'input-accepted', inputId: 'claude-cancel-after-submit' },
     });
-    await expect(iter.next()).resolves.toMatchObject({ done: true });
+    await expect(iter.next()).rejects.toMatchObject({
+      name: 'ProviderQuiescenceError',
+      message: expect.stringContaining('whole process tree'),
+    });
+    await expect(abort).rejects.toBeInstanceOf(ProviderQuiescenceError);
     expect(interrupted).toBe(true);
   });
 });

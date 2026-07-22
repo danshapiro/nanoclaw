@@ -321,7 +321,11 @@ export interface OpenCodeRuntimeController {
   denyPermission(sessionId: string, permissionId: string, reason: string): Promise<void>;
   /** Positive existence check for the exact attempted session id. */
   sessionExists(id: string): Promise<boolean>;
-  /** Tear down THIS runtime and resolve only after its process exits. */
+  /**
+   * Tear down THIS runtime and settle only after its direct process exits.
+   * Production rejects when whole-container descendant quiescence remains
+   * unproven; deterministic test controllers may provide a stronger proof.
+   */
   destroy(reason: string): Promise<void>;
 }
 
@@ -442,6 +446,14 @@ export class RealOpenCodeRuntimeController implements OpenCodeRuntimeController 
             );
           }),
         ]);
+        // A process-group exit proves only that the OpenCode server and
+        // descendants that remained in its original session stopped. A tool or
+        // MCP server can call setsid/double-fork and survive that group kill.
+        // This runner has no independent cgroup/process-namespace emptiness
+        // proof, so retain accepted correlation until host container stop.
+        throw new ProviderQuiescenceError(
+          'OpenCode runtime exited, but whole process tree quiescence is unproven until host container stop',
+        );
       } finally {
         if (timer) clearTimeout(timer);
         removeExitListeners();
