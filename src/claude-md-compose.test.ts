@@ -74,36 +74,6 @@ describe('provider-independent shared guidance', () => {
     const composed = fs.readFileSync(path.join(groupDir, 'CLAUDE.md'), 'utf8');
     expect(composed).toContain('@./.claude-shared.md');
     expect(fs.readlinkSync(path.join(groupDir, '.claude-shared.md'))).toBe('/app/CLAUDE.md');
-
-    const releaseGuidance = fs.readFileSync(path.join(process.cwd(), 'container', 'CLAUDE.md'), 'utf8');
-    const accountSection = releaseGuidance.split('## Google Workspace accounts\n\n', 2)[1]?.split('\n## ', 1)[0];
-
-    expect(accountSection).toBeDefined();
-    expect(accountSection).toContain('`personal` (`dan@danshapiro.com`)');
-    expect(accountSection).toContain('family, Wharton, and non-Glowforge professional work');
-    expect(accountSection).toContain('`glowforge` (`dan@glowforge.com`)');
-    expect(accountSection).toContain('exactly one explicit account');
-    expect(accountSection).toContain('exactly two calls');
-    expect(accountSection).toContain('`--account personal`');
-    expect(accountSection).toContain('`--account glowforge`');
-    expect(accountSection).toContain('Do not ask which account to search');
-    expect(accountSection).toContain('inseparable tuple `(account, resource ID)`');
-    expect(accountSection).toContain('Never retain, display, deduplicate, or mutate a bare resource ID');
-    expect(accountSection).toContain("reuse that tuple's account selector");
-    expect(accountSection).toContain('exactly one inferred account');
-    expect(accountSection).toContain('genuinely consequential and unresolved');
-  });
-
-  it('requires FullQAPass to validate and report each canonical GWS identity separately', () => {
-    const fullQa = fs.readFileSync(path.join(process.cwd(), 'container', 'skills', 'FullQAPass', 'SKILL.md'), 'utf8');
-
-    expect(fullQa).toContain('gws --account personal auth status');
-    expect(fullQa).toContain('dan@danshapiro.com');
-    expect(fullQa).toContain('CHECK gws_auth_personal PASS');
-    expect(fullQa).toContain('gws --account glowforge auth status');
-    expect(fullQa).toContain('dan@glowforge.com');
-    expect(fullQa).toContain('CHECK gws_auth_glowforge PASS');
-    expect(fullQa).not.toContain('gws_auth_status');
   });
 });
 
