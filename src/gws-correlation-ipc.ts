@@ -237,11 +237,20 @@ function expireAcceptedRows(
           WHERE host_acceptance_ended_at IS NULL AND host_acceptance_lease_id = ?`,
       ).run(endedAt, leaseId);
     } else {
-      db.prepare(
-        `UPDATE messages_in SET host_acceptance_ended_at = ?
-          WHERE host_acceptance_ended_at IS NULL
-            AND host_accepted_input_id IS NOT NULL`,
-      ).run(endedAt);
+      db.transaction(() => {
+        db.prepare(
+          `UPDATE messages_in SET host_acceptance_ended_at = NULL
+            WHERE host_accepted_input_id IS NULL
+              AND host_accepted_route_key IS NULL
+              AND host_accepted_at IS NULL
+              AND host_acceptance_ended_at IS NOT NULL`,
+        ).run();
+        db.prepare(
+          `UPDATE messages_in SET host_acceptance_ended_at = ?
+            WHERE host_acceptance_ended_at IS NULL
+              AND host_accepted_input_id IS NOT NULL`,
+        ).run(endedAt);
+      })();
     }
   } finally {
     db.close();

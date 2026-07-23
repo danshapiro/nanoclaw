@@ -664,6 +664,11 @@ describe('GWS acceptance lifecycle barriers', () => {
     const groupId = `ag-restart-${Date.now()}`;
     const sessionId = 'sess-restart';
     const dbPath = createAcceptedSession(groupId, sessionId, null);
+    const corrupted = new Database(dbPath);
+    corrupted
+      .prepare("UPDATE messages_in SET host_acceptance_ended_at = ? WHERE id = 'm-never-accepted'")
+      .run('2026-07-20T23:59:59.000Z');
+    corrupted.close();
     expireAllStaleGwsCorrelations('2026-07-21T00:00:02.000Z');
     const db = new Database(dbPath, { readonly: true });
     expect(db.prepare("SELECT host_acceptance_ended_at FROM messages_in WHERE id = 'm-life'").get()).toEqual({
