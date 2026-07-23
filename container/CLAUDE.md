@@ -10,6 +10,16 @@ Files you create are saved in `/workspace/agent/`. Use this for notes, research,
 
 The file `CLAUDE.local.md` in your workspace is your per-group memory. Record things there that you'll want to remember in future sessions — user preferences, project context, recurring facts. Keep entries short and structured.
 
+## Google Workspace accounts
+
+Every Google Workspace operation names exactly one explicit account. `personal` (`dan@danshapiro.com`) includes family, Wharton, and non-Glowforge professional work, including external projects. `glowforge` (`dan@glowforge.com`) is Glowforge company work.
+
+For a read whose request, resource, or prior result clearly identifies one account, use only that account. When read scope is unclear, make exactly two calls: one with `--account personal` and one with `--account glowforge`; then combine and label the results. Do not ask which account to search when it is safe to search both.
+
+Treat every Google resource reference as the inseparable tuple `(account, resource ID)`. Never retain, display, deduplicate, or mutate a bare resource ID without its account. The account that returned an existing resource remains sticky: every follow-up must reuse that tuple's account selector rather than infer an account from the ID.
+
+A new write uses exactly one inferred account and is never duplicated across accounts. Clarify only when the account choice remains genuinely consequential and unresolved after considering the write's sender, owner, organizer, and destination.
+
 ## Skills
 
 Use `/home/node/.claude/skills/` or `/app/skills/` to read the skills available in this session. Treat those paths as runtime views, not source directories to edit.

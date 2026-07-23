@@ -42,7 +42,8 @@ Always emit these checks in this order:
 16. `orchestration_roundtrip`
 17. `managed_skills_visible`
 18. `nanoclaw_mcp_roundtrip`
-19. `gws_auth_status` when `gws` is present in `PATH`
+19. `gws_auth_personal` when `gws` is present in `PATH`
+20. `gws_auth_glowforge` when `gws` is present in `PATH`
 
 If any check fails, continue running the remaining checks, then end with `SUMMARY FAIL`.
 
@@ -175,8 +176,20 @@ Fail this check only if the schedule request fails, the task ID never appears be
 
 ### 9. Optional GWS Check
 
-If `gws` is present in `PATH`, run a lightweight auth/status check and emit `gws_auth_status`.
-If `gws` is not present, omit this check entirely.
+If `gws` is present in `PATH`, run both account-specific checks in order:
+
+1. Run `gws --account personal auth status`. Require the response to identify
+   the canonical account as `dan@danshapiro.com`. Emit
+   `CHECK gws_auth_personal PASS <details>` only when that exact identity is
+   valid; otherwise emit `CHECK gws_auth_personal FAIL <details>`.
+2. Run `gws --account glowforge auth status`. Require the response to identify
+   the canonical account as `dan@glowforge.com`. Emit
+   `CHECK gws_auth_glowforge PASS <details>` only when that exact identity is
+   valid; otherwise emit `CHECK gws_auth_glowforge FAIL <details>`.
+
+A missing, invalid, or mismatched account is a failed check. Never collapse
+these checks into a generic one-row result. If `gws` is not present, omit both
+checks entirely.
 
 ## Cleanup
 
