@@ -52,6 +52,8 @@ const deliveryAttempts = new Map<string, number>();
  * second caller skips will be picked up on the next poll tick (~1s).
  */
 const inflightDeliveries = new Map<string, Promise<number>>();
+const deliveryContentionStreaks = new Map<string, number>();
+const DELIVERY_CONTENTION_ERROR_THRESHOLD = 3;
 const suppressedSessionOutbound = new Set<string>();
 
 export interface ChannelDeliveryAdapter {
@@ -167,11 +169,33 @@ export async function deliverSessionMessages(session: Session): Promise<void> {
   inflightDeliveries.set(session.id, delivery);
   try {
     await delivery;
+    deliveryContentionStreaks.delete(session.id);
+  } catch (err) {
+    if (!isSqliteBusyError(err)) throw err;
+
+    const streak = (deliveryContentionStreaks.get(session.id) ?? 0) + 1;
+    deliveryContentionStreaks.set(session.id, streak);
+    const context = {
+      sessionId: session.id,
+      agentGroupId: session.agent_group_id,
+      consecutiveDeferrals: streak,
+    };
+    if (streak >= DELIVERY_CONTENTION_ERROR_THRESHOLD) {
+      log.error('Session delivery repeatedly deferred by SQLite contention', context);
+    } else {
+      log.warn('Session delivery deferred by transient SQLite contention', context);
+    }
   } finally {
     if (inflightDeliveries.get(session.id) === delivery) {
       inflightDeliveries.delete(session.id);
     }
   }
+}
+
+function isSqliteBusyError(err: unknown): boolean {
+  if (!err || typeof err !== 'object' || !('code' in err)) return false;
+  const code = (err as { code?: unknown }).code;
+  return typeof code === 'string' && code.startsWith('SQLITE_BUSY');
 }
 
 export async function dropInactiveSessionOutbound(sessionId: string, reason: string): Promise<number> {

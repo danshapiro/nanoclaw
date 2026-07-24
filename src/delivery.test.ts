@@ -243,6 +243,42 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     expect(calls).toHaveLength(2);
   });
 
+  it('defers a transient outbound database lock and delivers on a later poll', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-after-lock');
+
+    const delivered: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        delivered.push(JSON.parse(content).text as string);
+        return 'platform-message';
+      },
+    });
+
+    const lockDb = new Database(outboundDbPath('ag-1', session.id));
+    lockDb.pragma('journal_mode = DELETE');
+    lockDb.exec('BEGIN EXCLUSIVE');
+    try {
+      await expect(deliverSessionMessages(session)).resolves.toBeUndefined();
+      expect(delivered).toEqual([]);
+    } finally {
+      lockDb.exec('ROLLBACK');
+      lockDb.close();
+    }
+
+    await deliverSessionMessages(session);
+
+    expect(delivered).toEqual(['hello']);
+    expect(deliveredRows('ag-1', session.id)).toEqual([
+      {
+        message_out_id: 'out-after-lock',
+        platform_message_id: 'platform-message',
+        status: 'delivered',
+      },
+    ]);
+  }, 10_000);
+
   it('does not re-deliver when retried after a successful send (cleanup-after-send safety)', async () => {
     // If something post-send throws (e.g. outbox cleanup), the message has
     // still landed on the user's screen — the catch path must not trigger
