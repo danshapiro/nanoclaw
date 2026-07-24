@@ -43,6 +43,26 @@ if [ -n "$ca_pem" ] && [ -f "$ca_pem" ] && [ -r "$ca_pem" ]; then
   else
     echo "entrypoint: system CA bundle $system_bundle missing; leaving SSL_CERT_FILE/CODEX_CA_CERTIFICATE unchanged" >&2
   fi
+
+  # Chromium uses the per-user NSS database rather than SSL_CERT_FILE. Import
+  # the same narrowly scoped gateway CA so agent-browser keeps full certificate
+  # verification while OneCLI performs credential injection.
+  certutil_bin="${NANOCLAW_CERTUTIL:-$(command -v certutil || true)}"
+  nss_db_dir="${NANOCLAW_NSS_DB_DIR:-${HOME}/.pki/nssdb}"
+  nss_db="sql:${nss_db_dir}"
+  if [ -z "$certutil_bin" ] || [ ! -x "$certutil_bin" ]; then
+    echo "entrypoint: certutil is required to install the OneCLI CA for Chromium" >&2
+    exit 1
+  fi
+  mkdir -p "$nss_db_dir"
+  if [ ! -f "$nss_db_dir/cert9.db" ]; then
+    "$certutil_bin" -N --empty-password -d "$nss_db"
+  fi
+  "$certutil_bin" -A \
+    -d "$nss_db" \
+    -n "NanoClaw OneCLI Gateway CA" \
+    -t "C,," \
+    -i "$ca_pem"
 fi
 # --- end onecli-ca-bundle ---
 

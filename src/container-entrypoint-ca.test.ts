@@ -30,7 +30,7 @@ function runSnippet(env: Record<string, string | undefined>): {
 } {
   const script = `${caBundleSnippet()}\nprintf '%s|%s' "\${SSL_CERT_FILE:-}" "\${CODEX_CA_CERTIFICATE:-}"\n`;
   const result = spawnSync('bash', ['-c', script], {
-    env: { PATH: process.env.PATH, ...env } as NodeJS.ProcessEnv,
+    env: { PATH: process.env.PATH, NANOCLAW_CERTUTIL: '/bin/true', ...env } as NodeJS.ProcessEnv,
     encoding: 'utf8',
   });
   return { status: result.status, stdout: result.stdout, stderr: result.stderr };
@@ -65,6 +65,52 @@ describe('container entrypoint OneCLI CA bundle', () => {
       expect(certCount).toBe(2);
       // System roots first, gateway CA appended.
       expect(bundle.indexOf('SYSTEMROOT')).toBeLessThan(bundle.indexOf('GATEWAYCA'));
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('imports the gateway CA into the Chromium NSS trust database', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-browser-ca-test-'));
+    try {
+      const gatewayCa = path.join(dir, 'gateway-ca.pem');
+      const systemBundle = path.join(dir, 'ca-certificates.crt');
+      const bundleOut = path.join(dir, 'onecli-ca-bundle.pem');
+      const nssDb = path.join(dir, 'nssdb');
+      const certutilLog = path.join(dir, 'certutil.log');
+      const fakeCertutil = path.join(dir, 'certutil');
+      fs.writeFileSync(gatewayCa, FAKE_CERT('GATEWAYCA'));
+      fs.writeFileSync(systemBundle, FAKE_CERT('SYSTEMROOT'));
+      fs.writeFileSync(
+        fakeCertutil,
+        [
+          '#!/bin/sh',
+          'set -eu',
+          'printf "%s\\n" "$*" >>"$NANOCLAW_CERTUTIL_LOG"',
+          'if [ "$1" = "-N" ]; then touch "$NANOCLAW_NSS_DB_DIR/cert9.db"; fi',
+        ].join('\n') + '\n',
+        { mode: 0o755 },
+      );
+
+      const result = runSnippet({
+        CODEX_CA_CERTIFICATE: gatewayCa,
+        SSL_CERT_FILE: gatewayCa,
+        NANOCLAW_SYSTEM_CA_BUNDLE: systemBundle,
+        NANOCLAW_CA_BUNDLE_OUT: bundleOut,
+        NANOCLAW_CERTUTIL: fakeCertutil,
+        NANOCLAW_CERTUTIL_LOG: certutilLog,
+        NANOCLAW_NSS_DB_DIR: nssDb,
+      });
+
+      expect(result.status).toBe(0);
+      expect(result.stderr).toBe('');
+      expect(fs.readFileSync(certutilLog, 'utf8')).toBe(
+        [
+          `-N --empty-password -d sql:${nssDb}`,
+          `-A -d sql:${nssDb} -n NanoClaw OneCLI Gateway CA -t C,, -i ${gatewayCa}`,
+          '',
+        ].join('\n'),
+      );
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
