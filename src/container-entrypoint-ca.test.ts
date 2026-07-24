@@ -75,12 +75,14 @@ describe('container entrypoint OneCLI CA bundle', () => {
     try {
       const gatewayCa = path.join(dir, 'gateway-ca.pem');
       const systemBundle = path.join(dir, 'ca-certificates.crt');
+      const combinedInput = path.join(dir, 'onecli-combined-ca.pem');
       const bundleOut = path.join(dir, 'onecli-ca-bundle.pem');
       const nssDb = path.join(dir, 'nssdb');
       const certutilLog = path.join(dir, 'certutil.log');
       const fakeCertutil = path.join(dir, 'certutil');
       fs.writeFileSync(gatewayCa, FAKE_CERT('GATEWAYCA'));
       fs.writeFileSync(systemBundle, FAKE_CERT('SYSTEMROOT'));
+      fs.writeFileSync(combinedInput, `${FAKE_CERT('SYSTEMROOT')}${FAKE_CERT('GATEWAYCA')}`);
       fs.writeFileSync(
         fakeCertutil,
         [
@@ -93,8 +95,12 @@ describe('container entrypoint OneCLI CA bundle', () => {
       );
 
       const result = runSnippet({
-        CODEX_CA_CERTIFICATE: gatewayCa,
-        SSL_CERT_FILE: gatewayCa,
+        // Production remaps the exclusive CA variables to this combined
+        // bundle before startup. NODE_EXTRA_CA_CERTS retains OneCLI's
+        // gateway-only certificate and is therefore the safe NSS input.
+        CODEX_CA_CERTIFICATE: combinedInput,
+        SSL_CERT_FILE: combinedInput,
+        NODE_EXTRA_CA_CERTS: gatewayCa,
         NANOCLAW_SYSTEM_CA_BUNDLE: systemBundle,
         NANOCLAW_CA_BUNDLE_OUT: bundleOut,
         NANOCLAW_CERTUTIL: fakeCertutil,

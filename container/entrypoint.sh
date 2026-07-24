@@ -40,9 +40,17 @@ prepare_onecli_ca() {
       echo "entrypoint: system CA bundle $system_bundle missing; leaving SSL_CERT_FILE/CODEX_CA_CERTIFICATE unchanged" >&2
     fi
 
-    # Chromium uses the per-user NSS database rather than SSL_CERT_FILE. Import
-    # the same narrowly scoped gateway CA so agent-browser keeps full certificate
-    # verification while OneCLI performs credential injection.
+    # Chromium uses the per-user NSS database rather than SSL_CERT_FILE.
+    # Container setup remaps CODEX_CA_CERTIFICATE and SSL_CERT_FILE to OneCLI's
+    # combined bundle, while NODE_EXTRA_CA_CERTS deliberately retains the
+    # gateway-only pem. NSS certutil imports only one certificate from a PEM
+    # file, so importing the combined bundle would silently trust its first
+    # public root instead of the OneCLI gateway CA.
+    gateway_ca_pem="${NODE_EXTRA_CA_CERTS:-$ca_pem}"
+    if [ ! -f "$gateway_ca_pem" ] || [ ! -r "$gateway_ca_pem" ]; then
+      echo "entrypoint: OneCLI gateway CA $gateway_ca_pem is missing or unreadable" >&2
+      exit 1
+    fi
     certutil_bin="${NANOCLAW_CERTUTIL:-$(command -v certutil || true)}"
     nss_db_dir="${NANOCLAW_NSS_DB_DIR:-${HOME}/.pki/nssdb}"
     nss_db="sql:${nss_db_dir}"
@@ -58,7 +66,7 @@ prepare_onecli_ca() {
       -d "$nss_db" \
       -n "NanoClaw OneCLI Gateway CA" \
       -t "C,," \
-      -i "$ca_pem"
+      -i "$gateway_ca_pem"
   fi
   # --- end onecli-ca-bundle ---
 }
