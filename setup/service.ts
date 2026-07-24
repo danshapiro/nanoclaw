@@ -272,6 +272,30 @@ function setupSystemd(
     systemctlPrefix = 'systemctl --user';
   }
 
+  // SDK tmp/CA routing (Task 2 verification of @onecli-sh/sdk 0.3.1,
+  // node_modules/@onecli-sh/sdk/lib/index.mjs):
+  //   1. The SDK derives its temp location via os.tmpdir() — `import { tmpdir }
+  //      from "os"` (index.mjs:32), used by writeCaCertificate (index.mjs:43,
+  //      `join(tmpdir(), "onecli-proxy-ca.pem")`) and buildCombinedCaBundle
+  //      (index.mjs:52, `join(tmpdir(), "onecli-combined-ca.pem")`). Node's
+  //      os.tmpdir() honors the TMPDIR env var.
+  //   2. The temp path is NOT cached at import time — tmpdir() is invoked
+  //      inside the function bodies (index.mjs:43, :52), reached from
+  //      applyContainerConfig at call time (index.mjs:118, :124). Setting
+  //      TMPDIR in the unit environment covers it either way.
+  //   3. The SDK exposes NO explicit CA-path option — writeCaCertificate and
+  //      buildCombinedCaBundle take only the certificate content
+  //      (index.mjs:42, :47), and neither OneCLIOptions (index.d.ts:1-6) nor
+  //      ApplyContainerConfigOptions (index.d.ts:13-17) has a path field.
+  // Decision: option (a) — Environment=TMPDIR= in the unit (option (b), an SDK
+  // CA-path option, does not exist). With PrivateTmp=yes the SDK's CA bundles
+  // land in the service's private /tmp, invisible to the host dockerd that
+  // must bind-mount them into agent containers. RuntimeDirectory= +
+  // TMPDIR=%t/nanoclaw-sdk-tmp routes them to a host-visible runtime dir
+  // (%t = /run for system units, $XDG_RUNTIME_DIR for user units), following
+  // the /run/nanoclaw-gws-correlation precedent without disabling PrivateTmp.
+  // The pems are rewritten on every applyContainerConfig call (container
+  // spawn), so they need not survive a service restart — %t is sufficient.
   const unit = `[Unit]
 Description=NanoClaw Personal Assistant
 After=network.target
@@ -283,6 +307,8 @@ WorkingDirectory=${projectRoot}
 Restart=always
 RestartSec=5
 KillMode=process
+RuntimeDirectory=nanoclaw-sdk-tmp
+Environment=TMPDIR=%t/nanoclaw-sdk-tmp
 Environment=HOME=${homeDir}
 Environment=PATH=/usr/local/bin:/usr/bin:/bin:${homeDir}/.local/bin
 StandardOutput=append:${projectRoot}/logs/nanoclaw.log
