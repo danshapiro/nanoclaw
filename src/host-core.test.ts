@@ -96,6 +96,9 @@ describe('session manager', () => {
     const dir = sessionDir('ag-1', 'sess-test');
     expect(fs.existsSync(dir)).toBe(true);
     expect(fs.existsSync(path.join(dir, 'outbox'))).toBe(true);
+    const sideEffectLedger = path.join(dir, 'side-effects.jsonl');
+    expect(fs.readFileSync(sideEffectLedger, 'utf8')).toBe('');
+    expect(fs.statSync(sideEffectLedger).mode & 0o777).toBe(0o600);
     expect(fs.existsSync(path.join(dir, 'group'))).toBe(true);
     fs.writeFileSync(path.join(dir, 'group', 'probe.txt'), 'ok');
     expect(fs.readFileSync(path.join(dir, 'group', 'probe.txt'), 'utf8')).toBe('ok');
@@ -119,6 +122,29 @@ describe('session manager', () => {
     expect(outTables.map((t) => t.name)).toContain('messages_out');
     expect(outTables.map((t) => t.name)).toContain('processing_ack');
     outDb.close();
+  });
+
+  it('preserves an existing side-effect ledger when preparing an old session to wake', async () => {
+    const { ensureSessionWorkspaceDirs } = await import('./session-manager.js');
+    const dir = sessionDir('ag-1', 'sess-existing');
+    fs.mkdirSync(dir, { recursive: true });
+    const ledger = path.join(dir, 'side-effects.jsonl');
+    const existing = '{"kind":"already-recorded"}\n';
+    fs.writeFileSync(ledger, existing, { mode: 0o600 });
+
+    ensureSessionWorkspaceDirs('ag-1', 'sess-existing');
+
+    expect(fs.readFileSync(ledger, 'utf8')).toBe(existing);
+  });
+
+  it('refuses to replace a non-file side-effect ledger during session preparation', async () => {
+    const { ensureSessionWorkspaceDirs } = await import('./session-manager.js');
+    const dir = sessionDir('ag-1', 'sess-invalid-ledger');
+    const ledger = path.join(dir, 'side-effects.jsonl');
+    fs.mkdirSync(ledger, { recursive: true });
+
+    expect(() => ensureSessionWorkspaceDirs('ag-1', 'sess-invalid-ledger')).toThrow(/not a regular file/);
+    expect(fs.statSync(ledger).isDirectory()).toBe(true);
   });
 
   it('should resolve to existing session (shared mode)', () => {

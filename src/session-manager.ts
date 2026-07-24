@@ -268,7 +268,48 @@ export function initSessionFolder(agentGroupId: string, sessionId: string): void
 export function ensureSessionWorkspaceDirs(agentGroupId: string, sessionId: string): void {
   const dir = sessionDir(agentGroupId, sessionId);
   ensureWritableSessionSubdir(dir, 'group');
+  ensureDurableSideEffectLedger(dir);
   fs.mkdirSync(hostCorrelationDir(agentGroupId, sessionId), { recursive: true, mode: 0o700 });
+}
+
+/**
+ * Create the empty side-effect ledger before a container can accept work.
+ *
+ * Strict crash recovery deliberately treats a missing ledger as ambiguous:
+ * absence could mean either "no mutation happened" or "power failed after the
+ * mutation but before its append." Persisting the empty-file directory entry
+ * before launch makes those states distinguishable without weakening recovery.
+ * Existing ledgers are never truncated or rewritten.
+ */
+function ensureDurableSideEffectLedger(dir: string): void {
+  const ledger = path.join(dir, 'side-effects.jsonl');
+  let ledgerFd: number | undefined;
+  let created = false;
+  try {
+    ledgerFd = fs.openSync(
+      ledger,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+      0o600,
+    );
+    created = true;
+    fs.fsyncSync(ledgerFd);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    const stat = fs.lstatSync(ledger);
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw new Error(`Session side-effect ledger is not a regular file: ${ledger}`, { cause: error });
+    }
+  } finally {
+    if (ledgerFd !== undefined) fs.closeSync(ledgerFd);
+  }
+
+  if (!created) return;
+  const dirFd = fs.openSync(dir, fs.constants.O_RDONLY);
+  try {
+    fs.fsyncSync(dirFd);
+  } finally {
+    fs.closeSync(dirFd);
+  }
 }
 
 function ensureWritableSessionSubdir(dir: string, name: string): void {
