@@ -24,7 +24,9 @@ import {
   IDLE_REAP_MS,
   IDLE_RECYCLE_GRACE_MS,
   OPENCODE_ABSOLUTE_TURN_TIMEOUT_MS,
+  QUARANTINE_THRESHOLD,
   clearProviderToolState,
+  decideQuarantine,
   decideSkillRecycle,
   decideStuckAction,
   discoverGwsCrashWindowDraftsScoped,
@@ -2033,5 +2035,51 @@ describe('decideSkillRecycle', () => {
 
   it('recycles a pre-feature container that never recorded a spawn generation', () => {
     expect(decideSkillRecycle({ ...idleArgs, spawnGeneration: '' }).action).toBe('recycle-skills');
+  });
+});
+
+describe('decideQuarantine', () => {
+  it('tracks the first failure with consecutive = 1', () => {
+    expect(decideQuarantine({ priorConsecutive: 0, priorError: null, newError: 'boom' })).toEqual({
+      action: 'track',
+      consecutive: 1,
+    });
+  });
+
+  it('increments on a repeat of the SAME error message', () => {
+    expect(decideQuarantine({ priorConsecutive: 1, priorError: 'boom', newError: 'boom' })).toEqual({
+      action: 'track',
+      consecutive: 2,
+    });
+  });
+
+  it('resets to 1 on a DIFFERENT error message (progress or a different problem)', () => {
+    expect(decideQuarantine({ priorConsecutive: 3, priorError: 'boom', newError: 'other boom' })).toEqual({
+      action: 'track',
+      consecutive: 1,
+    });
+  });
+
+  it('quarantines at QUARANTINE_THRESHOLD consecutive identical failures', () => {
+    expect(QUARANTINE_THRESHOLD).toBe(5); // default
+    expect(
+      decideQuarantine({ priorConsecutive: QUARANTINE_THRESHOLD - 1, priorError: 'boom', newError: 'boom' }),
+    ).toEqual({ action: 'quarantine', consecutive: QUARANTINE_THRESHOLD });
+  });
+
+  it('respects the NANOCLAW_QUARANTINE_THRESHOLD env override', async () => {
+    vi.stubEnv('NANOCLAW_QUARANTINE_THRESHOLD', '2');
+    vi.resetModules();
+    try {
+      const mod = await import('./host-sweep.js');
+      expect(mod.QUARANTINE_THRESHOLD).toBe(2);
+      // The 2nd identical failure quarantines under the override, but would
+      // still be 'track' under the default of 5 -- proves the override fired.
+      const res = mod.decideQuarantine({ priorConsecutive: 1, priorError: 'boom', newError: 'boom' });
+      expect(res).toEqual({ action: 'quarantine', consecutive: 2 });
+    } finally {
+      vi.unstubAllEnvs();
+      vi.resetModules();
+    }
   });
 });

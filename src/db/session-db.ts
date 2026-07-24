@@ -27,10 +27,29 @@ export function ensureSchema(dbPath: string, schema: 'inbound' | 'outbound'): vo
   if (schema === 'inbound') {
     migrateMessagesInTable(db);
     migrateSessionRoutingTable(db);
+    migrateRouteQuarantineTable(db);
   } else {
     migrateOutboundRouteColumns(db);
   }
   db.close();
+}
+
+/**
+ * Create the route_quarantine table on pre-existing inbound DBs. Fresh
+ * installs ship it in INBOUND_SCHEMA; this covers per-session DBs created
+ * before the table existed. Idempotent (CREATE TABLE IF NOT EXISTS).
+ */
+export function migrateRouteQuarantineTable(db: Database.Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS route_quarantine (
+      route_key            TEXT PRIMARY KEY,
+      consecutive_failures INTEGER NOT NULL DEFAULT 0,
+      last_error           TEXT,
+      quarantined_at       TEXT, -- NULL = tracking only, not quarantined
+      reason               TEXT,
+      updated_at           TEXT NOT NULL
+    );
+  `);
 }
 
 /**
@@ -130,6 +149,7 @@ export function openInboundDb(dbPath: string): Database.Database {
   db.pragma('busy_timeout = 5000');
   migrateMessagesInTable(db);
   migrateSessionRoutingTable(db);
+  migrateRouteQuarantineTable(db);
   return db;
 }
 

@@ -360,6 +360,20 @@ CREATE TABLE IF NOT EXISTS session_routing (
   messaging_group_id TEXT,
   is_group     INTEGER
 );
+
+-- Bounded quarantine state for side-effect import failures, keyed by host
+-- route key. The pure decision lives in host-sweep.ts (decideQuarantine);
+-- accessors live in route-quarantine.ts. quarantined_at NULL = tracking only,
+-- not quarantined. Exit is operator-only (clearRouteQuarantine) -- nothing
+-- clears a quarantine automatically.
+CREATE TABLE IF NOT EXISTS route_quarantine (
+  route_key            TEXT PRIMARY KEY,
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  last_error           TEXT,
+  quarantined_at       TEXT, -- NULL = tracking only, not quarantined
+  reason               TEXT,
+  updated_at           TEXT NOT NULL
+);
 `;
 
 /** Container-owned: outbound messages + processing acknowledgments. */

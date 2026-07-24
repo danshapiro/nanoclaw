@@ -126,6 +126,16 @@ export const IDLE_RECYCLE_GRACE_MS = 60 * 1000;
 const MAX_TRIES = 5;
 const BACKOFF_BASE_MS = 5000;
 
+// Bounded alternative to retry-forever for side-effect import failures: after
+// this many CONSECUTIVE IDENTICAL failures a route is quarantined. Exit is
+// operator-only (no automatic retry-out). Operator-overridable via
+// NANOCLAW_QUARANTINE_THRESHOLD (same pattern as NANOCLAW_IDLE_REAP_MS).
+export const QUARANTINE_THRESHOLD = Number(process.env.NANOCLAW_QUARANTINE_THRESHOLD) || 5;
+
+export type QuarantineDecision =
+  | { action: 'track'; consecutive: number }
+  | { action: 'quarantine'; consecutive: number };
+
 export type StuckDecision =
   | { action: 'ok' }
   | { action: 'kill-ceiling'; heartbeatAgeMs: number; ceilingMs: number }
@@ -205,6 +215,26 @@ export function decideStuckAction(args: {
   }
 
   return { action: 'ok' };
+}
+
+/**
+ * Pure decision for whether a route's side-effect import failure streak has
+ * crossed into quarantine -- the bounded alternative to retry-forever.
+ * "Identical" = exact error-message string equality: a changing message means
+ * progress or a different problem and resets the counter. Inputs are all
+ * deterministic; filesystem/DB reads happen in the caller (same precedent as
+ * decideStuckAction).
+ */
+export function decideQuarantine(args: {
+  priorConsecutive: number;
+  priorError: string | null;
+  newError: string;
+  threshold?: number;
+}): QuarantineDecision {
+  const threshold = args.threshold ?? QUARANTINE_THRESHOLD;
+  const consecutive = args.priorError === args.newError ? args.priorConsecutive + 1 : 1;
+  if (consecutive >= threshold) return { action: 'quarantine', consecutive };
+  return { action: 'track', consecutive };
 }
 
 /**
