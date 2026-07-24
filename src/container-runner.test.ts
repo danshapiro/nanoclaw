@@ -142,6 +142,7 @@ async function loadContainerRunnerHarness(
     await oneCliRelease.promise;
     return true;
   });
+  const unexpectedExitRecoveryMock = vi.fn().mockResolvedValue(undefined);
   const loadAgentMcpConfigForGroupMock = vi.fn(
     (folder: string) => options.mcpConfigForGroup?.(folder) ?? { bridges: {}, allowedTools: [] },
   );
@@ -213,6 +214,9 @@ async function loadContainerRunnerHarness(
         } as Parameters<typeof actual.registerGwsCorrelationLaunchLease>[0]),
     };
   });
+  vi.doMock('./host-sweep.js', () => ({
+    recoverSessionAfterUnexpectedExit: unexpectedExitRecoveryMock,
+  }));
   vi.doMock('./providers/index.js', () => ({}));
   vi.doMock('./yente/service-env.js', () => ({
     YENTE_LOCAL_PROXY_HOSTNAMES: [
@@ -284,6 +288,7 @@ async function loadContainerRunnerHarness(
       vi.doUnmock('./agent-mcp-config.js');
       vi.doUnmock('./agent-mcp-bridge.js');
       vi.doUnmock('./gws-correlation-ipc.js');
+      vi.doUnmock('./host-sweep.js');
       vi.doUnmock('./providers/index.js');
       vi.doUnmock('./yente/service-env.js');
       vi.resetModules();
@@ -304,6 +309,7 @@ async function loadContainerRunnerHarness(
     spawnedProcesses,
     spawnMock,
     startAgentMcpBridgeMock,
+    unexpectedExitRecoveryMock,
   };
 }
 
@@ -804,7 +810,8 @@ describe('session wake lifecycle', () => {
     }
   });
 
-  it('keeps the session active after a fatal runner exit and spawns one replacement on the next wake', async () => {
+  it('keeps the session active and schedules targeted recovery after a fatal runner exit', async () => {
+    vi.useFakeTimers();
     const harness = await loadContainerRunnerHarness();
     try {
       harness.oneCliRelease.resolve();
@@ -812,7 +819,7 @@ describe('session wake lifecycle', () => {
       expect(harness.spawnedProcesses).toHaveLength(1);
 
       harness.spawnedProcesses[0].emit('close', 1);
-      await new Promise<void>((resolve) => setImmediate(resolve));
+      await vi.advanceTimersByTimeAsync(harness.containerRunner.UNEXPECTED_EXIT_RECOVERY_BASE_MS);
 
       expect(harness.spawnedProcesses).toHaveLength(1);
       expect(harness.containerRunner.getActiveContainerCount()).toBe(0);
@@ -820,6 +827,8 @@ describe('session wake lifecycle', () => {
         status: 'active',
         container_status: 'stopped',
       });
+      expect(harness.unexpectedExitRecoveryMock).toHaveBeenCalledOnce();
+      expect(harness.unexpectedExitRecoveryMock).toHaveBeenCalledWith(harness.session.id);
 
       await harness.containerRunner.wakeContainer(harness.session);
       expect(harness.spawnedProcesses).toHaveLength(2);
@@ -827,6 +836,45 @@ describe('session wake lifecycle', () => {
       expect(harness.sessions.getSession(harness.session.id)?.container_status).toBe('running');
     } finally {
       harness.close();
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not schedule crash recovery after a clean container exit', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      harness.oneCliRelease.resolve();
+      await harness.containerRunner.wakeContainer(harness.session);
+
+      harness.spawnedProcesses[0].emit('close', 0);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      expect(harness.unexpectedExitRecoveryMock).not.toHaveBeenCalled();
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('bounds repeated fatal-exit recovery instead of creating an infinite crash loop', async () => {
+    vi.useFakeTimers();
+    const harness = await loadContainerRunnerHarness();
+    try {
+      harness.oneCliRelease.resolve();
+
+      for (let attempt = 1; attempt <= 4; attempt += 1) {
+        await harness.containerRunner.wakeContainer(harness.session);
+        harness.spawnedProcesses[attempt - 1].emit('close', 1);
+        await vi.advanceTimersByTimeAsync(
+          harness.containerRunner.UNEXPECTED_EXIT_RECOVERY_BASE_MS * 2 ** Math.min(attempt - 1, 2),
+        );
+      }
+
+      expect(harness.spawnedProcesses).toHaveLength(4);
+      expect(harness.unexpectedExitRecoveryMock).toHaveBeenCalledTimes(3);
+      expect(harness.containerRunner.getActiveContainerCount()).toBe(0);
+    } finally {
+      harness.close();
+      vi.useRealTimers();
     }
   });
 

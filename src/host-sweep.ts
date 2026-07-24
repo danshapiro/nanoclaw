@@ -31,7 +31,7 @@ import type Database from 'better-sqlite3';
 import { createHash } from 'crypto';
 import fs from 'fs';
 
-import { getActiveSessions } from './db/sessions.js';
+import { getActiveSessions, getSession } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { withRuntimeLock } from './db/runtime-locks.js';
 import {
@@ -288,6 +288,19 @@ async function sweep(): Promise<void> {
 
 export async function runHostSweepPassForTest(): Promise<void> {
   await runHostSweepPass();
+}
+
+/**
+ * Recover one session promptly after its container exits unexpectedly.
+ *
+ * This uses the same side-effect-aware recovery path as the periodic sweep,
+ * but does not wait behind every historical active session. The container
+ * runner bounds and backs off calls to this entrypoint.
+ */
+export async function recoverSessionAfterUnexpectedExit(sessionId: string): Promise<void> {
+  const session = getSession(sessionId);
+  if (!session || session.status !== 'active') return;
+  await sweepSession(session);
 }
 
 async function runHostSweepPass(): Promise<void> {

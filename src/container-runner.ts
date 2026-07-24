@@ -78,6 +78,9 @@ import {
 import type { AgentGroup, Session } from './types.js';
 
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
+export const UNEXPECTED_EXIT_RECOVERY_BASE_MS = 5_000;
+const UNEXPECTED_EXIT_RECOVERY_MAX_ATTEMPTS = 3;
+const UNEXPECTED_EXIT_RECOVERY_RESET_MS = 5 * 60_000;
 const YENTE_ONECLI_GATEWAY_PROXY_URL_ENV = 'YENTE_ONECLI_GATEWAY_PROXY_URL';
 const ONECLI_GATEWAY_PROXY_ENV_KEYS = [
   'HTTP_PROXY',
@@ -101,6 +104,7 @@ type ActiveContainer = {
   finalizationFailure?: 'revocation';
 };
 const activeContainers = new Map<string, ActiveContainer>();
+const unexpectedExitRecovery = new Map<string, { attempts: number; lastExitAtMs: number; timer?: NodeJS.Timeout }>();
 const activeMcpBridges = new Map<string, AgentMcpBridge[]>();
 const containerExitWaiters = new Map<string, Set<() => void>>();
 const CONTAINER_SKILLS_BIN = '/app/skills/.bin';
@@ -537,7 +541,72 @@ async function finalizeVerifiedContainerStop(
   stopTypingRefresh(sessionId);
   notifyContainerExit(sessionId);
   log.info('Container exited', { sessionId, code, containerName: current.containerName });
+  if (reason === 'docker-client-close' && typeof code === 'number' && code !== 0) {
+    scheduleUnexpectedExitRecovery(sessionId, current.containerName, code, current.startedAtMs);
+  } else {
+    clearUnexpectedExitRecovery(sessionId);
+  }
   return true;
+}
+
+function clearUnexpectedExitRecovery(sessionId: string): void {
+  const state = unexpectedExitRecovery.get(sessionId);
+  if (state?.timer) clearTimeout(state.timer);
+  unexpectedExitRecovery.delete(sessionId);
+}
+
+function scheduleUnexpectedExitRecovery(
+  sessionId: string,
+  containerName: string,
+  code: number,
+  startedAtMs: number,
+): void {
+  const now = Date.now();
+  const previous = unexpectedExitRecovery.get(sessionId);
+  if (previous?.timer) clearTimeout(previous.timer);
+  const attempts =
+    previous &&
+    now - previous.lastExitAtMs < UNEXPECTED_EXIT_RECOVERY_RESET_MS &&
+    now - startedAtMs < UNEXPECTED_EXIT_RECOVERY_RESET_MS
+      ? previous.attempts + 1
+      : 1;
+  const context = {
+    sessionId,
+    containerName,
+    code,
+    consecutiveUnexpectedExits: attempts,
+  };
+
+  if (attempts > UNEXPECTED_EXIT_RECOVERY_MAX_ATTEMPTS) {
+    unexpectedExitRecovery.set(sessionId, { attempts, lastExitAtMs: now });
+    log.error('Agent container repeatedly exited before recovery could stabilize it', context);
+    return;
+  }
+
+  const delayMs = UNEXPECTED_EXIT_RECOVERY_BASE_MS * 2 ** (attempts - 1);
+  const timer = setTimeout(() => {
+    const state = unexpectedExitRecovery.get(sessionId);
+    if (state?.timer === timer) {
+      state.timer = undefined;
+    }
+    void import('./host-sweep.js')
+      .then(({ recoverSessionAfterUnexpectedExit }) => recoverSessionAfterUnexpectedExit(sessionId))
+      .catch((err) => {
+        log.error('Targeted recovery after unexpected container exit failed', {
+          ...context,
+          err,
+        });
+      });
+  }, delayMs);
+  timer.unref();
+  unexpectedExitRecovery.set(sessionId, { attempts, lastExitAtMs: now, timer });
+
+  const logContext = { ...context, retryDelayMs: delayMs };
+  if (attempts >= UNEXPECTED_EXIT_RECOVERY_MAX_ATTEMPTS) {
+    log.error('Agent container repeatedly exited; scheduling final targeted recovery', logContext);
+  } else {
+    log.warn('Agent container exited unexpectedly; scheduling targeted recovery', logContext);
+  }
 }
 
 function notifyContainerExit(sessionId: string): void {
