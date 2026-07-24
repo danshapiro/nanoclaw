@@ -47,11 +47,14 @@ Always emit these checks in this order:
 
 If any check fails, continue running the remaining checks, then end with `SUMMARY FAIL`.
 
-Provider note: NanoClaw can run under either the Claude Code SDK provider or
-the OpenCode provider. The OpenCode provider intentionally exposes a smaller
-tool surface. In OpenCode sessions, do not fail checks solely because these
-Claude-only tools are absent: `WebSearch`, `ToolSearch`, `NotebookEdit`,
-`TaskOutput`, `TaskStop`, `TeamCreate`, and `TeamDelete`.
+Provider note: NanoClaw can run under the Claude Code SDK, Codex, or OpenCode
+provider. Validate each provider through its native tools. Do not fail a Codex
+check merely because a Claude tool alias is absent when the corresponding
+Codex capability is present and its probe succeeds. The OpenCode provider also
+intentionally exposes a smaller tool surface. In OpenCode sessions, do not fail
+checks solely because these Claude-only tools are absent: `WebSearch`,
+`ToolSearch`, `NotebookEdit`, `TaskOutput`, `TaskStop`, `TeamCreate`, and
+`TeamDelete`.
 
 ## Scratch Paths
 
@@ -67,10 +70,15 @@ Confirm you are running because the user requested `FullQAPass` by name.
 
 ### 2. Allowed Tool Surface
 
-Determine the provider profile from visible environment/config clues. Treat the
-session as OpenCode when `AGENT_PROVIDER=opencode`, `OPENCODE_PROVIDER` is set,
-or the available tool list lacks the Claude-only orchestration/tool-discovery
-families while OpenCode model variables are present.
+Determine the provider profile from visible environment/config clues:
+
+- Codex when `AGENT_PROVIDER=codex`, Codex model/config variables are present,
+  or provider-native tools such as `exec_command`, `apply_patch`,
+  `update_plan`, and `spawn_agent` identify the Codex surface.
+- OpenCode when `AGENT_PROVIDER=opencode`, `OPENCODE_PROVIDER` is set, or the
+  available tool list lacks the Claude-only orchestration/tool-discovery
+  families while OpenCode model variables are present.
+- Claude otherwise when the Claude tool families below are present.
 
 For the Claude profile, assert that the current environment includes these tool
 families:
@@ -111,9 +119,25 @@ tool families:
 - `Skill`
 - `mcp__nanoclaw__*`
 
+For the Codex profile, require these capabilities through provider-native
+tools; exact Claude aliases are neither required nor expected:
+
+- command execution and file reading;
+- patch-based file creation, editing, and deletion;
+- file discovery and content search;
+- plan/todo state updates;
+- HTTPS search and fetch;
+- deferred tool discovery;
+- skill discovery and nested skill use;
+- bounded subagent orchestration;
+- `mcp__nanoclaw__*`.
+
 If a provider-required family is missing, mark this check failed. If only
 Claude-only families are absent in the OpenCode profile, emit
 `CHECK allowed_tool_surface PASS opencode profile; Claude-only tools absent as expected`.
+For Codex, emit `CHECK allowed_tool_surface PASS codex native capability
+surface available` only after the required Codex capabilities are present; the
+provider-specific probes below must still run and may independently fail.
 
 ### 3. Local Skills Repo Checks
 
@@ -131,14 +155,33 @@ Validate `/home/node/.claude/settings.json`:
 
 ### 5. Tool Probes
 
-- `tool_bash_roundtrip`: use Bash to create, read, and delete a scratch file.
-- `tool_read_write_edit`: use `Write`, `Read`, and `Edit` on a file under `/workspace/agent/full-qa-pass/`.
-- `tool_glob_grep`: use `Glob` and `Grep` against the scratch directory and confirm the created file is found.
-- `tool_todowrite`: create at least one todo item and mark it completed.
-- `tool_notebookedit`: in the Claude profile, create or update a notebook entry tied to this run. In the OpenCode profile, emit PASS noting NotebookEdit is Claude-only and not expected.
-- `tool_websearch_https`: in the Claude profile, perform an HTTPS web search and confirm the result URLs are HTTPS. In the OpenCode profile, emit PASS noting WebSearch is Claude-only and covered by the WebFetch HTTPS check.
-- `tool_webfetch_https`: fetch an HTTPS URL and confirm content was returned.
-- `tool_toolsearch`: in the Claude profile, use `ToolSearch` and confirm it returns at least one result relevant to this environment. In the OpenCode profile, emit PASS noting ToolSearch is Claude-only and not expected.
+- `tool_bash_roundtrip`: use `Bash` under Claude/OpenCode or `exec_command`
+  under Codex to create, read, and delete a scratch file.
+- `tool_read_write_edit`: under Claude/OpenCode use `Write`, `Read`, and `Edit`
+  on a file under `/workspace/agent/full-qa-pass/`. Under Codex use
+  `apply_patch` to create and then edit the file, use `exec_command` to read and
+  verify it, and use `apply_patch` to delete it.
+- `tool_glob_grep`: under Claude/OpenCode use `Glob` and `Grep` against the
+  scratch directory. Under Codex use `rg --files` and `rg` through
+  `exec_command`. Confirm both discovery and content search find the expected
+  file.
+- `tool_todowrite`: under Claude/OpenCode create at least one todo item and
+  mark it completed. Under Codex use `update_plan` to create an in-progress
+  item and then mark it completed.
+- `tool_notebookedit`: in the Claude profile, create or update a notebook entry
+  tied to this run. In the Codex profile, use `apply_patch` to create and
+  update a minimal `.ipynb` under the scratch path, then parse it and confirm
+  the updated cell content before deleting it. In the OpenCode profile, emit
+  PASS noting NotebookEdit is Claude-only and not expected.
+- `tool_websearch_https`: in the Claude or Codex profile, perform an HTTPS web
+  search and confirm the result URLs are HTTPS. In the OpenCode profile, emit
+  PASS noting WebSearch is Claude-only and covered by the WebFetch HTTPS check.
+- `tool_webfetch_https`: fetch an HTTPS URL with the provider-native web tool
+  and confirm content was returned.
+- `tool_toolsearch`: in the Claude profile, use `ToolSearch`; in the Codex
+  profile, use `tool_search`. Confirm it returns at least one result relevant
+  to this environment. In the OpenCode profile, emit PASS noting ToolSearch is
+  Claude-only and not expected.
 - `tool_skill_nested`: invoke the built-in `status` skill by name and confirm it returns a result.
 
 ### 6. Orchestration Roundtrip
@@ -157,6 +200,13 @@ bounded way:
 - do not use Bash to remove `/home/node/.claude/teams/...`; team state is managed by orchestration tools and may be blocked as a sensitive path.
 
 Mark `orchestration_roundtrip` failed if any step fails.
+
+In the Codex profile, use the provider's bounded subagent tools to spawn one
+temporary subagent whose entire task is to return exactly `PROBE_OK`. Wait for
+the subagent to finish and verify its result contains exactly `PROBE_OK`.
+Close the subagent if the provider leaves completed agents open. Mark
+`orchestration_roundtrip` failed if the subagent cannot be created, does not
+finish within the tool's normal bounded wait, or returns anything else.
 
 In the OpenCode profile, emit `CHECK orchestration_roundtrip PASS opencode profile; Claude team tools are not expected` after confirming `Task` is available and `nanoclaw_mcp_roundtrip` will exercise durable scheduling.
 
