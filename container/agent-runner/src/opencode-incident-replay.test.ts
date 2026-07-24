@@ -38,6 +38,7 @@
  * and verification uses the PUBLIC key.
  */
 import crypto from 'crypto';
+import { spawn as spawnChild } from 'node:child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -115,6 +116,8 @@ const REPLAY_DESTINATION = 'incident-replay';
 const RECORDING = { recording_date: '2026-05-19', size_bytes: 2_560_000_000 };
 
 const SHIM_PATH = path.resolve(import.meta.dir, '../../shim/gws');
+const SHIM_REQUEST_HELPER_PATH = path.resolve(import.meta.dir, '../../shim/gws-request.mjs');
+const SHIM_WRITE_OPERATIONS_PATH = path.resolve(import.meta.dir, '../../shim/gws-v0.18.1-write-operations.json');
 const SDDND_DIR = '/home/dan/code/summarize-dnd/.worktrees/nanoclaw-side-effect-ledger';
 const SDDND_PY = path.join(SDDND_DIR, '.venv-wsl/bin/python');
 
@@ -627,6 +630,20 @@ function startGwsBoundary(signWith: 'ephemeral' | 'forged' | 'unsigned' = 'ephem
   const wrongKey = crypto.generateKeyPairSync('ed25519').privateKey;
   const publicKeyB64 = publicKey.export({ format: 'der', type: 'spki' }).toString('base64');
   const audits: GwsAuditRecord[] = [];
+  const runtimeShimPath = path.join(tmpDir(), 'gws');
+  let runtimeShim = fs.readFileSync(SHIM_PATH, 'utf8');
+  runtimeShim = runtimeShim.replace(
+    'readonly_write_operations_file="/usr/local/share/nanoclaw/gws-v0.18.1-write-operations.json"',
+    `readonly_write_operations_file=${JSON.stringify(SHIM_WRITE_OPERATIONS_PATH)}`,
+  );
+  runtimeShim = runtimeShim.replace(
+    'readonly_request_helper="/usr/local/lib/nanoclaw/gws-request.mjs"',
+    `readonly_request_helper=${JSON.stringify(SHIM_REQUEST_HELPER_PATH)}`,
+  );
+  if (!runtimeShim.includes(SHIM_REQUEST_HELPER_PATH) || !runtimeShim.includes(SHIM_WRITE_OPERATIONS_PATH)) {
+    throw new Error('incident replay could not redirect the production shim to its checked-in test helpers');
+  }
+  fs.writeFileSync(runtimeShimPath, runtimeShim, { mode: 0o755 });
 
   const server = Bun.serve({
     hostname: '127.0.0.1',
@@ -734,14 +751,39 @@ function startGwsBoundary(signWith: 'ephemeral' | 'forged' | 'unsigned' = 'ephem
         shimEnv.NANOCLAW_HOST_LEASE_FILE = hostLease;
         delete shimEnv.NANOCLAW_ACTIVE_INPUT_FILE;
       }
-      const proc = Bun.spawn(['sh', SHIM_PATH, ...args], {
-        env: { ...process.env, GWS_PROXY_URL: `http://127.0.0.1:${server.port}`, ...shimEnv },
-        stdout: 'pipe',
-        stderr: 'pipe',
+      const processEnv = { ...process.env, ...shimEnv };
+      // This boundary is deliberately local. Agent sessions may inherit a
+      // production OneCLI/HTTP proxy, and the production shim intentionally
+      // forces proxy use when one is configured. Letting that ambient state
+      // leak into this test sends the localhost fixture to the external
+      // gateway and leaves curl waiting forever.
+      for (const key of [
+        'YENTE_ONECLI_GATEWAY_PROXY_URL',
+        'http_proxy',
+        'HTTP_PROXY',
+        'https_proxy',
+        'HTTPS_PROXY',
+        'all_proxy',
+        'ALL_PROXY',
+      ]) {
+        delete processEnv[key];
+      }
+      processEnv.GWS_PROXY_URL = `http://127.0.0.1:${server.port}`;
+      const proc = spawnChild('sh', [runtimeShimPath, ...args], {
+        env: processEnv,
+        stdio: ['ignore', 'pipe', 'pipe'],
       });
-      const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
-      await proc.exited;
-      return { status: proc.exitCode, stdout, stderr };
+      const stdoutChunks: Buffer[] = [];
+      const stderrChunks: Buffer[] = [];
+      proc.stdout.on('data', (chunk: Buffer) => stdoutChunks.push(chunk));
+      proc.stderr.on('data', (chunk: Buffer) => stderrChunks.push(chunk));
+      const status = await new Promise<number | null>((resolve, reject) => {
+        proc.once('error', reject);
+        proc.once('close', resolve);
+      });
+      const stdout = Buffer.concat(stdoutChunks).toString('utf8');
+      const stderr = Buffer.concat(stderrChunks).toString('utf8');
+      return { status, stdout, stderr };
     },
     stop() {
       server.stop(true);
