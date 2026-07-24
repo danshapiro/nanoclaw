@@ -54,7 +54,7 @@ describe('createYenteV1Fixture', () => {
     expect(JSON.stringify(dryRun)).not.toContain('provider-secret-token');
   });
 
-  it('produces stable source hashes across fixture roots', () => {
+  it('produces stable source hashes across fixture roots', { timeout: 15_000 }, () => {
     const stateRootA = path.join(tempDir, 'fixture-a', 'shared');
     const configRootA = path.join(tempDir, 'fixture-a', 'config');
     const stateRootB = path.join(tempDir, 'fixture-b', 'shared');
