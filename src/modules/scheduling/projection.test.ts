@@ -131,7 +131,9 @@ describe('scheduler projection helpers', () => {
       expect(
         inDb
           .prepare(
-            'SELECT id, kind, status, process_after, recurrence, content, series_id, trigger, seq, timestamp FROM messages_in',
+            `SELECT id, kind, status, process_after, recurrence, content, series_id,
+                    trigger, seq, timestamp, host_input_id, host_route_key, host_received_at
+               FROM messages_in`,
           )
           .get(),
       ).toEqual({
@@ -145,8 +147,12 @@ describe('scheduler projection helpers', () => {
         trigger: 1,
         seq: 2,
         timestamp: expect.any(String),
+        host_input_id: expect.stringMatching(/^in-host-[0-9a-f]{24}$/),
+        host_route_key: 'claude|discord|chan-1|grp:mg-1:thread-1',
+        host_received_at: expect.any(String),
       });
       expect(Date.parse((messagesInRows(inDb)[0].timestamp as string) ?? '')).not.toBeNaN();
+      expect(Date.parse((messagesInRows(inDb)[0].host_received_at as string) ?? '')).not.toBeNaN();
       expect(getScheduledTask('ag-1', 'task-1')).toMatchObject({
         projected_session_id: 'sess-new',
         projected_message_id: 'task-task-1-g2',
@@ -188,6 +194,71 @@ describe('scheduler projection helpers', () => {
       });
     });
 
+    inDb.close();
+  });
+
+  it('repairs a pending legacy projection that is missing its host-backed trigger stamp', async () => {
+    const inDb = freshInboundDb();
+
+    await withSchedulerLock((owner) => {
+      const task = seedTask(owner);
+      const messageId = projectScheduledTask(inDb, task, 'sess-new', owner);
+      inDb
+        .prepare(
+          `UPDATE messages_in
+              SET host_input_id = NULL,
+                  host_route_key = NULL,
+                  host_received_at = NULL
+            WHERE id = ?`,
+        )
+        .run(messageId);
+
+      projectScheduledTask(inDb, task, 'sess-new', owner);
+    });
+
+    expect(
+      inDb
+        .prepare('SELECT host_input_id, host_route_key, host_received_at FROM messages_in WHERE series_id = ?')
+        .get('task-1'),
+    ).toEqual({
+      host_input_id: expect.stringMatching(/^in-host-[0-9a-f]{24}$/),
+      host_route_key: 'claude|discord|chan-1|grp:mg-1:thread-1',
+      host_received_at: expect.any(String),
+    });
+    inDb.close();
+  });
+
+  it('does not rewrite a projection trigger stamp after host acceptance', async () => {
+    const inDb = freshInboundDb();
+
+    await withSchedulerLock((owner) => {
+      const task = seedTask(owner);
+      const messageId = projectScheduledTask(inDb, task, 'sess-new', owner);
+      inDb
+        .prepare(
+          `UPDATE messages_in
+              SET host_input_id = 'accepted-input',
+                  host_route_key = 'accepted-route',
+                  host_received_at = '2026-06-06T11:59:00.000Z',
+                  host_accepted_input_id = 'accepted-input',
+                  host_accepted_route_key = 'accepted-route',
+                  host_accepted_at = '2026-06-06T12:00:00.000Z'
+            WHERE id = ?`,
+        )
+        .run(messageId);
+
+      projectScheduledTask(inDb, task, 'sess-new', owner);
+    });
+
+    expect(
+      inDb
+        .prepare('SELECT host_input_id, host_route_key, host_received_at FROM messages_in WHERE series_id = ?')
+        .get('task-1'),
+    ).toEqual({
+      host_input_id: 'accepted-input',
+      host_route_key: 'accepted-route',
+      host_received_at: '2026-06-06T11:59:00.000Z',
+    });
     inDb.close();
   });
 

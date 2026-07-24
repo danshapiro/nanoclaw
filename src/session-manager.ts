@@ -81,7 +81,7 @@ export function hostCorrelationPath(agentGroupId: string, sessionId: string): st
   return path.join(hostCorrelationDir(agentGroupId, sessionId), 'current.json');
 }
 
-function hostRouteKey(
+export function hostRouteKey(
   providerName: string,
   message: {
     platformId?: string | null;
@@ -102,6 +102,34 @@ function hostRouteKey(
     threadKey = `nometa:${channelType ?? ''}:${platformId ?? ''}:${message.threadId ?? 'null'}`;
   }
   return `${providerName}|${channelType ?? ''}|${platformId ?? ''}|${threadKey}`;
+}
+
+export function buildHostInputStamp(
+  agentGroupId: string,
+  sessionId: string,
+  message: {
+    id: string;
+    platformId?: string | null;
+    channelType?: string | null;
+    threadId?: string | null;
+    messagingGroupId?: string | null;
+    isGroup?: 0 | 1 | null;
+  },
+  receivedAt = new Date().toISOString(),
+): {
+  hostInputId: string;
+  hostRouteKey: string;
+  hostReceivedAt: string;
+} {
+  const agentGroup = getAgentGroup(agentGroupId);
+  const providerName = agentGroup
+    ? (readContainerConfig(agentGroup.folder).provider ?? 'claude').trim().toLowerCase()
+    : 'claude';
+  return {
+    hostInputId: `in-host-${createHash('sha256').update(`${sessionId}\0${message.id}`).digest('hex').slice(0, 24)}`,
+    hostRouteKey: hostRouteKey(providerName, message),
+    hostReceivedAt: receivedAt,
+  };
 }
 
 /**
@@ -357,13 +385,7 @@ export function writeSessionMessage(
   // Extract base64 attachment data, save to inbox, replace with file paths
   const content = extractAttachmentFiles(agentGroupId, message.id, message.channelType, message.content);
 
-  const agentGroup = getAgentGroup(agentGroupId);
-  const providerName = agentGroup
-    ? (readContainerConfig(agentGroup.folder).provider ?? 'claude').trim().toLowerCase()
-    : 'claude';
-  const hostReceivedAt = new Date().toISOString();
-  const hostInputId = `in-host-${createHash('sha256').update(`${sessionId}\0${message.id}`).digest('hex').slice(0, 24)}`;
-  const routeKey = hostRouteKey(providerName, message);
+  const hostStamp = buildHostInputStamp(agentGroupId, sessionId, message);
 
   const db = openInboundDb(agentGroupId, sessionId);
   try {
@@ -381,9 +403,7 @@ export function writeSessionMessage(
       trigger: message.trigger ?? 1,
       messagingGroupId: message.messagingGroupId ?? null,
       isGroup: message.isGroup ?? null,
-      hostInputId,
-      hostRouteKey: routeKey,
-      hostReceivedAt,
+      ...hostStamp,
     });
   } finally {
     db.close();

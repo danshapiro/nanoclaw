@@ -2,6 +2,7 @@ import type Database from 'better-sqlite3';
 
 import { nextEvenSeq } from '../../db/session-db.js';
 import type { RuntimeLockOwner } from '../../db/runtime-locks.js';
+import { buildHostInputStamp } from '../../session-manager.js';
 import { markTaskProjected, type ScheduledTaskRow } from './ledger.js';
 
 const LIVE_PROJECTION_STATUSES = ['pending', 'paused', 'processing'];
@@ -17,11 +18,24 @@ export function projectScheduledTask(
   owner: RuntimeLockOwner,
 ): string {
   const messageId = projectionMessageId(task);
+  const timestamp = new Date().toISOString();
+  const hostStamp = buildHostInputStamp(
+    task.agent_group_id,
+    sessionId,
+    {
+      id: messageId,
+      platformId: task.platform_id,
+      channelType: task.channel_type,
+      threadId: task.thread_id,
+      messagingGroupId: task.messaging_group_id,
+      isGroup: task.is_group,
+    },
+    timestamp,
+  );
   const writeProjection = inDb.transaction(() => {
     const existing = inDb.prepare('SELECT id, kind FROM messages_in WHERE id = ?').get(messageId) as
       | { id: string; kind: string }
       | undefined;
-    const timestamp = new Date().toISOString();
 
     if (existing && existing.kind !== 'task') {
       throw new Error(`Projection id ${messageId} already exists as kind=${existing.kind}; refusing to overwrite`);
@@ -56,6 +70,9 @@ export function projectScheduledTask(
              thread_id,
              messaging_group_id,
              is_group,
+             host_input_id,
+             host_route_key,
+             host_received_at,
              content,
              series_id
            ) VALUES (
@@ -72,6 +89,9 @@ export function projectScheduledTask(
              @threadId,
              @messagingGroupId,
              @isGroup,
+             @hostInputId,
+             @hostRouteKey,
+             @hostReceivedAt,
              @content,
              @seriesId
            )`,
@@ -88,6 +108,7 @@ export function projectScheduledTask(
           threadId: task.thread_id,
           messagingGroupId: task.messaging_group_id,
           isGroup: task.is_group,
+          ...hostStamp,
           content: task.content,
           seriesId: task.series_id,
         });
@@ -103,6 +124,9 @@ export function projectScheduledTask(
                thread_id = @threadId,
                messaging_group_id = @messagingGroupId,
                is_group = @isGroup,
+               host_input_id = CASE WHEN host_accepted_at IS NULL THEN @hostInputId ELSE host_input_id END,
+               host_route_key = CASE WHEN host_accepted_at IS NULL THEN @hostRouteKey ELSE host_route_key END,
+               host_received_at = CASE WHEN host_accepted_at IS NULL THEN @hostReceivedAt ELSE host_received_at END,
                content = @content,
                series_id = @seriesId,
                trigger = 1
@@ -119,6 +143,7 @@ export function projectScheduledTask(
           threadId: task.thread_id,
           messagingGroupId: task.messaging_group_id,
           isGroup: task.is_group,
+          ...hostStamp,
           content: task.content,
           seriesId: task.series_id,
         });
