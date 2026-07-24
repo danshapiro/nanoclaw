@@ -1512,7 +1512,8 @@ async function buildContainerArgs(
     }
   }
 
-  // Override entrypoint: run v2 entry point directly via Bun (no tsc).
+  // Override tini for v2, but retain the image entrypoint's OneCLI CA setup
+  // before running the TypeScript source directly via Bun (no tsc).
   args.push('--entrypoint', 'bash');
 
   const image = await resolveAgentImageForRun({
@@ -1522,7 +1523,7 @@ async function buildContainerArgs(
   });
   args.push(image.imageTag);
 
-  args.push('-c', 'exec bun run /app/src/index.ts');
+  args.push('-c', 'exec /app/entrypoint.sh --prepare-onecli-ca bun run /app/src/index.ts');
 
   // Move all `-e KEY=value` pairs (including OneCLI-gateway- and
   // provider-contributed secrets) into a private 0600 env file so token-

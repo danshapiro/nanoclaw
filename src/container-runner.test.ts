@@ -1039,6 +1039,21 @@ describe('session wake lifecycle', () => {
     }
   });
 
+  it('prepares the OneCLI CA before starting the production agent runtime', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      const wake = harness.containerRunner.wakeContainer(harness.session);
+      await harness.oneCliStarted.promise;
+      harness.oneCliRelease.resolve();
+      await wake;
+
+      const args = harness.spawnMock.mock.calls[0][1];
+      expect(args.slice(-2)).toEqual(['-c', 'exec /app/entrypoint.sh --prepare-onecli-ca bun run /app/src/index.ts']);
+    } finally {
+      harness.close();
+    }
+  });
+
   it('exposes Yente local service env and host aliases for configured provider sessions', async () => {
     const harness = await loadContainerRunnerHarness();
     try {

@@ -116,6 +116,53 @@ describe('container entrypoint OneCLI CA bundle', () => {
     }
   });
 
+  it('prepares Chromium trust before executing the production runtime command', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-runtime-ca-test-'));
+    try {
+      const gatewayCa = path.join(dir, 'gateway-ca.pem');
+      const systemBundle = path.join(dir, 'ca-certificates.crt');
+      const bundleOut = path.join(dir, 'onecli-ca-bundle.pem');
+      const nssDb = path.join(dir, 'nssdb');
+      const certutilLog = path.join(dir, 'certutil.log');
+      const fakeCertutil = path.join(dir, 'certutil');
+      fs.writeFileSync(gatewayCa, FAKE_CERT('GATEWAYCA'));
+      fs.writeFileSync(systemBundle, FAKE_CERT('SYSTEMROOT'));
+      fs.writeFileSync(
+        fakeCertutil,
+        [
+          '#!/bin/sh',
+          'set -eu',
+          'printf "%s\\n" "$*" >>"$NANOCLAW_CERTUTIL_LOG"',
+          'if [ "$1" = "-N" ]; then touch "$NANOCLAW_NSS_DB_DIR/cert9.db"; fi',
+        ].join('\n') + '\n',
+        { mode: 0o755 },
+      );
+
+      const result = spawnSync(ENTRYPOINT_PATH, ['--prepare-onecli-ca', '/bin/sh', '-c', 'printf "runtime-started"'], {
+        env: {
+          PATH: process.env.PATH,
+          CODEX_CA_CERTIFICATE: gatewayCa,
+          SSL_CERT_FILE: gatewayCa,
+          NANOCLAW_SYSTEM_CA_BUNDLE: systemBundle,
+          NANOCLAW_CA_BUNDLE_OUT: bundleOut,
+          NANOCLAW_CERTUTIL: fakeCertutil,
+          NANOCLAW_CERTUTIL_LOG: certutilLog,
+          NANOCLAW_NSS_DB_DIR: nssDb,
+        } as NodeJS.ProcessEnv,
+        encoding: 'utf8',
+      });
+
+      expect(result.status).toBe(0);
+      expect(result.stdout).toBe('runtime-started');
+      expect(result.stderr).toBe('');
+      expect(fs.readFileSync(certutilLog, 'utf8')).toContain(
+        `-A -d sql:${nssDb} -n NanoClaw OneCLI Gateway CA -t C,, -i ${gatewayCa}`,
+      );
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('leaves env untouched and warns on stderr when the system bundle is missing', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-ca-test-'));
     try {
