@@ -105,6 +105,31 @@ export function resolveClaudeImports(content: string, baseDir: string, seen: Set
   });
 }
 
+/**
+ * Restore the exact chat body before submitting a turn to Codex.
+ *
+ * The shared formatter XML-escapes inbound chat text so user-authored tags
+ * cannot be confused with NanoClaw's routing envelope. Codex treats that
+ * envelope as plain prompt text, though, and can copy entity spellings such
+ * as `&amp;` into shell commands. Keep the trusted `<message>` wrapper escaped
+ * while placing only its body in a CDATA boundary. Splitting an inbound `]]>`
+ * sequence keeps the boundary well-formed without changing the user's text.
+ */
+export function prepareCodexInputText(input: string): string {
+  return input.replace(
+    /(<message\b[^>]*>)([\s\S]*?)(<\/message>)/g,
+    (_match, open: string, escapedBody: string, close: string) => {
+      const body = escapedBody
+        .replace(/&quot;/g, '"')
+        .replace(/&gt;/g, '>')
+        .replace(/&lt;/g, '<')
+        .replace(/&amp;/g, '&')
+        .replace(/]]>/g, ']]]]><![CDATA[>');
+      return `${open}<![CDATA[${body}]]>${close}`;
+    },
+  );
+}
+
 function readAgentAndGlobalClaudeMd(): string | undefined {
   // Per-group CLAUDE.md is responsible for pulling in the global instructions
   // if the group wants them (the default scaffold starts with
@@ -481,7 +506,7 @@ export class CodexProvider implements AgentProvider {
           if (pending.length === 0 && ended) return;
 
           const turn = pending.shift()!;
-          const text = turn.prompt;
+          const text = prepareCodexInputText(turn.prompt);
           const turnInputId = turn.inputId;
           if (turn.visibleDestinationName) {
             visibleDestinationName = turn.visibleDestinationName;

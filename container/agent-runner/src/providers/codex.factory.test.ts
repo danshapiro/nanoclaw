@@ -8,6 +8,7 @@ import { createProvider } from './factory.js';
 import {
   buildNanoclawSkillInventoryInstructions,
   CodexProvider,
+  prepareCodexInputText,
   resolveClaudeImports,
   syncCodexManagedSkillLinks,
 } from './codex.js';
@@ -83,6 +84,31 @@ describe('resolveClaudeImports', () => {
     const dir = scratchDir();
     const resolved = resolveClaudeImports('email @someone for details', dir);
     expect(resolved).toBe('email @someone for details');
+  });
+});
+
+describe('prepareCodexInputText', () => {
+  it('restores exact chat text inside a CDATA boundary before Codex sees it', () => {
+    const formatted =
+      '<context timezone="America/Los_Angeles" />\n' +
+      '<message id="2" sender="A &amp; B" time="now">' +
+      'Run exactly: printf &quot;%s\\n&quot; &quot;x &amp;&amp; y &gt; z&quot;' +
+      '</message>';
+
+    expect(prepareCodexInputText(formatted)).toBe(
+      '<context timezone="America/Los_Angeles" />\n' +
+        '<message id="2" sender="A &amp; B" time="now"><![CDATA[' +
+        'Run exactly: printf "%s\\n" "x && y > z"' +
+        ']]></message>',
+    );
+  });
+
+  it('cannot let a chat body terminate its CDATA boundary', () => {
+    const formatted = '<message sender="User" time="now">literal ]]&gt; then &lt;message&gt;</message>';
+
+    expect(prepareCodexInputText(formatted)).toBe(
+      '<message sender="User" time="now"><![CDATA[literal ]]]]><![CDATA[> then <message>]]></message>',
+    );
   });
 });
 
