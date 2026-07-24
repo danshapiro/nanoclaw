@@ -66,6 +66,8 @@ WorkingDirectory=${projectRoot}
 Restart=always
 RestartSec=5
 KillMode=process
+RuntimeDirectory=nanoclaw-sdk-tmp
+Environment=TMPDIR=%t/nanoclaw-sdk-tmp
 Environment=HOME=${homeDir}
 Environment=PATH=/usr/local/bin:/usr/bin:/bin:${homeDir}/.local/bin
 StandardOutput=append:${projectRoot}/logs/nanoclaw.log
@@ -164,6 +166,45 @@ describe('systemd unit generation', () => {
     expect(unit).toContain(
       'ExecStart=/usr/bin/node /srv/nanoclaw/dist/index.js',
     );
+  });
+
+  it('declares a runtime directory for SDK tmp/CA material', () => {
+    const unit = generateSystemdUnit(
+      '/usr/bin/node',
+      '/home/user/nanoclaw',
+      '/home/user',
+      false,
+    );
+    expect(unit).toContain('RuntimeDirectory=nanoclaw-sdk-tmp');
+  });
+
+  it('points TMPDIR at the runtime directory', () => {
+    const unit = generateSystemdUnit(
+      '/usr/bin/node',
+      '/home/user/nanoclaw',
+      '/home/user',
+      false,
+    );
+    expect(unit).toContain('Environment=TMPDIR=%t/nanoclaw-sdk-tmp');
+  });
+
+  it('keeps the SDK TMPDIR outside systemd PrivateTmp', () => {
+    // Same spirit as src/gws-correlation-ipc.test.ts: material written under
+    // literal /tmp is invisible to the host (and dockerd) when the unit runs
+    // with PrivateTmp=yes. The whole point of TMPDIR here is to escape that
+    // namespace, so the configured value must never resolve under /tmp.
+    const unit = generateSystemdUnit(
+      '/usr/bin/node',
+      '/home/user/nanoclaw',
+      '/home/user',
+      false,
+    );
+    const tmpdirLine = unit
+      .split('\n')
+      .find((line) => line.startsWith('Environment=TMPDIR='));
+    expect(tmpdirLine).toBeDefined();
+    const tmpdirValue = tmpdirLine!.slice('Environment=TMPDIR='.length);
+    expect(tmpdirValue.startsWith('/tmp')).toBe(false);
   });
 });
 

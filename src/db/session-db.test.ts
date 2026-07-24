@@ -881,3 +881,54 @@ describe('discoverGwsCrashWindowDrafts (host-only)', () => {
     expect(count).toBe(0);
   });
 });
+
+// ── Durable empty ledger: reconciliation against a truthful empty ledger ─────
+
+describe('importHostSideEffects with a durable empty ledger', () => {
+  function strictScope() {
+    return {
+      inputId: 'input-1',
+      routeKey: 'route-1',
+      notBefore: new Date(Date.now() - 60_000).toISOString(),
+      notAfter: new Date(Date.now() + 60_000).toISOString(),
+    };
+  }
+
+  it('returns zero counts without throwing when the ledger exists but is empty', () => {
+    freshDir();
+    const sessionPath = path.join(TEST_DIR, 'sess');
+    fs.mkdirSync(sessionPath, { recursive: true });
+    const outPath = path.join(sessionPath, 'outbound.db');
+    const out = new Database(outPath);
+    out.exec(OUTBOUND_SCHEMA);
+    out.close();
+    fs.writeFileSync(path.join(sessionPath, 'side-effects.jsonl'), '');
+
+    const r = importHostSideEffects({
+      sessionDir: sessionPath,
+      containerStopped: true,
+      strictGwsScopes: [strictScope()],
+    });
+
+    expect(r).toEqual({ imported: 0, skipped: 0, validated: 0 });
+  });
+
+  it('still fails closed when the ledger file is missing and a strict scope is set', () => {
+    freshDir();
+    const sessionPath = path.join(TEST_DIR, 'sess');
+    fs.mkdirSync(sessionPath, { recursive: true });
+    const outPath = path.join(sessionPath, 'outbound.db');
+    const out = new Database(outPath);
+    out.exec(OUTBOUND_SCHEMA);
+    out.close();
+    // No side-effects.jsonl written: a missing ledger is an anomalous state.
+
+    expect(() =>
+      importHostSideEffects({
+        sessionDir: sessionPath,
+        containerStopped: true,
+        strictGwsScopes: [strictScope()],
+      }),
+    ).toThrow(/ledger|missing/i);
+  });
+});

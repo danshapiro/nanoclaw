@@ -4529,6 +4529,97 @@ describe('provider finalization barriers', () => {
   });
 });
 
+describe('poll-loop post-accept provider error surfacing', () => {
+  it('sanitizes secret-shaped tokens in the post-accept error surfaced to the user', async () => {
+    insertMessage(
+      'postaccept-sanitize-init',
+      'chat',
+      { sender: 'User', text: 'do work' },
+      { platformId: 'chan-postaccept-sanitize', channelType: 'discord' },
+    );
+    // Throws AFTER init (the ScriptedProvider adapter emits input-accepted
+    // right after init), so this exercises the post-accept catch path.
+    const provider = new ScriptedProvider(async function* () {
+      yield { type: 'init', continuation: 'postaccept-sanitize-session' };
+      throw new Error('provider auth failed for key sk-abc123def456ghi789');
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+    await waitFor(() => getUndeliveredMessages().some((message) => message.content.includes('Error:')), 2000);
+    controller.abort();
+    await loopPromise.catch(() => {});
+
+    const errorRows = getUndeliveredMessages().filter((message) => message.content.includes('Error:'));
+    expect(errorRows).toHaveLength(1);
+    const text = (JSON.parse(errorRows[0].content) as { text: string }).text;
+    expect(text).toContain('[redacted-key]');
+    expect(text).not.toContain('sk-abc123def456ghi789');
+    // Post-accept failure: the accepted row is recovery-owned, never completed.
+    expect(getAckStatus('postaccept-sanitize-init')).toBe('recovery');
+  });
+
+  it('emits exactly one user-facing error row for consecutive identical failures in one turn', async () => {
+    insertMessage(
+      'postaccept-dedup-init',
+      'chat',
+      { sender: 'User', text: 'retry then fail again' },
+      { platformId: 'chan-postaccept-dedup', channelType: 'discord' },
+    );
+    // Attempt 1 fails pre-accept (throws before any event), which schedules a
+    // durable retry and emits the one allowed user-facing error. The retry
+    // (attempt 2) is accepted, then fails post-accept with the IDENTICAL
+    // error. The user must not receive a second error row for the same turn.
+    let attempts = 0;
+    const provider = new ScriptedProvider(async function* () {
+      attempts++;
+      if (attempts === 1) throw new Error('identical provider failure');
+      yield { type: 'init', continuation: 'postaccept-dedup-session' };
+      throw new Error('identical provider failure');
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+    await waitFor(() => attempts >= 2, 3000);
+    await waitFor(() => getAckStatus('postaccept-dedup-init') === 'recovery', 2000);
+    // Let the post-accept catch finish its (potential) duplicate write.
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    controller.abort();
+    await loopPromise.catch(() => {});
+
+    const surfaced = getUndeliveredMessages().filter((message) =>
+      message.content.includes('identical provider failure'),
+    );
+    expect(surfaced).toHaveLength(1);
+  });
+
+  it('keeps the raw error message in the runner log while sanitizing the user-facing text', async () => {
+    const errSpy = spyOn(console, 'error');
+    insertMessage(
+      'postaccept-log-init',
+      'chat',
+      { sender: 'User', text: 'log the raw error' },
+      { platformId: 'chan-postaccept-log', channelType: 'discord' },
+    );
+    const provider = new ScriptedProvider(async function* () {
+      yield { type: 'init', continuation: 'postaccept-log-session' };
+      throw new Error('provider auth failed for key sk-abc123def456ghi789');
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+    await waitFor(() => getAckStatus('postaccept-log-init') === 'recovery', 2000);
+    controller.abort();
+    await loopPromise.catch(() => {});
+
+    const rawLogged = errSpy.mock.calls.some((call) =>
+      String(call[0]).includes('Query error: provider auth failed for key sk-abc123def456ghi789'),
+    );
+    expect(rawLogged).toBe(true);
+    errSpy.mockRestore();
+  });
+});
+
 describe('routeless-trigger reply routing', () => {
   // Host-owned table (src/db/session-db.ts INBOUND_SCHEMA); replicate the shape
   // the runner reads via getSessionRouting().

@@ -358,6 +358,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
   let pollCount = 0;
   while (!config.signal?.aborted) {
+    // Per-wake guard: at most one user-facing provider-error row per route per
+    // wake ("once per turn"). Resets each wake; the durable retry schedule's
+    // userErrorEmittedAt covers de-dup across wakes within one retry series.
+    const userErrorEmittedRoutes = new Set<string>();
     // Skip system messages — they're responses for MCP tools (e.g., ask_user_question)
     const messages = getPendingMessages().filter((m) => m.kind !== 'system');
     pollCount++;
@@ -459,6 +463,13 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       }
       clearProviderRetrySchedule(config.providerName, activeRouteKey);
     }
+    // Captured BEFORE provider acceptance clears the durable schedule
+    // (onInputAccepted): the post-accept catch below must still honor the
+    // one-user-error-per-retry-series guard. An exhausted schedule cleared
+    // just above (distinct new trigger) starts a fresh series, so it is
+    // deliberately not captured.
+    const priorUserErrorEmittedAt =
+      retrySchedule?.status === 'exhausted' ? undefined : retrySchedule?.userErrorEmittedAt;
     const retryRemainingMs = retrySchedule?.nextAttemptAt ? Date.parse(retrySchedule.nextAttemptAt) - Date.now() : 0;
     if (retryRemainingMs > 0) {
       await sleep(Math.min(retryRemainingMs, 500), config.signal);
@@ -767,14 +778,27 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // finally block has already chosen exactly one durable disposition:
       // accepted/submitted rows are recovery-owned; unsubmitted rows are back
       // to pending. Never overwrite either outcome with `completed` here.
-      writeMessageOut({
-        id: generateId(),
-        kind: 'chat',
-        platform_id: routing.platformId,
-        channel_type: routing.channelType,
-        thread_id: routing.threadId,
-        content: JSON.stringify({ text: `Error: ${errMsg}` }),
-      });
+      // User-facing text is sanitized + de-duped; the raw error stays in the
+      // journal via the `Query error:` log line above.
+      const priorSchedule = readProviderRetrySchedule(config.providerName, activeRouteKey);
+      if (
+        !priorSchedule?.userErrorEmittedAt &&
+        !priorUserErrorEmittedAt &&
+        !userErrorEmittedRoutes.has(activeRouteKey)
+      ) {
+        writeMessageOut({
+          id: generateId(),
+          kind: 'chat',
+          platform_id: routing.platformId,
+          channel_type: routing.channelType,
+          thread_id: routing.threadId,
+          content: JSON.stringify({ text: `Error: ${sanitizeProviderErrorText(errMsg)}` }),
+        });
+        userErrorEmittedRoutes.add(activeRouteKey);
+        // Persists the guard when a retry schedule exists; no-ops otherwise
+        // (the in-memory set covers the schedule-less case within this wake).
+        markProviderRetryUserErrorEmitted(config.providerName, activeRouteKey);
+      }
     }
     log(`Completed wake for route ${activeRouteKey} (${ids.length} active row(s))`);
   }

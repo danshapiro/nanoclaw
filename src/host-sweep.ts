@@ -54,6 +54,13 @@ import {
   type ImportSideEffectsResult,
   type GwsManualReconciliation,
 } from './db/session-db.js';
+import {
+  clearImportFailures,
+  isRouteQuarantined,
+  markMessageQuarantined,
+  markRouteQuarantined,
+  recordImportFailure,
+} from './db/route-quarantine.js';
 import { log } from './log.js';
 import { resolveGwsSideEffectVerifyKey } from './gws-side-effect-key.js';
 import {
@@ -125,6 +132,16 @@ export const IDLE_REAP_MS = Number(process.env.NANOCLAW_IDLE_REAP_MS) || 10 * 60
 export const IDLE_RECYCLE_GRACE_MS = 60 * 1000;
 const MAX_TRIES = 5;
 const BACKOFF_BASE_MS = 5000;
+
+// Bounded alternative to retry-forever for side-effect import failures: after
+// this many CONSECUTIVE IDENTICAL failures a route is quarantined. Exit is
+// operator-only (no automatic retry-out). Operator-overridable via
+// NANOCLAW_QUARANTINE_THRESHOLD (same pattern as NANOCLAW_IDLE_REAP_MS).
+export const QUARANTINE_THRESHOLD = Number(process.env.NANOCLAW_QUARANTINE_THRESHOLD) || 5;
+
+export type QuarantineDecision =
+  | { action: 'track'; consecutive: number }
+  | { action: 'quarantine'; consecutive: number };
 
 export type StuckDecision =
   | { action: 'ok' }
@@ -205,6 +222,26 @@ export function decideStuckAction(args: {
   }
 
   return { action: 'ok' };
+}
+
+/**
+ * Pure decision for whether a route's side-effect import failure streak has
+ * crossed into quarantine -- the bounded alternative to retry-forever.
+ * "Identical" = exact error-message string equality: a changing message means
+ * progress or a different problem and resets the counter. Inputs are all
+ * deterministic; filesystem/DB reads happen in the caller (same precedent as
+ * decideStuckAction).
+ */
+export function decideQuarantine(args: {
+  priorConsecutive: number;
+  priorError: string | null;
+  newError: string;
+  threshold?: number;
+}): QuarantineDecision {
+  const threshold = args.threshold ?? QUARANTINE_THRESHOLD;
+  const consecutive = args.priorError === args.newError ? args.priorConsecutive + 1 : 1;
+  if (consecutive >= threshold) return { action: 'quarantine', consecutive };
+  return { action: 'track', consecutive };
 }
 
 /**
@@ -639,6 +676,143 @@ export async function recoverInterruptedTurn(opts: {
 }
 
 /**
+ * Distinct accepted route keys over the current processing claims, with the
+ * claimed message ids for each route. Rows without host acceptance carry no
+ * route identity and are excluded (they are returned to pending by the
+ * recovery plan, never quarantined).
+ */
+function acceptedClaimRoutes(inDb: Database.Database, outDb: Database.Database): Map<string, string[]> {
+  const lookup = inDb.prepare('SELECT host_accepted_route_key FROM messages_in WHERE id = ?');
+  const routes = new Map<string, string[]>();
+  for (const claim of getProcessingClaims(outDb)) {
+    const row = lookup.get(claim.message_id) as { host_accepted_route_key: string | null } | undefined;
+    const key = row?.host_accepted_route_key;
+    if (!key) continue;
+    const ids = routes.get(key) ?? [];
+    ids.push(claim.message_id);
+    routes.set(key, ids);
+  }
+  return routes;
+}
+
+export type BoundedRecoveryOutcome = 'recovered' | 'skipped-quarantined' | 'quarantined';
+
+/**
+ * Bounded wrapper around recoverInterruptedTurn -- the alternative to
+ * retry-forever when the strict side-effect import throws on every sweep tick
+ * (Issue 2b part 2). Behavior:
+ *
+ *   - SKIP recovery entirely (debug log) when any claimed route is already
+ *     quarantined, so a quarantined route never re-enters the throw loop.
+ *   - On an import failure, record it per accepted route (identical-error
+ *     streak via decideQuarantine). Below the threshold the fail-closed throw
+ *     is untouched: rethrow, turn stays blocked, next sweep retries.
+ *   - At the threshold, QUARANTINE the route: loud `route_quarantined`
+ *     log.error event, park the wedged inbound rows with the terminal
+ *     'quarantined' marker (data preserved for operator review -- ledger,
+ *     session rows, and outbound DB are never deleted), and clear orphan
+ *     processing claims the way resetStuckProcessingRows does so the route is
+ *     freed for new inbound work.
+ *   - On a successful import for a tracked route, clear the streak.
+ *
+ * Exit from quarantine is ONLY the explicit operator accessor
+ * clearRouteQuarantine -- no sweep path ever clears it.
+ */
+export async function recoverInterruptedTurnBounded(opts: {
+  inDb: Database.Database;
+  outDb: Database.Database;
+  session: Session;
+  reason: string;
+  writableOutDb?: Database.Database;
+  verifyContainerStopped: () => Promise<boolean>;
+  sealAndDrainAcceptedInputs: () => Promise<void>;
+  importSideEffects: (args: { containerStopped: boolean }) => void;
+  writeRecovery: () => void;
+  wakeContainer: () => Promise<void>;
+  /** Override for tests; production uses QUARANTINE_THRESHOLD. */
+  quarantineThreshold?: number;
+}): Promise<BoundedRecoveryOutcome> {
+  const routes = acceptedClaimRoutes(opts.inDb, opts.outDb);
+  const routeKeys = [...routes.keys()].sort();
+
+  const quarantinedKeys = routeKeys.filter((key) => isRouteQuarantined(opts.inDb, key));
+  if (quarantinedKeys.length > 0) {
+    log.debug('Skipping interrupted-turn recovery for quarantined route(s)', {
+      sessionId: opts.session.id,
+      routeKeys: quarantinedKeys,
+      reason: opts.reason,
+    });
+    return 'skipped-quarantined';
+  }
+
+  let importFailed = false;
+  try {
+    await recoverInterruptedTurn({
+      inDb: opts.inDb,
+      outDb: opts.outDb,
+      session: opts.session,
+      reason: opts.reason,
+      writableOutDb: opts.writableOutDb,
+      verifyContainerStopped: opts.verifyContainerStopped,
+      sealAndDrainAcceptedInputs: opts.sealAndDrainAcceptedInputs,
+      importSideEffects: (args) => {
+        try {
+          opts.importSideEffects(args);
+        } catch (err) {
+          importFailed = true;
+          throw err;
+        }
+        // Successful import for tracked route(s): reset the failure streak.
+        for (const key of routeKeys) clearImportFailures(opts.inDb, key);
+      },
+      writeRecovery: opts.writeRecovery,
+      wakeContainer: opts.wakeContainer,
+    });
+    return 'recovered';
+  } catch (err) {
+    // Only the side-effect import failure path is bounded; every other
+    // recovery failure keeps its existing fail-closed semantics untouched.
+    if (!importFailed) throw err;
+    const message = err instanceof Error ? err.message : String(err);
+    let allQuarantined = routeKeys.length > 0;
+    for (const key of routeKeys) {
+      const decision = recordImportFailure(opts.inDb, key, message, opts.quarantineThreshold);
+      if (decision.action !== 'quarantine') {
+        allQuarantined = false;
+        continue;
+      }
+      markRouteQuarantined(opts.inDb, key, message);
+      log.error('Route quarantined after repeated identical side-effect import failures', {
+        event: 'route_quarantined',
+        sessionId: opts.session.id,
+        routeKey: key,
+        consecutiveFailures: decision.consecutive,
+        lastError: message,
+      });
+      // Free the route: park the wedged rows terminally. Data is preserved --
+      // the rows (and the ledger/outbound DB) stay on disk for operator review.
+      for (const messageId of routes.get(key) ?? []) {
+        markMessageQuarantined(opts.inDb, messageId);
+      }
+    }
+    if (!allQuarantined) throw err;
+    // Clear orphan processing claims the way resetStuckProcessingRows does.
+    // Safe: recoverInterruptedTurn verified the container stopped before the
+    // import ran, so the container-owned writer is gone.
+    const useDb = opts.writableOutDb ?? opts.outDb;
+    const cleared = deleteOrphanProcessingClaims(useDb);
+    if (cleared > 0) {
+      log.info('Cleared orphan processing claims for quarantined route(s)', {
+        sessionId: opts.session.id,
+        cleared,
+        routeKeys,
+      });
+    }
+    return 'quarantined';
+  }
+}
+
+/**
  * Scoping for the host-only GWS crash-window discovery, derived from the
  * interrupted turn's recovery context so we import ONLY the active turn's
  * orphan draft-create — never another session's/route's drafts from the shared
@@ -1065,6 +1239,9 @@ export function recoverGwsClaimPartitions(opts: {
  * Production wiring for recoverInterruptedTurn from the sweep loop. Reopens the
  * outbound DB writable only after a verified container stop, imports the host
  * session path for /workspace/side-effects.jsonl, writes recovery, then resets.
+ * Wrapped in the bounded quarantine layer: quarantined routes are skipped, and
+ * a repeated identical side-effect import failure quarantines instead of
+ * retrying forever.
  */
 export async function recoverAfterKill(inDb: Database.Database, session: Session, reason: string): Promise<void> {
   const dir = sessionDir(session.agent_group_id, session.id);
@@ -1076,7 +1253,7 @@ export async function recoverAfterKill(inDb: Database.Database, session: Session
   const writableOutDb = openOutboundDbRw(session.agent_group_id, session.id);
   let shouldWake = false;
   try {
-    await recoverInterruptedTurn({
+    await recoverInterruptedTurnBounded({
       inDb,
       outDb: writableOutDb,
       session,

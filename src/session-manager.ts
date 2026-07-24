@@ -281,7 +281,7 @@ export function ensureSessionWorkspaceDirs(agentGroupId: string, sessionId: stri
  * before launch makes those states distinguishable without weakening recovery.
  * Existing ledgers are never truncated or rewritten.
  */
-function ensureDurableSideEffectLedger(dir: string): void {
+export function ensureDurableSideEffectLedger(dir: string): void {
   const ledger = path.join(dir, 'side-effects.jsonl');
   let ledgerFd: number | undefined;
   let created = false;
