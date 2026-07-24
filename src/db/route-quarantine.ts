@@ -27,7 +27,12 @@ function nowIso(): string {
  * decision. Does NOT set quarantined_at -- the caller acts on an
  * `action: 'quarantine'` decision via markRouteQuarantined (with a reason).
  */
-export function recordImportFailure(inDb: Database.Database, routeKey: string, error: string): QuarantineDecision {
+export function recordImportFailure(
+  inDb: Database.Database,
+  routeKey: string,
+  error: string,
+  threshold?: number,
+): QuarantineDecision {
   const prior = inDb
     .prepare('SELECT consecutive_failures, last_error FROM route_quarantine WHERE route_key = ?')
     .get(routeKey) as TrackingRow | undefined;
@@ -35,6 +40,7 @@ export function recordImportFailure(inDb: Database.Database, routeKey: string, e
     priorConsecutive: prior?.consecutive_failures ?? 0,
     priorError: prior?.last_error ?? null,
     newError: error,
+    threshold,
   });
   inDb
     .prepare(
@@ -76,6 +82,16 @@ export function markRouteQuarantined(inDb: Database.Database, routeKey: string, 
          updated_at = excluded.updated_at`,
     )
     .run({ routeKey, reason, now });
+}
+
+/**
+ * Terminal marker for an inbound row freed by a quarantine transition.
+ * Distinct from markMessageFailed's 'failed' so operator review can tell a
+ * quarantined-route park from an ordinary max-retry failure. The row itself
+ * is preserved untouched apart from the status flip -- never deleted.
+ */
+export function markMessageQuarantined(inDb: Database.Database, messageId: string): void {
+  inDb.prepare("UPDATE messages_in SET status = 'quarantined' WHERE id = ?").run(messageId);
 }
 
 export function isRouteQuarantined(inDb: Database.Database, routeKey: string): boolean {

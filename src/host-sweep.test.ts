@@ -16,7 +16,9 @@ import {
   countDueMessagesExcludingRecovery,
   getProcessingClaims,
 } from './db/session-db.js';
-import { OUTBOUND_SCHEMA } from './db/schema.js';
+import { INBOUND_SCHEMA, OUTBOUND_SCHEMA } from './db/schema.js';
+import { clearRouteQuarantine, isRouteQuarantined } from './db/route-quarantine.js';
+import { log } from './log.js';
 import { canonicalSideEffectPayload } from './db/side-effects-verify.js';
 import {
   ABSOLUTE_CEILING_MS,
@@ -36,6 +38,7 @@ import {
   parseSqliteUtc,
   recoverGwsClaimPartitions,
   recoverInterruptedTurn,
+  recoverInterruptedTurnBounded,
   resetStuckProcessingRows,
   sealAndDrainAcceptedGwsClaims,
   writeHostInterruptedRecovery,
@@ -2081,5 +2084,294 @@ describe('decideQuarantine', () => {
       vi.unstubAllEnvs();
       vi.resetModules();
     }
+  });
+});
+
+/**
+ * Issue 2b part 2 -- host-sweep quarantine wiring. The bounded alternative to
+ * retry-forever when the strict side-effect import throws every sweep tick:
+ * track identical failures, quarantine at the threshold with a loud
+ * `route_quarantined` log.error event, free the route (terminal 'quarantined'
+ * marker + orphan-claim cleanup) while preserving all data for operator
+ * review, and skip recovery entirely for quarantined routes. Exit is
+ * operator-only via clearRouteQuarantine.
+ */
+describe('recoverInterruptedTurnBounded (quarantine wiring for wedged side-effect imports)', () => {
+  let tmpRoot: string;
+
+  beforeEach(() => {
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'host-sweep-quarantine-'));
+  });
+  afterEach(() => {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    vi.restoreAllMocks();
+  });
+
+  const ROUTE = 'opencode|discord|chan-q|dm:mg-q';
+
+  function setupQuarantineSession(): {
+    sessionPath: string;
+    inDb: Database.Database;
+    outDb: Database.Database;
+  } {
+    const sessionPath = path.join(tmpRoot, 'sess');
+    fs.mkdirSync(sessionPath, { recursive: true });
+    const inDb = new Database(path.join(sessionPath, 'inbound.db'));
+    inDb.exec(INBOUND_SCHEMA);
+    const outDb = new Database(path.join(sessionPath, 'outbound.db'));
+    outDb.exec(OUTBOUND_SCHEMA);
+    return { sessionPath, inDb, outDb };
+  }
+
+  function addAcceptedClaim(
+    inDb: Database.Database,
+    outDb: Database.Database,
+    values: { messageId?: string; inputId?: string; routeKey?: string; acceptedAt?: string } = {},
+  ): { messageId: string; routeKey: string; content: string } {
+    const messageId = values.messageId ?? 'm-q';
+    const inputId = values.inputId ?? 'in-q';
+    const routeKey = values.routeKey ?? ROUTE;
+    const acceptedAt = values.acceptedAt ?? '2026-05-29T12:00:00.000Z';
+    const content = '{"text":"wedged turn"}';
+    inDb
+      .prepare(
+        `INSERT INTO messages_in
+           (id, kind, status, tries, trigger, timestamp, content, host_input_id, host_route_key, host_received_at,
+            host_accepted_input_id, host_accepted_route_key, host_accepted_at)
+         VALUES (?, 'message', 'pending', 0, 1, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(messageId, acceptedAt, content, inputId, routeKey, acceptedAt, inputId, routeKey, acceptedAt);
+    outDb
+      .prepare('INSERT INTO processing_ack (message_id, status, status_changed) VALUES (?, ?, ?)')
+      .run(messageId, 'processing', acceptedAt);
+    return { messageId, routeKey, content };
+  }
+
+  function runBounded(args: {
+    inDb: Database.Database;
+    outDb: Database.Database;
+    importSideEffects: (a: { containerStopped: boolean }) => void;
+    threshold?: number;
+  }) {
+    return recoverInterruptedTurnBounded({
+      inDb: args.inDb,
+      outDb: args.outDb,
+      session: fakeSession(),
+      reason: 'container not running',
+      writableOutDb: args.outDb,
+      verifyContainerStopped: async () => true,
+      sealAndDrainAcceptedInputs: async () => {},
+      importSideEffects: args.importSideEffects,
+      writeRecovery: () => {},
+      wakeContainer: async () => {},
+      quarantineThreshold: args.threshold ?? 2,
+    });
+  }
+
+  function quarantineRow(inDb: Database.Database, routeKey: string) {
+    return inDb.prepare('SELECT * FROM route_quarantine WHERE route_key = ?').get(routeKey) as
+      | {
+          consecutive_failures: number;
+          last_error: string | null;
+          quarantined_at: string | null;
+          reason: string | null;
+        }
+      | undefined;
+  }
+
+  it('quarantines the route after N consecutive identical import failures (fail-closed until then)', async () => {
+    const { inDb, outDb } = setupQuarantineSession();
+    addAcceptedClaim(inDb, outDb);
+    const boom = () => {
+      throw new Error('incomplete ledger evidence');
+    };
+
+    // 1st failure: below threshold -- the fail-closed throw is untouched, the
+    // turn stays blocked, and nothing is quarantined yet.
+    await expect(runBounded({ inDb, outDb, importSideEffects: boom })).rejects.toThrow(/incomplete ledger/);
+    expect(isRouteQuarantined(inDb, ROUTE)).toBe(false);
+    expect(getProcessingClaims(outDb)).toHaveLength(1);
+    expect(inDb.prepare('SELECT status FROM messages_in WHERE id = ?').get('m-q')).toEqual({ status: 'pending' });
+
+    // 2nd identical failure: crosses threshold 2 -> quarantine transition.
+    await expect(runBounded({ inDb, outDb, importSideEffects: boom })).resolves.toBe('quarantined');
+    expect(isRouteQuarantined(inDb, ROUTE)).toBe(true);
+
+    inDb.close();
+    outDb.close();
+  });
+
+  it('resets the counter on a differing error -- no quarantine at what would have been the Nth tick', async () => {
+    const { inDb, outDb } = setupQuarantineSession();
+    addAcceptedClaim(inDb, outDb);
+
+    await expect(
+      runBounded({
+        inDb,
+        outDb,
+        importSideEffects: () => {
+          throw new Error('error-alpha');
+        },
+      }),
+    ).rejects.toThrow(/error-alpha/);
+
+    // A DIFFERENT error at tick 2 resets the streak to 1 -- no quarantine even
+    // though this is the 2nd consecutive failure under threshold 2.
+    await expect(
+      runBounded({
+        inDb,
+        outDb,
+        importSideEffects: () => {
+          throw new Error('error-beta');
+        },
+      }),
+    ).rejects.toThrow(/error-beta/);
+
+    expect(isRouteQuarantined(inDb, ROUTE)).toBe(false);
+    expect(quarantineRow(inDb, ROUTE)).toMatchObject({ consecutive_failures: 1, last_error: 'error-beta' });
+    expect(getProcessingClaims(outDb)).toHaveLength(1);
+
+    inDb.close();
+    outDb.close();
+  });
+
+  it('clears tracking after a successful import for a tracked route', async () => {
+    const { inDb, outDb } = setupQuarantineSession();
+    addAcceptedClaim(inDb, outDb);
+
+    await expect(
+      runBounded({
+        inDb,
+        outDb,
+        importSideEffects: () => {
+          throw new Error('boom');
+        },
+      }),
+    ).rejects.toThrow(/boom/);
+    expect(quarantineRow(inDb, ROUTE)).toMatchObject({ consecutive_failures: 1, last_error: 'boom' });
+
+    await expect(runBounded({ inDb, outDb, importSideEffects: () => {} })).resolves.toBe('recovered');
+    expect(quarantineRow(inDb, ROUTE)).toMatchObject({ consecutive_failures: 0, last_error: null });
+    expect(isRouteQuarantined(inDb, ROUTE)).toBe(false);
+
+    inDb.close();
+    outDb.close();
+  });
+
+  it('frees the route on quarantine: recovery skipped, new inbound work unblocked, exit only via clearRouteQuarantine', async () => {
+    const { inDb, outDb } = setupQuarantineSession();
+    addAcceptedClaim(inDb, outDb);
+    const boom = () => {
+      throw new Error('incomplete ledger evidence');
+    };
+    await expect(runBounded({ inDb, outDb, importSideEffects: boom })).rejects.toThrow();
+    await expect(runBounded({ inDb, outDb, importSideEffects: boom })).resolves.toBe('quarantined');
+
+    // Route freed: the wedged claim no longer blocks or retries. Distinct
+    // terminal marker so operator review can tell these from max-retry fails.
+    expect(getProcessingClaims(outDb)).toEqual([]);
+    expect(inDb.prepare('SELECT status, tries FROM messages_in WHERE id = ?').get('m-q')).toEqual({
+      status: 'quarantined',
+      tries: 0,
+    });
+
+    // A NEW inbound message on that route is not blocked by the wedged turn.
+    inDb
+      .prepare(
+        `INSERT INTO messages_in (id, kind, status, trigger, timestamp, content)
+         VALUES ('m-new', 'message', 'pending', 1, '2026-05-29T12:05:00.000Z', '{"text":"hello"}')`,
+      )
+      .run();
+    expect(countDueMessagesExcludingRecovery(inDb, outDb)).toBe(1);
+
+    // The sweep's recovery path skips the quarantined route entirely: even
+    // with a fresh wedged claim, no further import attempt / throw loop.
+    addAcceptedClaim(inDb, outDb, { messageId: 'm-q2', inputId: 'in-q2' });
+    const importSpy = vi.fn();
+    await expect(runBounded({ inDb, outDb, importSideEffects: importSpy })).resolves.toBe('skipped-quarantined');
+    expect(importSpy).not.toHaveBeenCalled();
+
+    // Exit from quarantine is ONLY the explicit operator accessor.
+    clearRouteQuarantine(inDb, ROUTE);
+    expect(isRouteQuarantined(inDb, ROUTE)).toBe(false);
+    await expect(runBounded({ inDb, outDb, importSideEffects: () => {} })).resolves.toBe('recovered');
+
+    inDb.close();
+    outDb.close();
+  });
+
+  it('preserves the wedged turn data untouched (ledger bytes, session rows, pending inbound rows)', async () => {
+    const { sessionPath, inDb, outDb } = setupQuarantineSession();
+    const wedged = addAcceptedClaim(inDb, outDb);
+    // Unrelated pending inbound row that must survive the transition intact.
+    inDb
+      .prepare(
+        `INSERT INTO messages_in (id, kind, status, trigger, timestamp, content)
+         VALUES ('m-other', 'message', 'pending', 1, '2026-05-29T11:59:00.000Z', '{"text":"other"}')`,
+      )
+      .run();
+    // Truncated ledger: the REAL strict import (guarded in Task 4) throws.
+    const ledgerPath = path.join(sessionPath, 'side-effects.jsonl');
+    const ledgerBytes = '{"kind":"gws_mutation_completed';
+    fs.writeFileSync(ledgerPath, ledgerBytes);
+
+    const realImport = ({ containerStopped }: { containerStopped: boolean }) => {
+      importInterruptedTurnSideEffects({
+        sessionDir: sessionPath,
+        inDb,
+        outDb,
+        containerStopped,
+        stoppedAt: '2026-05-29T12:00:10.000Z',
+      });
+    };
+
+    await expect(runBounded({ inDb, outDb, importSideEffects: realImport })).rejects.toThrow(
+      /ledger|unresolved|authoritative/i,
+    );
+    await expect(runBounded({ inDb, outDb, importSideEffects: realImport })).resolves.toBe('quarantined');
+
+    // Nothing was deleted: ledger bytes, wedged session row (content intact,
+    // just parked terminally), the other pending row, and the outbound DB.
+    expect(fs.readFileSync(ledgerPath, 'utf8')).toBe(ledgerBytes);
+    expect(inDb.prepare('SELECT status, content FROM messages_in WHERE id = ?').get(wedged.messageId)).toEqual({
+      status: 'quarantined',
+      content: wedged.content,
+    });
+    expect(inDb.prepare('SELECT status FROM messages_in WHERE id = ?').get('m-other')).toEqual({
+      status: 'pending',
+    });
+    expect(fs.existsSync(path.join(sessionPath, 'outbound.db'))).toBe(true);
+
+    inDb.close();
+    outDb.close();
+  });
+
+  it('emits a loud structured route_quarantined log.error event on the transition', async () => {
+    const { inDb, outDb } = setupQuarantineSession();
+    addAcceptedClaim(inDb, outDb);
+    const errorSpy = vi.spyOn(log, 'error');
+    const boom = () => {
+      throw new Error('incomplete ledger evidence');
+    };
+
+    await expect(runBounded({ inDb, outDb, importSideEffects: boom })).rejects.toThrow();
+    expect(errorSpy).not.toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({ event: 'route_quarantined' }),
+    );
+
+    await expect(runBounded({ inDb, outDb, importSideEffects: boom })).resolves.toBe('quarantined');
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        event: 'route_quarantined',
+        routeKey: ROUTE,
+        consecutiveFailures: 2,
+        lastError: expect.stringContaining('incomplete ledger evidence'),
+      }),
+    );
+
+    inDb.close();
+    outDb.close();
   });
 });
