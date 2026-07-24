@@ -2496,6 +2496,40 @@ describe('drainAllContainers', () => {
     }
   });
 
+  it('waits for each host-side docker client to close after the runtime reports the container stopped', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      harness.oneCliRelease.resolve();
+      await harness.containerRunner.wakeContainer(harness.session);
+      expect(harness.containerRunner.getActiveContainerCount()).toBe(1);
+
+      let completeStop!: () => void;
+      harness.execFileMock.mockImplementation((_file, args, _opts, cb) => {
+        if ((args as string[])[0] === 'stop') {
+          completeStop = () => (cb as (err: null) => void)(null);
+          return;
+        }
+        (cb as (err: null, stdout: string, stderr: string) => void)(null, '', '');
+      });
+
+      let drainCompleted = false;
+      const drain = harness.containerRunner.drainAllContainers(30).then(() => {
+        drainCompleted = true;
+      });
+
+      completeStop();
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(drainCompleted).toBe(false);
+
+      harness.spawnedProcesses[0].emit('close', 0);
+      await drain;
+      expect(drainCompleted).toBe(true);
+    } finally {
+      harness.close();
+    }
+  });
+
   it('resolves even when one docker stop rejects', async () => {
     const harness = await loadContainerRunnerHarness();
     try {

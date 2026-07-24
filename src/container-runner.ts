@@ -91,6 +91,7 @@ const ONECLI_GATEWAY_PROXY_ENV_KEYS = [
 /** Active containers tracked by session ID. */
 type ActiveContainer = {
   process: ChildProcess;
+  processClosed: Promise<void>;
   containerName: string;
   leaseId: string;
   revokeGwsAfterConfirmedStop: () => boolean;
@@ -106,6 +107,7 @@ const CONTAINER_SKILLS_BIN = '/app/skills/.bin';
 const AGENT_CONTAINER_PATH = `${CONTAINER_SKILLS_BIN}:/pnpm/bin:/pnpm:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin`;
 const SESSION_CONTAINER_LABEL_KEY = 'nanoclaw-session';
 const CLEANUP_PROCESS_EXIT_TIMEOUT_MS = 30_000;
+const SHUTDOWN_CLIENT_EXIT_TIMEOUT_MS = 10_000;
 
 /**
  * In-flight wake promises, keyed by session id. Deduplicates concurrent
@@ -201,6 +203,10 @@ export async function drainAllContainers(graceSeconds = 30): Promise<void> {
       try {
         await stopContainerAsync(entry.containerName, graceSeconds);
         await verifyContainerProcessExited(sessionId, entry, 'shutdown-drain');
+        const clientClosed = await waitForProcessClose(entry, SHUTDOWN_CLIENT_EXIT_TIMEOUT_MS);
+        if (!clientClosed) {
+          throw new Error(`Host-side container client did not exit for session ${sessionId}`);
+        }
       } catch (err) {
         log.warn('Failed to stop container during drain', {
           sessionId,
@@ -368,6 +374,10 @@ async function spawnContainer(session: Session): Promise<void> {
     throw err;
   }
   if (!container) throw new Error(`Container runtime returned no process for session ${session.id}`);
+  let resolveProcessClosed!: () => void;
+  const processClosed = new Promise<void>((resolve) => {
+    resolveProcessClosed = resolve;
+  });
 
   // `docker run` reads --env-file client-side at create time. Delete the file
   // at the earliest signal that create has completed: any container output,
@@ -381,6 +391,7 @@ async function spawnContainer(session: Session): Promise<void> {
 
   activeContainers.set(session.id, {
     process: container,
+    processClosed,
     containerName,
     leaseId: launchControl.leaseId,
     revokeGwsAfterConfirmedStop: launchControl.revokeAfterConfirmedStop,
@@ -411,6 +422,7 @@ async function spawnContainer(session: Session): Promise<void> {
   // on a wall-clock timer.
 
   container.on('close', (code) => {
+    resolveProcessClosed();
     void finalizeContainerProcess(session.id, containerName, launchControl.leaseId, code, 'docker-client-close').catch(
       (err) => {
         log.error('Failed to verify container stop after docker client close', {
@@ -549,6 +561,21 @@ function processAppearsAlive(proc: ChildProcess): boolean {
     return true;
   } catch {
     return false;
+  }
+}
+
+async function waitForProcessClose(entry: ActiveContainer, timeoutMs: number): Promise<boolean> {
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      entry.processClosed.then(() => true),
+      new Promise<boolean>((resolve) => {
+        timeout = setTimeout(() => resolve(false), timeoutMs);
+        timeout.unref();
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
   }
 }
 
