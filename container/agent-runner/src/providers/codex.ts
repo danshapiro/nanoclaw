@@ -13,6 +13,7 @@
  * only pushes once it has new pending messages, and we only drain between
  * turns, so no message is dropped).
  */
+import { createHash } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
@@ -130,27 +131,40 @@ export function prepareCodexInputText(input: string): string {
   );
 }
 
-function readAgentAndGlobalClaudeMd(): string | undefined {
-  // Per-group CLAUDE.md is responsible for pulling in the global instructions
-  // if the group wants them (the default scaffold starts with
-  // `@./.claude-global.md` which resolveClaudeImports inlines). Appending
-  // `/workspace/global/CLAUDE.md` explicitly here would double-inline the
-  // global content for any non-main group, wasting context tokens and
-  // risking contradictory instructions. Groups that don't import global
-  // intentionally don't get it — same as Claude-backed agents.
-  const groupDir = '/workspace/agent';
+/** @internal exported for unit tests */
+export function readAgentAndGlobalClaudeMd(
+  groupDir = '/workspace/agent',
+  globalDir = '/workspace/global',
+): { text: string | undefined; sources: Record<string, number> } {
+  // Load order (mirrors the OpenCode provider's instructions list):
+  //  1. <groupDir>/CLAUDE.md — composed at spawn: shared base + module
+  //     fragments, inlined via @-imports
+  //  2. <globalDir>/CLAUDE.local.md — global persona and effort directives,
+  //     mounted read-only into every container
+  //  3. <groupDir>/CLAUDE.local.md — per-group memory (loaded last, highest
+  //     precedence)
+  // The composed group CLAUDE.md no longer imports the global layer
+  // (composeGroupClaudeMd emits only local imports, and the CLAUDE.local.md
+  // migration deletes the legacy `.claude-global.md` symlink), so the global
+  // file must be read explicitly here or Codex groups never receive it.
   const groupPath = `${groupDir}/CLAUDE.md`;
+  const globalPath = `${globalDir}/CLAUDE.local.md`;
   const localPath = `${groupDir}/CLAUDE.local.md`;
   const parts: string[] = [];
+  const sources: Record<string, number> = {};
 
-  if (fs.existsSync(groupPath)) {
-    parts.push(resolveClaudeImports(fs.readFileSync(groupPath, 'utf-8'), groupDir));
-  }
-  if (fs.existsSync(localPath)) {
-    parts.push(resolveClaudeImports(fs.readFileSync(localPath, 'utf-8'), groupDir));
-  }
+  const load = (label: string, filePath: string, baseDir: string) => {
+    if (!fs.existsSync(filePath)) return;
+    const text = resolveClaudeImports(fs.readFileSync(filePath, 'utf-8'), baseDir);
+    parts.push(text);
+    sources[label] = text.length;
+  };
 
-  return parts.length > 0 ? parts.join('\n\n---\n\n') : undefined;
+  load('agent/CLAUDE.md', groupPath, groupDir);
+  load('global/CLAUDE.local.md', globalPath, globalDir);
+  load('agent/CLAUDE.local.md', localPath, groupDir);
+
+  return { text: parts.length > 0 ? parts.join('\n\n---\n\n') : undefined, sources };
 }
 
 function codexSkillsDir(): string {
@@ -287,12 +301,24 @@ export function buildNanoclawSkillInventoryInstructions(skillsRoot = NANOCLAW_SK
 function composeBaseInstructions(promptAddendum: string | undefined): string | undefined {
   const claudeMd = readAgentAndGlobalClaudeMd();
   const pieces = [
-    claudeMd,
+    claudeMd.text,
     CODEX_NANOCLAW_BRIDGE_INSTRUCTIONS,
     buildNanoclawSkillInventoryInstructions(),
     promptAddendum,
   ].filter((s): s is string => Boolean(s));
-  return pieces.length > 0 ? pieces.join('\n\n---\n\n') : undefined;
+  const composed = pieces.length > 0 ? pieces.join('\n\n---\n\n') : undefined;
+
+  // Payload proof: log which instruction layers were actually delivered to
+  // Codex so a missing layer (e.g. global/CLAUDE.local.md) is observable in
+  // container logs instead of silently absent from the model's context.
+  logStructured('codex_base_instructions_composed', {
+    totalChars: composed?.length ?? 0,
+    sha256: composed ? createHash('sha256').update(composed).digest('hex') : null,
+    claudeMdSources: claudeMd.sources,
+    hasPromptAddendum: Boolean(promptAddendum),
+  });
+
+  return composed;
 }
 
 // ── Provider ────────────────────────────────────────────────────────────────
