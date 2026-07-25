@@ -33,7 +33,7 @@ import fs from 'fs';
 
 import { getActiveSessions, getSession } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
-import { withRuntimeLock } from './db/runtime-locks.js';
+import { RuntimeLockHeldError, withRuntimeLock } from './db/runtime-locks.js';
 import {
   assertHostGwsSideEffectsReconciledForScopes,
   assertNoUnresolvedGwsReconciliationRecords,
@@ -400,7 +400,14 @@ async function sweepSession(session: Session): Promise<void> {
         ensureSessionSchedulerProjections(inDb, session, resolveProjectionContext(session), owner);
       });
     } catch (err) {
-      log.error('Scheduler sync failed during host sweep', { sessionId: session.id, err });
+      if (err instanceof RuntimeLockHeldError) {
+        // Another in-process task holds the scheduler-mutator lock. The sweep
+        // revisits every session on its next interval, so this is a benign
+        // deferral, not a failure.
+        log.warn('Scheduler sync deferred during host sweep: mutator lock held', { sessionId: session.id });
+      } else {
+        log.error('Scheduler sync failed during host sweep', { sessionId: session.id, err });
+      }
     }
 
     // 3. Recover a crashed accepted turn before any replacement can wake.

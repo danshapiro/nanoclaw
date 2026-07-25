@@ -10,6 +10,7 @@ import { DATA_DIR } from './config.js';
 import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
 import { initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
+import { clearStaleRuntimeLocks } from './db/runtime-locks.js';
 import { ensureContainerRuntimeRunning, cleanupOrphansVerified } from './container-runtime.js';
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
@@ -68,6 +69,7 @@ async function main(): Promise<void> {
   const dbPath = path.join(DATA_DIR, 'v2.db');
   const db = initDb(dbPath);
   runMigrations(db);
+  clearStaleRuntimeLocks();
   log.info('Central DB ready', { path: dbPath });
   // 1b. One-time filesystem cutover — idempotent, no-op after first run.
   migrateGroupsToClaudeLocal();

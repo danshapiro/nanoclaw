@@ -20,6 +20,37 @@ interface RuntimeLockRow {
 const ownerId = `${hostname()}:${process.pid}`;
 const lockOwners = new AsyncLocalStorage<Map<string, RuntimeLockOwner>>();
 
+/**
+ * Thrown when a runtime lock is already held by an unexpired owner. Callers
+ * that can safely retry later (e.g. the periodic host sweep) should treat
+ * this as a deferral rather than a failure.
+ */
+export class RuntimeLockHeldError extends Error {
+  constructor(name: string) {
+    super(`Runtime lock "${name}" is already held by an unexpired owner`);
+    this.name = 'RuntimeLockHeldError';
+  }
+}
+
+/**
+ * Delete runtime lock rows left behind by previous process instances.
+ *
+ * Runtime locks coordinate async tasks within the single NanoClaw service
+ * process; owner_id embeds the pid, so after a restart any row with a
+ * different owner_id belongs to a dead process. Without this cleanup, a lock
+ * held at shutdown (e.g. scheduler-mutator, 120s TTL, taken per-session by
+ * the historical host sweep) blocks the restarted process's sweeps until the
+ * TTL expires — observed as a burst of "Scheduler sync failed during host
+ * sweep" errors right after restart.
+ */
+export function clearStaleRuntimeLocks(): number {
+  const result = getDb().prepare('DELETE FROM runtime_locks WHERE owner_id != ?').run(ownerId);
+  if (result.changes > 0) {
+    log.info('Cleared stale runtime locks from previous process instances', { count: result.changes });
+  }
+  return result.changes;
+}
+
 function nowIso(): string {
   return new Date(Date.now()).toISOString();
 }
@@ -60,7 +91,7 @@ export function acquireRuntimeLock(name: string, ttlMs: number): RuntimeLockOwne
 
   if (result.changes !== 1) {
     log.warn('Runtime lock acquisition rejected', { name, ownerId });
-    throw new Error(`Runtime lock "${name}" is already held by an unexpired owner`);
+    throw new RuntimeLockHeldError(name);
   }
 
   log.debug('Runtime lock acquired', { name, ownerId });

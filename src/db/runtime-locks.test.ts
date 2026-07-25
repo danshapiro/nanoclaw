@@ -4,7 +4,9 @@ import { closeDb, getDb, initTestDb, runMigrations } from './index.js';
 import {
   acquireRuntimeLock,
   assertRuntimeLockOwner,
+  clearStaleRuntimeLocks,
   renewRuntimeLock,
+  RuntimeLockHeldError,
   withRuntimeLock,
   type RuntimeLockOwner,
 } from './runtime-locks.js';
@@ -152,5 +154,47 @@ describe('runtime locks', () => {
       insertLock(owner.name, 'other-owner', 'other-token', new Date(Date.now() + 10_000).toISOString());
       expect(() => assertRuntimeLockOwner(owner)).toThrow(/owner token/);
     });
+  });
+
+  it('throws RuntimeLockHeldError when the lock is held by an unexpired owner', () => {
+    insertLock('scheduler-mutator', 'other-host:999999', 'other-token', new Date(Date.now() + 120_000).toISOString());
+    let thrown: unknown;
+    try {
+      acquireRuntimeLock('scheduler-mutator', 1_000);
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(RuntimeLockHeldError);
+    expect((thrown as Error).message).toMatch(/already held by an unexpired owner/);
+  });
+
+  it('clearStaleRuntimeLocks removes rows from previous process instances', async () => {
+    // Simulate locks left behind by a killed prior process (different pid).
+    insertLock('scheduler-mutator', 'other-host:999999', 'stale-token-1', new Date(Date.now() + 120_000).toISOString());
+    insertLock('another-lock', 'other-host:999998', 'stale-token-2', new Date(Date.now() - 1_000).toISOString());
+
+    const cleared = clearStaleRuntimeLocks();
+    expect(cleared).toBe(2);
+    expect(lockRow('scheduler-mutator')).toBeUndefined();
+    expect(lockRow('another-lock')).toBeUndefined();
+
+    // The previously "held" lock is immediately acquirable again.
+    await withRuntimeLock('scheduler-mutator', 1_000, () => {});
+  });
+
+  it('clearStaleRuntimeLocks preserves locks held by the current process', async () => {
+    const entered = deferred();
+    const release = deferred();
+    const locked = withRuntimeLock('scheduler', 10_000, async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    await entered.promise;
+
+    expect(clearStaleRuntimeLocks()).toBe(0);
+    expect(lockRow('scheduler')).toBeDefined();
+
+    release.resolve();
+    await locked;
   });
 });

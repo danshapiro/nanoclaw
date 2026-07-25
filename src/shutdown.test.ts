@@ -19,6 +19,7 @@ vi.mock('./config.js', () => ({ DATA_DIR: '/tmp/nanoclaw-shutdown-test' }));
 vi.mock('./claude-md-compose.js', () => ({ migrateGroupsToClaudeLocal: vi.fn() }));
 vi.mock('./db/connection.js', () => ({ initDb: vi.fn() }));
 vi.mock('./db/migrations/index.js', () => ({ runMigrations: vi.fn() }));
+vi.mock('./db/runtime-locks.js', () => ({ clearStaleRuntimeLocks: vi.fn() }));
 vi.mock('./container-runtime.js', () => ({
   ensureContainerRuntimeRunning: vi.fn(),
   cleanupOrphans: vi.fn(),
