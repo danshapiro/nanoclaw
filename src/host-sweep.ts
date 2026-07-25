@@ -333,6 +333,11 @@ async function runHostSweepPass(): Promise<void> {
       } catch (err) {
         log.error('Host sweep session error', { sessionId: session.id, err });
       }
+      // A large historical session set can otherwise form one continuous
+      // microtask chain. Yield a full event-loop turn so container-exit
+      // recovery timers and normal channel I/O are not delayed until the
+      // entire sweep finishes.
+      await new Promise<void>((resolve) => setImmediate(resolve));
     }
   } catch (err) {
     log.error('Host sweep error', { err });
