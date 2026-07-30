@@ -45,7 +45,7 @@
 
 **Conditionally terminal `failed`, with the lease KEPT.** The spec requires all three of: (a) the wrapper marks a route `failed` when forwarding throws, (b) catch-up retries failed messages ("POST failure: … retried next run"), and (c) bounded abandonment ("3rd failure → terminal failed"). These are satisfied by making `failed` **conditionally terminal**: `markDiscordMessageFailed` records `status='failed'` and KEEPS `lease_expires_at` — a `failed` row inside its lease refuses reclaim as `active-lease`, so the live forwarder's rapid HTTP retries (250 ms / 1000 ms) cannot burn multiple claim attempts on one transient blip. After the lease expires, `claimDiscordMessage` re-claims a `failed` row (bumping `attempts`) while `attempts < DISCORD_ROUTE_MAX_ATTEMPTS (= 3)`, and refuses (`status: 'abandoned'`) once `attempts >= 3`. `isDiscordMessageTerminal` is true for `routed` or (`failed` AND `attempts >= 3`). The engine's own POSTs are SINGLE-ATTEMPT (`retryDelaysMs: []`), so each of the 3 attempts is a genuinely separate recovery opportunity (a separate live delivery or catch-up run), never an intra-call HTTP retry.
 
-**Who re-presents a failed row (the stranded-row sweep).** The cursor walk only fetches messages AFTER the cursor; a live failure followed by a later live success on the same channel leaves the failed row BEHIND the cursor, where the walk can never see it again. Retries of such rows are therefore driven by the sweep, not the cursor walk: every run, `doRun` re-presents up to 50 rows from `listRetriableDiscordMessageRoutes` (retriable `failed` rows plus expired-lease `processing` orphans from crashes between claim and mark) by fetching each message individually (`GET /channels/{channel_id}/messages/{message_id}`) and re-POSTing it through the same synthesis path — with NO cursor movement (the cursor is already past these rows). A 404 (message deleted) burns one bounded claim attempt and records the failure, so the row stops recurring. Net effect: attempt 1 (live or catch-up) fails → retried by the sweep or the walk; attempt 2 fails → retried; attempt 3 fails → terminal, catch-up logs `Discord catch-up abandoned message` (ERROR) — the walk advances the cursor past terminal rows — bounded, never wedges a channel, and a single transient pre-dispatch/transport error can never permanently lose a message.
+**Who re-presents a failed row (the stranded-row sweep).** The cursor walk only fetches messages AFTER the cursor; a live failure followed by a later live success on the same channel leaves the failed row BEHIND the cursor, where the walk can never see it again. Retries of such rows are therefore driven by the sweep, not the cursor walk: every run, `doRun` re-presents up to 50 rows from `listRetriableDiscordMessageRoutes` (retriable `failed` rows plus expired-lease `processing` orphans from crashes between claim and mark) by fetching each message individually (`GET /channels/{channel_id}/messages/{message_id}`) and re-POSTing it through the same synthesis path — with NO cursor movement (the cursor is already past these rows). A 404 (message deleted) or a non-guild (DM) row burns one bounded claim attempt and records the failure, so the row stops recurring; the listing itself is horizon-filtered in SQL (`first_seen_at >= now - maxAge`), so aged rows can never occupy the oldest-first LIMIT budget and starve newer retriable rows. Net effect: attempt 1 (live or catch-up) fails → retried by the sweep or the walk; attempt 2 fails → retried; attempt 3 fails → terminal, catch-up logs `Discord catch-up abandoned message` (ERROR) — the walk advances the cursor past terminal rows — bounded, never wedges a channel, and a single transient pre-dispatch/transport error can never permanently lose a message.
 
 **Routed means verified-routed.** A webhook 200 is NOT proof of routing: a duplicate-drop and an abandoned/active-lease refusal also answer 200. After every POST the engine reads the row via `getDiscordMessageRouteStatus` and only counts routed / marks `source='catchup'` / advances the cursor when the row is genuinely `'routed'`. The one non-routed case that advances the cursor is a terminal-abandoned row (`failed` AND `attempts >= 3`), logged `Discord catch-up abandoned message` at ERROR.
 
@@ -602,8 +602,9 @@ export function pruneDiscordMessageRoutes(cutoff: string): number; // deletes st
 export function markDiscordMessageSource(channelId: string, messageId: string, source: 'gateway' | 'catchup'): void;
 export function listRetriableDiscordMessageRoutes(
   now: string,
+  horizon: string,
   limit: number,
-): Array<{ channel_id: string; message_id: string; first_seen_at: string }>; // sweep feed (A11): failed & attempts < max & lease expired, plus processing & lease expired; oldest first
+): Array<{ channel_id: string; message_id: string; first_seen_at: string }>; // sweep feed (A11): failed & attempts < max & lease expired, plus processing & lease expired; first_seen_at >= horizon ONLY (aged rows must never occupy the LIMIT budget — starvation guard); oldest first
 ```
 
 - [ ] **Step 1: Add the failing tests**
@@ -678,9 +679,13 @@ describe('Discord channel cursors and route hygiene', () => {
       );
       markDiscordMessageFailed('c1', 'm-abandoned', `2026-07-30T00:0${attempt}:01.000Z`, 'poison');
     }
-    const rows = listRetriableDiscordMessageRoutes('2026-07-30T01:00:00.000Z', 10);
+    const rows = listRetriableDiscordMessageRoutes('2026-07-30T01:00:00.000Z', '2026-01-01T00:00:00.000Z', 10);
     expect(rows.map((r) => r.message_id)).toEqual(['m-failed', 'm-orphan']);
-    expect(listRetriableDiscordMessageRoutes('2026-07-30T01:00:00.000Z', 1).map((r) => r.message_id)).toEqual([
+    expect(
+      listRetriableDiscordMessageRoutes('2026-07-30T01:00:00.000Z', '2026-01-01T00:00:00.000Z', 1).map(
+        (r) => r.message_id,
+      ),
+    ).toEqual([
       'm-failed',
     ]);
   });
@@ -688,7 +693,23 @@ describe('Discord channel cursors and route hygiene', () => {
   it('does not list a failed row while its lease is still unexpired (live retry window)', () => {
     claimDiscordMessage('c1', 'm-fresh-fail', META, T0, '2027-01-01T00:00:00.000Z');
     markDiscordMessageFailed('c1', 'm-fresh-fail', T1, 'boom');
-    expect(listRetriableDiscordMessageRoutes(AFTER_LEASE, 10)).toEqual([]);
+    expect(listRetriableDiscordMessageRoutes(AFTER_LEASE, '2026-01-01T00:00:00.000Z', 10)).toEqual([]);
+  });
+
+  it('excludes rows older than the horizon from the sweep budget (no starvation)', () => {
+    // Aged row (first_seen before the horizon): must not occupy a LIMIT slot.
+    claimDiscordMessage('c1', 'm-aged', META, '2026-01-01T00:00:00.000Z', '2026-01-01T00:02:00.000Z');
+    markDiscordMessageFailed('c1', 'm-aged', '2026-01-01T00:00:01.000Z', 'boom');
+    // Fresh retriable row inside the horizon.
+    claimDiscordMessage('c1', 'm-fresh', META, T0, T0_LEASE);
+    markDiscordMessageFailed('c1', 'm-fresh', T1, 'boom');
+    // With LIMIT 1 and oldest-first ordering, an out-of-horizon row would
+    // otherwise permanently shadow every newer retriable row (starvation).
+    expect(
+      listRetriableDiscordMessageRoutes('2026-07-30T01:00:00.000Z', '2026-07-27T01:00:00.000Z', 1).map(
+        (r) => r.message_id,
+      ),
+    ).toEqual(['m-fresh']);
   });
 });
 ```
@@ -752,21 +773,26 @@ export function markDiscordMessageSource(channelId: string, messageId: string, s
  * mark). Rows behind the cursor are invisible to the after=cursor walk; this
  * list is their ONLY re-presentation path. Lease gating keeps the sweep from
  * racing a live delivery (or a just-failed row still inside its kept lease).
+ * The horizon filter lives IN THE SQL (not in the caller): with oldest-first
+ * ordering and a LIMIT, rows older than the backfill horizon would otherwise
+ * permanently occupy the budget and starve every newer retriable row.
  */
 export function listRetriableDiscordMessageRoutes(
   now: string,
+  horizon: string,
   limit: number,
 ): Array<{ channel_id: string; message_id: string; first_seen_at: string }> {
   return getDb()
     .prepare(
       `SELECT channel_id, message_id, first_seen_at
          FROM discord_message_routes
-        WHERE (status = 'failed' AND attempts < ? AND (lease_expires_at IS NULL OR lease_expires_at < ?))
-           OR (status = 'processing' AND lease_expires_at IS NOT NULL AND lease_expires_at < ?)
+        WHERE first_seen_at >= ?
+          AND ((status = 'failed' AND attempts < ? AND (lease_expires_at IS NULL OR lease_expires_at < ?))
+           OR (status = 'processing' AND lease_expires_at IS NOT NULL AND lease_expires_at < ?))
         ORDER BY first_seen_at
         LIMIT ?`,
     )
-    .all(DISCORD_ROUTE_MAX_ATTEMPTS, now, now, limit) as Array<{
+    .all(horizon, DISCORD_ROUTE_MAX_ATTEMPTS, now, now, limit) as Array<{
     channel_id: string;
     message_id: string;
     first_seen_at: string;
@@ -777,7 +803,7 @@ export function listRetriableDiscordMessageRoutes(
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `pnpm exec vitest run src/channels/discord-state.test.ts`
-Expected: PASS (12 tests).
+Expected: PASS (13 tests).
 
 - [ ] **Step 5: Full-suite + commit**
 
@@ -1597,14 +1623,35 @@ export function createDiscordCatchup(deps: DiscordCatchupDeps): DiscordCatchup {
     row: { channel_id: string; message_id: string },
     summary: DiscordCatchupRunSummary,
   ): Promise<void> {
+    const boundOut = (guild: string | null, reason: string): void => {
+      // Burn one BOUNDED claim attempt and record the failure: after
+      // DISCORD_ROUTE_MAX_ATTEMPTS sweeps the row is terminal and the SQL
+      // stops listing it — attempts stay bounded, the sweep never loops forever.
+      const nowStr = nowIso();
+      claimDiscordMessage(
+        row.channel_id,
+        row.message_id,
+        { guildId: guild, authorId: null, source: 'catchup' },
+        nowStr,
+        new Date(now() + config.routeLeaseMs).toISOString(),
+      );
+      markDiscordMessageFailed(row.channel_id, row.message_id, nowStr, reason);
+      summary.failed += 1;
+    };
     let guildId = guildCache.get(row.channel_id);
     if (guildId === undefined) {
       const info = await discordGetJson<{ guild_id?: string }>(`/channels/${encodeURIComponent(row.channel_id)}`);
-      if (!info) return; // channel unreadable this run; the row stays listed for next run
+      if (!info) return; // channel unreadable THIS run (transient); the SQL horizon bounds how long such rows can hold a budget slot
       guildId = typeof info.guild_id === 'string' && info.guild_id.length > 0 ? info.guild_id : null;
       guildCache.set(row.channel_id, guildId);
     }
-    if (guildId === null) return; // non-guild channels are out of scope v1 (matches the walk)
+    if (guildId === null) {
+      // Non-guild (DM) rows are PERMANENTLY out of scope v1 (matches the walk):
+      // drive them terminal instead of letting them occupy a sweep-budget slot
+      // on every run until the horizon ages them out.
+      boundOut(null, 'non-guild channel out of scope (v1)');
+      return;
+    }
 
     // One-shot fetch by id — we need the raw status code to detect deletion.
     const response = await fetchImpl(
@@ -1613,23 +1660,8 @@ export function createDiscordCatchup(deps: DiscordCatchupDeps): DiscordCatchup {
     );
     await sleep(DISCORD_CATCHUP_REST_PACING_MS);
     if (response.status === 429) return; // rate-limited: the row stays listed for next run
-    const boundOut = (reason: string): void => {
-      // Burn one BOUNDED claim attempt and record the failure: after
-      // DISCORD_ROUTE_MAX_ATTEMPTS sweeps the row is terminal and the SQL
-      // stops listing it — attempts stay bounded, the sweep never loops forever.
-      const nowStr = nowIso();
-      claimDiscordMessage(
-        row.channel_id,
-        row.message_id,
-        { guildId, authorId: null, source: 'catchup' },
-        nowStr,
-        new Date(now() + config.routeLeaseMs).toISOString(),
-      );
-      markDiscordMessageFailed(row.channel_id, row.message_id, nowStr, reason);
-      summary.failed += 1;
-    };
     if (response.status === 404) {
-      boundOut('message deleted (404) during sweep');
+      boundOut(guildId, 'message deleted (404) during sweep');
       return;
     }
     if (!response.ok) {
@@ -1643,7 +1675,7 @@ export function createDiscordCatchup(deps: DiscordCatchupDeps): DiscordCatchup {
     const message = (await response.json()) as DiscordRestMessage;
     summary.fetched += 1;
     if (!ROUTABLE_MESSAGE_TYPES.has(message.type)) {
-      boundOut('non-routable message type');
+      boundOut(guildId, 'non-routable message type');
       return;
     }
     const event = {
@@ -1719,10 +1751,13 @@ export function createDiscordCatchup(deps: DiscordCatchupDeps): DiscordCatchup {
       // success leaves a retriable 'failed' (or crash-orphaned 'processing')
       // row BEHIND the cursor, where the after=cursor walk can never see it
       // again. Re-present each such row individually. NO cursor movement here.
-      const sweepCutoffIso = new Date(now() - config.maxAgeMs).toISOString();
-      for (const row of listRetriableDiscordMessageRoutes(nowIso(), 50)) {
+      // Horizon enforced IN the SQL (starvation guard): rows older than the
+      // backfill horizon are excluded by the query itself, so they can never
+      // occupy one of the 50 oldest-first budget slots and starve newer
+      // retriable rows — an aged row is an accepted residual.
+      const sweepHorizonIso = new Date(now() - config.maxAgeMs).toISOString();
+      for (const row of listRetriableDiscordMessageRoutes(nowIso(), sweepHorizonIso, 50)) {
         if (now() > deadline) break;
-        if (row.first_seen_at < sweepCutoffIso) continue; // outside the backfill horizon — accepted residual
         try {
           await sweepRetriableRoute(row, summary);
         } catch (error) {
@@ -1763,7 +1798,7 @@ export function createDiscordCatchup(deps: DiscordCatchupDeps): DiscordCatchup {
 }
 ```
 
-Sweep semantics (A11): the sweep is the ONLY re-presentation path for rows behind the cursor. It uses the same single-attempt POST + row-status verification as the walk (anything else would reintroduce the A16 holes), never moves any cursor, and bounds every row: routed rows and attempts-exhausted rows drop out of `listRetriableDiscordMessageRoutes` by SQL; deleted (404) and non-routable messages are bounded out by burning one claim attempt per run until terminal. Sweep re-delivery is out-of-order relative to the walk (an older stranded message may arrive after newer ones) — the same ordering exposure the spec already accepts.
+Sweep semantics (A11): the sweep is the ONLY re-presentation path for rows behind the cursor. It uses the same single-attempt POST + row-status verification as the walk (anything else would reintroduce the A16 holes), never moves any cursor, and bounds every row: routed rows, attempts-exhausted rows, and rows older than the backfill horizon drop out of `listRetriableDiscordMessageRoutes` by SQL (the horizon lives in the query precisely so aged rows can never occupy the oldest-first LIMIT budget and starve newer retriable rows); deleted (404), non-routable, and non-guild (DM) rows are bounded out by burning one claim attempt per run until terminal; unreadable-channel and rate-limited rows stay listed but are horizon-bounded. Sweep re-delivery is out-of-order relative to the walk (an older stranded message may arrive after newer ones) — the same ordering exposure the spec already accepts.
 
 Note on the import cycle: `discord-catchup.ts` imports `forwardDiscordGatewayEventWithRetry` from `./discord.js`, and Task 11 makes `discord.ts` import from `./discord-catchup.js`. Both are function-level uses (no top-level execution of each other's bindings), so the ESM cycle is benign — but if `pnpm exec tsc --noEmit` or runtime import order complains, move `forwardDiscordGatewayEventWithRetry`, `GATEWAY_FORWARD_RETRY_DELAYS_MS`, and `isTransientGatewayForwardError` into a new leaf module `src/channels/discord-gateway-forward.ts` and re-export them from `discord.ts` (`export { forwardDiscordGatewayEventWithRetry, GATEWAY_FORWARD_RETRY_DELAYS_MS } from './discord-gateway-forward.js';`) so existing imports keep working.
 
@@ -1880,14 +1915,18 @@ Append to the `describe('createDiscordCatchup runOnce', …)` block:
 
   it('prunes old routed rows on periodic runs only', async () => {
     advanceDiscordChannelCursor('chan-1', '500', '2026-07-30T00:00:00.000Z');
+    // makeEngine's default clock is 1753900000000 = 2025-07-30T18:26:40Z, so
+    // the periodic prune cutoff (now - 30d) is ~2025-06-30. The "ancient"
+    // routed row must predate THAT cutoff — 2025-01-01, NOT a 2026 date
+    // (2026 would be in the engine clock's future and never pruned).
     claimDiscordMessage(
       'chan-1',
       'ancient',
       { guildId: 'guild-1', authorId: 'user-1', source: 'gateway' },
-      '2026-01-01T00:00:00.000Z',
-      '2026-01-01T00:02:00.000Z',
+      '2025-01-01T00:00:00.000Z',
+      '2025-01-01T00:02:00.000Z',
     );
-    markDiscordMessageRouted('chan-1', 'ancient', '2026-01-01T00:00:01.000Z');
+    markDiscordMessageRouted('chan-1', 'ancient', '2025-01-01T00:00:01.000Z');
     const transport = () =>
       fakeTransport({
         '/channels/chan-1?': [json(CHANNEL_INFO)],
@@ -2836,12 +2875,22 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { closeDb, getDb, initTestDb } from '../db/connection.js';
 import { runMigrations } from '../db/migrations/index.js';
-import { createDiscordCatchup } from './discord-catchup.js';
+import { createDiscordCatchup, unixMsToSnowflake } from './discord-catchup.js';
 import { wrapYenteDiscordChannelIds } from './discord.js';
 import { advanceDiscordChannelCursor, getDiscordChannelCursor } from './discord-state.js';
 
 const CHANNEL = '1516341314621276171'; // the incident channel
 const GUILD = 'guild-1';
+
+// The engine clamps stale cursors to now - 72h (default maxAgeMs), and the
+// REST fake below keys pages on the EXACT `after` value — so the cursor and
+// message ids MUST be realistic snowflakes inside the 72h window of the
+// injected clock. Toy ids like '600'/'601' decode to ~2015 timestamps: the
+// clamp would rewrite the cursor and the fake would return [] for everything.
+const NOW_MS = 1753900000000;
+const CURSOR = unixMsToSnowflake(NOW_MS - 60 * 60 * 1000); // 1h before "now"
+const MSG_1 = unixMsToSnowflake(NOW_MS - 30 * 60 * 1000);
+const MSG_2 = unixMsToSnowflake(NOW_MS - 15 * 60 * 1000);
 
 function restMessage(id: string): Record<string, unknown> {
   return {
@@ -2912,7 +2961,7 @@ describe('discord catch-up integration: gap message routed exactly once', () => 
     const webhookUrl = `http://127.0.0.1:${port}/webhook`;
 
     // --- fake Discord REST; real fetch for the loopback webhook ---
-    const pages: Record<string, unknown[]> = { '600': [restMessage('601'), restMessage('602')], '602': [] };
+    const pages: Record<string, unknown[]> = { [CURSOR]: [restMessage(MSG_1), restMessage(MSG_2)], [MSG_2]: [] };
     const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
       if (url.startsWith('http://127.0.0.1')) return fetch(input as never, init);
@@ -2921,14 +2970,14 @@ describe('discord catch-up integration: gap message routed exactly once', () => 
         return new Response(JSON.stringify(pages[after] ?? []), { status: 200 });
       }
       if (url.includes(`/channels/${CHANNEL}`)) {
-        return new Response(JSON.stringify({ id: CHANNEL, guild_id: GUILD, last_message_id: '602' }), { status: 200 });
+        return new Response(JSON.stringify({ id: CHANNEL, guild_id: GUILD, last_message_id: MSG_2 }), { status: 200 });
       }
       if (url.includes('/threads/active')) return new Response(JSON.stringify({ threads: [] }), { status: 200 });
       return new Response('[]', { status: 200 });
     }) as typeof fetch;
 
-    // The gap: cursor sits at 600; messages 601 and 602 arrived while disconnected.
-    advanceDiscordChannelCursor(CHANNEL, '600', '2026-07-30T00:00:00.000Z');
+    // The gap: the cursor sits 1h back; MSG_1 and MSG_2 arrived while disconnected.
+    advanceDiscordChannelCursor(CHANNEL, CURSOR, '2026-07-30T00:00:00.000Z');
 
     const engine = createDiscordCatchup({
       botToken: 'test-token',
@@ -2937,6 +2986,7 @@ describe('discord catch-up integration: gap message routed exactly once', () => 
       env: {},
       fetchImpl,
       sleep: async () => {},
+      now: () => NOW_MS, // pins the 72h clamp window CURSOR/MSG_1/MSG_2 are built against
     });
 
     const summary = await engine.runOnce('ready');
@@ -2946,22 +2996,24 @@ describe('discord catch-up integration: gap message routed exactly once', () => 
     expect(inner.handleForwardedMessage).toHaveBeenCalledTimes(2);
     expect(inner.createDiscordThread).toHaveBeenCalledTimes(2);
     const first = inner.handleForwardedMessage.mock.calls[0]?.[0] as Record<string, unknown>;
-    expect(first.id).toBe('601');
+    expect(first.id).toBe(MSG_1);
     expect(first.guild_id).toBe(GUILD); // injected for thread-id derivation
     expect(first.thread).toEqual({ id: 'thread-new', parent_id: CHANNEL });
-    expect(getDiscordChannelCursor(CHANNEL)).toBe('602');
+    expect(getDiscordChannelCursor(CHANNEL)).toBe(MSG_2);
 
     // Route rows are terminal and attributed to catch-up.
     const rows = getDb()
       .prepare(`SELECT message_id, status, source FROM discord_message_routes ORDER BY message_id`)
       .all() as Array<{ message_id: string; status: string; source: string }>;
+    // MSG_1 and MSG_2 are same-length snowflakes, so ORDER BY message_id
+    // (lexicographic) matches numeric order here.
     expect(rows).toEqual([
-      { message_id: '601', status: 'routed', source: 'catchup' },
-      { message_id: '602', status: 'routed', source: 'catchup' },
+      { message_id: MSG_1, status: 'routed', source: 'catchup' },
+      { message_id: MSG_2, status: 'routed', source: 'catchup' },
     ]);
 
-    // NO-DUPLICATE: a late live gateway replay of 601 is dropped at the choke point.
-    await wrapped.handleForwardedMessage(restMessage('601'), {});
+    // NO-DUPLICATE: a late live gateway replay of MSG_1 is dropped at the choke point.
+    await wrapped.handleForwardedMessage(restMessage(MSG_1), {});
     expect(inner.handleForwardedMessage).toHaveBeenCalledTimes(2); // unchanged
     expect(inner.createDiscordThread).toHaveBeenCalledTimes(2); // no second thread
 
@@ -2976,7 +3028,7 @@ describe('discord catch-up integration: gap message routed exactly once', () => 
 - [ ] **Step 2: Run test to verify current state**
 
 Run: `pnpm exec vitest run src/channels/discord-catchup.integration.test.ts`
-Expected: PASS if Tasks 1–11 are correct. Any FAIL is a real integration bug (most likely candidates: URL matching order in the REST fake — the `/channels/{id}/messages` check must come BEFORE the `/channels/{id}` check, as written; or the engine advancing the cursor with a different `after` than `600`). Fix the production code or the fake's fidelity — never weaken the assertions.
+Expected: PASS if Tasks 1–11 are correct. Any FAIL is a real integration bug (most likely candidates: URL matching order in the REST fake — the `/channels/{id}/messages` check must come BEFORE the `/channels/{id}` check, as written; or the engine advancing the cursor with a different `after` than `CURSOR`). Fix the production code or the fake's fidelity — never weaken the assertions.
 
 - [ ] **Step 3: Full-suite + commit**
 
