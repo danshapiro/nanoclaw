@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { closeDb, getDb, initTestDb } from '../db/connection.js';
 import { runMigrations } from '../db/migrations/index.js';
@@ -478,5 +478,92 @@ describe('createDiscordCatchup runOnce', () => {
     expect(summary?.routed).toBe(1);
     expect(getDiscordMessageRouteStatus('chan-1', '498')).toBe('routed');
     expect(getDiscordChannelCursor('chan-1')).toBe('500'); // the sweep NEVER moves the cursor
+  });
+});
+
+describe('createDiscordCatchup triggers', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    const db = initTestDb();
+    runMigrations(db);
+    advanceDiscordChannelCursor('chan-1', '500', '2026-07-30T00:00:00.000Z');
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    closeDb();
+  });
+
+  function timerEngine(env: NodeJS.ProcessEnv = {}) {
+    // Empty pages: each run costs 1 channel-info fetch (first run only) + 1 messages fetch.
+    const transport = fakeTransport({
+      '/channels/chan-1?': [json(CHANNEL_INFO), json(CHANNEL_INFO), json(CHANNEL_INFO)],
+      '/channels/chan-1': [json(CHANNEL_INFO), json(CHANNEL_INFO), json(CHANNEL_INFO)],
+    });
+    const engine = createDiscordCatchup({
+      botToken: 'test-token',
+      webhookUrl: 'http://127.0.0.1:9999/webhook',
+      monitoredChannelIds: () => new Set(['chan-1']),
+      env,
+      fetchImpl: transport.fetchImpl,
+      sleep: async () => {},
+      now: () => Date.now(), // fake-timer controlled
+    });
+    return { engine, transport };
+  }
+
+  const messagesCalls = (transport: ReturnType<typeof fakeTransport>) =>
+    transport.restCalls.filter((u) => u.includes('/messages?after=')).length;
+
+  it('debounces a READY burst into a single run and ignores GATEWAY_RESUMED', async () => {
+    const { engine, transport } = timerEngine();
+    engine.onGatewayEvent('GATEWAY_READY');
+    engine.onGatewayEvent('GATEWAY_READY');
+    engine.onGatewayEvent('GATEWAY_RESUMED');
+    engine.onGatewayEvent('GATEWAY_READY');
+    await vi.advanceTimersByTimeAsync(14999);
+    expect(messagesCalls(transport)).toBe(0); // still inside the debounce window
+    await vi.advanceTimersByTimeAsync(20000);
+    expect(messagesCalls(transport)).toBe(1); // exactly one coalesced run
+    engine.stop();
+  });
+
+  it('start() runs startup immediately and then periodically', async () => {
+    const { engine, transport } = timerEngine({ DISCORD_CATCHUP_INTERVAL_MS: '60000' });
+    engine.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(messagesCalls(transport)).toBe(1); // startup run
+    await vi.advanceTimersByTimeAsync(60000);
+    expect(messagesCalls(transport)).toBe(2); // first periodic run
+    engine.stop();
+    await vi.advanceTimersByTimeAsync(180000);
+    expect(messagesCalls(transport)).toBe(2); // stop() disarms the timer
+  });
+
+  it('interval 0 disables the periodic timer but not the startup run', async () => {
+    const { engine, transport } = timerEngine({ DISCORD_CATCHUP_INTERVAL_MS: '0' });
+    engine.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(messagesCalls(transport)).toBe(1);
+    await vi.advanceTimersByTimeAsync(3600000);
+    expect(messagesCalls(transport)).toBe(1);
+    engine.stop();
+  });
+
+  it('kill switch disables start() and onGatewayEvent()', async () => {
+    const { engine, transport } = timerEngine({ DISCORD_CATCHUP_DISABLED: '1' });
+    engine.start();
+    engine.onGatewayEvent('GATEWAY_READY');
+    await vi.advanceTimersByTimeAsync(600000);
+    expect(transport.restCalls).toHaveLength(0);
+    engine.stop();
+  });
+
+  it('single-flight: concurrent runOnce calls share one run', async () => {
+    vi.useRealTimers();
+    const { engine, transport } = timerEngine();
+    const [a, b] = await Promise.all([engine.runOnce('periodic'), engine.runOnce('ready')]);
+    expect(a).toBe(b); // coalesced into the same run/promise result
+    expect(messagesCalls(transport)).toBe(1);
   });
 });

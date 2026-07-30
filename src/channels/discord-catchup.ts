@@ -128,6 +128,8 @@ export function createDiscordCatchup(deps: DiscordCatchupDeps): DiscordCatchup {
   const now = deps.now ?? (() => Date.now());
   const guildCache = new Map<string, string | null>();
   let running: Promise<DiscordCatchupRunSummary | null> | null = null;
+  let readyDebounceTimer: NodeJS.Timeout | null = null;
+  let periodicTimer: NodeJS.Timeout | null = null;
 
   const nowIso = (): string => new Date(now()).toISOString();
 
@@ -446,10 +448,38 @@ export function createDiscordCatchup(deps: DiscordCatchupDeps): DiscordCatchup {
     return run;
   }
 
-  return {
-    runOnce,
-    onGatewayEvent: () => {}, // Task 8
-    start: () => {}, // Task 8
-    stop: () => {}, // Task 8
-  };
+  function onGatewayEvent(type: string): void {
+    if (config.disabled) return;
+    // RESUMED is deliberately NOT a trigger: Discord replays missed events on
+    // a session resume; only a fresh IDENTIFY (READY) leaves a gap.
+    if (type !== 'GATEWAY_READY') return;
+    if (readyDebounceTimer) clearTimeout(readyDebounceTimer);
+    readyDebounceTimer = setTimeout(() => {
+      readyDebounceTimer = null;
+      void runOnce('ready');
+    }, config.readyDebounceMs);
+    readyDebounceTimer.unref?.();
+  }
+
+  function start(): void {
+    if (config.disabled) {
+      log.info('Discord catch-up disabled via DISCORD_CATCHUP_DISABLED');
+      return;
+    }
+    void runOnce('startup');
+    if (periodicTimer || config.intervalMs <= 0) return;
+    periodicTimer = setInterval(() => {
+      void runOnce('periodic');
+    }, config.intervalMs);
+    periodicTimer.unref?.();
+  }
+
+  function stop(): void {
+    if (periodicTimer) clearInterval(periodicTimer);
+    periodicTimer = null;
+    if (readyDebounceTimer) clearTimeout(readyDebounceTimer);
+    readyDebounceTimer = null;
+  }
+
+  return { runOnce, onGatewayEvent, start, stop };
 }
