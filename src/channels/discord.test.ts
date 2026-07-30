@@ -10,8 +10,10 @@ import {
   forwardDiscordGatewayEventWithRetry,
   normalizeDiscordOutboundMarkdown,
   toDiscordThreadId,
+  wrapYenteDiscordChannelIds,
   yenteDiscordPlatformIdFromThreadId,
 } from './discord.js';
+import { getDiscordChannelCursor, getDiscordMessageRouteAttempts, isDiscordMessageTerminal } from './discord-state.js';
 
 vi.mock('../config.js', async () => {
   const actual = await vi.importActual('../config.js');
@@ -368,5 +370,156 @@ describe('forwardDiscordGatewayEventWithRetry', () => {
       }),
     ).resolves.toBe(false);
     expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('wrapYenteDiscordChannelIds ingress claim', () => {
+  function fakeAdapter() {
+    return {
+      handleForwardedMessage: vi.fn(async (..._args: unknown[]) => 'handled'),
+      createDiscordThread: vi.fn(async () => ({ id: 'thread-9' })),
+      postMessage: vi.fn(async () => 'mid'),
+      editMessage: vi.fn(async () => undefined),
+      deleteMessage: vi.fn(async () => undefined),
+      addReaction: vi.fn(async () => undefined),
+      removeReaction: vi.fn(async () => undefined),
+      startTyping: vi.fn(async () => undefined),
+      channelIdFromThreadId: (threadId: string) => threadId,
+    };
+  }
+
+  function wrap(fake: ReturnType<typeof fakeAdapter>, autoThread: string[] = [], monitored: string[] = ['chan-1']) {
+    return wrapYenteDiscordChannelIds(
+      fake as unknown as Parameters<typeof wrapYenteDiscordChannelIds>[0],
+      'test-token',
+      new Set(autoThread),
+      { monitoredChannelIds: () => new Set(monitored), routeLeaseMs: 120000 },
+    ) as unknown as {
+      handleForwardedMessage: (data: unknown, options: unknown) => Promise<unknown>;
+      forwardGatewayEvent: (webhookUrl: string, event: { type: string }) => Promise<void>;
+    };
+  }
+
+  const message = (id: string, channelId = 'chan-1'): Record<string, unknown> => ({
+    id,
+    channel_id: channelId,
+    guild_id: 'guild-1',
+    author: { id: 'user-1', bot: false },
+    content: 'hello',
+    mentions: [],
+    attachments: [],
+  });
+
+  beforeEach(() => {
+    const db = initTestDb();
+    runMigrations(db);
+  });
+
+  afterEach(() => {
+    closeDb();
+    vi.restoreAllMocks();
+  });
+
+  it('claims before forwarding and drops a duplicate of the same channel+message', async () => {
+    const fake = fakeAdapter();
+    // Wrapping replaces the adapter's handleForwardedMessage property in place,
+    // so capture the inner spy before wrapping to assert on actual forwards.
+    const forwardSpy = fake.handleForwardedMessage;
+    const wrapped = wrap(fake);
+    await wrapped.handleForwardedMessage(message('m1'), {});
+    await wrapped.handleForwardedMessage(message('m1'), {});
+    expect(forwardSpy).toHaveBeenCalledTimes(1);
+    expect(isDiscordMessageTerminal('chan-1', 'm1')).toBe(true); // routed
+  });
+
+  it('advances the channel cursor for monitored channels after a successful route', async () => {
+    const fake = fakeAdapter();
+    const wrapped = wrap(fake);
+    await wrapped.handleForwardedMessage(message('777'), {});
+    expect(getDiscordChannelCursor('chan-1')).toBe('777');
+  });
+
+  it('does not advance a cursor for unmonitored channels (still claims)', async () => {
+    const fake = fakeAdapter();
+    const wrapped = wrap(fake, [], ['other-chan']);
+    await wrapped.handleForwardedMessage(message('778'), {});
+    expect(getDiscordChannelCursor('chan-1')).toBeNull();
+    expect(isDiscordMessageTerminal('chan-1', '778')).toBe(true);
+  });
+
+  it('still creates auto-threads (after the claim) for auto-thread channels', async () => {
+    const fake = fakeAdapter();
+    const forwardSpy = fake.handleForwardedMessage;
+    const wrapped = wrap(fake, ['chan-1']);
+    await wrapped.handleForwardedMessage(message('m2'), {});
+    expect(fake.createDiscordThread).toHaveBeenCalledWith('chan-1', 'm2');
+    const forwarded = forwardSpy.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(forwarded.thread).toEqual({ id: 'thread-9', parent_id: 'chan-1' });
+  });
+
+  it('marks the route failed (keeping the lease) and rethrows; immediate retries drop, post-lease retries route', async () => {
+    const fake = fakeAdapter();
+    const forwardSpy = fake.handleForwardedMessage;
+    forwardSpy.mockRejectedValueOnce(new Error('dispatch exploded'));
+    let nowMs = Date.parse('2026-07-30T00:00:00.000Z');
+    const wrapped = wrapYenteDiscordChannelIds(
+      fake as unknown as Parameters<typeof wrapYenteDiscordChannelIds>[0],
+      'test-token',
+      new Set(),
+      {
+        monitoredChannelIds: () => new Set(['chan-1']),
+        routeLeaseMs: 120000,
+        now: () => new Date(nowMs).toISOString(),
+      },
+    ) as unknown as { handleForwardedMessage: (data: unknown, options: unknown) => Promise<unknown> };
+    await expect(wrapped.handleForwardedMessage(message('m3'), {})).rejects.toThrow('dispatch exploded');
+    expect(isDiscordMessageTerminal('chan-1', 'm3')).toBe(false); // failed but reclaimable
+    expect(getDiscordMessageRouteAttempts('chan-1', 'm3')).toBe(1);
+    // An IMMEDIATE retry (the live forwarder's 250ms/1000ms re-POSTs) hits the
+    // KEPT lease -> duplicate-dropped: no attempt burned, nothing forwarded (A16).
+    await wrapped.handleForwardedMessage(message('m3'), {});
+    expect(forwardSpy).toHaveBeenCalledTimes(1);
+    expect(getDiscordMessageRouteAttempts('chan-1', 'm3')).toBe(1);
+    expect(isDiscordMessageTerminal('chan-1', 'm3')).toBe(false);
+    // After the lease expires (catch-up arrives minutes later) it re-claims and routes.
+    nowMs += 120001;
+    await wrapped.handleForwardedMessage(message('m3'), {});
+    expect(isDiscordMessageTerminal('chan-1', 'm3')).toBe(true);
+  });
+
+  it('fails open: routes the message even when the claim state is unavailable', async () => {
+    const errorSpy = vi.spyOn(log, 'error');
+    const fake = fakeAdapter();
+    const forwardSpy = fake.handleForwardedMessage;
+    const wrapped = wrap(fake);
+    closeDb(); // simulate DB outage: getDb() now throws
+    await wrapped.handleForwardedMessage(message('m4'), {});
+    expect(forwardSpy).toHaveBeenCalledTimes(1); // routed anyway
+    expect(errorSpy).toHaveBeenCalled();
+    initTestDb(); // restore for afterEach symmetry
+  });
+
+  it('passes non-message payloads through untouched', async () => {
+    const fake = fakeAdapter();
+    const forwardSpy = fake.handleForwardedMessage;
+    const wrapped = wrap(fake);
+    await wrapped.handleForwardedMessage({ some: 'interaction' }, {});
+    expect(forwardSpy).toHaveBeenCalledWith({ some: 'interaction' }, {});
+  });
+
+  it('taps gateway event types before forwarding', () => {
+    const fake = fakeAdapter();
+    const seen: string[] = [];
+    wrapYenteDiscordChannelIds(
+      fake as unknown as Parameters<typeof wrapYenteDiscordChannelIds>[0],
+      'test-token',
+      new Set(),
+      { onGatewayEvent: (type) => seen.push(type) },
+    );
+    const forward = (fake as unknown as { forwardGatewayEvent: (url: string, e: { type: string }) => Promise<void> })
+      .forwardGatewayEvent;
+    void forward('http://127.0.0.1:1/webhook', { type: 'GATEWAY_READY' });
+    void forward('http://127.0.0.1:1/webhook', { type: 'GATEWAY_RESUMED' });
+    expect(seen).toEqual(['GATEWAY_READY', 'GATEWAY_RESUMED']); // tap sees everything; filtering is the engine's job
   });
 });

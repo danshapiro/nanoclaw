@@ -10,6 +10,13 @@ import { log } from '../log.js';
 import { createChatSdkBridge, type ReplyContext } from './chat-sdk-bridge.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import { syncYenteDiscordApplicationCommands } from './discord-commands.js';
+import {
+  advanceDiscordChannelCursor,
+  claimDiscordMessage,
+  markDiscordMessageFailed,
+  markDiscordMessageRouted,
+} from './discord-state.js';
+import { DEFAULT_DISCORD_CATCHUP_ROUTE_LEASE_MS } from './discord-catchup.js';
 
 const DISCORD_API_BASE = 'https://discord.com/api/v10';
 const DISCORD_MESSAGE_TEXT_LIMIT = 2000;
@@ -355,18 +362,31 @@ export async function forwardDiscordGatewayEventWithRetry(
   return false;
 }
 
-function wrapYenteDiscordChannelIds(
+export type YenteDiscordWrapOptions = {
+  monitoredChannelIds?: () => Set<string>;
+  routeLeaseMs?: number;
+  onGatewayEvent?: (type: string) => void;
+  now?: () => string;
+};
+
+export function wrapYenteDiscordChannelIds(
   adapter: DiscordAdapterInstance,
   botToken: string,
   autoCreateThreadChannelIds: Set<string> = new Set(),
+  options: YenteDiscordWrapOptions = {},
 ): DiscordAdapterInstance {
+  const monitoredChannelIds = options.monitoredChannelIds ?? ((): Set<string> => new Set());
+  const routeLeaseMs = options.routeLeaseMs ?? DEFAULT_DISCORD_CATCHUP_ROUTE_LEASE_MS;
+  const nowIso = options.now ?? ((): string => new Date().toISOString());
   // Replace the vendored adapter's single-shot Gateway event forwarder with
   // the bounded-retry version. The adapter awaits forwardGatewayEvent per
   // event, so sequencing is unchanged — a retry only delays that one event.
   (
-    adapter as unknown as { forwardGatewayEvent: (webhookUrl: string, event: { type: string }) => Promise<boolean> }
-  ).forwardGatewayEvent = (webhookUrl: string, event: { type: string }) =>
-    forwardDiscordGatewayEventWithRetry(webhookUrl, event, botToken);
+    adapter as unknown as { forwardGatewayEvent: (webhookUrl: string, event: { type: string }) => Promise<void> }
+  ).forwardGatewayEvent = (webhookUrl: string, event: { type: string }) => {
+    options.onGatewayEvent?.(event.type);
+    return forwardDiscordGatewayEventWithRetry(webhookUrl, event, botToken).then(() => undefined);
+  };
 
   const cache = new Map<string, string>();
   const resolve = async (threadId: string): Promise<string> => {
@@ -405,40 +425,100 @@ function wrapYenteDiscordChannelIds(
   adapter.startTyping = (async (threadId, status) =>
     startTyping(await resolve(threadId), status)) as typeof adapter.startTyping;
 
-  if (autoCreateThreadChannelIds.size > 0) {
-    const rawAdapter = adapter as any;
-    const originalHandleForwardedMessage = rawAdapter.handleForwardedMessage.bind(rawAdapter);
-    rawAdapter.handleForwardedMessage = async (dataArg: unknown, optionsArg: unknown, ...rest: unknown[]) => {
-      const data = dataArg as Record<string, any> | undefined;
-      const options = optionsArg;
-      const channelId = data?.channel_id as string | undefined;
-      const messageId = data?.id as string | undefined;
-      const alreadyInThread = data?.thread != null || data?.channel_type === 11 || data?.channel_type === 12;
-      if (channelId && messageId && !alreadyInThread && autoCreateThreadChannelIds.has(channelId)) {
-        try {
-          const newThread = await rawAdapter.createDiscordThread(channelId, messageId);
-          if (newThread?.id) {
-            dataArg = {
-              ...data,
-              thread: { id: newThread.id, parent_id: channelId },
-            };
-            log.info('Created Discord thread for auto-thread channel', {
-              channelId,
-              messageId,
-              threadId: newThread.id,
-            });
-          }
-        } catch (error) {
-          log.warn('Failed to create Discord thread for auto-thread channel', {
+  const rawAdapter = adapter as any;
+  const originalHandleForwardedMessage = rawAdapter.handleForwardedMessage.bind(rawAdapter);
+  rawAdapter.handleForwardedMessage = async (dataArg: unknown, optionsArg: unknown, ...rest: unknown[]) => {
+    const data = dataArg as Record<string, any> | undefined;
+    const opts = optionsArg;
+    const channelId = data?.channel_id as string | undefined;
+    const messageId = data?.id as string | undefined;
+
+    if (!channelId || !messageId) {
+      // Not a message-shaped payload — pass through untouched.
+      return originalHandleForwardedMessage(dataArg, opts, ...rest);
+    }
+
+    // 1. Idempotency gate: claim before forwarding. Live and catch-up
+    //    messages traverse this same choke point, so one claim covers both.
+    //    FAIL-OPEN on DB errors: a state bug must never silence live messages.
+    try {
+      const claimedAt = nowIso();
+      const leaseExpiresAt = new Date(Date.parse(claimedAt) + routeLeaseMs).toISOString();
+      const claim = claimDiscordMessage(
+        channelId,
+        messageId,
+        {
+          guildId: (data?.guild_id as string | undefined) ?? null,
+          authorId: (data?.author?.id as string | undefined) ?? null,
+          source: 'gateway',
+        },
+        claimedAt,
+        leaseExpiresAt,
+      );
+      if (!claim.claimed) {
+        // INFO, not debug: the deployed default log level is info, and the
+        // host smoke greps logs/nanoclaw.log for this exact bare token.
+        log.info('discord_message_duplicate_dropped', { channelId, messageId, status: claim.status });
+        return undefined;
+      }
+    } catch (error) {
+      log.error('Discord message claim failed, routing anyway', { channelId, messageId, error: String(error) });
+    }
+
+    // 2. Auto-thread creation (existing behavior), after the claim.
+    const alreadyInThread = data?.thread != null || data?.channel_type === 11 || data?.channel_type === 12;
+    if (!alreadyInThread && autoCreateThreadChannelIds.has(channelId)) {
+      try {
+        const newThread = await rawAdapter.createDiscordThread(channelId, messageId);
+        if (newThread?.id) {
+          dataArg = {
+            ...data,
+            thread: { id: newThread.id, parent_id: channelId },
+          };
+          log.info('Created Discord thread for auto-thread channel', {
             channelId,
             messageId,
-            error: error instanceof Error ? error.message : String(error),
+            threadId: newThread.id,
           });
         }
+      } catch (error) {
+        log.warn('Failed to create Discord thread for auto-thread channel', {
+          channelId,
+          messageId,
+          error: error instanceof Error ? error.message : String(error),
+        });
       }
-      return originalHandleForwardedMessage(dataArg, options, ...rest);
-    };
-  }
+    }
+
+    // 3. Forward, then record the outcome (fail-open on state errors).
+    try {
+      const result = await originalHandleForwardedMessage(dataArg, opts, ...rest);
+      try {
+        const routedAt = nowIso();
+        markDiscordMessageRouted(channelId, messageId, routedAt);
+        const monitored = monitoredChannelIds();
+        const parentId = (dataArg as Record<string, any>)?.thread?.parent_id as string | undefined;
+        if (monitored.has(channelId) || (parentId !== undefined && monitored.has(parentId))) {
+          advanceDiscordChannelCursor(channelId, messageId, routedAt);
+        }
+      } catch (error) {
+        log.error('Discord route bookkeeping failed', { channelId, messageId, error: String(error) });
+      }
+      return result;
+    } catch (error) {
+      try {
+        markDiscordMessageFailed(
+          channelId,
+          messageId,
+          nowIso(),
+          error instanceof Error ? error.message : String(error),
+        );
+      } catch (stateError) {
+        log.error('Discord route failure bookkeeping failed', { channelId, messageId, error: String(stateError) });
+      }
+      throw error;
+    }
+  };
 
   return adapter;
 }
