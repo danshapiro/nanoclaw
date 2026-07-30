@@ -131,3 +131,78 @@ export function getDiscordMessageRouteStatus(channelId: string, messageId: strin
     .get(channelId, messageId) as { status: string } | undefined;
   return row?.status ?? null;
 }
+
+export function getDiscordChannelCursor(channelId: string): string | null {
+  const row = getDb()
+    .prepare(`SELECT last_message_id FROM discord_channel_cursors WHERE channel_id = ?`)
+    .get(channelId) as { last_message_id: string } | undefined;
+  return row?.last_message_id ?? null;
+}
+
+/**
+ * Move the durable last-seen cursor forward. Monotonic under numeric
+ * (BigInt) snowflake comparison — a stale writer can never move it back.
+ */
+export function advanceDiscordChannelCursor(channelId: string, messageId: string, updatedAt: string): void {
+  const advance = getDb().transaction((): void => {
+    const existing = getDiscordChannelCursor(channelId);
+    if (existing !== null && BigInt(existing) >= BigInt(messageId)) return;
+    getDb()
+      .prepare(
+        `INSERT INTO discord_channel_cursors (channel_id, last_message_id, updated_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(channel_id) DO UPDATE SET
+           last_message_id = excluded.last_message_id,
+           updated_at = excluded.updated_at`,
+      )
+      .run(channelId, messageId, updatedAt);
+  }) as () => void;
+  advance();
+}
+
+/** Bound table growth: drop 'routed' rows older than the cutoff (ISO string). */
+export function pruneDiscordMessageRoutes(cutoff: string): number {
+  const result = getDb()
+    .prepare(`DELETE FROM discord_message_routes WHERE status = 'routed' AND routed_at < ?`)
+    .run(cutoff);
+  return result.changes;
+}
+
+/** Post-hoc source attribution — catch-up marks rows it routed (see plan design notes). */
+export function markDiscordMessageSource(channelId: string, messageId: string, source: 'gateway' | 'catchup'): void {
+  getDb()
+    .prepare(`UPDATE discord_message_routes SET source = ? WHERE channel_id = ? AND message_id = ?`)
+    .run(source, channelId, messageId);
+}
+
+/**
+ * Sweep feed (A11): non-terminal rows needing re-presentation — retriable
+ * failures and expired-lease 'processing' orphans (crash between claim and
+ * mark). Rows behind the cursor are invisible to the after=cursor walk; this
+ * list is their ONLY re-presentation path. Lease gating keeps the sweep from
+ * racing a live delivery (or a just-failed row still inside its kept lease).
+ * The horizon filter lives IN THE SQL (not in the caller): with oldest-first
+ * ordering and a LIMIT, rows older than the backfill horizon would otherwise
+ * permanently occupy the budget and starve every newer retriable row.
+ */
+export function listRetriableDiscordMessageRoutes(
+  now: string,
+  horizon: string,
+  limit: number,
+): Array<{ channel_id: string; message_id: string; first_seen_at: string }> {
+  return getDb()
+    .prepare(
+      `SELECT channel_id, message_id, first_seen_at
+         FROM discord_message_routes
+        WHERE first_seen_at >= ?
+          AND ((status = 'failed' AND attempts < ? AND (lease_expires_at IS NULL OR lease_expires_at < ?))
+           OR (status = 'processing' AND lease_expires_at IS NOT NULL AND lease_expires_at < ?))
+        ORDER BY first_seen_at
+        LIMIT ?`,
+    )
+    .all(horizon, DISCORD_ROUTE_MAX_ATTEMPTS, now, now, limit) as Array<{
+    channel_id: string;
+    message_id: string;
+    first_seen_at: string;
+  }>;
+}
