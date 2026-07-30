@@ -287,7 +287,7 @@ function isTransientGatewayForwardError(error: unknown): boolean {
  * prod, clustered around service restart windows). Retries ONLY transient
  * network-level failures and 5xx responses — never 4xx. Logs WARN per retry
  * attempt; the ERROR (same messages as the upstream adapter) is emitted only
- * after the final attempt fails. Never throws, matching upstream behavior.
+ * after the final attempt fails. Never throws; resolves true only when the webhook accepted the event.
  */
 export async function forwardDiscordGatewayEventWithRetry(
   webhookUrl: string,
@@ -296,11 +296,13 @@ export async function forwardDiscordGatewayEventWithRetry(
   deps: {
     fetchImpl?: typeof fetch;
     sleep?: (ms: number) => Promise<void>;
+    retryDelaysMs?: readonly number[];
   } = {},
-): Promise<void> {
+): Promise<boolean> {
   const fetchImpl = deps.fetchImpl ?? fetch;
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
-  const maxAttempts = GATEWAY_FORWARD_RETRY_DELAYS_MS.length + 1;
+  const retryDelays = deps?.retryDelaysMs ?? GATEWAY_FORWARD_RETRY_DELAYS_MS;
+  const maxAttempts = retryDelays.length + 1;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     let response: Response;
@@ -321,14 +323,14 @@ export async function forwardDiscordGatewayEventWithRetry(
           maxAttempts,
           error: String(error),
         });
-        await sleep(GATEWAY_FORWARD_RETRY_DELAYS_MS[attempt - 1]);
+        await sleep(retryDelays[attempt - 1]);
         continue;
       }
       log.error('Error forwarding Gateway event', { type: event.type, attempt, error: String(error) });
-      return;
+      return false;
     }
 
-    if (response.ok) return;
+    if (response.ok) return true;
 
     if (response.status >= 500 && attempt < maxAttempts) {
       log.warn('Failed to forward Gateway event (5xx), retrying', {
@@ -337,7 +339,7 @@ export async function forwardDiscordGatewayEventWithRetry(
         maxAttempts,
         status: response.status,
       });
-      await sleep(GATEWAY_FORWARD_RETRY_DELAYS_MS[attempt - 1]);
+      await sleep(retryDelays[attempt - 1]);
       continue;
     }
 
@@ -348,8 +350,9 @@ export async function forwardDiscordGatewayEventWithRetry(
       attempt,
       error: errorText,
     });
-    return;
+    return false;
   }
+  return false;
 }
 
 function wrapYenteDiscordChannelIds(
@@ -361,7 +364,7 @@ function wrapYenteDiscordChannelIds(
   // the bounded-retry version. The adapter awaits forwardGatewayEvent per
   // event, so sequencing is unchanged — a retry only delays that one event.
   (
-    adapter as unknown as { forwardGatewayEvent: (webhookUrl: string, event: { type: string }) => Promise<void> }
+    adapter as unknown as { forwardGatewayEvent: (webhookUrl: string, event: { type: string }) => Promise<boolean> }
   ).forwardGatewayEvent = (webhookUrl: string, event: { type: string }) =>
     forwardDiscordGatewayEventWithRetry(webhookUrl, event, botToken);
 

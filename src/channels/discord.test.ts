@@ -326,4 +326,47 @@ describe('forwardDiscordGatewayEventWithRetry', () => {
     expect(errorSpy).toHaveBeenCalledTimes(1);
     expect(errorSpy).toHaveBeenCalledWith('Error forwarding Gateway event', expect.objectContaining({ attempt: 1 }));
   });
+
+  it('resolves true when the webhook accepts the event', async () => {
+    const fetchImpl = vi.fn(async () => new Response('{"ok":true}', { status: 200 })) as unknown as typeof fetch;
+    await expect(
+      forwardDiscordGatewayEventWithRetry('http://127.0.0.1:9/webhook', { type: 'GATEWAY_MESSAGE_CREATE' }, 't', {
+        fetchImpl,
+        sleep: async () => {},
+      }),
+    ).resolves.toBe(true);
+  });
+
+  it('resolves false after exhausting retries', async () => {
+    const fetchImpl = vi.fn(async () => new Response('nope', { status: 500 })) as unknown as typeof fetch;
+    await expect(
+      forwardDiscordGatewayEventWithRetry('http://127.0.0.1:9/webhook', { type: 'GATEWAY_MESSAGE_CREATE' }, 't', {
+        fetchImpl,
+        sleep: async () => {},
+      }),
+    ).resolves.toBe(false);
+  });
+
+  it('resolves false immediately on 4xx', async () => {
+    const fetchImpl = vi.fn(async () => new Response('bad', { status: 401 })) as unknown as typeof fetch;
+    await expect(
+      forwardDiscordGatewayEventWithRetry('http://127.0.0.1:9/webhook', { type: 'GATEWAY_MESSAGE_CREATE' }, 't', {
+        fetchImpl,
+        sleep: async () => {},
+      }),
+    ).resolves.toBe(false);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it('makes exactly one attempt when retryDelaysMs is empty (engine mode)', async () => {
+    const fetchImpl = vi.fn(async () => new Response('nope', { status: 500 })) as unknown as typeof fetch;
+    await expect(
+      forwardDiscordGatewayEventWithRetry('http://127.0.0.1:9/webhook', { type: 'GATEWAY_MESSAGE_CREATE' }, 't', {
+        fetchImpl,
+        sleep: async () => {},
+        retryDelaysMs: [],
+      }),
+    ).resolves.toBe(false);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+  });
 });
