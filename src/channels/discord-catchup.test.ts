@@ -497,6 +497,8 @@ describe('createDiscordCatchup triggers', () => {
   function timerEngine(env: NodeJS.ProcessEnv = {}) {
     // Empty pages: each run costs 1 channel-info fetch (first run only) + 1 messages fetch.
     const transport = fakeTransport({
+      // Insertion order matters: this needle must precede the '/channels/chan-1' catch-all.
+      'messages?after=': [json([]), json([]), json([])],
       '/channels/chan-1?': [json(CHANNEL_INFO), json(CHANNEL_INFO), json(CHANNEL_INFO)],
       '/channels/chan-1': [json(CHANNEL_INFO), json(CHANNEL_INFO), json(CHANNEL_INFO)],
     });
