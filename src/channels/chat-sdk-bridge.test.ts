@@ -4,6 +4,8 @@ import { describe, expect, it, vi } from 'vitest';
 import type { Adapter } from 'chat';
 
 import type { ChannelSetup } from './adapter.js';
+import { closeDb, initTestDb } from '../db/connection.js';
+import { runMigrations } from '../db/migrations/index.js';
 import {
   createChatSdkBridge,
   disableWebhookServerKeepAlive,
@@ -384,5 +386,40 @@ describe('Chat SDK bridge deliver — reactions', () => {
     });
 
     expect(editMessage).toHaveBeenCalledWith('discord:guild-1:parent-1', 'thread-9', { markdown: 'updated' });
+  });
+});
+
+describe('onGatewayWebhookReady hook', () => {
+  it('is invoked once with the local webhook URL during setup', async () => {
+    const db = initTestDb();
+    runMigrations(db);
+    const seen: string[] = [];
+    const fakeAdapter = {
+      name: 'discord',
+      userName: 'yente-test',
+      initialize: async () => {},
+      channelIdFromThreadId: (threadId: string) => threadId,
+      startGatewayListener: async () => new Response('ok'),
+    } as unknown as Parameters<typeof createChatSdkBridge>[0]['adapter'];
+
+    const bridge = createChatSdkBridge({
+      adapter: fakeAdapter,
+      supportsThreads: true,
+      botToken: 'test-token',
+      onGatewayWebhookReady: (webhookUrl) => seen.push(webhookUrl),
+    });
+    try {
+      await bridge.setup({
+        onInbound: async () => {},
+        onInboundEvent: async () => {},
+        onMetadata: async () => {},
+        onAction: async () => {},
+      } as never);
+      expect(seen).toHaveLength(1);
+      expect(seen[0]).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/webhook$/);
+    } finally {
+      await bridge.teardown();
+      closeDb();
+    }
   });
 });

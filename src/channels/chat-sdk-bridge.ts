@@ -137,6 +137,15 @@ export interface ChatSdkBridgeConfig {
    * and reactions still target the head of the reply.
    */
   maxTextLength?: number;
+  /**
+   * Invoked once per setup() with the local gateway webhook URL, immediately
+   * after the webhook server binds and before the gateway listener starts.
+   * The Discord channel uses this to arm its catch-up engine, which POSTs
+   * synthesized gateway events back to this URL (see discord-catchup.ts).
+   * The 24h gateway listener restart reuses the same URL, so this fires
+   * exactly once per setup().
+   */
+  onGatewayWebhookReady?: (webhookUrl: string) => void;
 }
 
 type SerializableAttachment = Record<string, unknown>;
@@ -539,6 +548,14 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
 
         // Start local HTTP server to receive forwarded Gateway events (including interactions)
         const webhookUrl = await startLocalWebhookServer(gatewayAdapter, setupConfig, config.botToken);
+
+        if (config.onGatewayWebhookReady) {
+          try {
+            config.onGatewayWebhookReady(webhookUrl);
+          } catch (err) {
+            log.error('onGatewayWebhookReady hook failed', { adapter: adapter.name, err });
+          }
+        }
 
         const startGateway = () => {
           if (gatewayAbort?.signal.aborted) return;
