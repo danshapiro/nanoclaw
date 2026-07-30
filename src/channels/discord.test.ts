@@ -8,6 +8,7 @@ import { inboundDbPath, resolveSession, writeSessionMessage } from '../session-m
 import { log } from '../log.js';
 import {
   forwardDiscordGatewayEventWithRetry,
+  monitoredDiscordChannelIds,
   normalizeDiscordOutboundMarkdown,
   toDiscordThreadId,
   wrapYenteDiscordChannelIds,
@@ -532,5 +533,45 @@ describe('wrapYenteDiscordChannelIds ingress claim', () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+});
+
+describe('monitoredDiscordChannelIds', () => {
+  beforeEach(() => {
+    const db = initTestDb();
+    runMigrations(db);
+  });
+
+  afterEach(() => closeDb());
+
+  it('unions registered discord channels (normalized) with auto-thread channels, excluding quarantined', () => {
+    createMessagingGroup({
+      id: 'mg-1',
+      channel_type: 'discord',
+      platform_id: 'discord:guild-1:chan-a',
+      name: 'a',
+      is_group: 1,
+      unknown_sender_policy: 'public',
+      created_at: '2026-07-30T00:00:00.000Z',
+    });
+    createMessagingGroup({
+      id: 'mg-2',
+      channel_type: 'discord',
+      platform_id: 'chan-b',
+      name: 'b',
+      is_group: 1,
+      unknown_sender_policy: 'public',
+      created_at: '2026-07-30T00:00:00.000Z',
+    });
+    createMessagingGroup({
+      id: 'mg-3',
+      channel_type: 'discord',
+      platform_id: 'quarantined:chan-c',
+      name: 'c',
+      is_group: 1,
+      unknown_sender_policy: 'public',
+      created_at: '2026-07-30T00:00:00.000Z',
+    });
+    expect(monitoredDiscordChannelIds(new Set(['chan-d']))).toEqual(new Set(['chan-a', 'chan-b', 'chan-d']));
   });
 });

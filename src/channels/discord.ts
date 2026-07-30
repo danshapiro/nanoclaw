@@ -16,7 +16,12 @@ import {
   markDiscordMessageFailed,
   markDiscordMessageRouted,
 } from './discord-state.js';
-import { DEFAULT_DISCORD_CATCHUP_ROUTE_LEASE_MS } from './discord-catchup.js';
+import {
+  createDiscordCatchup,
+  DEFAULT_DISCORD_CATCHUP_ROUTE_LEASE_MS,
+  discordCatchupConfigFromEnv,
+  type DiscordCatchup,
+} from './discord-catchup.js';
 
 const DISCORD_API_BASE = 'https://discord.com/api/v10';
 const DISCORD_MESSAGE_TEXT_LIMIT = 2000;
@@ -43,6 +48,13 @@ registerChannelAdapter('discord', {
       'DISCORD_PUBLIC_KEY',
       'DISCORD_APPLICATION_ID',
       'DISCORD_AUTO_CREATE_THREAD_CHANNEL_IDS',
+      'DISCORD_CATCHUP_DISABLED',
+      'DISCORD_CATCHUP_INTERVAL_MS',
+      'DISCORD_CATCHUP_READY_DEBOUNCE_MS',
+      'DISCORD_CATCHUP_MAX_MESSAGES',
+      'DISCORD_CATCHUP_MAX_AGE_MS',
+      'DISCORD_CATCHUP_ROUTE_LEASE_MS',
+      'DISCORD_CATCHUP_MAX_THREADS',
     ]);
     const botToken = process.env.DISCORD_BOT_TOKEN || env.DISCORD_BOT_TOKEN;
     if (!botToken) return null;
@@ -66,14 +78,36 @@ registerChannelAdapter('discord', {
       publicKey: process.env.DISCORD_PUBLIC_KEY || env.DISCORD_PUBLIC_KEY || commandSync.publicKey,
       applicationId: process.env.DISCORD_APPLICATION_ID || env.DISCORD_APPLICATION_ID || commandSync.applicationId,
     });
+    // Catch-up wiring. For env-file keys, process.env wins (house precedence);
+    // note: spread order makes process.env values override file values, but
+    // only for keys present in process.env — matching the `process.env.X || env.X`
+    // pattern used above for the other Discord keys.
+    const catchupEnv: NodeJS.ProcessEnv = { ...env, ...process.env };
+    const catchupConfig = discordCatchupConfigFromEnv(catchupEnv);
+    const channelIds = (): Set<string> => monitoredDiscordChannelIds(autoCreateThreadChannelIds);
+    let catchup: DiscordCatchup | null = null;
     return createChatSdkBridge({
-      adapter: wrapYenteDiscordChannelIds(discordAdapter, botToken, autoCreateThreadChannelIds),
+      adapter: wrapYenteDiscordChannelIds(discordAdapter, botToken, autoCreateThreadChannelIds, {
+        monitoredChannelIds: channelIds,
+        routeLeaseMs: catchupConfig.routeLeaseMs,
+        onGatewayEvent: (type) => catchup?.onGatewayEvent(type),
+      }),
       concurrency: 'concurrent',
       botToken,
       extractReplyContext,
       supportsThreads: true,
       maxTextLength: DISCORD_MESSAGE_TEXT_LIMIT,
       transformOutboundText: normalizeDiscordOutboundMarkdown,
+      onGatewayWebhookReady: (webhookUrl) => {
+        if (catchup) return; // idempotency guard: channel-registry retries the WHOLE setup() body on NetworkError (channel-registry.ts:68-87) — a re-fired hook must not build a second engine + duplicate unref()'d timers
+        catchup = createDiscordCatchup({
+          botToken,
+          webhookUrl,
+          monitoredChannelIds: channelIds,
+          env: catchupEnv,
+        });
+        catchup.start(); // startup run + periodic timer (kill switch handled inside)
+      },
     });
   },
 });
@@ -233,6 +267,16 @@ function getRegisteredDiscordChannelIds(): string[] {
     )
     .all() as Array<{ platform_id: string }>;
   return [...new Set(rows.map((row) => yenteDiscordPlatformIdFromThreadId(row.platform_id)).filter(Boolean))].sort();
+}
+
+/**
+ * Channels the catch-up engine monitors: registered Discord messaging groups
+ * (normalized to parent channel snowflakes, quarantined excluded) plus the
+ * auto-thread channels. Recomputed per call so newly registered channels
+ * join without a restart.
+ */
+export function monitoredDiscordChannelIds(autoCreateThreadChannelIds: Set<string>): Set<string> {
+  return new Set([...getRegisteredDiscordChannelIds(), ...autoCreateThreadChannelIds]);
 }
 
 export function yenteDiscordPlatformIdFromThreadId(threadId: string): string {
