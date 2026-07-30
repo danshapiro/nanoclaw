@@ -507,19 +507,30 @@ describe('wrapYenteDiscordChannelIds ingress claim', () => {
     expect(forwardSpy).toHaveBeenCalledWith({ some: 'interaction' }, {});
   });
 
-  it('taps gateway event types before forwarding', () => {
-    const fake = fakeAdapter();
-    const seen: string[] = [];
-    wrapYenteDiscordChannelIds(
-      fake as unknown as Parameters<typeof wrapYenteDiscordChannelIds>[0],
-      'test-token',
-      new Set(),
-      { onGatewayEvent: (type) => seen.push(type) },
+  it('taps gateway event types before forwarding', async () => {
+    // Stub fetch so the forwards don't hit the real network (and never retry/WARN after the test ends).
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(null, { status: 204 })),
     );
-    const forward = (fake as unknown as { forwardGatewayEvent: (url: string, e: { type: string }) => Promise<void> })
-      .forwardGatewayEvent;
-    void forward('http://127.0.0.1:1/webhook', { type: 'GATEWAY_READY' });
-    void forward('http://127.0.0.1:1/webhook', { type: 'GATEWAY_RESUMED' });
-    expect(seen).toEqual(['GATEWAY_READY', 'GATEWAY_RESUMED']); // tap sees everything; filtering is the engine's job
+    try {
+      const fake = fakeAdapter();
+      const seen: string[] = [];
+      wrapYenteDiscordChannelIds(
+        fake as unknown as Parameters<typeof wrapYenteDiscordChannelIds>[0],
+        'test-token',
+        new Set(),
+        { onGatewayEvent: (type) => seen.push(type) },
+      );
+      const forward = (fake as unknown as { forwardGatewayEvent: (url: string, e: { type: string }) => Promise<void> })
+        .forwardGatewayEvent;
+      const p1 = forward('http://127.0.0.1:1/webhook', { type: 'GATEWAY_READY' });
+      const p2 = forward('http://127.0.0.1:1/webhook', { type: 'GATEWAY_RESUMED' });
+      // The tap fires synchronously, before the forwards settle.
+      expect(seen).toEqual(['GATEWAY_READY', 'GATEWAY_RESUMED']); // tap sees everything; filtering is the engine's job
+      await Promise.all([p1, p2]); // cleanup: no floating promises outlive the test
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
