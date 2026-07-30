@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { closeDb, initTestDb } from '../db/connection.js';
+import { closeDb, getDb, initTestDb } from '../db/connection.js';
 import { runMigrations } from '../db/migrations/index.js';
 import {
   compareSnowflakes,
@@ -19,6 +19,8 @@ import {
   advanceDiscordChannelCursor,
   claimDiscordMessage,
   getDiscordChannelCursor,
+  getDiscordMessageRouteAttempts,
+  getDiscordMessageRouteStatus,
   markDiscordMessageFailed,
   markDiscordMessageRouted,
 } from './discord-state.js';
@@ -288,5 +290,193 @@ describe('createDiscordCatchup runOnce', () => {
     const engine = makeEngine(fetchImpl, { DISCORD_CATCHUP_DISABLED: '1' });
     expect(await engine.runOnce('startup')).toBeNull();
     expect(restCalls).toHaveLength(0);
+  });
+
+  it('stops advancing the cursor at a POST failure and retries from there next run', async () => {
+    advanceDiscordChannelCursor('chan-1', '500', '2026-07-30T00:00:00.000Z');
+    let webhookOk = false;
+    const { fetchImpl, webhookPosts } = fakeTransport(
+      {
+        '/channels/chan-1?': [json(CHANNEL_INFO)],
+        'messages?after=': [
+          json([restMessage('501'), restMessage('502')]),
+          json([restMessage('501'), restMessage('502')]),
+          json([]),
+        ],
+        '/channels/chan-1': [json(CHANNEL_INFO)],
+      },
+      () => (webhookOk ? 200 : 500),
+    );
+    const engine = makeEngine(fetchImpl);
+    const first = await engine.runOnce('periodic');
+    expect(first?.failed).toBe(1);
+    expect(getDiscordChannelCursor('chan-1')).toBe('500'); // did not advance past the failure
+    expect(webhookPosts.filter((p) => p.data.id === '502')).toHaveLength(0); // stopped at 501
+
+    webhookOk = true;
+    const second = await engine.runOnce('periodic');
+    expect(second?.routed).toBe(2);
+    expect(getDiscordChannelCursor('chan-1')).toBe('502');
+  });
+
+  it('treats an attempts-exhausted message as terminal and advances past it', async () => {
+    advanceDiscordChannelCursor('chan-1', '500', '2026-07-30T00:00:00.000Z');
+    // Simulate a poison message: the route row already burned all attempts
+    // (each failed live/catch-up traversal claims then fails).
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      claimDiscordMessage(
+        'chan-1',
+        '501',
+        { guildId: 'guild-1', authorId: 'user-1', source: 'gateway' },
+        `2026-07-30T00:0${attempt}:00.000Z`,
+        `2026-07-30T00:0${attempt}:30.000Z`,
+      );
+      markDiscordMessageFailed('chan-1', '501', `2026-07-30T00:0${attempt}:01.000Z`, 'poison');
+    }
+    const { fetchImpl, webhookPosts } = fakeTransport({
+      '/channels/chan-1?': [json(CHANNEL_INFO)],
+      'messages?after=': [json([restMessage('501'), restMessage('502')]), json([])],
+      '/channels/chan-1': [json(CHANNEL_INFO)],
+    });
+    const engine = makeEngine(fetchImpl);
+    const summary = await engine.runOnce('periodic');
+    // 501 is terminal (failed, attempts exhausted) -> skipped, cursor advances, 502 still routes
+    expect(summary?.skippedTerminal).toBe(1);
+    expect(webhookPosts.map((p) => p.data.id)).toEqual(['502']);
+    expect(getDiscordChannelCursor('chan-1')).toBe('502');
+  });
+
+  it('honors 429 Retry-After on REST fetches', async () => {
+    advanceDiscordChannelCursor('chan-1', '500', '2026-07-30T00:00:00.000Z');
+    const sleeps: number[] = [];
+    const { fetchImpl } = fakeTransport({
+      '/channels/chan-1?': [json(CHANNEL_INFO)],
+      'messages?after=': [
+        new Response('{"retry_after":2}', { status: 429, headers: { 'Retry-After': '2' } }),
+        json([restMessage('501')]),
+        json([]),
+      ],
+      '/channels/chan-1': [json(CHANNEL_INFO)],
+    });
+    const engine = createDiscordCatchup({
+      botToken: 'test-token',
+      webhookUrl: 'http://127.0.0.1:9999/webhook',
+      monitoredChannelIds: () => new Set(['chan-1']),
+      env: {},
+      fetchImpl,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+      now: () => 1753900000000,
+    });
+    const summary = await engine.runOnce('periodic');
+    expect(sleeps).toContain(2000); // Retry-After: 2s honored
+    expect(summary?.routed).toBe(1);
+  });
+
+  it('prunes old routed rows on periodic runs only', async () => {
+    advanceDiscordChannelCursor('chan-1', '500', '2026-07-30T00:00:00.000Z');
+    // makeEngine's default clock is 1753900000000 = 2025-07-30T18:26:40Z, so
+    // the periodic prune cutoff (now - 30d) is ~2025-06-30. The "ancient"
+    // routed row must predate THAT cutoff — 2025-01-01, NOT a 2026 date
+    // (2026 would be in the engine clock's future and never pruned).
+    claimDiscordMessage(
+      'chan-1',
+      'ancient',
+      { guildId: 'guild-1', authorId: 'user-1', source: 'gateway' },
+      '2025-01-01T00:00:00.000Z',
+      '2025-01-01T00:02:00.000Z',
+    );
+    markDiscordMessageRouted('chan-1', 'ancient', '2025-01-01T00:00:01.000Z');
+    const transport = () =>
+      fakeTransport({
+        '/channels/chan-1?': [json(CHANNEL_INFO)],
+        'messages?after=': [json([])],
+        '/channels/chan-1': [json(CHANNEL_INFO)],
+      });
+    const countRows = () =>
+      (getDb().prepare(`SELECT COUNT(*) AS n FROM discord_message_routes`).get() as { n: number }).n;
+
+    await makeEngine(transport().fetchImpl).runOnce('ready');
+    expect(countRows()).toBe(1); // ready runs do not prune
+    await makeEngine(transport().fetchImpl).runOnce('periodic');
+    expect(countRows()).toBe(0); // periodic runs prune >30-day routed rows
+  });
+
+  it('burns exactly ONE claim attempt per run on a persistent 500 (single-attempt POST)', async () => {
+    advanceDiscordChannelCursor('chan-1', '500', '2026-07-30T00:00:00.000Z');
+    const { fetchImpl } = fakeTransport(
+      {
+        '/channels/chan-1?': [json(CHANNEL_INFO)],
+        'messages?after=': [json([restMessage('501')]), json([])],
+        '/channels/chan-1': [json(CHANNEL_INFO)],
+      },
+      () => 500,
+    );
+    const engine = makeEngine(fetchImpl);
+    const summary = await engine.runOnce('periodic');
+    // The claiming fake webhook saw exactly ONE claim: with the old 3-retry
+    // POST this would be 3 — all attempts burned in ~1.3 s (A16 trace 1).
+    expect(getDiscordMessageRouteAttempts('chan-1', '501')).toBe(1);
+    expect(summary?.failed).toBe(1);
+    expect(getDiscordChannelCursor('chan-1')).toBe('500');
+  });
+
+  it('does not count a duplicate-drop 200 as routed (row-status verification)', async () => {
+    advanceDiscordChannelCursor('chan-1', '500', '2026-07-30T00:00:00.000Z');
+    // A live delivery of 501 is still in flight: processing row, unexpired lease.
+    claimDiscordMessage(
+      'chan-1',
+      '501',
+      { guildId: 'guild-1', authorId: 'user-1', source: 'gateway' },
+      '2026-07-30T00:00:00.000Z',
+      '2027-01-01T00:00:00.000Z',
+    );
+    const { fetchImpl } = fakeTransport({
+      '/channels/chan-1?': [json(CHANNEL_INFO)],
+      'messages?after=': [json([restMessage('501')]), json([])],
+      '/channels/chan-1': [json(CHANNEL_INFO)],
+    });
+    const engine = makeEngine(fetchImpl);
+    const summary = await engine.runOnce('periodic');
+    // The webhook claim was refused (active lease) -> it answered 200 -> but
+    // the row is NOT 'routed': the engine must not count it routed, mislabel
+    // the source, or advance the cursor past a message that was never routed
+    // (A16 trace 2 / its active-lease variant).
+    expect(summary?.routed).toBe(0);
+    expect(summary?.failed).toBe(1);
+    expect(getDiscordMessageRouteStatus('chan-1', '501')).toBe('processing');
+    expect(getDiscordChannelCursor('chan-1')).toBe('500');
+  });
+
+  it('sweeps a stranded failed row from BEHIND the cursor and re-routes it without moving the cursor', async () => {
+    // A11 counterexample: live 498 failed (cursor untouched), then live 500
+    // succeeded (cursor advanced past 498) -> the after=cursor walk can never
+    // see 498 again. The sweep must re-present it.
+    claimDiscordMessage(
+      'chan-1',
+      '498',
+      { guildId: 'guild-1', authorId: 'user-1', source: 'gateway' },
+      '2026-07-30T00:00:00.000Z',
+      '2026-07-30T00:02:00.000Z',
+    );
+    markDiscordMessageFailed('chan-1', '498', '2026-07-30T00:00:01.000Z', 'transient dispatch error');
+    advanceDiscordChannelCursor('chan-1', '500', '2026-07-30T00:00:02.000Z');
+    const { fetchImpl, webhookPosts } = fakeTransport({
+      '/channels/chan-1?': [json(CHANNEL_INFO)],
+      'messages?after=': [json([])],
+      // Insertion order matters: this single-message needle must precede the
+      // '/channels/chan-1' catch-all below.
+      '/channels/chan-1/messages/498': [json(restMessage('498', { channel_id: 'chan-1' }))],
+      '/channels/chan-1': [json(CHANNEL_INFO)],
+    });
+    // Engine clock past the KEPT lease (00:02) so the row is sweep-eligible.
+    const engine = makeEngine(fetchImpl, {}, () => Date.parse('2026-07-30T01:00:00.000Z'));
+    const summary = await engine.runOnce('periodic');
+    expect(webhookPosts.map((p) => p.data.id)).toEqual(['498']);
+    expect(webhookPosts[0]?.data.guild_id).toBe('guild-1'); // hard-required injection, in the sweep too
+    expect(summary?.routed).toBe(1);
+    expect(getDiscordMessageRouteStatus('chan-1', '498')).toBe('routed');
+    expect(getDiscordChannelCursor('chan-1')).toBe('500'); // the sweep NEVER moves the cursor
   });
 });
