@@ -30,6 +30,7 @@ import { withRuntimeLock } from './db/runtime-locks.js';
 import {
   findActiveNonNullSessionThreadIdsForAgent,
   findActiveSessionThreadIdEndingWithForAgent,
+  findLatestArchivedSessionForAgent,
   findSessionForAgent,
   getSession,
 } from './db/sessions.js';
@@ -420,7 +421,10 @@ function evaluateEngage(
       // — the thread was activated before, keep firing.
       if (mg.is_group === 0) return false; // DMs never use mention-sticky sensibly
       const existing = findSessionForAgent(agent.agent_group_id, mg.id, threadId);
-      return existing !== undefined;
+      if (existing !== undefined) return true;
+      // An ARCHIVED session keeps the thread subscribed: the follow-up
+      // revives it downstream in resolveSession instead of being dropped.
+      return findLatestArchivedSessionForAgent(agent.agent_group_id, mg.id, threadId) !== undefined;
     }
     default:
       return false;
@@ -487,7 +491,13 @@ async function deliverToAgent(
   let session: Session;
   let created: boolean;
   try {
-    ({ session, created } = resolveSession(agent.agent_group_id, mg.id, agentEvent.threadId, effectiveSessionMode));
+    ({ session, created } = resolveSession(
+      agent.agent_group_id,
+      mg.id,
+      agentEvent.threadId,
+      effectiveSessionMode,
+      true, // HARD REQUIREMENT: inbound messages revive archived sessions
+    ));
   } catch (err) {
     if (err instanceof RouteResetInProgressError) {
       await deliverHostText(

@@ -22,9 +22,12 @@ import { getMessagingGroup } from './db/messaging-groups.js';
 import {
   archiveSession,
   createSession,
+  findLatestArchivedSessionByAgentGroup,
+  findLatestArchivedSessionForAgent,
   findSessionByAgentGroup,
   findSessionForAgent,
   getSession,
+  reactivateSession,
   updateSession,
 } from './db/sessions.js';
 import {
@@ -190,6 +193,7 @@ export function resolveSession(
   messagingGroupId: string | null,
   threadId: string | null,
   sessionMode: SessionMode,
+  reviveArchived = false,
 ): { session: Session; created: boolean } {
   // agent-shared: single session per agent group, regardless of messaging group
   if (sessionMode === 'agent-shared') {
@@ -207,12 +211,31 @@ export function resolveSession(
     }
   }
 
+  // Guard BEFORE revival: during a scheduler-aware reset both route
+  // sessions are 'resetting', so the active lookups above miss — reviving
+  // an archived sibling here would end with two active sessions after the
+  // reset finalizes. Throwing preserves today's exact mid-reset behavior.
   assertNoRouteResetInProgress({
     agentGroupId,
     messagingGroupId,
     threadId,
     sessionMode,
   });
+
+  if (reviveArchived) {
+    if (sessionMode === 'agent-shared') {
+      const archived = findLatestArchivedSessionByAgentGroup(agentGroupId);
+      if (archived) {
+        return { session: reviveArchivedSession(archived), created: false };
+      }
+    } else if (messagingGroupId) {
+      const lookupThreadId = sessionMode === 'shared' ? null : threadId;
+      const archived = findLatestArchivedSessionForAgent(agentGroupId, messagingGroupId, lookupThreadId);
+      if (archived) {
+        return { session: reviveArchivedSession(archived), created: false };
+      }
+    }
+  }
 
   const id = generateId();
   const lookupThreadId = sessionMode === 'per-thread' ? threadId : null;
@@ -233,6 +256,30 @@ export function resolveSession(
   log.info('Session created', { id, agentGroupId, messagingGroupId, threadId: lookupThreadId, sessionMode });
 
   return { session, created: true };
+}
+
+/**
+ * HARD REQUIREMENT (see docs/plans/2026-07-30-sqlite-write-churn.md): an
+ * inbound message for an archived session revives it and delivers into it —
+ * never drops, never forks a duplicate session. Revival is OPT-IN
+ * (reviveArchived=true) at the router inbound call site only; every other
+ * caller (a2a agent-route, rollActiveSession) keeps today's mint-fresh
+ * semantics — a fresh session still delivers, so never-drop holds there too.
+ */
+function reviveArchivedSession(session: Session): Session {
+  reactivateSession(session.id);
+  // The on-disk folder normally survives archival; recreate it only if it
+  // vanished (e.g. manual cleanup) so the message write cannot fail.
+  if (!fs.existsSync(sessionDir(session.agent_group_id, session.id))) {
+    initSessionFolder(session.agent_group_id, session.id);
+  }
+  log.info('Session reactivated by inbound routing', {
+    id: session.id,
+    agentGroupId: session.agent_group_id,
+    messagingGroupId: session.messaging_group_id,
+    threadId: session.thread_id,
+  });
+  return { ...session, status: 'active' };
 }
 
 export function rollActiveSession(args: {
