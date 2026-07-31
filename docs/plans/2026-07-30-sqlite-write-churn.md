@@ -9,10 +9,14 @@
 `v2.db` by (3.1) replacing DB-row runtime locks with an in-process async
 mutex, (3.2 code side) bounding the per-minute host sweep to genuinely-live
 sessions with archived-session support, (3.3) a read-before-lock early exit
-in `sweepSession`, and (3.4) explicit `synchronous=NORMAL` +
-`wal_autocheckpoint=4000` pragmas — while guaranteeing that archived
-sessions are revived (never dropped) by an inbound message or due scheduled
-work.
+in `sweepSession`, and (3.4) explicit `synchronous=FULL` +
+`wal_autocheckpoint=4000` pragmas (durability pinned, checkpoint clustering
+reduced) — while guaranteeing that archived sessions are revived (never
+dropped) by an inbound message or due scheduled work. Validation of the
+plan's load-bearing assumptions added three hardening tasks: a one-time
+startup legacy-import reconciliation (Task 8), a write-free steady-state
+scheduler projection (Task 9), and a boot-time process-singleton guard
+(Task 10).
 
 **Architecture:** The write storm is pure lock bookkeeping: the 60 s host
 sweep takes a `runtime_locks` DB-row lock per active session per pass
@@ -22,10 +26,18 @@ wipes all foreign rows), so an in-memory `Map`-based mutex is semantically
 identical with zero disk writes. Independently, the sweep set is bounded to
 recently-active sessions plus sessions with live scheduled tasks, archived
 sessions become revivable at the routing layer and the sweep, and idle
-sessions skip the scheduler-lock block entirely via cheap reads.
+sessions skip the scheduler-lock block entirely via cheap reads. The
+`runtime_locks` table itself is NOT dropped this release — the DROP is
+deferred to a post-soak release (Task 2, deferred): the table simply
+becomes write-free after Task 1, which captures ~all of the churn win.
 
 **Tech Stack:** TypeScript (NodeNext, strict), better-sqlite3, vitest.
 Repo root (isolated worktree): `/home/dan/code/nanoclaw-reboot-resilience/.worktrees/sqlite-write-churn`, branch `fix/sqlite-write-churn`.
+
+**Setup note (validation A8.1):** the worktree currently has NO
+`node_modules` — run `pnpm install` once at the worktree root BEFORE
+starting Task 1, or every `pnpm exec vitest`/`pnpm test` step below fails
+with "Command not found".
 
 **Authoritative analysis:** `/home/dan/code/shapiroserver2/docs/plans/2026-07-30-nanoclaw-write-stream-findings-and-ssd-plan.md`
 (file:line evidence for every claim above; its §2.4 sacred/housekeeping
@@ -66,8 +78,10 @@ split is normative for this plan).
   sibling functions already are.
 - Do NOT change the three `getActiveSessions()` callers other than
   `src/host-sweep.ts:329` — `src/modules/scheduling/repair.ts:30` and
-  `src/delivery.ts:152` keep their current result set (their iteration is
-  read-mostly and cheap once locks are in-memory).
+  `src/delivery.ts:152` keep their current result set. (Task 9 makes the
+  repair loop's projection pass steady-state write-free WITHOUT touching
+  its session set; repair's unbounded per-minute archived-session scan is
+  a flagged follow-up — see post-plan notes.)
 - Do NOT touch `'closed'` status (never written in production; vestigial)
   and do NOT change `'resetting'` semantics or the five active-only session
   selectors' behavior for `resetting` (pinned by
@@ -91,25 +105,27 @@ runtime's central-DB write path) and share test fixtures; one plan.
 | `src/db/runtime-locks.test.ts` | rewrite | behavior suite for the in-memory engine (no raw SQL) |
 | `src/modules/scheduling/actions.test.ts` | touch (2 lines + import) | release blocker via exported `releaseRuntimeLock` instead of raw SQL |
 | `src/yente/scheduler-reset.test.ts` | touch (~5 lines) | simulate contention via `acquireRuntimeLock` instead of raw INSERT |
-| `src/db/migrations/018-drop-runtime-locks.ts` | create | drop the now-unused `runtime_locks` table |
-| `src/db/migrations/index.ts` | touch (2 lines) | register migration 018 |
-| `src/db/migrations/018-drop-runtime-locks.test.ts` | create | migration behavior (table gone, idempotent) |
-| `src/db/schema.ts` | touch | remove `runtime_locks` DDL block (fresh-install mirror) |
-| `src/db/db-v2.test.ts` | touch (~3 lines) | flip `runtime_locks` table-existence expectation |
 | `src/db/sessions.ts` | extend | `findLatestArchivedSessionForAgent`, `findLatestArchivedSessionByAgentGroup`, `reactivateSession`, `getSweepableSessions`, `SWEEP_RECENCY_WINDOW_MS` |
 | `src/db/index.ts` | touch | barrel-export the new session helpers |
 | `src/db/sessions.test.ts` | extend | unit tests for revival helpers |
-| `src/db/sweepable-sessions.test.ts` | create | unit tests for the bounded sweep query |
-| `src/session-manager.ts` | touch | `resolveSession` archived-revival arm; `rollActiveSession` opts out |
-| `src/router.ts` | touch (~3 lines) | `mention-sticky` treats archived sessions as still subscribed |
+| `src/db/sweepable-sessions.test.ts` | create | unit tests for the bounded, session-mode-aware sweep query |
+| `src/session-manager.ts` | touch | `resolveSession` archived-revival arm (opt-in `reviveArchived` param, default OFF; reset guard before revival) |
+| `src/router.ts` | touch (~5 lines) | `mention-sticky` treats archived sessions as still subscribed; inbound call site opts into revival |
 | `src/session-revival.test.ts` | create | **acceptance tests**: archive → message → revive → deliver; roll regression |
-| `src/host-sweep.ts` | touch | use `getSweepableSessions`; archived-reactivation branch; read-before-lock gate; test exports |
-| `src/host-sweep.revival.test.ts` | create | sweep revives archived session with due scheduled work, end to end |
+| `src/host-sweep.ts` | touch | use `getSweepableSessions`; archived-reactivation branch (with folder recreate); failed-wake `last_active` stamp; read-before-lock gate; test exports |
+| `src/host-sweep.revival.test.ts` | create | sweep revival end to end: per-thread, agent-shared, deleted-folder; no-double-active roll regression |
 | `src/host-sweep.early-exit.test.ts` | create | idle session skips the scheduler-mutator lock |
 | `src/db/session-db.ts` | extend | `hasSchedulerTaskRows(db)` cheap gate read |
 | `src/modules/scheduling/ledger.ts` | extend | `hasLiveScheduledTasksForAgentGroup(agentGroupId)` cheap gate read |
-| `src/db/connection.ts` | touch (2 lines) | `synchronous=NORMAL`, `wal_autocheckpoint=4000` pragmas |
+| `src/db/connection.ts` | touch (3 lines) | explicit `synchronous=FULL`, `wal_autocheckpoint=4000` pragmas |
 | `src/db/connection.test.ts` | create | pragma assertions on a file-backed DB |
+| `src/modules/scheduling/startup-import.ts` | create | one-time startup legacy-task import reconciliation (Task 8) |
+| `src/modules/scheduling/startup-import.test.ts` | create | reconciliation imports from a >30d-stale active session |
+| `src/modules/scheduling/projection.ts` | touch | skip the existing-row UPDATE when the projection is unchanged (Task 9) |
+| `src/modules/scheduling/projection.test.ts` | extend | steady-state re-projection preserves `host_received_at` (no write) |
+| `src/process-singleton.ts` | create | boot-time exclusive-lock-DB singleton guard (Task 10) |
+| `src/process-singleton.test.ts` | create | two-connection contention on a /tmp lock DB |
+| `src/index.ts` | touch | singleton guard before `initDb`; startup reconciliation kickoff |
 
 Design notes locked in here (rationale lives in the findings doc):
 
@@ -121,11 +137,22 @@ Design notes locked in here (rationale lives in the findings doc):
 2. **Due-inbound liveness needs no SQL clause of its own** in the sweep
    predicate: every inbound write stamps `sessions.last_active`
    (`src/session-manager.ts:453`), so a session with pending inbound work
-   is "recent" by construction; future-dated due work is always represented
-   by a live `scheduled_tasks` row (`pending`/`paused`), which the
-   predicate checks directly.
+   is "recent" by construction; future-dated due work written by the
+   scheduler is always represented by a live `scheduled_tasks` row
+   (`pending`/`paused`), which the predicate checks directly. Two
+   validation-found gaps (A3, A7) are closed elsewhere: legacy pre-ledger
+   task rows have NO central row until imported — Task 8's one-time
+   startup reconciliation visits ALL active sessions so >30d-stale ones
+   cannot silently strand them; and obligation-SERVICING failure loops
+   (wedged containers, continuously failing wakes) do not stamp
+   `last_active` — covered by the active arm's
+   `container_status <> 'stopped'` clause and the failed-wake
+   `last_active` stamp (both Task 5).
 3. **Conservatism direction:** every gate errs toward sweeping/locking MORE
-   (never less). Any doubt ⇒ take the lock and sync as today.
+   (never less) on the ACTIVE arm — any doubt ⇒ take the lock and sync as
+   today. The one deliberate exception is revival: the archived arm never
+   revives while an `active` OR `resetting` sibling exists (a duplicate
+   active session is strictly worse than a one-sweep-cycle delivery delay).
 4. **`canonicalThreadIdForExistingSession` and the `/new` retarget helper
    stay active-only.** In the rare case a platform-shortened thread id for
    an archived session misses canonicalization, routing creates a fresh
@@ -134,7 +161,7 @@ Design notes locked in here (rationale lives in the findings doc):
 5. **`repairSchedulerProjections`'s tombstone path is compatible** with
    sweep revival: `tombstoneLegacyArchivedTask` fires only for legacy
    inbound task rows with NO central `scheduled_tasks` row
-   (`repair.ts:459-460` in the current tree: `if (central) continue;`);
+   (`repair.ts:77-78` in the current tree: `if (central) continue;`);
    the sweep's archived arm requires a live central row, which repair
    never touches.
 
@@ -638,130 +665,33 @@ git commit -m "fix(locks): replace DB-row runtime locks with an in-process async
 
 ---
 
-### Task 2: Drop the `runtime_locks` table (migration 018)
+### Task 2: `runtime_locks` table drop — DEFERRED (no steps)
 
-**Files:**
-- Create: `src/db/migrations/018-drop-runtime-locks.ts`
-- Create: `src/db/migrations/018-drop-runtime-locks.test.ts`
-- Modify: `src/db/migrations/index.ts` (register in the array at lines ~26-42)
-- Modify: `src/db/schema.ts:238-245` (remove the `runtime_locks` DDL block)
-- Modify: `src/db/db-v2.test.ts:170-187`
+**Decision (load-bearing-assumption validation, A1 — critical): this
+release does NOT drop the `runtime_locks` table.** Validation ran the real
+old binary's startup path against a simulated post-drop `v2.db`: the old
+code prepares SQL against `runtime_locks` unconditionally at startup
+(`clearStaleRuntimeLocks`, `src/index.ts:72`), and better-sqlite3 compiles
+statements eagerly — the throw lands at `prepare()` time, `main()` rejects,
+`process.exit(1)` fires, and the supervisor's KeepAlive respawns it into a
+hard crash-loop with zero service availability. The deploy model is
+in-place (fixed `dist/` path, no version pinning, no guaranteed `v2.db`
+backup at deploy time) and migrations have no `down()` — so "the old
+binary never meets the post-drop DB" is not a property anyone can promise,
+and the outcome when it happens is the worst case.
 
-**Interfaces:**
-- Consumes: Task 1 (nothing reads or writes `runtime_locks` anymore —
-  verified: raw SQL against it existed only in the tests Task 1 updated;
-  nothing outside `src/` mentions the table).
-- Produces: migration `version: 18`, `name: 'drop-runtime-locks'` (the
-  runner dedupes applied migrations by `name`, not version —
-  `src/db/migrations/index.ts:54-63`).
+What this release does instead:
 
-- [ ] **Step 1: Write the failing migration test**
-
-First open `src/db/migrations/017-*.ts` and its co-located test and mirror
-their exact export/registration shape. Create
-`src/db/migrations/018-drop-runtime-locks.test.ts` (ESM imports like every
-sibling test; adjust the two import lines to match how the 017 test
-imports the runner and connection helpers):
-
-```ts
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-
-import { getDb, hasTable, initTestDb } from '../connection.js';
-import { closeDb } from '../index.js';
-import { runMigrations } from './index.js';
-
-describe('migration 018-drop-runtime-locks', () => {
-  beforeEach(() => {
-    const db = initTestDb();
-    runMigrations(db);
-  });
-
-  afterEach(() => {
-    closeDb();
-  });
-
-  it('drops the runtime_locks table', () => {
-    expect(hasTable(getDb(), 'runtime_locks')).toBe(false);
-  });
-
-  it('is idempotent (re-running up() does not throw)', async () => {
-    const migration = await import('./018-drop-runtime-locks.js');
-    expect(() => migration.up(getDb())).not.toThrow();
-    expect(() => migration.up(getDb())).not.toThrow();
-  });
-});
-```
-
-(If 017 exports a single migration object instead of named
-`version`/`name`/`up` consts, mirror that exact shape here and in Step 3.)
-
-- [ ] **Step 2: Run it to verify it fails**
-
-```bash
-pnpm exec vitest run src/db/migrations/018-drop-runtime-locks.test.ts
-```
-
-Expected: FAIL — module `./018-drop-runtime-locks.js` does not exist /
-`hasTable` returns `true`.
-
-- [ ] **Step 3: Write the migration and register it**
-
-`src/db/migrations/018-drop-runtime-locks.ts` (mirror 017's export shape;
-shown here in the `{version, name, up}` convention the runner consumes):
-
-```ts
-import type Database from 'better-sqlite3';
-
-/**
- * Runtime locks moved in-process (src/db/runtime-locks.ts): the table only
- * ever coordinated async tasks inside the single NanoClaw process and was
- * wiped at every startup. Dropping it removes the ~99%-of-all-bytes WAL
- * churn source for good. No data is migrated — rows were transient by design.
- */
-export const version = 18;
-export const name = 'drop-runtime-locks';
-
-export function up(db: Database.Database): void {
-  db.exec(`DROP TABLE IF EXISTS runtime_locks;`);
-}
-```
-
-Register it in `src/db/migrations/index.ts`: add the import next to the
-017 import and append it to the migrations array exactly the way 017 is
-appended (same object/property shape).
-
-Remove the `runtime_locks` CREATE TABLE block from `src/db/schema.ts`
-(lines 238-245, the fresh-install mirror — the whole
-`CREATE TABLE runtime_locks (...)` statement). Do NOT touch migration 014
-— historical migrations are immutable; fresh DBs run 014 then 018, ending
-in the same no-table state.
-
-Update `src/db/db-v2.test.ts:170-187`
-(`creates all scheduler ledger and runtime lock tables`): remove
-`runtime_locks` from the expected-present assertions and add an explicit
-absence assertion:
-
-```ts
-expect(hasTable(getDb(), 'runtime_locks')).toBe(false);
-```
-
-(rename the test to `creates all scheduler ledger tables and drops runtime_locks`).
-
-- [ ] **Step 4: Run the tests**
-
-```bash
-pnpm exec vitest run src/db/migrations/018-drop-runtime-locks.test.ts src/db/db-v2.test.ts
-```
-
-Expected: PASS.
-
-- [ ] **Step 5: Full suite + typecheck, then commit**
-
-```bash
-pnpm test && pnpm exec tsc --noEmit
-git add src/db/migrations/018-drop-runtime-locks.ts src/db/migrations/018-drop-runtime-locks.test.ts src/db/migrations/index.ts src/db/schema.ts src/db/db-v2.test.ts
-git commit -m "feat(db): drop the runtime_locks table (locks are in-process now)"
-```
+- The table persists via migration 014 and simply becomes **write-free**
+  after Task 1 — the in-process mutex already captures ~all of the churn
+  win; the DROP itself bought nothing measurable.
+- No migration 018 is created. `src/db/schema.ts`, `src/db/migrations/*`,
+  and `src/db/db-v2.test.ts` are untouched by this plan (the existing
+  `runtime_locks` table-existence assertion in `db-v2.test.ts` stays
+  green as-is).
+- The DROP moves to a future release, after the in-memory-locks change has
+  soaked in production, with a **pre-drop `v2.db` backup as a hard
+  precondition** (see post-plan notes).
 
 ---
 
@@ -933,17 +863,26 @@ git commit -m "feat(sessions): add archived-session revival lookups and reactiva
 ### Task 4: Inbound-message revival at the routing layer (+ acceptance test)
 
 **Files:**
-- Modify: `src/session-manager.ts` (`resolveSession` ~:188-236, `rollActiveSession` ~:238-255)
-- Modify: `src/router.ts` (`mention-sticky` case, ~:416-423)
+- Modify: `src/session-manager.ts` (`resolveSession` ~:188-236 only —
+  `rollActiveSession` is NOT touched)
+- Modify: `src/router.ts` (`mention-sticky` case ~:416-423; inbound
+  `resolveSession` call ~:490)
 - Create: `src/session-revival.test.ts`
 
 **Interfaces:**
 - Consumes (Task 3): `findLatestArchivedSessionForAgent`,
   `findLatestArchivedSessionByAgentGroup`, `reactivateSession`.
-- Produces: `resolveSession(agentGroupId, messagingGroupId, threadId, sessionMode, reviveArchived = true)`
-  — 5th optional parameter, default `true`; all existing 4-arg callers keep
-  today's behavior *plus* revival. `rollActiveSession` passes `false`
-  (a roll must always mint a fresh session).
+- Produces: `resolveSession(agentGroupId, messagingGroupId, threadId, sessionMode, reviveArchived = false)`
+  — 5th optional parameter, default `false` (revival is OPT-IN; validation
+  A5). Only the router inbound call site (`src/router.ts:490`, inside its
+  existing `RouteResetInProgressError` handler) passes `true`. Every other
+  caller — `src/modules/agent-to-agent/agent-route.ts:139` (a2a) and
+  `rollActiveSession` — keeps today's mint-fresh semantics via the default:
+  never-drop still holds everywhere, because a freshly minted session
+  delivers the message. (`rollActiveSession` itself has ZERO production
+  callers — the real `/new`//`/clear` path is scheduler-reset's
+  `activateFreshAndArchiveOldAtomically`, which is untouched; the `/new`
+  regression test below exercises that real path.)
 
 - [ ] **Step 1: Write the failing acceptance tests**
 
@@ -1159,7 +1098,18 @@ this point, the harness is wrong — fix the harness before proceeding.
 In `src/session-manager.ts`, extend the imports from `./db/sessions.js`
 (or the barrel it currently uses) with `findLatestArchivedSessionForAgent`,
 `findLatestArchivedSessionByAgentGroup`, `reactivateSession`. Change
-`resolveSession` (currently `:188-236`) to:
+`resolveSession` (currently `:188-236`) to the following. TWO load-bearing
+ordering/default decisions (validation A4 + A5):
+
+1. `assertNoRouteResetInProgress` runs BEFORE the archived-revival lookup
+   (order: active lookup → miss → assert → archived lookup → revive, else
+   fall through to creation). A mid-reset inbound therefore throws
+   `RouteResetInProgressError` exactly as today (pinned by
+   `scheduler-reset.test.ts`) — otherwise revival could resurrect an
+   archived sibling while old+fresh sessions sit at `'resetting'`, leaving
+   TWO active sessions on the route after the reset finalizes.
+2. `reviveArchived` defaults to `false`; only the router inbound call site
+   opts in (Step 3c below).
 
 ```ts
 export function resolveSession(
@@ -1167,19 +1117,13 @@ export function resolveSession(
   messagingGroupId: string | null,
   threadId: string | null,
   sessionMode: SessionMode,
-  reviveArchived = true,
+  reviveArchived = false,
 ): { session: Session; created: boolean } {
   // agent-shared: single session per agent group, regardless of messaging group
   if (sessionMode === 'agent-shared') {
     const existing = findSessionByAgentGroup(agentGroupId);
     if (existing) {
       return { session: existing, created: false };
-    }
-    if (reviveArchived) {
-      const archived = findLatestArchivedSessionByAgentGroup(agentGroupId);
-      if (archived) {
-        return { session: reviveArchivedSession(archived), created: false };
-      }
     }
   } else if (messagingGroupId) {
     const lookupThreadId = sessionMode === 'shared' ? null : threadId;
@@ -1189,20 +1133,33 @@ export function resolveSession(
     if (existing) {
       return { session: existing, created: false };
     }
-    if (reviveArchived) {
-      const archived = findLatestArchivedSessionForAgent(agentGroupId, messagingGroupId, lookupThreadId);
-      if (archived) {
-        return { session: reviveArchivedSession(archived), created: false };
-      }
-    }
   }
 
+  // Guard BEFORE revival: during a scheduler-aware reset both route
+  // sessions are 'resetting', so the active lookups above miss — reviving
+  // an archived sibling here would end with two active sessions after the
+  // reset finalizes. Throwing preserves today's exact mid-reset behavior.
   assertNoRouteResetInProgress({
     agentGroupId,
     messagingGroupId,
     threadId,
     sessionMode,
   });
+
+  if (reviveArchived) {
+    if (sessionMode === 'agent-shared') {
+      const archived = findLatestArchivedSessionByAgentGroup(agentGroupId);
+      if (archived) {
+        return { session: reviveArchivedSession(archived), created: false };
+      }
+    } else if (messagingGroupId) {
+      const lookupThreadId = sessionMode === 'shared' ? null : threadId;
+      const archived = findLatestArchivedSessionForAgent(agentGroupId, messagingGroupId, lookupThreadId);
+      if (archived) {
+        return { session: reviveArchivedSession(archived), created: false };
+      }
+    }
+  }
 
   // ... creation path UNCHANGED from here down (generateId, createSession,
   // initSessionFolder, log 'Session created', return { session, created: true })
@@ -1211,8 +1168,10 @@ export function resolveSession(
 /**
  * HARD REQUIREMENT (see docs/plans/2026-07-30-sqlite-write-churn.md): an
  * inbound message for an archived session revives it and delivers into it —
- * never drops, never forks a duplicate session. Rolls (/new, /clear) opt out
- * via reviveArchived=false because a roll must mint a fresh session.
+ * never drops, never forks a duplicate session. Revival is OPT-IN
+ * (reviveArchived=true) at the router inbound call site only; every other
+ * caller (a2a agent-route, rollActiveSession) keeps today's mint-fresh
+ * semantics — a fresh session still delivers, so never-drop holds there too.
  */
 function reviveArchivedSession(session: Session): Session {
   reactivateSession(session.id);
@@ -1234,14 +1193,32 @@ function reviveArchivedSession(session: Session): Session {
 (`fs`, `sessionDir`, `initSessionFolder`, and `log` are already available
 in `session-manager.ts`.)
 
-In `rollActiveSession` (`:238-255`), change the final line to opt out of
-revival:
+`rollActiveSession` (`:238-255`) is NOT changed: it calls the 4-arg
+`resolveSession(...)`, and the new default (`reviveArchived = false`)
+already preserves its mint-a-fresh-session semantics. (It has zero
+production callers anyway — the real `/new`//`/clear` reset path is
+`activateFreshAndArchiveOldAtomically` in `src/yente/scheduler-reset.ts`,
+untouched by this plan.) Likewise `src/modules/agent-to-agent/agent-route.ts:139`
+stays 4-arg: a2a messages keep minting fresh agent-shared sessions.
+
+In `src/router.ts`, TWO changes:
+
+(3c) The inbound call site (`deliverToAgent`, `:490`) opts INTO revival —
+it already sits inside the `RouteResetInProgressError` try/catch, so the
+mid-reset throw from the reordered guard lands in today's handler
+("Session reset is still finishing..."):
 
 ```ts
-  return resolveSession(args.agentGroupId, args.messagingGroupId, args.threadId, args.sessionMode, false).session;
+    ({ session, created } = resolveSession(
+      agent.agent_group_id,
+      mg.id,
+      agentEvent.threadId,
+      effectiveSessionMode,
+      true, // HARD REQUIREMENT: inbound messages revive archived sessions
+    ));
 ```
 
-In `src/router.ts`, the `mention-sticky` case (`:416-423`): import
+(3d) The `mention-sticky` case (`:416-423`): import
 `findLatestArchivedSessionForAgent` next to the existing
 `findSessionForAgent` import and change the tail of the case to:
 
@@ -1259,6 +1236,12 @@ In `src/router.ts`, the `mention-sticky` case (`:416-423`): import
     }
 ```
 
+> Note (validation A4): the mention-sticky arm is unaffected by the reset
+> guard — it only decides ENGAGEMENT (whether the agent fires at all).
+> Revival itself happens, and is reset-guarded, inside `resolveSession`;
+> a sticky follow-up arriving mid-reset engages, then hits the guard and
+> gets today's "reset is still finishing" reply.
+
 - [ ] **Step 4: Run the acceptance tests**
 
 ```bash
@@ -1273,9 +1256,12 @@ Expected: PASS (all 3).
 pnpm exec vitest run src/router.test.ts src/host-core.test.ts src/yente/scheduler-reset.test.ts src/session-manager.test.ts src/delivery.test.ts
 ```
 
-Expected: PASS — in particular `router.test.ts`'s
+Expected: PASS — in particular `scheduler-reset.test.ts`'s
+`blocks competing route session creation while a supersession is unfinished`
+(the guard-before-revival ordering preserves it), `router.test.ts`'s
 `archives and rolls the addressed session for admin /new and /clear`
-(the `reviveArchived=false` opt-out preserves it) and `delivery.test.ts`'s
+(the opt-in default preserves it: the roll/reset machinery never passes
+`reviveArchived=true`) and `delivery.test.ts`'s
 archived-session drop behavior (delivery still treats non-active sessions
 as inactive; revival only happens on new inbound routing).
 
@@ -1295,7 +1281,7 @@ git commit -m "feat(routing): revive archived sessions on inbound messages inste
 - Modify: `src/db/sessions.ts` (append `SWEEP_RECENCY_WINDOW_MS`, `getSweepableSessions`)
 - Modify: `src/db/index.ts` (barrel export)
 - Create: `src/db/sweepable-sessions.test.ts`
-- Modify: `src/host-sweep.ts` (`:329` swap; `sweepSession` head ~`:347`; add `sweepSessionForTest` export next to `runHostSweepPassForTest` ~`:298`)
+- Modify: `src/host-sweep.ts` (`:329` swap; `sweepSession` head ~`:347`; wake path ~`:426-430`; add `sweepSessionForTest` export next to `runHostSweepPassForTest` ~`:298`)
 - Modify: `src/host-sweep.scheduler.test.ts:39,79` (mock `getSweepableSessions` instead of `getActiveSessions`)
 - Create: `src/host-sweep.revival.test.ts`
 
@@ -1308,7 +1294,21 @@ git commit -m "feat(routing): revive archived sessions on inbound messages inste
   sourceMessageId`; must run inside
   `withRuntimeLock('scheduler-mutator', 120_000, ...)`) for test seeding.
   Live scheduled-task statuses are exactly `'pending'` and `'paused'`
-  (the `listLiveScheduledTasksForSession` filter).
+  (the `listLiveScheduledTasksForSession` filter). The archived arm is
+  SESSION-MODE-AWARE (validation A2 + A2-v2): a session row `x` is
+  **agent-shared-classified** IFF its OWN route's wiring row is
+  agent-shared, OR it has NO messaging group and ANY wiring row in its
+  agent group is agent-shared — exactly mirroring
+  `resolveProjectionContext` (`src/modules/scheduling/sync.ts:393-409`:
+  NULL-mg sessions use a GROUP-WIDE agent-shared check with no mg filter;
+  non-NULL-mg sessions use their own route row). Agent-shared delivery is
+  served ONLY by agent-shared-classified sessions (the `ledger.ts:208-217`
+  non-agent-shared arm is strict-route), so the agent-shared branch's
+  sibling guard and latest-archived tiebreak must range over exactly that
+  classified set — group-blind or mode-blind scoping either over-blocks
+  (an active per-thread session that cannot serve the task) or picks an
+  archived sibling that cannot serve it (both never-drop violations,
+  validator-A2-v2 scenarios 8a/8b/8c).
 - Produces:
   - `SWEEP_RECENCY_WINDOW_MS = 30 * 24 * 60 * 60 * 1000` (exported const)
   - `getSweepableSessions(now?: Date): Session[]`
@@ -1326,6 +1326,7 @@ import {
   closeDb,
   createAgentGroup,
   createMessagingGroup,
+  createMessagingGroupAgent,
   createSession,
   getSweepableSessions,
   initTestDb,
@@ -1333,7 +1334,7 @@ import {
   SWEEP_RECENCY_WINDOW_MS,
 } from './index.js';
 import { withRuntimeLock } from './runtime-locks.js';
-import { createOrReplaceScheduledTask } from '../modules/scheduling/ledger.js';
+import { createOrReplaceScheduledTask, type CreateScheduledTaskInput } from '../modules/scheduling/ledger.js';
 import type { Session } from '../types.js';
 
 const NOW = new Date('2026-07-30T12:00:00.000Z');
@@ -1359,7 +1360,7 @@ function seedSession(id: string, overrides: Partial<Session> = {}): void {
   });
 }
 
-async function seedLiveTask(seriesId: string): Promise<void> {
+async function seedLiveTask(seriesId: string, overrides: Partial<CreateScheduledTaskInput> = {}): Promise<void> {
   await withRuntimeLock('scheduler-mutator', 120_000, (owner) => {
     createOrReplaceScheduledTask(
       {
@@ -1375,9 +1376,26 @@ async function seedLiveTask(seriesId: string): Promise<void> {
         content: JSON.stringify({ prompt: 'heartbeat', script: null }),
         sessionId: 'sess-seed',
         sourceMessageId: `msg-${seriesId}`,
+        ...overrides,
       },
       owner,
     );
+  });
+}
+
+/** Wire the (ag-1, mg-1) route agent-shared — the archived arm's per-route mode source. */
+function wireAgentShared(): void {
+  createMessagingGroupAgent({
+    id: 'mga-shared',
+    messaging_group_id: 'mg-1',
+    agent_group_id: 'ag-1',
+    engage_mode: 'pattern',
+    engage_pattern: '.',
+    sender_scope: 'all',
+    ignored_message_policy: 'drop',
+    session_mode: 'agent-shared',
+    priority: 0,
+    created_at: now(),
   });
 }
 
@@ -1454,6 +1472,239 @@ describe('getSweepableSessions', () => {
     seedSession('sess-resetting', { status: 'resetting' });
     expect(sweepableIds()).toEqual([]);
   });
+
+  it('keeps a stale ACTIVE session with a non-stopped container sweepable', () => {
+    // Obligation-servicing loops (wedged containers, SLA kills, orphaned
+    // claims after a host restart) never stamp last_active — the
+    // container_status clause keeps them under sweep supervision.
+    seedSession('sess-wedged', { last_active: STALE, container_status: 'running' });
+    expect(sweepableIds()).toEqual(['sess-wedged']);
+  });
+
+  it('agent-shared: a cross-route live task makes the LATEST archived group session sweepable', async () => {
+    wireAgentShared();
+    // Archived agent-shared sessions carry the RAW mg of whichever route
+    // created them (or NULL for a2a-created ones) — a due task's stored
+    // route may differ. Exact-route IS matching would drop this work.
+    seedSession('sess-arch-shared-old', {
+      status: 'archived',
+      last_active: STALE,
+      thread_id: null,
+      created_at: '2026-01-01T00:00:00.000Z',
+    });
+    seedSession('sess-arch-shared-new', {
+      status: 'archived',
+      last_active: STALE,
+      thread_id: null,
+      created_at: '2026-02-01T00:00:00.000Z',
+    });
+    await seedLiveTask('task-null-route', { messagingGroupId: null, threadId: null });
+    expect(sweepableIds()).toEqual(['sess-arch-shared-new']);
+  });
+
+  it('agent-shared: any active session in the group shadows every archived sibling (no double-active)', async () => {
+    wireAgentShared();
+    seedSession('sess-shared-active', { thread_id: null }); // active + recent
+    seedSession('sess-arch-shared', { status: 'archived', last_active: STALE, thread_id: null });
+    // Task route-matches the ARCHIVED sibling's raw columns (post-roll shape):
+    // the group-scoped sibling guard must still refuse revival.
+    await seedLiveTask('task-post-roll', { threadId: null });
+    expect(sweepableIds()).toEqual(['sess-shared-active']);
+  });
+
+  it('a RESETTING sibling on the route blocks archived revival without being swept itself', async () => {
+    seedSession('sess-resetting-sib', { status: 'resetting', last_active: STALE });
+    seedSession('sess-arch-behind-reset', { status: 'archived', last_active: STALE });
+    await seedLiveTask('task-mid-reset');
+    // Neither: resetting sessions are never swept (pinned semantics), and
+    // the archived sibling must not be revived mid-reset (validation A4).
+    expect(sweepableIds()).toEqual([]);
+  });
+
+  it('MIXED-mode group: exact-route revival on the per-thread route survives an active agent-shared session elsewhere in the group', async () => {
+    // ag-1 wired per-thread on mg-1 and agent-shared on mg-2. Mode is
+    // determined per SESSION ROUTE: the archived mg-1 session must take the
+    // exact-route branch — group-level detection would put it under the
+    // group-scoped sibling guard and the active mg-2 session would block
+    // its revival (an under-revive, violating never-drop).
+    createMessagingGroup({
+      id: 'mg-2',
+      channel_type: 'discord',
+      platform_id: 'channel-2',
+      name: 'MG2',
+      is_group: 1,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    createMessagingGroupAgent({
+      id: 'mga-per-thread',
+      messaging_group_id: 'mg-1',
+      agent_group_id: 'ag-1',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'per-thread',
+      priority: 0,
+      created_at: now(),
+    });
+    createMessagingGroupAgent({
+      id: 'mga-shared-mg2',
+      messaging_group_id: 'mg-2',
+      agent_group_id: 'ag-1',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'agent-shared',
+      priority: 0,
+      created_at: now(),
+    });
+
+    seedSession('sess-shared-active-mg2', { messaging_group_id: 'mg-2', thread_id: null }); // active + recent
+    seedSession('sess-arch-thread', { status: 'archived', last_active: STALE }); // mg-1/thread-1
+    await seedLiveTask('task-exact-route'); // exact route: mg-1/thread-1
+
+    // Both: the active session via recency, the archived per-thread session
+    // via its OWN route's exact-route branch.
+    expect(sweepableIds()).toEqual(['sess-arch-thread', 'sess-shared-active-mg2']);
+  });
+
+  it('8a: a NEWER archived NULL-mg (a2a) sibling wins the classified tiebreak for an mg-routed group task', async () => {
+    wireAgentShared(); // (ag-1, mg-1) agent-shared
+    // Post-roll-via-a2a shape: older archived sibling carries the mg route,
+    // newer one carries NULL mg (agent-route.ts:139 provenance). BOTH are
+    // agent-shared-classified — the NULL-mg one via resolveProjectionContext's
+    // group-wide fallback — and either would deliver the group task once
+    // active. The tiebreak must pick the newer NULL-mg sibling, not exile it
+    // to the exact-route branch (where 'mg-1' IS NULL fails -> silent drop).
+    seedSession('sess-arch-mg', {
+      status: 'archived',
+      last_active: STALE,
+      thread_id: null,
+      created_at: '2026-01-01T00:00:00.000Z',
+    });
+    seedSession('sess-arch-null', {
+      status: 'archived',
+      last_active: STALE,
+      messaging_group_id: null,
+      thread_id: null,
+      created_at: '2026-02-01T00:00:00.000Z',
+    });
+    await seedLiveTask('task-mg-routed', { threadId: null });
+    expect(sweepableIds()).toEqual(['sess-arch-null']);
+  });
+
+  it('8b: an active PER-THREAD session cannot block agent-shared revival in a mixed-mode group', async () => {
+    // ag-1: per-thread on mg-1, agent-shared on mg-2. The active per-thread
+    // session CANNOT serve the group task (ledger.ts non-agent-shared arm is
+    // strict-route), so the classification-scoped guard must ignore it —
+    // a group-blind guard would stall delivery for as long as ANY session
+    // in the group stays active.
+    createMessagingGroup({
+      id: 'mg-2',
+      channel_type: 'discord',
+      platform_id: 'channel-2',
+      name: 'MG2',
+      is_group: 1,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    createMessagingGroupAgent({
+      id: 'mga-pt-mg1',
+      messaging_group_id: 'mg-1',
+      agent_group_id: 'ag-1',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'per-thread',
+      priority: 0,
+      created_at: now(),
+    });
+    createMessagingGroupAgent({
+      id: 'mga-as-mg2',
+      messaging_group_id: 'mg-2',
+      agent_group_id: 'ag-1',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'agent-shared',
+      priority: 0,
+      created_at: now(),
+    });
+
+    seedSession('sess-pt-active', { thread_id: 'thread-x' }); // per-thread route, active + recent
+    seedSession('sess-arch-as', {
+      status: 'archived',
+      last_active: STALE,
+      messaging_group_id: 'mg-2',
+      thread_id: null,
+    });
+    await seedLiveTask('task-group', { messagingGroupId: 'mg-2', threadId: null });
+
+    // Both: the per-thread session via recency, the archived agent-shared
+    // session (the ONLY session that can deliver the task) via revival.
+    expect(sweepableIds()).toEqual(['sess-arch-as', 'sess-pt-active']);
+  });
+
+  it('8c: the agent-shared tiebreak ignores NEWER archived per-thread siblings (mode-blind pick would drop the work)', async () => {
+    createMessagingGroup({
+      id: 'mg-2',
+      channel_type: 'discord',
+      platform_id: 'channel-2',
+      name: 'MG2',
+      is_group: 1,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    createMessagingGroupAgent({
+      id: 'mga-pt-mg1',
+      messaging_group_id: 'mg-1',
+      agent_group_id: 'ag-1',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'per-thread',
+      priority: 0,
+      created_at: now(),
+    });
+    createMessagingGroupAgent({
+      id: 'mga-as-mg2',
+      messaging_group_id: 'mg-2',
+      agent_group_id: 'ag-1',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'agent-shared',
+      priority: 0,
+      created_at: now(),
+    });
+
+    // Older archived agent-shared candidate vs NEWER archived per-thread
+    // sibling. A mode-blind group-latest pick would select the per-thread
+    // one — which then fails its own exact-route task match — reviving
+    // nothing. The classified tiebreak must pick the agent-shared session.
+    seedSession('sess-arch-as', {
+      status: 'archived',
+      last_active: STALE,
+      messaging_group_id: 'mg-2',
+      thread_id: null,
+      created_at: '2026-01-01T00:00:00.000Z',
+    });
+    seedSession('sess-arch-pt', {
+      status: 'archived',
+      last_active: STALE,
+      thread_id: 'thread-y',
+      created_at: '2026-02-01T00:00:00.000Z',
+    });
+    await seedLiveTask('task-group', { messagingGroupId: 'mg-2', threadId: null });
+
+    expect(sweepableIds()).toEqual(['sess-arch-as']);
+  });
 });
 ```
 
@@ -1475,11 +1726,19 @@ Append to `src/db/sessions.ts`:
 
 ```ts
 /**
- * Recency window for the bounded host sweep. Sessions with no activity for
- * this long — and no live scheduled task — stop being swept every minute.
- * They are NOT dead: an inbound message revives them at the routing layer
- * (resolveSession), and due scheduled work revives them via the archived
- * arm below. First wake after revival may take up to ~one sweep cycle.
+ * Recency window for the bounded host sweep. A session stays in the
+ * per-minute sweep while ANY liveness signal holds:
+ *  - recent activity: COALESCE(last_active, created_at) inside the window
+ *    (inbound writes, successful container spawns, revival, and FAILED
+ *    wake attempts all stamp last_active);
+ *  - a live ('pending'/'paused') central scheduled task for its group;
+ *  - container_status <> 'stopped' (wedged/running containers, SLA kills,
+ *    orphaned claims after a host restart — servicing-failure loops that
+ *    never stamp last_active).
+ * Sessions outside all of these are NOT dead: an inbound message revives
+ * them at the routing layer (resolveSession), and due scheduled work
+ * revives them via the archived arm below. First wake after revival may
+ * take up to ~one sweep cycle.
  */
 export const SWEEP_RECENCY_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -1492,14 +1751,41 @@ export const SWEEP_RECENCY_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
  *    within the window) — inbound-message liveness needs no clause of its
  *    own because every inbound write stamps last_active
  *    (src/session-manager.ts writeSessionMessage); OR
+ *  - status='active' AND container_status <> 'stopped' — wedged/running
+ *    containers, SLA kills, and orphaned claims are serviced by the sweep
+ *    but their failure loops never stamp last_active; OR
  *  - status='active' AND its agent group has a live ('pending'/'paused')
  *    scheduled task that could belong to it (conservative: tasks with NULL
  *    messaging_group_id match every session in the group); OR
- *  - status='archived' AND a live task targets its exact route
- *    (mg + thread, NULL-safe IS matching) AND no active session exists on
- *    that route: orphaned due scheduled work — the sweep revives exactly
- *    the latest such archived sibling (HARD REQUIREMENT: revive and
- *    deliver, never drop).
+ *  - status='archived' AND live scheduled work is orphaned on it — the
+ *    sweep revives exactly the latest such archived sibling (HARD
+ *    REQUIREMENT: revive and deliver, never drop). This arm is
+ *    SESSION-MODE-AWARE, mirroring what delivery would actually do once
+ *    the session is active. A session row x is AGENT-SHARED-CLASSIFIED
+ *    iff EXISTS an mga row with x's agent group, session_mode =
+ *    'agent-shared', AND (x.messaging_group_id IS NULL OR
+ *    mga.messaging_group_id = x.messaging_group_id) — the exact rule of
+ *    resolveProjectionContext (sync.ts:393-409): a NULL-mg session (a2a
+ *    provenance) is agent-shared iff ANY wiring in its group is
+ *    agent-shared (group-wide, no mg filter); a routed session uses its
+ *    OWN route's wiring row, so mixed-mode groups keep per-route modes.
+ *     * agent-shared-classified archived sessions: task delivery ignores
+ *       route columns (ledger.ts agent-shared arm matches by
+ *       agent_group_id only), so ANY live task in the agent group
+ *       matches; the sibling guard and latest-archived tiebreak range
+ *       ONLY over sessions that are THEMSELVES agent-shared-classified —
+ *       an active per-thread session in a mixed group CANNOT serve
+ *       agent-shared tasks (ledger.ts:208-217 is strict-route) and must
+ *       not block revival, and a newer archived per-thread sibling must
+ *       not win the tiebreak and then fail its own route match (both
+ *       would strand the work — validator-A2-v2 8b/8c);
+ *     * everything else: exact-route NULL-safe IS matching on
+ *       (messaging_group_id, thread_id), route-scoped guard and tiebreak.
+ *    The sibling guard counts status IN ('active','resetting'): a
+ *    resetting sibling means a scheduler-aware reset is mid-flight and
+ *    will produce the active session itself — reviving beside it would
+ *    create two active sessions on the route. (This does NOT sweep
+ *    resetting sessions — their pinned exclusion is unchanged.)
  */
 export function getSweepableSessions(now: Date = new Date()): Session[] {
   const cutoff = new Date(now.getTime() - SWEEP_RECENCY_WINDOW_MS).toISOString();
@@ -1509,6 +1795,7 @@ export function getSweepableSessions(now: Date = new Date()): Session[] {
         WHERE (
           s.status = 'active' AND (
             COALESCE(s.last_active, s.created_at) >= @cutoff
+            OR s.container_status <> 'stopped'
             OR EXISTS (
               SELECT 1 FROM scheduled_tasks t
                WHERE t.agent_group_id = s.agent_group_id
@@ -1518,29 +1805,70 @@ export function getSweepableSessions(now: Date = new Date()): Session[] {
           )
         ) OR (
           s.status = 'archived'
-          AND EXISTS (
-            SELECT 1 FROM scheduled_tasks t
-             WHERE t.agent_group_id = s.agent_group_id
-               AND t.status IN ('pending', 'paused')
-               AND t.messaging_group_id IS s.messaging_group_id
-               AND t.thread_id IS s.thread_id
-          )
-          AND NOT EXISTS (
-            SELECT 1 FROM sessions a
-             WHERE a.status = 'active'
-               AND a.agent_group_id = s.agent_group_id
-               AND a.messaging_group_id IS s.messaging_group_id
-               AND a.thread_id IS s.thread_id
-          )
-          AND s.id = (
-            SELECT s2.id FROM sessions s2
-             WHERE s2.status = 'archived'
-               AND s2.agent_group_id = s.agent_group_id
-               AND s2.messaging_group_id IS s.messaging_group_id
-               AND s2.thread_id IS s.thread_id
-             ORDER BY COALESCE(s2.last_active, s2.created_at) DESC, s2.created_at DESC, s2.id DESC
-             LIMIT 1
-          )
+          AND CASE
+            WHEN EXISTS (
+              SELECT 1 FROM messaging_group_agents mga
+               WHERE mga.agent_group_id = s.agent_group_id
+                 AND mga.session_mode = 'agent-shared'
+                 AND (s.messaging_group_id IS NULL OR mga.messaging_group_id = s.messaging_group_id)
+            )
+            THEN (
+              EXISTS (
+                SELECT 1 FROM scheduled_tasks t
+                 WHERE t.agent_group_id = s.agent_group_id
+                   AND t.status IN ('pending', 'paused')
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM sessions a
+                 WHERE a.status IN ('active', 'resetting')
+                   AND a.agent_group_id = s.agent_group_id
+                   AND EXISTS (
+                     SELECT 1 FROM messaging_group_agents amga
+                      WHERE amga.agent_group_id = a.agent_group_id
+                        AND amga.session_mode = 'agent-shared'
+                        AND (a.messaging_group_id IS NULL OR amga.messaging_group_id = a.messaging_group_id)
+                   )
+              )
+              AND s.id = (
+                SELECT s2.id FROM sessions s2
+                 WHERE s2.status = 'archived'
+                   AND s2.agent_group_id = s.agent_group_id
+                   AND EXISTS (
+                     SELECT 1 FROM messaging_group_agents smga
+                      WHERE smga.agent_group_id = s2.agent_group_id
+                        AND smga.session_mode = 'agent-shared'
+                        AND (s2.messaging_group_id IS NULL OR smga.messaging_group_id = s2.messaging_group_id)
+                   )
+                 ORDER BY COALESCE(s2.last_active, s2.created_at) DESC, s2.created_at DESC, s2.id DESC
+                 LIMIT 1
+              )
+            )
+            ELSE (
+              EXISTS (
+                SELECT 1 FROM scheduled_tasks t
+                 WHERE t.agent_group_id = s.agent_group_id
+                   AND t.status IN ('pending', 'paused')
+                   AND t.messaging_group_id IS s.messaging_group_id
+                   AND t.thread_id IS s.thread_id
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM sessions a
+                 WHERE a.status IN ('active', 'resetting')
+                   AND a.agent_group_id = s.agent_group_id
+                   AND a.messaging_group_id IS s.messaging_group_id
+                   AND a.thread_id IS s.thread_id
+              )
+              AND s.id = (
+                SELECT s2.id FROM sessions s2
+                 WHERE s2.status = 'archived'
+                   AND s2.agent_group_id = s.agent_group_id
+                   AND s2.messaging_group_id IS s.messaging_group_id
+                   AND s2.thread_id IS s.thread_id
+                 ORDER BY COALESCE(s2.last_active, s2.created_at) DESC, s2.created_at DESC, s2.id DESC
+                 LIMIT 1
+              )
+            )
+          END
         )`,
     )
     .all({ cutoff }) as Session[];
@@ -1555,7 +1883,7 @@ Barrel-export both names from `src/db/index.ts`.
 pnpm exec vitest run src/db/sweepable-sessions.test.ts
 ```
 
-Expected: PASS (8 tests).
+Expected: PASS (16 tests).
 
 - [ ] **Step 5: Wire the sweep to the bounded set + archived reactivation**
 
@@ -1568,8 +1896,13 @@ In `src/host-sweep.ts`:
 ```
 
 updating the import at `:34` from `getActiveSessions` to
-`getSweepableSessions` (and add `reactivateSession` to the same import).
-`getActiveSessions` keeps its other two callers untouched.
+`getSweepableSessions` (and add `reactivateSession` and `updateSession` to
+the same import — `updateSession` is used by the failed-wake stamp in (e)
+below). `getActiveSessions` keeps its other two callers untouched. Also
+add `sessionDir` and `initSessionFolder` to the existing
+`./session-manager.js` import (check the actual import list at the top of
+`host-sweep.ts` — both are exported from `src/session-manager.ts:56` and
+`:258`).
 
 (b) At the head of `sweepSession` (`:347`), directly AFTER the
 `getAgentGroup` bail and BEFORE the `fs.existsSync(inPath)` guard, insert:
@@ -1577,11 +1910,20 @@ updating the import at `:34` from `getActiveSessions` to
 ```ts
   if (session.status === 'archived') {
     // getSweepableSessions only yields an archived session when live
-    // scheduled work targets its exact route and no active session can
-    // serve it. Revive it FIRST (before any early-outs) so the scheduler
-    // block below sees an active central row and projects + wakes as
-    // normal. HARD REQUIREMENT: due work revives, never drops.
+    // scheduled work is orphaned on it (mode-aware match) and no
+    // active-or-resetting session can serve it. Revive it FIRST (before
+    // any early-outs) so the scheduler block below sees an active central
+    // row and projects + wakes as normal. HARD REQUIREMENT: due work
+    // revives, never drops.
     reactivateSession(session.id);
+    // Recreate the on-disk folder if it vanished (e.g. manual host
+    // cleanup) — mirrors Task 4's reviveArchivedSession. Without this,
+    // the fs.existsSync(inPath) guard below would bail forever on a row
+    // that is now active-and-recent: a permanent, incident-free
+    // half-revival (validation A10). initSessionFolder is idempotent.
+    if (!fs.existsSync(sessionDir(session.agent_group_id, session.id))) {
+      initSessionFolder(session.agent_group_id, session.id);
+    }
     log.info('Reactivated archived session for due scheduled work', { sessionId: session.id });
     session = { ...session, status: 'active' };
   }
@@ -1602,11 +1944,38 @@ sweep now calls `getSweepableSessions`, rename that override to
 `getSweepableSessions` (same behavior: push `'session-sweep'` / return the
 fake session array).
 
+(e) In `sweepSession` step 4 (the wake block, `:426-430`), stamp
+`last_active` when a wake attempt FAILS. `wakeContainer` only stamps via
+`markContainerRunning` after a SUCCESSFUL spawn — a continuously failing
+wake would otherwise age out of the recency window after 30 days and
+strand its due work silently (validation A7). The write cost is bounded by
+the number of concurrently FAILING sessions (normally zero — success paths
+write nothing new):
+
+```ts
+    const dueCount = outDb ? countDueMessagesExcludingRecovery(inDb, outDb) : countDueMessages(inDb);
+    if (dueCount > 0 && !isContainerRunning(session.id)) {
+      log.info('Waking container for due messages', { sessionId: session.id, count: dueCount });
+      try {
+        await wakeContainer(session);
+      } catch (err) {
+        // Keep the failing session inside the sweep recency window so the
+        // wake is retried next pass instead of silently aging out.
+        updateSession(session.id, { last_active: new Date().toISOString() });
+        throw err; // caller loop logs it, exactly as today
+      }
+    }
+```
+
 - [ ] **Step 6: Write the sweep-revival integration test (second revival trigger)**
 
 Create `src/host-sweep.revival.test.ts` — end to end through a REAL sweep
 pass: an archived session with a due live task gets revived, its task
-projected into its inbound.db, and its container woken.
+projected into its inbound.db, and its container woken. Coverage spans the
+modes the archived arm distinguishes (validation A2/A4/A10): per-thread
+exact-route revival, agent-shared cross-route revival, revival of a session
+whose on-disk folder was deleted, and the no-double-active regression after
+an agent-shared roll.
 
 ```ts
 import fs from 'fs';
@@ -1621,9 +1990,9 @@ import {
   initTestDb,
   runMigrations,
 } from './db/index.js';
-import { getSession } from './db/sessions.js';
+import { getSession, getSessionsByAgentGroup } from './db/sessions.js';
 import { withRuntimeLock } from './db/runtime-locks.js';
-import { createOrReplaceScheduledTask } from './modules/scheduling/ledger.js';
+import { createOrReplaceScheduledTask, type CreateScheduledTaskInput } from './modules/scheduling/ledger.js';
 
 const wakeContainerMock = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 
@@ -1685,6 +2054,44 @@ afterEach(() => {
   closeDb();
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
 });
+
+/** Second agent group wired agent-shared — used by the agent-shared cases. */
+function wireAgentSharedGroup(): void {
+  createAgentGroup({ id: 'ag-shared', name: 'Shared', folder: 'shared', agent_provider: null, created_at: now() });
+  createMessagingGroupAgent({
+    id: 'mga-shared',
+    messaging_group_id: 'mg-discord',
+    agent_group_id: 'ag-shared',
+    engage_mode: 'pattern',
+    engage_pattern: '.',
+    sender_scope: 'all',
+    ignored_message_policy: 'drop',
+    session_mode: 'agent-shared',
+    priority: 0,
+    created_at: now(),
+  });
+}
+
+async function seedTask(input: Partial<CreateScheduledTaskInput> & Pick<CreateScheduledTaskInput, 'seriesId' | 'sessionId'>): Promise<void> {
+  await withRuntimeLock('scheduler-mutator', 120_000, (owner) => {
+    createOrReplaceScheduledTask(
+      {
+        agentGroupId: 'ag-yente',
+        messagingGroupId: 'mg-discord',
+        threadId: 'thread-1',
+        platformId: 'channel',
+        channelType: 'discord',
+        isGroup: 1,
+        processAfter: '2026-01-02T00:00:00.000Z',
+        recurrence: null,
+        content: JSON.stringify({ prompt: 'wake up', script: null }),
+        sourceMessageId: `msg-${input.seriesId}`,
+        ...input,
+      },
+      owner,
+    );
+  });
+}
 
 describe('host sweep revival of archived sessions with due scheduled work', () => {
   it('reactivates the archived session, projects its task, and wakes its container', async () => {
@@ -1766,6 +2173,128 @@ describe('host sweep revival of archived sessions with due scheduled work', () =
 
     expect(getSession('sess-archived-idle')?.status).toBe('archived');
     expect(wakeContainerMock).not.toHaveBeenCalled();
+  });
+
+  it('revives an archived session whose on-disk FOLDER was deleted: recreates it, projects, wakes', async () => {
+    const { sessionDir } = await import('./session-manager.js');
+    createSession({
+      id: 'sess-archived-no-folder',
+      agent_group_id: 'ag-yente',
+      messaging_group_id: 'mg-discord',
+      thread_id: 'thread-nf',
+      agent_provider: null,
+      status: 'archived',
+      container_status: 'stopped',
+      last_active: STALE,
+      created_at: STALE,
+    });
+    // Deliberately NO initSessionFolder — simulates host-side manual cleanup
+    // of the session directory after archival (validation A10).
+    await seedTask({ seriesId: 'task-no-folder', sessionId: 'sess-archived-no-folder', threadId: 'thread-nf' });
+
+    const { runHostSweepPassForTest } = await import('./host-sweep.js');
+    await runHostSweepPassForTest();
+
+    expect(getSession('sess-archived-no-folder')?.status).toBe('active');
+    expect(fs.existsSync(sessionDir('ag-yente', 'sess-archived-no-folder'))).toBe(true);
+    const { openInboundDb } = await import('./session-manager.js');
+    const inDb = openInboundDb('ag-yente', 'sess-archived-no-folder');
+    try {
+      const taskRows = inDb
+        .prepare("SELECT series_id FROM messages_in WHERE kind = 'task'")
+        .all() as Array<{ series_id: string }>;
+      expect(taskRows.some((r) => r.series_id === 'task-no-folder')).toBe(true);
+    } finally {
+      inDb.close();
+    }
+    expect(wakeContainerMock).toHaveBeenCalled();
+    expect((wakeContainerMock.mock.calls.at(-1)?.[0] as { id: string }).id).toBe('sess-archived-no-folder');
+  });
+
+  it('agent-shared: revives the latest archived group session for a task whose stored route no longer matches', async () => {
+    const { initSessionFolder } = await import('./session-manager.js');
+    wireAgentSharedGroup();
+    createSession({
+      id: 'sess-shared-arch',
+      agent_group_id: 'ag-shared',
+      messaging_group_id: 'mg-discord',
+      thread_id: null,
+      agent_provider: null,
+      status: 'archived',
+      container_status: 'stopped',
+      last_active: STALE,
+      created_at: STALE,
+    });
+    initSessionFolder('ag-shared', 'sess-shared-arch');
+
+    // NULL-route task (a2a-created agent-shared provenance): exact-route IS
+    // matching would never select it — the agent-shared arm must.
+    await seedTask({
+      seriesId: 'task-shared-due',
+      sessionId: 'sess-shared-arch',
+      agentGroupId: 'ag-shared',
+      messagingGroupId: null,
+      threadId: null,
+      platformId: null,
+      channelType: null,
+      isGroup: null,
+      content: JSON.stringify({ prompt: 'shared wake', script: null }),
+    });
+
+    const { runHostSweepPassForTest } = await import('./host-sweep.js');
+    await runHostSweepPassForTest();
+
+    expect(getSession('sess-shared-arch')?.status).toBe('active');
+    expect(wakeContainerMock).toHaveBeenCalled();
+    expect((wakeContainerMock.mock.calls.at(-1)?.[0] as { id: string }).id).toBe('sess-shared-arch');
+  });
+
+  it('agent-shared roll regression: never revives the old sibling while the group has an active session', async () => {
+    const { initSessionFolder } = await import('./session-manager.js');
+    wireAgentSharedGroup();
+    // Post-roll shape: old session archived with its RAW old route, new
+    // session active; the old task still route-matches the ARCHIVED row.
+    createSession({
+      id: 'sess-shared-old',
+      agent_group_id: 'ag-shared',
+      messaging_group_id: 'mg-discord',
+      thread_id: null,
+      agent_provider: null,
+      status: 'archived',
+      container_status: 'stopped',
+      last_active: STALE,
+      created_at: STALE,
+    });
+    createSession({
+      id: 'sess-shared-new',
+      agent_group_id: 'ag-shared',
+      messaging_group_id: 'mg-discord',
+      thread_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: now(),
+      created_at: now(),
+    });
+    initSessionFolder('ag-shared', 'sess-shared-old');
+    initSessionFolder('ag-shared', 'sess-shared-new');
+    await seedTask({
+      seriesId: 'task-old-route',
+      sessionId: 'sess-shared-old',
+      agentGroupId: 'ag-shared',
+      threadId: null,
+      processAfter: '2099-01-01T00:00:00.000Z', // future: no wake expected
+    });
+
+    const { runHostSweepPassForTest } = await import('./host-sweep.js');
+    await runHostSweepPassForTest();
+
+    // The active sibling serves the group's tasks — the archived one must
+    // NOT come back (two active agent-shared sessions would break the
+    // findSessionByAgentGroup single-session invariant).
+    expect(getSession('sess-shared-old')?.status).toBe('archived');
+    const active = getSessionsByAgentGroup('ag-shared').filter((sess) => sess.status === 'active');
+    expect(active.map((sess) => sess.id)).toEqual(['sess-shared-new']);
   });
 });
 ```
@@ -2130,7 +2659,7 @@ git commit -m "feat(sweep): read-before-lock early exit skips scheduler sync for
 
 ---
 
-### Task 7: Explicit central-DB pragmas + final verification
+### Task 7: Explicit central-DB pragmas (`synchronous=FULL` pinned)
 
 **Files:**
 - Modify: `src/db/connection.ts:18-25` (`initDb`)
@@ -2139,14 +2668,24 @@ git commit -m "feat(sweep): read-before-lock early exit skips scheduler sync for
 **Interfaces:**
 - Consumes: nothing new.
 - Produces: no API change — `initDb(dbPath)` now sets
-  `synchronous = NORMAL` and `wal_autocheckpoint = 4000` in addition to the
-  existing `journal_mode = WAL` and `foreign_keys = ON`.
-- Durability note (findings doc §3.4): `NORMAL` in WAL mode makes today's
-  *measured* behavior explicit — power loss can drop the last commits but
-  never corrupts, and every sacred Discord write is re-derivable from the
-  catch-up ledger + Discord history replay. Session DBs
-  (`journal_mode=DELETE`, per-txn fsync) are NOT touched — that is a
-  sacred cross-mount invariant.
+  `synchronous = FULL` EXPLICITLY and `wal_autocheckpoint = 4000` in
+  addition to the existing `journal_mode = WAL` and `foreign_keys = ON`.
+- Durability note (validation A6 — critical): **`synchronous=NORMAL` was
+  REJECTED.** The scheduler's replay machinery acks container-emitted
+  scheduling actions in the FULL-durable per-session DBs (`markDelivered`
+  in inbound.db, both on the delivery path and the drain path) AFTER the
+  volatile central `v2.db` apply. Under NORMAL, a power loss inside the
+  un-checkpointed WAL tail can drop the central write while the durable
+  ack survives and suppresses replay: a `schedule_task` is silently lost
+  (a recurring series dies after ≤1 run; a one-shot gets tombstoned) and a
+  `cancel_task` is actively undone (per-minute repair re-projects the
+  resurrected task). Explicit FULL pins today's compiled-in default so
+  `v2.db` stays at least as durable as the session-DB ledgers that gate
+  replay — do not downgrade without first moving those gates into `v2.db`
+  itself. The headline churn win comes from Tasks 1/5/6;
+  `wal_autocheckpoint=4000` alone still trims checkpoint fsync clustering
+  (~1-3 GB/day of the 165). Session DBs (`journal_mode=DELETE`, per-txn
+  fsync) are NOT touched — that is a sacred cross-mount invariant.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2173,12 +2712,14 @@ describe('initDb pragmas', () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it('sets WAL + NORMAL sync + larger autocheckpoint + foreign keys explicitly', () => {
+  it('sets WAL + explicit FULL sync + larger autocheckpoint + foreign keys', () => {
     const db = initDb(path.join(tmpDir, 'v2.db'));
 
     expect(db.pragma('journal_mode', { simple: true })).toBe('wal');
-    // synchronous: 1 = NORMAL
-    expect(db.pragma('synchronous', { simple: true })).toBe(1);
+    // synchronous: 2 = FULL — explicit and load-bearing (see the durability
+    // note: scheduling-action replay is gated on session-DB acks written
+    // AFTER the central apply; v2.db must stay at least as durable).
+    expect(db.pragma('synchronous', { simple: true })).toBe(2);
     expect(db.pragma('wal_autocheckpoint', { simple: true })).toBe(4000);
     expect(db.pragma('foreign_keys', { simple: true })).toBe(1);
   });
@@ -2191,8 +2732,11 @@ describe('initDb pragmas', () => {
 pnpm exec vitest run src/db/connection.test.ts
 ```
 
-Expected: FAIL — `synchronous` is 2 (FULL, the default) and
-`wal_autocheckpoint` is 1000.
+Expected: FAIL — `wal_autocheckpoint` is 1000 (the compiled default). The
+other three assertions already pass today (`synchronous` compiles to
+2/FULL by default — the point of setting it explicitly is to PIN that
+against build/env drift, and to leave a comment that stops a future
+NORMAL downgrade).
 
 - [ ] **Step 3: Implement**
 
@@ -2203,11 +2747,14 @@ export function initDb(dbPath: string): Database.Database {
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
   _db = new Database(dbPath);
   _db.pragma('journal_mode = WAL');
-  // NORMAL is safe in WAL mode (never corrupts; a power loss can drop the
-  // most recent commits, all of which are re-derivable — Discord writes via
-  // the catch-up ledger + history replay). This makes the previously
-  // implicit fsync behavior explicit and cuts checkpoint fsync clusters.
-  _db.pragma('synchronous = NORMAL');
+  // FULL is EXPLICIT and load-bearing. Scheduling-action replay is gated on
+  // acks/drain ledgers persisted in the FULL-durable session DBs AFTER the
+  // central apply — synchronous=NORMAL would let a power loss drop the
+  // central write while the durable ack suppresses replay (schedule_task
+  // silently lost; cancel_task resurrected by the per-minute repair). Do
+  // NOT downgrade to NORMAL without first moving those replay gates into
+  // this database.
+  _db.pragma('synchronous = FULL');
   _db.pragma('wal_autocheckpoint = 4000');
   _db.pragma('foreign_keys = ON');
   log.info('Central DB initialized', { path: dbPath });
@@ -2226,7 +2773,7 @@ pnpm exec vitest run src/db/connection.test.ts
 
 Expected: PASS.
 
-- [ ] **Step 5: Final whole-plan verification**
+- [ ] **Step 5: Full suite + typecheck (all four gates)**
 
 ```bash
 pnpm test
@@ -2242,7 +2789,654 @@ Expected: everything green. If `format:check` complains, run
 
 ```bash
 git add src/db/connection.ts src/db/connection.test.ts
-git commit -m "feat(db): explicit synchronous=NORMAL and wal_autocheckpoint=4000 on the central DB"
+git commit -m "feat(db): pin synchronous=FULL explicitly and raise wal_autocheckpoint to 4000 on the central DB"
+```
+
+---
+
+### Task 8: One-time startup legacy-task import reconciliation
+
+**Why (validation A3, high):** `importLegacyActiveTasks` runs ONLY inside
+`sweepSession` (`src/host-sweep.ts:380-381`). Once Task 5 bounds the sweep,
+an ACTIVE session that is already >30 days stale at deploy time and holds
+unimported legacy `kind='task'` inbound rows (pre-ledger, far-future
+`process_after`, NO central `scheduled_tasks` row) is never visited again —
+its scheduled work is silently dropped. Repair does not close this hole:
+`repairSchedulerProjections` only projects EXISTING central rows for active
+sessions, and its legacy scan covers only non-active sessions. This task
+runs one unbounded import pass over ALL active sessions at startup;
+persistent import failures surface as dedupe-keyed scheduler incidents
+(loud, not silent — accepted residual).
+
+**Files:**
+- Create: `src/modules/scheduling/startup-import.ts`
+- Create: `src/modules/scheduling/startup-import.test.ts`
+- Modify: `src/index.ts` (kick off after the service is up, ~:186)
+
+**Interfaces:**
+- Consumes: `getActiveSessions()` (`src/db/sessions.ts:99` — the FULL
+  active set, deliberately unbounded, one-time),
+  `importLegacyActiveTasks(inDb, session, owner)`
+  (`src/modules/scheduling/legacy-import.ts:27`, async, returns imported
+  count), `withRuntimeLock('scheduler-mutator', 120_000, ...)`,
+  `inboundDbPath`/`openInboundDb` (`src/session-manager.ts:61,557`),
+  `reportSchedulerIncident` (`src/yente/scheduler-alerts.ts:54`).
+- Produces: `reconcileLegacyTaskImportsOnStartup(): Promise<{ scanned: number; imported: number; failed: number }>`.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `src/modules/scheduling/startup-import.test.ts` (harness mirrors
+`legacy-import.test.ts`: config-mocked DATA_DIR, real migrations, real
+session folder):
+
+```ts
+import fs from 'fs';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import {
+  closeDb,
+  createAgentGroup,
+  createMessagingGroup,
+  createMessagingGroupAgent,
+  createSession,
+  initTestDb,
+  runMigrations,
+} from '../../db/index.js';
+import { initSessionFolder, openInboundDb } from '../../session-manager.js';
+import { getScheduledTask } from './ledger.js';
+import { reconcileLegacyTaskImportsOnStartup } from './startup-import.js';
+
+vi.mock('../../config.js', async () => {
+  const actual = await vi.importActual('../../config.js');
+  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-startup-import' };
+});
+
+const TEST_DIR = '/tmp/nanoclaw-test-startup-import';
+const STALE = '2026-01-01T00:00:00.000Z'; // far outside SWEEP_RECENCY_WINDOW_MS
+
+function now(): string {
+  return new Date().toISOString();
+}
+
+beforeEach(() => {
+  fs.rmSync(TEST_DIR, { recursive: true, force: true });
+  fs.mkdirSync(TEST_DIR, { recursive: true });
+  const db = initTestDb();
+  runMigrations(db);
+
+  createAgentGroup({ id: 'ag-yente', name: 'Yente', folder: 'yente', agent_provider: null, created_at: now() });
+  createMessagingGroup({
+    id: 'mg-discord',
+    channel_type: 'discord',
+    platform_id: 'channel',
+    name: 'Yente Test',
+    is_group: 1,
+    unknown_sender_policy: 'public',
+    created_at: now(),
+  });
+  createMessagingGroupAgent({
+    id: 'mga-yente',
+    messaging_group_id: 'mg-discord',
+    agent_group_id: 'ag-yente',
+    engage_mode: 'pattern',
+    engage_pattern: '.',
+    sender_scope: 'all',
+    ignored_message_policy: 'drop',
+    session_mode: 'per-thread',
+    priority: 0,
+    created_at: now(),
+  });
+});
+
+afterEach(() => {
+  closeDb();
+  fs.rmSync(TEST_DIR, { recursive: true, force: true });
+});
+
+describe('startup legacy-task import reconciliation', () => {
+  it('imports legacy future tasks from an active session too stale for the bounded sweep', async () => {
+    createSession({
+      id: 'sess-stale-legacy',
+      agent_group_id: 'ag-yente',
+      messaging_group_id: 'mg-discord',
+      thread_id: 'thread-1',
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: STALE, // >30d stale — getSweepableSessions never yields it
+      created_at: STALE,
+    });
+    initSessionFolder('ag-yente', 'sess-stale-legacy');
+
+    // A legacy pre-ledger task row: kind='task', live status, far-future
+    // due date, and NO central scheduled_tasks row.
+    const inDb = openInboundDb('ag-yente', 'sess-stale-legacy');
+    try {
+      inDb
+        .prepare(
+          `INSERT INTO messages_in
+             (id, seq, kind, timestamp, status, process_after, recurrence, trigger,
+              platform_id, channel_type, thread_id, messaging_group_id, is_group, content, series_id)
+           VALUES (?, 2, 'task', ?, 'pending', '2099-01-01T00:00:00.000Z', NULL, 1,
+              'channel', 'discord', 'thread-1', 'mg-discord', 1, ?, 'series-legacy')`,
+        )
+        .run('legacy-task-1', STALE, JSON.stringify({ prompt: 'future heartbeat', script: null }));
+    } finally {
+      inDb.close();
+    }
+    expect(getScheduledTask('ag-yente', 'series-legacy')).toBeUndefined();
+
+    const summary = await reconcileLegacyTaskImportsOnStartup();
+
+    expect(summary).toEqual({ scanned: 1, imported: 1, failed: 0 });
+    expect(getScheduledTask('ag-yente', 'series-legacy')).toMatchObject({
+      series_id: 'series-legacy',
+      status: 'pending',
+      process_after: '2099-01-01T00:00:00.000Z',
+    });
+  });
+
+  it('skips sessions whose inbound.db is missing without failing the pass', async () => {
+    createSession({
+      id: 'sess-no-folder',
+      agent_group_id: 'ag-yente',
+      messaging_group_id: 'mg-discord',
+      thread_id: 'thread-2',
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: STALE,
+      created_at: STALE,
+    });
+
+    const summary = await reconcileLegacyTaskImportsOnStartup();
+    expect(summary).toEqual({ scanned: 1, imported: 0, failed: 0 });
+  });
+});
+```
+
+(If the raw `messages_in` INSERT column list drifts from the real inbound
+schema, copy the exact column names from `INBOUND_SCHEMA` in
+`src/db/schema.ts` — the point is a live legacy `kind='task'` row with a
+`series_id` and no central row.)
+
+- [ ] **Step 2: Run to verify failure**
+
+```bash
+pnpm exec vitest run src/modules/scheduling/startup-import.test.ts
+```
+
+Expected: FAIL — module `./startup-import.js` does not exist.
+
+- [ ] **Step 3: Implement the reconciliation pass**
+
+Create `src/modules/scheduling/startup-import.ts`:
+
+```ts
+import fs from 'fs';
+
+import { withRuntimeLock } from '../../db/runtime-locks.js';
+import { getActiveSessions } from '../../db/sessions.js';
+import { log } from '../../log.js';
+import { inboundDbPath, openInboundDb } from '../../session-manager.js';
+import { reportSchedulerIncident } from '../../yente/scheduler-alerts.js';
+import { importLegacyActiveTasks } from './legacy-import.js';
+
+/**
+ * One-time startup reconciliation for legacy pre-ledger scheduled tasks.
+ *
+ * The bounded host sweep (getSweepableSessions) deliberately skips active
+ * sessions with no recency/task/container liveness signal — but a legacy
+ * kind='task' inbound row has NO central scheduled_tasks row until
+ * importLegacyActiveTasks first succeeds, so a session already >30 days
+ * stale at deploy time would never be visited and its future-dated legacy
+ * work would be silently dropped. This pass visits ALL active sessions
+ * (deliberately unbounded — it runs ONCE per process start, in the
+ * background, after the service is up) and runs the exact same import
+ * path the sweep uses.
+ */
+export async function reconcileLegacyTaskImportsOnStartup(): Promise<{
+  scanned: number;
+  imported: number;
+  failed: number;
+}> {
+  const sessions = getActiveSessions(); // FULL active set — one-time, unbounded by design
+  let imported = 0;
+  let failed = 0;
+  for (const session of sessions) {
+    if (!fs.existsSync(inboundDbPath(session.agent_group_id, session.id))) continue;
+    try {
+      const inDb = openInboundDb(session.agent_group_id, session.id);
+      try {
+        imported += await withRuntimeLock('scheduler-mutator', 120_000, (owner) =>
+          importLegacyActiveTasks(inDb, session, owner),
+        );
+      } finally {
+        inDb.close();
+      }
+    } catch (err) {
+      failed += 1;
+      log.error('Startup legacy import failed for session', { sessionId: session.id, err });
+      try {
+        await reportSchedulerIncident({
+          // Same dedupe key as the sweep's legacy-import incident — retries
+          // and later sweep passes will not spam duplicates.
+          dedupeKey: `legacy-import:${session.id}`,
+          severity: 'error',
+          message: `Startup legacy-task import reconciliation failed for session ${session.id}. Scheduled tasks may be delayed until import succeeds.`,
+          agentGroupId: session.agent_group_id,
+          sessionId: session.id,
+          messagingGroupId: session.messaging_group_id,
+          threadId: session.thread_id,
+          details: { err: err instanceof Error ? err.message : String(err) },
+        });
+      } catch (incidentErr) {
+        log.error('Failed to record startup legacy-import incident', { sessionId: session.id, err: incidentErr });
+      }
+    }
+    // Yield a full event-loop turn per session — deploy day can mean
+    // thousands of sessions and this must not starve adapters or the sweep.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  log.info('Startup legacy-task import reconciliation finished', {
+    scanned: sessions.length,
+    imported,
+    failed,
+  });
+  return { scanned: sessions.length, imported, failed };
+}
+```
+
+Wire it into `src/index.ts` `main()` AFTER the service is fully up (after
+`startHostSweep()` at ~:185, before the final `log.info('NanoClaw running')`)
+— non-blocking, fire-and-forget:
+
+```ts
+  // 6b. One-time legacy-task import reconciliation (non-blocking): the
+  // bounded sweep never visits >30d-stale active sessions, so any legacy
+  // pre-ledger future tasks they hold must be imported once here.
+  void reconcileLegacyTaskImportsOnStartup().catch((err) => {
+    log.error('Startup legacy-task import reconciliation failed', { err });
+  });
+```
+
+adding `import { reconcileLegacyTaskImportsOnStartup } from './modules/scheduling/startup-import.js';`
+next to the other module imports. A contended `scheduler-mutator` lock on
+a given session simply lands in that session's try/catch (dedupe-keyed
+incident) — the sweep's own import path remains the steady-state retry.
+
+- [ ] **Step 4: Run to verify pass**
+
+```bash
+pnpm exec vitest run src/modules/scheduling/startup-import.test.ts src/modules/scheduling/legacy-import.test.ts
+```
+
+Expected: PASS.
+
+- [ ] **Step 5: Full suite + typecheck, then commit**
+
+```bash
+pnpm test && pnpm exec tsc --noEmit
+git add src/modules/scheduling/startup-import.ts src/modules/scheduling/startup-import.test.ts src/index.ts
+git commit -m "feat(scheduler): reconcile unimported legacy tasks across all active sessions at startup"
+```
+
+---
+
+### Task 9: Make scheduler projection steady-state write-free
+
+**Why (validation A9, medium):** `projectScheduledTask`
+(`src/modules/scheduling/projection.ts:115-149`, existing-row branch) runs
+an UNCONDITIONAL `UPDATE` whose `host_received_at = CASE WHEN
+host_accepted_at IS NULL THEN @hostReceivedAt ...` rewrites a FRESH
+timestamp on every call while the projection awaits acceptance. Both the
+per-minute repair pass (`repairSchedulerProjections` →
+`ensureSessionSchedulerProjections`) and the host sweep call it for EVERY
+live task — so every live, not-yet-accepted projection costs one real
+journal+fsync transaction per pass on its `journal_mode=DELETE`
+inbound.db. A /tmp probe (validator-A9) proved SQLite skips ALL disk I/O
+for same-value and 0-row UPDATEs — so skipping the UPDATE when the
+projected values are unchanged makes the steady-state pass write nothing.
+
+**Files:**
+- Modify: `src/modules/scheduling/projection.ts` (`projectScheduledTask`,
+  existing-row branch)
+- Modify: `src/modules/scheduling/projection.test.ts` (add one test)
+
+**Interfaces:** no signature changes. Behavior pinned by the existing
+suite: changed tasks still update in place (`updates an existing
+projection without changing its stable id or seq`), NULLed host stamps
+still get repaired (`repairs a pending legacy projection that is missing
+its host-backed trigger stamp`), accepted stamps stay frozen (`does not
+rewrite a projection trigger stamp after host acceptance`).
+
+- [ ] **Step 1: Write the failing test**
+
+Append inside the `describe('scheduler projection helpers', ...)` block of
+`src/modules/scheduling/projection.test.ts`:
+
+```ts
+  it('re-projecting an UNCHANGED live task is a steady-state no-op (host_received_at preserved)', async () => {
+    const inDb = freshInboundDb();
+
+    await withSchedulerLock((owner) => {
+      const task = seedTask(owner);
+      projectScheduledTask(inDb, task, 'sess-new', owner);
+      // Sentinel: if the second projection runs its UPDATE, this value is
+      // overwritten with a fresh timestamp (host_accepted_at IS NULL).
+      inDb
+        .prepare("UPDATE messages_in SET host_received_at = '2020-01-01T00:00:00.000Z' WHERE series_id = 'task-1'")
+        .run();
+
+      projectScheduledTask(inDb, getScheduledTask('ag-1', 'task-1')!, 'sess-new', owner);
+    });
+
+    expect(inDb.prepare('SELECT host_received_at FROM messages_in WHERE series_id = ?').get('task-1')).toEqual({
+      host_received_at: '2020-01-01T00:00:00.000Z',
+    });
+    inDb.close();
+  });
+```
+
+- [ ] **Step 2: Run to verify failure**
+
+```bash
+pnpm exec vitest run src/modules/scheduling/projection.test.ts
+```
+
+Expected: FAIL — the new test sees a fresh `host_received_at` (today's
+unconditional UPDATE rewrites it). All existing tests PASS.
+
+- [ ] **Step 3: Implement the unchanged-skip**
+
+In `projectScheduledTask`, widen the existence probe (currently
+`SELECT id, kind FROM messages_in WHERE id = ?`, `:36-38`) to fetch the
+compared columns:
+
+```ts
+    const existing = inDb
+      .prepare(
+        `SELECT id, kind, status, process_after, recurrence, platform_id, channel_type,
+                thread_id, messaging_group_id, is_group, content, series_id, trigger,
+                host_input_id, host_route_key, host_received_at
+           FROM messages_in WHERE id = ?`,
+      )
+      .get(messageId) as
+      | {
+          id: string;
+          kind: string;
+          status: string;
+          process_after: string | null;
+          recurrence: string | null;
+          platform_id: string | null;
+          channel_type: string | null;
+          thread_id: string | null;
+          messaging_group_id: string | null;
+          is_group: 0 | 1 | null;
+          content: string;
+          series_id: string | null;
+          trigger: number;
+          host_input_id: string | null;
+          host_route_key: string | null;
+          host_received_at: string | null;
+        }
+      | undefined;
+```
+
+and wrap the existing-row UPDATE (`:116-149`) so it only runs when
+something would actually change (the INSERT branch and the
+retire-other-generations UPDATE above it are untouched):
+
+```ts
+    } else {
+      // Steady-state guard: the repair pass and the host sweep re-project
+      // every live task every minute. When nothing changed, skip the UPDATE
+      // entirely — the previous unconditional UPDATE refreshed
+      // host_received_at each pass, costing one fsynced journal transaction
+      // per live task per minute on the DELETE-journal inbound.db. The
+      // host-stamp NULL checks keep the legacy-repair behavior: a projection
+      // missing its trigger stamp is NOT "unchanged".
+      const unchanged =
+        existing.status === task.status &&
+        existing.process_after === task.process_after &&
+        existing.recurrence === task.recurrence &&
+        existing.platform_id === task.platform_id &&
+        existing.channel_type === task.channel_type &&
+        existing.thread_id === task.thread_id &&
+        existing.messaging_group_id === task.messaging_group_id &&
+        existing.is_group === task.is_group &&
+        existing.content === task.content &&
+        existing.series_id === task.series_id &&
+        existing.trigger === 1 &&
+        existing.host_input_id !== null &&
+        existing.host_route_key !== null &&
+        existing.host_received_at !== null;
+      if (!unchanged) {
+        inDb
+          .prepare(
+            `UPDATE messages_in
+             ... // the existing UPDATE statement and .run() payload, verbatim
+          );
+      }
+    }
+```
+
+(`markTaskProjected` after the transaction stays as-is — its steady-state
+short-circuit already returns without writing.)
+
+- [ ] **Step 4: Run to verify pass**
+
+```bash
+pnpm exec vitest run src/modules/scheduling/projection.test.ts src/modules/scheduling/sync.test.ts src/modules/scheduling/repair.test.ts src/host-sweep.scheduler.test.ts
+```
+
+Expected: PASS — including the pinned repair/acceptance/update-in-place
+behaviors listed under Interfaces.
+
+- [ ] **Step 5: Full suite + typecheck, then commit**
+
+```bash
+pnpm test && pnpm exec tsc --noEmit
+git add src/modules/scheduling/projection.ts src/modules/scheduling/projection.test.ts
+git commit -m "fix(scheduler): skip the projection update when a live task is unchanged"
+```
+
+---
+
+### Task 10: Boot-time process-singleton guard
+
+**Why (validation A11, medium):** the DB-row `runtime_locks` table was the
+only (accidental) cross-process contention detector; Task 1's in-memory
+locks cannot see a second process. Real overlap paths exist and are
+unguarded: a manual `pnpm start`/`pnpm dev` beside the running service,
+the legacy `com.nanoclaw` plist plus the new per-checkout
+`com.nanoclaw-v2-<slug>` label both KeepAlive'd on the same checkout, a
+`launchctl unload`→`load` during the ~60 s graceful drain, and the nohup
+fallback's `kill; sleep 2`. Two service processes mutating one `v2.db`
+must fail loudly instead.
+
+**Files:**
+- Create: `src/process-singleton.ts`
+- Create: `src/process-singleton.test.ts`
+- Modify: `src/index.ts` (`main()`, BEFORE `initDb` at ~:69-70)
+
+**Interfaces:**
+- Consumes: better-sqlite3 (`PRAGMA locking_mode=EXCLUSIVE` + a write
+  transaction takes the OS-level exclusive file lock and, in this mode,
+  HOLDS it until the connection closes — i.e. process exit), `DATA_DIR`
+  from `src/config.js` (`v2.db` lives at `path.join(DATA_DIR, 'v2.db')`,
+  `src/index.ts:69`; the lock DB sits beside it).
+- Produces:
+  - `acquireProcessSingletonLock(lockDbPath: string): void` — throws a
+    loud, named error on `SQLITE_BUSY`.
+  - `releaseProcessSingletonLockForTest(): void` (test-only).
+- Deliberately SERVICE-scoped: ops scripts (`scripts/run-migrations.ts`,
+  `scripts/q.ts`, yente tools) stay OUTSIDE the guard — they are
+  operator-supervised and legitimately run beside the service (accepted
+  residual, A11).
+
+- [ ] **Step 1: Write the failing test**
+
+Create `src/process-singleton.test.ts` (a `/tmp` lock DB; two connections
+in one test process contend at the OS level exactly like two processes):
+
+```ts
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+
+import { acquireProcessSingletonLock, releaseProcessSingletonLockForTest } from './process-singleton.js';
+
+describe('process-singleton guard', () => {
+  let tmpDir: string;
+  let lockPath: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-singleton-test-'));
+    lockPath = path.join(tmpDir, 'nanoclaw.lock.db');
+  });
+
+  afterEach(() => {
+    releaseProcessSingletonLockForTest();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('acquires the lock on a fresh path', () => {
+    expect(() => acquireProcessSingletonLock(lockPath)).not.toThrow();
+  });
+
+  it('a second connection cannot acquire the held lock (loud contention failure)', () => {
+    acquireProcessSingletonLock(lockPath);
+    // Each call opens an independent better-sqlite3 connection — the same
+    // OS-level file-lock contention two overlapping processes would hit.
+    expect(() => acquireProcessSingletonLock(lockPath)).toThrow(/already holds the singleton lock/);
+  });
+
+  it('re-acquisition succeeds after the holder releases (process-exit analogue)', () => {
+    acquireProcessSingletonLock(lockPath);
+    releaseProcessSingletonLockForTest();
+    expect(() => acquireProcessSingletonLock(lockPath)).not.toThrow();
+  });
+});
+```
+
+- [ ] **Step 2: Run to verify failure**
+
+```bash
+pnpm exec vitest run src/process-singleton.test.ts
+```
+
+Expected: FAIL — module `./process-singleton.js` does not exist.
+
+- [ ] **Step 3: Implement the guard**
+
+Create `src/process-singleton.ts`:
+
+```ts
+import Database from 'better-sqlite3';
+import fs from 'fs';
+import path from 'path';
+
+import { log } from './log.js';
+
+let lockDb: Database.Database | null = null;
+
+/**
+ * Boot-time process-singleton guard.
+ *
+ * In-process runtime locks (src/db/runtime-locks.ts) cannot detect a SECOND
+ * nanoclaw process — and real overlap paths exist (manual start beside the
+ * service, legacy + slug launchd labels on one checkout, unload→load during
+ * the graceful drain, the nohup fallback). This takes an EXCLUSIVE SQLite
+ * lock on a dedicated lock DB beside v2.db and HOLDS it for the process
+ * lifetime; a second service process fails loudly at boot instead of
+ * silently double-writing v2.db.
+ *
+ * Deliberately service-scoped: ops scripts (scripts/run-migrations.ts,
+ * scripts/q.ts, yente tools) remain outside the guard — operator-supervised.
+ */
+export function acquireProcessSingletonLock(lockDbPath: string): void {
+  fs.mkdirSync(path.dirname(lockDbPath), { recursive: true });
+  // Short busy timeout: a conflicting boot should fail fast, not hang.
+  const db = new Database(lockDbPath, { timeout: 1_000 });
+  try {
+    // locking_mode=EXCLUSIVE + a write transaction acquires the OS-level
+    // exclusive file lock; in this mode SQLite NEVER releases it until the
+    // connection closes (process exit) — no lease, no renewal, no staleness:
+    // the kernel drops the lock the instant the process dies.
+    db.pragma('locking_mode = EXCLUSIVE');
+    db.exec('BEGIN EXCLUSIVE; CREATE TABLE IF NOT EXISTS singleton (pid INTEGER NOT NULL); DELETE FROM singleton;');
+    db.prepare('INSERT INTO singleton (pid) VALUES (?)').run(process.pid);
+    db.exec('COMMIT;');
+    lockDb = db; // held for process lifetime — deliberately never closed
+    log.info('Process-singleton lock acquired', { lockDbPath, pid: process.pid });
+  } catch (err) {
+    db.close();
+    if ((err as { code?: string }).code === 'SQLITE_BUSY') {
+      log.error('Another nanoclaw process already holds the singleton lock — refusing to start', { lockDbPath });
+      throw new Error(
+        `Another nanoclaw process already holds the singleton lock at ${lockDbPath}; ` +
+          'refusing to start a second writer against the same v2.db',
+      );
+    }
+    throw err;
+  }
+}
+
+/** Test-only: release the held lock so contention can be exercised. */
+export function releaseProcessSingletonLockForTest(): void {
+  lockDb?.close();
+  lockDb = null;
+}
+```
+
+Wire it into `src/index.ts` `main()` as the FIRST step, before `initDb`
+(`:68-70` today), importing
+`import { acquireProcessSingletonLock } from './process-singleton.js';`:
+
+```ts
+async function main(): Promise<void> {
+  log.info('NanoClaw starting');
+
+  // 0. Process-singleton guard — MUST precede initDb: two overlapping
+  // service processes must never both write v2.db (in-process runtime
+  // locks cannot see across processes). A throw here lands in
+  // main().catch → log.fatal → exit(1): the SECOND instance crash-loops
+  // loudly under its supervisor while the first keeps serving.
+  acquireProcessSingletonLock(path.join(DATA_DIR, 'nanoclaw.lock.db'));
+
+  // 1. Init central DB
+  const dbPath = path.join(DATA_DIR, 'v2.db');
+```
+
+- [ ] **Step 4: Run to verify pass**
+
+```bash
+pnpm exec vitest run src/process-singleton.test.ts src/shutdown.test.ts
+```
+
+Expected: PASS. (`shutdown.test.ts` guards `index.ts`'s import surface —
+if it imports `main`'s module, the guard must not fire at import time; it
+runs only inside `main()`.)
+
+- [ ] **Step 5: Final whole-plan verification**
+
+```bash
+pnpm test
+pnpm exec tsc --noEmit
+pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit
+pnpm run format:check
+```
+
+Expected: everything green. If `format:check` complains, run
+`pnpm run format:fix` and re-stage.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/process-singleton.ts src/process-singleton.test.ts src/index.ts
+git commit -m "feat(boot): hold an exclusive singleton lock beside v2.db and fail loudly on overlap"
 ```
 
 ---
@@ -2253,7 +3447,31 @@ git commit -m "feat(db): explicit synchronous=NORMAL and wal_autocheckpoint=4000
   backup) is a supervised host action AFTER this code ships; the code-side
   predicate (`getSweepableSessions`) already keeps the set bounded even
   before the migration runs, via the recency window.
+- **Deferred `runtime_locks` DROP (Task 2):** ship it in a FUTURE release
+  only after the in-memory-locks change has soaked in production. Hard
+  precondition: a fresh `v2.db` backup taken immediately before the
+  migration runs (e.g. `cp data/v2.db data/v2.db.bak-pre-drop` with the
+  service stopped), plus a one-line rollback runbook (the migration-014
+  `CREATE TABLE runtime_locks (...)` DDL). An old binary against a
+  post-drop DB crash-loops at startup — validated, not hypothetical.
+- **Verify the live host's ACTUAL pragma values** (validation A6 caveat):
+  `sqlite3 data/v2.db 'PRAGMA journal_mode; PRAGMA synchronous; PRAGMA wal_autocheckpoint;'`.
+  The findings doc's 12 s write trace showed NORMAL-like fsync behavior
+  (~61 fsyncs for ~15,300 WAL frames), contradicting the code-default
+  FULL that Task 7 pins. Investigate on the host (better-sqlite3 build's
+  `SQLITE_DEFAULT_SYNCHRONOUS`, WSL2/storage-layer behavior, or trace
+  misattribution) — if commits genuinely weren't fsyncing, the A6 loss
+  window already existed in production and needs its own follow-up.
+- **Flagged follow-up (out of scope, validation A9):** `repair.ts`'s
+  `reportUnsafeArchivedSchedulerRows` still runs an UNBOUNDED per-minute
+  scan over ALL non-active sessions (open + full `messages_in` scan each),
+  with no event-loop yield — the set grows without bound and is untouched
+  by this plan's sweep bounding. Task 9 removes the write mechanism, not
+  the loop. Bound/stagger it in a follow-up release.
 - Host verification after deploy (findings doc execution note): service
   `write_bytes` < 0.2 MB/s sustained over an hour; WAL mtime quiet between
-  real events; sweep pass duration in logs; zero regressions in catch-up
-  counters and message round-trips.
+  real events; sweep pass duration AND scheduler-repair pass duration in
+  logs (the A9 scale unknowns become observable here); zero regressions in
+  catch-up counters and message round-trips; the startup reconciliation's
+  summary log line (`Startup legacy-task import reconciliation finished`)
+  shows `failed: 0` — investigate any incident it filed.
