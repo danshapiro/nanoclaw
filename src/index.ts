@@ -11,6 +11,7 @@ import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
 import { initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
 import { clearStaleRuntimeLocks } from './db/runtime-locks.js';
+import { acquireProcessSingletonLock } from './process-singleton.js';
 import { ensureContainerRuntimeRunning, cleanupOrphansVerified } from './container-runtime.js';
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
@@ -65,6 +66,13 @@ import { initChannelAdapters, teardownChannelAdapters, getChannelAdapter } from 
 
 async function main(): Promise<void> {
   log.info('NanoClaw starting');
+
+  // 0. Process-singleton guard — MUST precede initDb: two overlapping
+  // service processes must never both write v2.db (in-process runtime
+  // locks cannot see across processes). A throw here lands in
+  // main().catch → log.fatal → exit(1): the SECOND instance crash-loops
+  // loudly under its supervisor while the first keeps serving.
+  acquireProcessSingletonLock(path.join(DATA_DIR, 'nanoclaw.lock.db'));
 
   // 1. Init central DB
   const dbPath = path.join(DATA_DIR, 'v2.db');
