@@ -31,6 +31,8 @@ export {
   findSessionByAgentGroup,
   getSessionsByAgentGroup,
   getActiveSessions,
+  getSweepableSessions,
+  SWEEP_RECENCY_WINDOW_MS,
   getRunningSessions,
   updateSession,
   archiveSession,

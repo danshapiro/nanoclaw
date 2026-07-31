@@ -36,7 +36,7 @@ describe('host sweep scheduler passes', () => {
       const actual = await importOriginal<typeof import('./db/sessions.js')>();
       return {
         ...actual,
-        getActiveSessions: vi.fn(() => {
+        getSweepableSessions: vi.fn(() => {
           calls.push('session-sweep');
           return [];
         }),
@@ -76,7 +76,7 @@ describe('host sweep scheduler passes', () => {
       const actual = await importOriginal<typeof import('./db/sessions.js')>();
       return {
         ...actual,
-        getActiveSessions: vi.fn(() => [session('sess-old-1', 'ag-old-1'), session('sess-old-2', 'ag-old-2')]),
+        getSweepableSessions: vi.fn(() => [session('sess-old-1', 'ag-old-1'), session('sess-old-2', 'ag-old-2')]),
       };
     });
     vi.doMock('./db/agent-groups.js', async (importOriginal) => {

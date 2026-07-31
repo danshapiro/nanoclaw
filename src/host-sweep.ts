@@ -31,7 +31,7 @@ import type Database from 'better-sqlite3';
 import { createHash } from 'crypto';
 import fs from 'fs';
 
-import { getActiveSessions, getSession } from './db/sessions.js';
+import { getSession, getSweepableSessions, reactivateSession, updateSession } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { RuntimeLockHeldError, withRuntimeLock } from './db/runtime-locks.js';
 import {
@@ -76,6 +76,7 @@ import {
   heartbeatPath,
   readSpawnSkillGeneration,
   sessionDir,
+  initSessionFolder,
 } from './session-manager.js';
 import {
   getContainerStartedAtMs,
@@ -290,6 +291,10 @@ export async function runHostSweepPassForTest(): Promise<void> {
   await runHostSweepPass();
 }
 
+export async function sweepSessionForTest(session: Session): Promise<void> {
+  await sweepSession(session);
+}
+
 /**
  * Recover one session promptly after its container exits unexpectedly.
  *
@@ -326,7 +331,7 @@ async function runHostSweepPass(): Promise<void> {
   }
 
   try {
-    const sessions = getActiveSessions();
+    const sessions = getSweepableSessions();
     for (const session of sessions) {
       try {
         await sweepSession(session);
@@ -347,6 +352,26 @@ async function runHostSweepPass(): Promise<void> {
 async function sweepSession(session: Session): Promise<void> {
   const agentGroup = getAgentGroup(session.agent_group_id);
   if (!agentGroup) return;
+
+  if (session.status === 'archived') {
+    // getSweepableSessions only yields an archived session when live
+    // scheduled work is orphaned on it (mode-aware match) and no
+    // active-or-resetting session can serve it. Revive it FIRST (before
+    // any early-outs) so the scheduler block below sees an active central
+    // row and projects + wakes as normal. HARD REQUIREMENT: due work
+    // revives, never drops.
+    reactivateSession(session.id);
+    // Recreate the on-disk folder if it vanished (e.g. manual host
+    // cleanup) — mirrors Task 4's reviveArchivedSession. Without this,
+    // the fs.existsSync(inPath) guard below would bail forever on a row
+    // that is now active-and-recent: a permanent, incident-free
+    // half-revival (validation A10). initSessionFolder is idempotent.
+    if (!fs.existsSync(sessionDir(session.agent_group_id, session.id))) {
+      initSessionFolder(session.agent_group_id, session.id);
+    }
+    log.info('Reactivated archived session for due scheduled work', { sessionId: session.id });
+    session = { ...session, status: 'active' };
+  }
 
   const inPath = inboundDbPath(agentGroup.id, session.id);
   if (!fs.existsSync(inPath)) return;
@@ -426,7 +451,14 @@ async function sweepSession(session: Session): Promise<void> {
     const dueCount = outDb ? countDueMessagesExcludingRecovery(inDb, outDb) : countDueMessages(inDb);
     if (dueCount > 0 && !isContainerRunning(session.id)) {
       log.info('Waking container for due messages', { sessionId: session.id, count: dueCount });
-      await wakeContainer(session);
+      try {
+        await wakeContainer(session);
+      } catch (err) {
+        // Keep the failing session inside the sweep recency window so the
+        // wake is retried next pass instead of silently aging out.
+        updateSession(session.id, { last_active: new Date().toISOString() });
+        throw err; // caller loop logs it, exactly as today
+      }
     }
 
     const alive = isContainerRunning(session.id);

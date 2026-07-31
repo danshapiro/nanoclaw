@@ -321,3 +321,152 @@ export function findLatestArchivedSessionByAgentGroup(agentGroupId: string): Ses
 export function reactivateSession(id: string): void {
   updateSession(id, { status: 'active', last_active: new Date().toISOString() });
 }
+
+/**
+ * Recency window for the bounded host sweep. A session stays in the
+ * per-minute sweep while ANY liveness signal holds:
+ *  - recent activity: COALESCE(last_active, created_at) inside the window
+ *    (inbound writes, successful container spawns, revival, and FAILED
+ *    wake attempts all stamp last_active);
+ *  - a live ('pending'/'paused') central scheduled task for its group;
+ *  - container_status <> 'stopped' (wedged/running containers, SLA kills,
+ *    orphaned claims after a host restart — servicing-failure loops that
+ *    never stamp last_active).
+ * Sessions outside all of these are NOT dead: an inbound message revives
+ * them at the routing layer (resolveSession), and due scheduled work
+ * revives them via the archived arm below. First wake after revival may
+ * take up to ~one sweep cycle.
+ */
+export const SWEEP_RECENCY_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+
+/**
+ * The sweep-scoped session set (replaces getActiveSessions for the host
+ * sweep ONLY — scheduler repair and delivery keep the full active set).
+ *
+ * A session is sweepable when:
+ *  - status='active' AND recently active (COALESCE(last_active, created_at)
+ *    within the window) — inbound-message liveness needs no clause of its
+ *    own because every inbound write stamps last_active
+ *    (src/session-manager.ts writeSessionMessage); OR
+ *  - status='active' AND container_status <> 'stopped' — wedged/running
+ *    containers, SLA kills, and orphaned claims are serviced by the sweep
+ *    but their failure loops never stamp last_active; OR
+ *  - status='active' AND its agent group has a live ('pending'/'paused')
+ *    scheduled task that could belong to it (conservative: tasks with NULL
+ *    messaging_group_id match every session in the group); OR
+ *  - status='archived' AND live scheduled work is orphaned on it — the
+ *    sweep revives exactly the latest such archived sibling (HARD
+ *    REQUIREMENT: revive and deliver, never drop). This arm is
+ *    SESSION-MODE-AWARE, mirroring what delivery would actually do once
+ *    the session is active. A session row x is AGENT-SHARED-CLASSIFIED
+ *    iff EXISTS an mga row with x's agent group, session_mode =
+ *    'agent-shared', AND (x.messaging_group_id IS NULL OR
+ *    mga.messaging_group_id = x.messaging_group_id) — the exact rule of
+ *    resolveProjectionContext (sync.ts:393-409): a NULL-mg session (a2a
+ *    provenance) is agent-shared iff ANY wiring in its group is
+ *    agent-shared (group-wide, no mg filter); a routed session uses its
+ *    OWN route's wiring row, so mixed-mode groups keep per-route modes.
+ *     * agent-shared-classified archived sessions: task delivery ignores
+ *       route columns (ledger.ts agent-shared arm matches by
+ *       agent_group_id only), so ANY live task in the agent group
+ *       matches; the sibling guard and latest-archived tiebreak range
+ *       ONLY over sessions that are THEMSELVES agent-shared-classified —
+ *       an active per-thread session in a mixed group CANNOT serve
+ *       agent-shared tasks (ledger.ts:208-217 is strict-route) and must
+ *       not block revival, and a newer archived per-thread sibling must
+ *       not win the tiebreak and then fail its own route match (both
+ *       would strand the work — validator-A2-v2 8b/8c);
+ *     * everything else: exact-route NULL-safe IS matching on
+ *       (messaging_group_id, thread_id), route-scoped guard and tiebreak.
+ *    The sibling guard counts status IN ('active','resetting'): a
+ *    resetting sibling means a scheduler-aware reset is mid-flight and
+ *    will produce the active session itself — reviving beside it would
+ *    create two active sessions on the route. (This does NOT sweep
+ *    resetting sessions — their pinned exclusion is unchanged.)
+ */
+export function getSweepableSessions(now: Date = new Date()): Session[] {
+  const cutoff = new Date(now.getTime() - SWEEP_RECENCY_WINDOW_MS).toISOString();
+  return getDb()
+    .prepare(
+      `SELECT s.* FROM sessions s
+        WHERE (
+          s.status = 'active' AND (
+            COALESCE(s.last_active, s.created_at) >= @cutoff
+            OR s.container_status <> 'stopped'
+            OR EXISTS (
+              SELECT 1 FROM scheduled_tasks t
+               WHERE t.agent_group_id = s.agent_group_id
+                 AND t.status IN ('pending', 'paused')
+                 AND (t.messaging_group_id IS NULL OR t.messaging_group_id IS s.messaging_group_id)
+            )
+          )
+        ) OR (
+          s.status = 'archived'
+          AND CASE
+            WHEN EXISTS (
+              SELECT 1 FROM messaging_group_agents mga
+               WHERE mga.agent_group_id = s.agent_group_id
+                 AND mga.session_mode = 'agent-shared'
+                 AND (s.messaging_group_id IS NULL OR mga.messaging_group_id = s.messaging_group_id)
+            )
+            THEN (
+              EXISTS (
+                SELECT 1 FROM scheduled_tasks t
+                 WHERE t.agent_group_id = s.agent_group_id
+                   AND t.status IN ('pending', 'paused')
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM sessions a
+                 WHERE a.status IN ('active', 'resetting')
+                   AND a.agent_group_id = s.agent_group_id
+                   AND EXISTS (
+                     SELECT 1 FROM messaging_group_agents amga
+                      WHERE amga.agent_group_id = a.agent_group_id
+                        AND amga.session_mode = 'agent-shared'
+                        AND (a.messaging_group_id IS NULL OR amga.messaging_group_id = a.messaging_group_id)
+                   )
+              )
+              AND s.id = (
+                SELECT s2.id FROM sessions s2
+                 WHERE s2.status = 'archived'
+                   AND s2.agent_group_id = s.agent_group_id
+                   AND EXISTS (
+                     SELECT 1 FROM messaging_group_agents smga
+                      WHERE smga.agent_group_id = s2.agent_group_id
+                        AND smga.session_mode = 'agent-shared'
+                        AND (s2.messaging_group_id IS NULL OR smga.messaging_group_id = s2.messaging_group_id)
+                   )
+                 ORDER BY COALESCE(s2.last_active, s2.created_at) DESC, s2.created_at DESC, s2.id DESC
+                 LIMIT 1
+              )
+            )
+            ELSE (
+              EXISTS (
+                SELECT 1 FROM scheduled_tasks t
+                 WHERE t.agent_group_id = s.agent_group_id
+                   AND t.status IN ('pending', 'paused')
+                   AND t.messaging_group_id IS s.messaging_group_id
+                   AND t.thread_id IS s.thread_id
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM sessions a
+                 WHERE a.status IN ('active', 'resetting')
+                   AND a.agent_group_id = s.agent_group_id
+                   AND a.messaging_group_id IS s.messaging_group_id
+                   AND a.thread_id IS s.thread_id
+              )
+              AND s.id = (
+                SELECT s2.id FROM sessions s2
+                 WHERE s2.status = 'archived'
+                   AND s2.agent_group_id = s.agent_group_id
+                   AND s2.messaging_group_id IS s.messaging_group_id
+                   AND s2.thread_id IS s.thread_id
+                 ORDER BY COALESCE(s2.last_active, s2.created_at) DESC, s2.created_at DESC, s2.id DESC
+                 LIMIT 1
+              )
+            )
+          END
+        )`,
+    )
+    .all({ cutoff }) as Session[];
+}
