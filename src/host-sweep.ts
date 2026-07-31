@@ -31,7 +31,13 @@ import type Database from 'better-sqlite3';
 import { createHash } from 'crypto';
 import fs from 'fs';
 
-import { getSession, getSweepableSessions, reactivateSession, updateSession } from './db/sessions.js';
+import {
+  getSession,
+  getSweepableSessions,
+  hasActiveOrResettingRevivalBlocker,
+  reactivateSession,
+  updateSession,
+} from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { RuntimeLockHeldError, withRuntimeLock } from './db/runtime-locks.js';
 import {
@@ -374,17 +380,42 @@ async function sweepSession(session: Session): Promise<void> {
     // any early-outs) so the scheduler block below sees an active central
     // row and projects + wakes as normal. HARD REQUIREMENT: due work
     // revives, never drops.
-    reactivateSession(session.id);
-    // Recreate the on-disk folder if it vanished (e.g. manual host
-    // cleanup) — mirrors Task 4's reviveArchivedSession. Without this,
-    // the fs.existsSync(inPath) guard below would bail forever on a row
-    // that is now active-and-recent: a permanent, incident-free
-    // half-revival (validation A10). initSessionFolder is idempotent.
-    if (!fs.existsSync(sessionDir(session.agent_group_id, session.id))) {
-      initSessionFolder(session.agent_group_id, session.id);
+    //
+    // TOCTOU window: `session` is a pass-start snapshot and the per-session
+    // awaits mean the SQL's sibling/resetting guards may have been evaluated
+    // seconds-to-minutes ago. A router revival + /new roll (or a reset)
+    // starting mid-pass can put a fresh active/resetting sibling on this
+    // route — reviving unconditionally would create TWO active sessions on
+    // it (strictly worse than a one-sweep-cycle delay, per plan). Refetch
+    // the CURRENT row and re-run the sibling guard against live data;
+    // skipping revival this pass is always safe: the session stays
+    // sweepable and is revived next pass — never dropped.
+    const current = getSession(session.id);
+    if (!current) return;
+    if (current.status !== 'archived') {
+      // Revived by another path mid-pass: continue sweeping the fresh
+      // active row; anything else (resetting/closed) is owned elsewhere.
+      if (current.status !== 'active') return;
+      session = current;
+    } else {
+      if (hasActiveOrResettingRevivalBlocker(current)) {
+        log.info('Skipped archived-session revival: live active/resetting sibling appeared mid-pass', {
+          sessionId: session.id,
+        });
+        return;
+      }
+      reactivateSession(session.id);
+      // Recreate the on-disk folder if it vanished (e.g. manual host
+      // cleanup) — mirrors Task 4's reviveArchivedSession. Without this,
+      // the fs.existsSync(inPath) guard below would bail forever on a row
+      // that is now active-and-recent: a permanent, incident-free
+      // half-revival (validation A10). initSessionFolder is idempotent.
+      if (!fs.existsSync(sessionDir(session.agent_group_id, session.id))) {
+        initSessionFolder(session.agent_group_id, session.id);
+      }
+      log.info('Reactivated archived session for due scheduled work', { sessionId: session.id });
+      session = { ...current, status: 'active' };
     }
-    log.info('Reactivated archived session for due scheduled work', { sessionId: session.id });
-    session = { ...session, status: 'active' };
   }
 
   const inPath = inboundDbPath(agentGroup.id, session.id);

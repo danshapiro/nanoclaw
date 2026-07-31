@@ -10,7 +10,7 @@ import {
   initTestDb,
   runMigrations,
 } from './db/index.js';
-import { getSession, getSessionsByAgentGroup } from './db/sessions.js';
+import { getSession, getSessionsByAgentGroup, getSweepableSessions } from './db/sessions.js';
 import { withRuntimeLock } from './db/runtime-locks.js';
 import { createOrReplaceScheduledTask, type CreateScheduledTaskInput } from './modules/scheduling/ledger.js';
 
@@ -231,6 +231,55 @@ describe('host sweep revival of archived sessions with due scheduled work', () =
     }
     expect(wakeContainerMock).toHaveBeenCalled();
     expect((wakeContainerMock.mock.calls.at(-1)?.[0] as { id: string }).id).toBe('sess-archived-no-folder');
+  });
+
+  it('TOCTOU regression: does not revive a stale-snapshot archived session after a mid-pass revive+roll put an active sibling on the route', async () => {
+    const { initSessionFolder } = await import('./session-manager.js');
+    createSession({
+      id: 'sess-toctou-old',
+      agent_group_id: 'ag-yente',
+      messaging_group_id: 'mg-discord',
+      thread_id: 'thread-1',
+      agent_provider: null,
+      status: 'archived',
+      container_status: 'stopped',
+      last_active: STALE,
+      created_at: STALE,
+    });
+    initSessionFolder('ag-yente', 'sess-toctou-old');
+    await seedTask({ seriesId: 'task-toctou', sessionId: 'sess-toctou-old' });
+
+    // Pass-start snapshot: the archived session IS sweepable (due work, no
+    // sibling at snapshot time).
+    const stale = getSweepableSessions().find((sess) => sess.id === 'sess-toctou-old');
+    expect(stale?.status).toBe('archived');
+
+    // Mid-pass: an inbound message revives the session at the router, then
+    // the user rolls with /new — the old session is re-archived and a fresh
+    // active sibling now owns the route.
+    createSession({
+      id: 'sess-toctou-new',
+      agent_group_id: 'ag-yente',
+      messaging_group_id: 'mg-discord',
+      thread_id: 'thread-1',
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: now(),
+      created_at: now(),
+    });
+    initSessionFolder('ag-yente', 'sess-toctou-new');
+
+    // The sweep now reaches the STALE snapshot object.
+    const { sweepSessionForTest } = await import('./host-sweep.js');
+    await sweepSessionForTest(stale!);
+
+    // The stale row must NOT be revived beside the fresh sibling: exactly
+    // one active session on the route, the old one stays archived (and
+    // remains sweepable next pass — delayed, never dropped).
+    expect(getSession('sess-toctou-old')?.status).toBe('archived');
+    const active = getSessionsByAgentGroup('ag-yente').filter((sess) => sess.status === 'active');
+    expect(active.map((sess) => sess.id)).toEqual(['sess-toctou-new']);
   });
 
   it('agent-shared: revives the latest archived group session for a task whose stored route no longer matches', async () => {

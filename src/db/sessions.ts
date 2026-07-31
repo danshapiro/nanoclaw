@@ -323,6 +323,57 @@ export function reactivateSession(id: string): void {
 }
 
 /**
+ * Live re-check of getSweepableSessions' archived-revival sibling guard,
+ * for callers acting on a snapshot row (the host sweep). Returns true when
+ * an active-or-resetting session NOW exists that would make reviving this
+ * archived session create a duplicate on its route/classification:
+ *  - agent-shared-classified sessions (same rule as the sweepable SQL /
+ *    resolveProjectionContext): blocked by any active/resetting sibling in
+ *    the agent group that is ITSELF agent-shared-classified;
+ *  - everything else: blocked by any active/resetting sibling on the exact
+ *    (agent_group_id, messaging_group_id, thread_id) route, NULL-safe.
+ */
+export function hasActiveOrResettingRevivalBlocker(
+  session: Pick<Session, 'agent_group_id' | 'messaging_group_id' | 'thread_id'>,
+): boolean {
+  const row = getDb()
+    .prepare(
+      `SELECT CASE
+         WHEN EXISTS (
+           SELECT 1 FROM messaging_group_agents mga
+            WHERE mga.agent_group_id = @agent_group_id
+              AND mga.session_mode = 'agent-shared'
+              AND (@messaging_group_id IS NULL OR mga.messaging_group_id = @messaging_group_id)
+         )
+         THEN EXISTS (
+           SELECT 1 FROM sessions a
+            WHERE a.status IN ('active', 'resetting')
+              AND a.agent_group_id = @agent_group_id
+              AND EXISTS (
+                SELECT 1 FROM messaging_group_agents amga
+                 WHERE amga.agent_group_id = a.agent_group_id
+                   AND amga.session_mode = 'agent-shared'
+                   AND (a.messaging_group_id IS NULL OR amga.messaging_group_id = a.messaging_group_id)
+              )
+         )
+         ELSE EXISTS (
+           SELECT 1 FROM sessions a
+            WHERE a.status IN ('active', 'resetting')
+              AND a.agent_group_id = @agent_group_id
+              AND a.messaging_group_id IS @messaging_group_id
+              AND a.thread_id IS @thread_id
+         )
+       END AS blocked`,
+    )
+    .get({
+      agent_group_id: session.agent_group_id,
+      messaging_group_id: session.messaging_group_id,
+      thread_id: session.thread_id,
+    }) as { blocked: number };
+  return row.blocked === 1;
+}
+
+/**
  * Recency window for the bounded host sweep. A session stays in the
  * per-minute sweep while ANY liveness signal holds:
  *  - recent activity: COALESCE(last_active, created_at) inside the window
