@@ -16,6 +16,7 @@ import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, st
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
 import { cleanupStaleContainerEnvFiles, drainAllContainers } from './container-runner.js';
 import { routeInbound } from './router.js';
+import { reconcileLegacyTaskImportsOnStartup } from './modules/scheduling/startup-import.js';
 import { log } from './log.js';
 import {
   expireAllStaleGwsCorrelations,
@@ -184,6 +185,13 @@ async function main(): Promise<void> {
   // 6. Start host sweep
   startHostSweep();
   log.info('Host sweep started');
+
+  // 6b. One-time legacy-task import reconciliation (non-blocking): the
+  // bounded sweep never visits >30d-stale active sessions, so any legacy
+  // pre-ledger future tasks they hold must be imported once here.
+  void reconcileLegacyTaskImportsOnStartup().catch((err) => {
+    log.error('Startup legacy-task import reconciliation failed', { err });
+  });
 
   log.info('NanoClaw running');
 }
