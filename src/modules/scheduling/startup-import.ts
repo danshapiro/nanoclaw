@@ -1,11 +1,15 @@
 import fs from 'fs';
 
-import { withRuntimeLock } from '../../db/runtime-locks.js';
+import { RuntimeLockHeldError, withRuntimeLock } from '../../db/runtime-locks.js';
 import { getActiveSessions } from '../../db/sessions.js';
 import { log } from '../../log.js';
 import { inboundDbPath, openInboundDb } from '../../session-manager.js';
 import { reportSchedulerIncident } from '../../yente/scheduler-alerts.js';
 import { importLegacyActiveTasks } from './legacy-import.js';
+
+/** Bounded retries per session when the scheduler-mutator lock is contended. */
+const MAX_LOCK_RETRIES = 5;
+const LOCK_RETRY_BACKOFF_MS = 25;
 
 /**
  * One-time startup reconciliation for legacy pre-ledger scheduled tasks.
@@ -28,7 +32,19 @@ export async function reconcileLegacyTaskImportsOnStartup(): Promise<{
   const sessions = getActiveSessions(); // FULL active set — one-time, unbounded by design
   let imported = 0;
   let failed = 0;
-  for (const session of sessions) {
+  // The host sweep's first pass runs concurrently with this loop and takes
+  // the same per-session 'scheduler-mutator' lock, which throws
+  // RuntimeLockHeldError immediately on contention. A collision must NOT
+  // permanently fail the session: the >30-day-stale sessions this one-time
+  // pass exists for are never revisited by the bounded sweep, so a dropped
+  // session strands its legacy tasks until the next restart. Instead,
+  // re-queue the session and retry after a short backoff — the sweep's
+  // per-session lock hold is brief, so a handful of attempts is plenty.
+  const queue = sessions.map((session) => ({ session, lockAttempts: 0 }));
+  while (queue.length > 0) {
+    const entry = queue.shift();
+    if (!entry) break;
+    const { session } = entry;
     if (!fs.existsSync(inboundDbPath(session.agent_group_id, session.id))) continue;
     try {
       const inDb = openInboundDb(session.agent_group_id, session.id);
@@ -40,6 +56,16 @@ export async function reconcileLegacyTaskImportsOnStartup(): Promise<{
         inDb.close();
       }
     } catch (err) {
+      if (err instanceof RuntimeLockHeldError && entry.lockAttempts < MAX_LOCK_RETRIES) {
+        entry.lockAttempts += 1;
+        queue.push(entry);
+        log.debug('Startup legacy import deferred on scheduler-mutator contention', {
+          sessionId: session.id,
+          attempt: entry.lockAttempts,
+        });
+        await new Promise<void>((resolve) => setTimeout(resolve, LOCK_RETRY_BACKOFF_MS * entry.lockAttempts));
+        continue;
+      }
       failed += 1;
       log.error('Startup legacy import failed for session', { sessionId: session.id, err });
       try {
