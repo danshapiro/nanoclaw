@@ -19,6 +19,15 @@ export function initDb(dbPath: string): Database.Database {
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
   _db = new Database(dbPath);
   _db.pragma('journal_mode = WAL');
+  // FULL is EXPLICIT and load-bearing. Scheduling-action replay is gated on
+  // acks/drain ledgers persisted in the FULL-durable session DBs AFTER the
+  // central apply — synchronous=NORMAL would let a power loss drop the
+  // central write while the durable ack suppresses replay (schedule_task
+  // silently lost; cancel_task resurrected by the per-minute repair). Do
+  // NOT downgrade to NORMAL without first moving those replay gates into
+  // this database.
+  _db.pragma('synchronous = FULL');
+  _db.pragma('wal_autocheckpoint = 4000');
   _db.pragma('foreign_keys = ON');
   log.info('Central DB initialized', { path: dbPath });
   return _db;
