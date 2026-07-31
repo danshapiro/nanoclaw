@@ -268,3 +268,56 @@ export function getAskQuestionRender(
 
   return undefined;
 }
+
+/**
+ * Most recently used ARCHIVED session for an agent+route — the revival
+ * lookup. Archived sessions are revivable by design (an inbound message or
+ * due scheduled work must revive them, never drop): callers that intend
+ * revival consult this AFTER the active-only lookups miss. 'resetting' and
+ * 'closed' are deliberately excluded — reset has its own supersession
+ * machinery, and 'closed' is vestigial.
+ */
+export function findLatestArchivedSessionForAgent(
+  agentGroupId: string,
+  messagingGroupId: string,
+  threadId: string | null,
+): Session | undefined {
+  if (threadId) {
+    return getDb()
+      .prepare(
+        `SELECT * FROM sessions
+          WHERE agent_group_id = ? AND messaging_group_id = ? AND thread_id = ? AND status = 'archived'
+          ORDER BY COALESCE(last_active, created_at) DESC, created_at DESC, id DESC
+          LIMIT 1`,
+      )
+      .get(agentGroupId, messagingGroupId, threadId) as Session | undefined;
+  }
+  return getDb()
+    .prepare(
+      `SELECT * FROM sessions
+        WHERE agent_group_id = ? AND messaging_group_id = ? AND thread_id IS NULL AND status = 'archived'
+        ORDER BY COALESCE(last_active, created_at) DESC, created_at DESC, id DESC
+        LIMIT 1`,
+    )
+    .get(agentGroupId, messagingGroupId) as Session | undefined;
+}
+
+/** Agent-shared-mode variant of findLatestArchivedSessionForAgent. */
+export function findLatestArchivedSessionByAgentGroup(agentGroupId: string): Session | undefined {
+  return getDb()
+    .prepare(
+      `SELECT * FROM sessions
+        WHERE agent_group_id = ? AND status = 'archived'
+        ORDER BY COALESCE(last_active, created_at) DESC, created_at DESC, id DESC
+        LIMIT 1`,
+    )
+    .get(agentGroupId) as Session | undefined;
+}
+
+/**
+ * Revive an archived session: back to 'active' and freshly last_active so
+ * the bounded host sweep (getSweepableSessions) picks it up immediately.
+ */
+export function reactivateSession(id: string): void {
+  updateSession(id, { status: 'active', last_active: new Date().toISOString() });
+}
