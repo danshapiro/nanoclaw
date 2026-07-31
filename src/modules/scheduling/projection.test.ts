@@ -465,4 +465,25 @@ describe('scheduler projection helpers', () => {
     ]);
     inDb.close();
   });
+
+  it('re-projecting an UNCHANGED live task is a steady-state no-op (host_received_at preserved)', async () => {
+    const inDb = freshInboundDb();
+
+    await withSchedulerLock((owner) => {
+      const task = seedTask(owner);
+      projectScheduledTask(inDb, task, 'sess-new', owner);
+      // Sentinel: if the second projection runs its UPDATE, this value is
+      // overwritten with a fresh timestamp (host_accepted_at IS NULL).
+      inDb
+        .prepare("UPDATE messages_in SET host_received_at = '2020-01-01T00:00:00.000Z' WHERE series_id = 'task-1'")
+        .run();
+
+      projectScheduledTask(inDb, getScheduledTask('ag-1', 'task-1')!, 'sess-new', owner);
+    });
+
+    expect(inDb.prepare('SELECT host_received_at FROM messages_in WHERE series_id = ?').get('task-1')).toEqual({
+      host_received_at: '2020-01-01T00:00:00.000Z',
+    });
+    inDb.close();
+  });
 });
