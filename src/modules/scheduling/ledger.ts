@@ -217,6 +217,20 @@ export function listLiveScheduledTasksForSession(args: {
     .all(args) as ScheduledTaskRow[];
 }
 
+/**
+ * Conservative group-level gate for the host sweep's read-before-lock
+ * early exit: ANY live task in the agent group means every session of the
+ * group runs the full lock + sync path. Reads cost no WAL frames.
+ */
+export function hasLiveScheduledTasksForAgentGroup(agentGroupId: string): boolean {
+  const row = getDb()
+    .prepare(
+      "SELECT EXISTS(SELECT 1 FROM scheduled_tasks WHERE agent_group_id = ? AND status IN ('pending', 'paused')) AS present",
+    )
+    .get(agentGroupId) as { present: number };
+  return row.present === 1;
+}
+
 export function createOrReplaceScheduledTask(input: CreateScheduledTaskInput, owner: RuntimeLockOwner): number {
   return withSchedulerWrite(owner, (db) => {
     if (eventExists(db, input.agentGroupId, input.seriesId, 'scheduled', input.sessionId, input.sourceMessageId)) {

@@ -45,6 +45,7 @@ import {
   getHostAuthoritativeSideEffects,
   getMessageForRetry,
   getProcessingClaims,
+  hasSchedulerTaskRows,
   importHostSideEffects,
   markMessageFailed,
   retryWithBackoff,
@@ -86,6 +87,7 @@ import {
   wakeContainer,
 } from './container-runner.js';
 import { currentManagedSkillGeneration } from './yente/managed-skills.js';
+import { hasLiveScheduledTasksForAgentGroup } from './modules/scheduling/ledger.js';
 import {
   ensureSessionSchedulerProjections,
   resolveProjectionContext,
@@ -268,6 +270,18 @@ export function decideSkillRecycle(args: {
   return { action: 'recycle-skills', currentGeneration, spawnGeneration };
 }
 
+/**
+ * Read-before-lock gate (defense in depth for the write-churn fix): the
+ * scheduler-mutator block in sweepSession is skipped only when it is
+ * PROVABLY a no-op — no inbound task rows to import/sync AND no live
+ * central task in the agent group to project. Conservative by
+ * construction: any task row of any status, or any live task anywhere in
+ * the group, takes the lock exactly as before.
+ */
+export function sessionNeedsSchedulerSync(inDb: Database.Database, agentGroupId: string): boolean {
+  return hasSchedulerTaskRows(inDb) || hasLiveScheduledTasksForAgentGroup(agentGroupId);
+}
+
 let running = false;
 
 export function startHostSweep(): void {
@@ -398,40 +412,44 @@ async function sweepSession(session: Session): Promise<void> {
 
     // 2. Sync durable scheduler projection state before due-count so completed
     // recurring projections fan out centrally and reset-resistant projections
-    // are repaired before the wake decision.
-    try {
-      await withRuntimeLock('scheduler-mutator', 120_000, async (owner) => {
-        try {
-          const { importLegacyActiveTasks } = await import('./modules/scheduling/legacy-import.js');
-          const imported = await importLegacyActiveTasks(inDb, session, owner);
-          if (imported > 0) {
-            log.info('Imported active legacy scheduled tasks', { sessionId: session.id, imported });
+    // are repaired before the wake decision. Skipped entirely when cheap
+    // reads prove there is nothing to sync (the common case for idle
+    // sessions) — see sessionNeedsSchedulerSync.
+    if (sessionNeedsSchedulerSync(inDb, session.agent_group_id)) {
+      try {
+        await withRuntimeLock('scheduler-mutator', 120_000, async (owner) => {
+          try {
+            const { importLegacyActiveTasks } = await import('./modules/scheduling/legacy-import.js');
+            const imported = await importLegacyActiveTasks(inDb, session, owner);
+            if (imported > 0) {
+              log.info('Imported active legacy scheduled tasks', { sessionId: session.id, imported });
+            }
+          } catch (err) {
+            log.error('Legacy scheduler import failed during host sweep', { sessionId: session.id, err });
+            const { reportSchedulerIncident } = await import('./yente/scheduler-alerts.js');
+            await reportSchedulerIncident({
+              dedupeKey: `legacy-import:${session.id}`,
+              severity: 'error',
+              message: `Scheduler legacy import failed for session ${session.id}. Scheduled tasks may be delayed until import succeeds.`,
+              agentGroupId: session.agent_group_id,
+              sessionId: session.id,
+              messagingGroupId: session.messaging_group_id,
+              threadId: session.thread_id,
+              details: { err: err instanceof Error ? err.message : String(err) },
+            });
           }
-        } catch (err) {
-          log.error('Legacy scheduler import failed during host sweep', { sessionId: session.id, err });
-          const { reportSchedulerIncident } = await import('./yente/scheduler-alerts.js');
-          await reportSchedulerIncident({
-            dedupeKey: `legacy-import:${session.id}`,
-            severity: 'error',
-            message: `Scheduler legacy import failed for session ${session.id}. Scheduled tasks may be delayed until import succeeds.`,
-            agentGroupId: session.agent_group_id,
-            sessionId: session.id,
-            messagingGroupId: session.messaging_group_id,
-            threadId: session.thread_id,
-            details: { err: err instanceof Error ? err.message : String(err) },
-          });
+          syncSessionSchedulerState(inDb, outDb, session, owner);
+          ensureSessionSchedulerProjections(inDb, session, resolveProjectionContext(session), owner);
+        });
+      } catch (err) {
+        if (err instanceof RuntimeLockHeldError) {
+          // Another in-process task holds the scheduler-mutator lock. The sweep
+          // revisits every session on its next interval, so this is a benign
+          // deferral, not a failure.
+          log.warn('Scheduler sync deferred during host sweep: mutator lock held', { sessionId: session.id });
+        } else {
+          log.error('Scheduler sync failed during host sweep', { sessionId: session.id, err });
         }
-        syncSessionSchedulerState(inDb, outDb, session, owner);
-        ensureSessionSchedulerProjections(inDb, session, resolveProjectionContext(session), owner);
-      });
-    } catch (err) {
-      if (err instanceof RuntimeLockHeldError) {
-        // Another in-process task holds the scheduler-mutator lock. The sweep
-        // revisits every session on its next interval, so this is a benign
-        // deferral, not a failure.
-        log.warn('Scheduler sync deferred during host sweep: mutator lock held', { sessionId: session.id });
-      } else {
-        log.error('Scheduler sync failed during host sweep', { sessionId: session.id, err });
       }
     }
 

@@ -300,6 +300,20 @@ export function countDueMessages(db: Database.Database): number {
 }
 
 /**
+ * Cheap read used by the host sweep's read-before-lock gate: does this
+ * session's inbound DB contain ANY scheduler task row (projection or
+ * legacy)? Deliberately a superset of both the projection-sync selector
+ * (kind='task' AND series_id IS NOT NULL) and the legacy-import selector
+ * (kind='task' with live-ish statuses) — any doubt means "take the lock".
+ */
+export function hasSchedulerTaskRows(db: Database.Database): boolean {
+  const row = db.prepare("SELECT EXISTS(SELECT 1 FROM messages_in WHERE kind = 'task') AS present").get() as {
+    present: number;
+  };
+  return row.present === 1;
+}
+
+/**
  * Outbound-aware due count: like countDueMessages, but excludes rows whose
  * outbound processing_ack is recovery-owned (status='recovery'). Those rows are
  * already owned by route-scoped recovery, so they must not trip a fresh wake.
