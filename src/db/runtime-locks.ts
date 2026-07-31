@@ -3,7 +3,6 @@ import { randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
 
 import { log } from '../log.js';
-import { getDb } from './connection.js';
 
 export interface RuntimeLockOwner {
   name: string;
@@ -11,19 +10,31 @@ export interface RuntimeLockOwner {
   ownerToken: string;
 }
 
-interface RuntimeLockRow {
-  owner_id: string;
-  owner_token: string;
-  expires_at: string;
+interface RuntimeLockEntry {
+  ownerId: string;
+  ownerToken: string;
+  expiresAtMs: number;
 }
 
 const ownerId = `${hostname()}:${process.pid}`;
 const lockOwners = new AsyncLocalStorage<Map<string, RuntimeLockOwner>>();
 
 /**
+ * In-process lock table. Runtime locks coordinate async tasks within the
+ * single NanoClaw service process only — the historical SQLite-row backing
+ * bought durability for state that was deliberately wiped on every restart
+ * (and generated ~99% of the service's disk writes; see
+ * docs/plans/2026-07-30-sqlite-write-churn.md). Same semantics, zero disk.
+ */
+const locks = new Map<string, RuntimeLockEntry>();
+
+/**
  * Thrown when a runtime lock is already held by an unexpired owner. Callers
  * that can safely retry later (e.g. the periodic host sweep) should treat
  * this as a deferral rather than a failure.
+ *
+ * NOTE: the message text is load-bearing — router.ts, scheduler-alerts.ts,
+ * and scheduling/actions.ts detect contention by substring match on it.
  */
 export class RuntimeLockHeldError extends Error {
   constructor(name: string) {
@@ -33,30 +44,17 @@ export class RuntimeLockHeldError extends Error {
 }
 
 /**
- * Delete runtime lock rows left behind by previous process instances.
- *
- * Runtime locks coordinate async tasks within the single NanoClaw service
- * process; owner_id embeds the pid, so after a restart any row with a
- * different owner_id belongs to a dead process. Without this cleanup, a lock
- * held at shutdown (e.g. scheduler-mutator, 120s TTL, taken per-session by
- * the historical host sweep) blocks the restarted process's sweeps until the
- * TTL expires — observed as a burst of "Scheduler sync failed during host
- * sweep" errors right after restart.
+ * Clear all in-process runtime locks. In a freshly started process the map
+ * is empty, so the startup call (src/index.ts) is a no-op kept for parity
+ * with the historical DB-backed cleanup; tests use it as a reset hook.
  */
 export function clearStaleRuntimeLocks(): number {
-  const result = getDb().prepare('DELETE FROM runtime_locks WHERE owner_id != ?').run(ownerId);
-  if (result.changes > 0) {
-    log.info('Cleared stale runtime locks from previous process instances', { count: result.changes });
+  const count = locks.size;
+  locks.clear();
+  if (count > 0) {
+    log.info('Cleared runtime locks', { count });
   }
-  return result.changes;
-}
-
-function nowIso(): string {
-  return new Date(Date.now()).toISOString();
-}
-
-function expiresAtIso(ttlMs: number): string {
-  return new Date(Date.now() + ttlMs).toISOString();
+  return count;
 }
 
 function validateTtl(ttlMs: number): void {
@@ -66,81 +64,49 @@ function validateTtl(ttlMs: number): void {
 }
 
 export function acquireRuntimeLock(name: string, ttlMs: number): RuntimeLockOwner {
-  const owner: RuntimeLockOwner = { name, ownerId, ownerToken: randomUUID() };
-  const now = nowIso();
-  const expiresAt = expiresAtIso(ttlMs);
-  const result = getDb()
-    .prepare(
-      `INSERT INTO runtime_locks (name, owner_id, owner_token, expires_at, acquired_at, renewed_at)
-       VALUES (@name, @ownerId, @ownerToken, @expiresAt, @now, @now)
-       ON CONFLICT(name) DO UPDATE SET
-         owner_id = excluded.owner_id,
-         owner_token = excluded.owner_token,
-         expires_at = excluded.expires_at,
-         acquired_at = excluded.acquired_at,
-         renewed_at = excluded.renewed_at
-       WHERE runtime_locks.expires_at <= @now`,
-    )
-    .run({
-      name,
-      ownerId: owner.ownerId,
-      ownerToken: owner.ownerToken,
-      expiresAt,
-      now,
-    });
-
-  if (result.changes !== 1) {
+  const now = Date.now();
+  const existing = locks.get(name);
+  if (existing && existing.expiresAtMs > now) {
     log.warn('Runtime lock acquisition rejected', { name, ownerId });
     throw new RuntimeLockHeldError(name);
   }
-
+  const owner: RuntimeLockOwner = { name, ownerId, ownerToken: randomUUID() };
+  locks.set(name, { ownerId: owner.ownerId, ownerToken: owner.ownerToken, expiresAtMs: now + ttlMs });
   log.debug('Runtime lock acquired', { name, ownerId });
   return owner;
 }
 
 export function renewRuntimeLock(owner: RuntimeLockOwner, ttlMs: number): void {
-  const now = nowIso();
-  const expiresAt = expiresAtIso(ttlMs);
-  const result = getDb()
-    .prepare(
-      `UPDATE runtime_locks
-       SET expires_at = @expiresAt, renewed_at = @now
-       WHERE name = @name
-         AND owner_id = @ownerId
-         AND owner_token = @ownerToken
-         AND expires_at > @now`,
-    )
-    .run({
-      name: owner.name,
-      ownerId: owner.ownerId,
-      ownerToken: owner.ownerToken,
-      expiresAt,
-      now,
-    });
-
-  if (result.changes !== 1) {
+  const now = Date.now();
+  const entry = locks.get(owner.name);
+  if (!entry || entry.ownerId !== owner.ownerId || entry.ownerToken !== owner.ownerToken || entry.expiresAtMs <= now) {
     throw new Error(`Runtime lock "${owner.name}" ownership was lost before renewal`);
   }
+  entry.expiresAtMs = now + ttlMs;
 }
 
-function releaseRuntimeLock(owner: RuntimeLockOwner): void {
-  const result = getDb()
-    .prepare('DELETE FROM runtime_locks WHERE name = ? AND owner_token = ?')
-    .run(owner.name, owner.ownerToken);
-  log.debug('Runtime lock released', { name: owner.name, ownerId: owner.ownerId, released: result.changes === 1 });
+/**
+ * Release is best-effort and token-fenced: releasing a lock that was
+ * stolen/expired is a debug-logged no-op, never an error.
+ */
+export function releaseRuntimeLock(owner: RuntimeLockOwner): void {
+  const entry = locks.get(owner.name);
+  const released = entry !== undefined && entry.ownerToken === owner.ownerToken;
+  if (released) {
+    locks.delete(owner.name);
+  }
+  log.debug('Runtime lock released', { name: owner.name, ownerId: owner.ownerId, released });
 }
 
 export function assertRuntimeLockOwner(owner: RuntimeLockOwner): void {
-  const row = getDb()
-    .prepare('SELECT owner_id, owner_token, expires_at FROM runtime_locks WHERE name = ?')
-    .get(owner.name) as RuntimeLockRow | undefined;
-  if (!row) {
+  const entry = locks.get(owner.name);
+  if (!entry) {
     throw new Error(`Runtime lock "${owner.name}" is not held`);
   }
-  if (row.owner_id !== owner.ownerId || row.owner_token !== owner.ownerToken) {
+  if (entry.ownerId !== owner.ownerId || entry.ownerToken !== owner.ownerToken) {
     throw new Error(`Runtime lock "${owner.name}" owner token does not match`);
   }
-  if (row.expires_at <= nowIso()) {
+  if (entry.expiresAtMs <= Date.now()) {
     throw new Error(`Runtime lock "${owner.name}" has expired`);
   }
 }

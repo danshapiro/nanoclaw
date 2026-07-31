@@ -11,7 +11,7 @@ import {
   initTestDb,
   runMigrations,
 } from '../db/index.js';
-import { withRuntimeLock } from '../db/runtime-locks.js';
+import { acquireRuntimeLock, releaseRuntimeLock, withRuntimeLock } from '../db/runtime-locks.js';
 import { getSession, updateSession } from '../db/sessions.js';
 import { setDeliveryAdapter } from '../delivery.js';
 import { createOrReplaceScheduledTask, getScheduledTask } from '../modules/scheduling/ledger.js';
@@ -332,12 +332,7 @@ describe('resetYenteSessionPreservingScheduler', () => {
       sessionMode: 'per-thread',
       phase: 'old-resetting',
     });
-    getDb()
-      .prepare(
-        `INSERT INTO runtime_locks (name, owner_id, owner_token, expires_at, acquired_at, renewed_at)
-         VALUES ('scheduler-mutator', 'other-owner', 'other-token', ?, ?, ?)`,
-      )
-      .run(new Date(Date.now() + 60_000).toISOString(), now(), now());
+    const blocker = acquireRuntimeLock('scheduler-mutator', 120_000);
 
     await expect(
       resetYenteSessionPreservingScheduler({
@@ -353,6 +348,7 @@ describe('resetYenteSessionPreservingScheduler', () => {
     ).rejects.toThrow('Yente scheduler-aware reset failed');
 
     expect(supersessionPhase(oldSession.id)).toBe('old-resetting');
+    releaseRuntimeLock(blocker);
   });
 });
 

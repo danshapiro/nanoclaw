@@ -1,72 +1,60 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { closeDb, getDb, initTestDb, runMigrations } from './index.js';
 import {
   acquireRuntimeLock,
   assertRuntimeLockOwner,
   clearStaleRuntimeLocks,
+  releaseRuntimeLock,
   renewRuntimeLock,
   RuntimeLockHeldError,
   withRuntimeLock,
-  type RuntimeLockOwner,
 } from './runtime-locks.js';
 
-function deferred<T = void>() {
-  let resolve!: (value?: T | PromiseLike<T>) => void;
-  let reject!: (reason?: unknown) => void;
-  const promise = new Promise<T>((res, rej) => {
-    resolve = (value?: T | PromiseLike<T>) => res(value as T | PromiseLike<T>);
-    reject = rej;
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
   });
-  return { promise, resolve, reject };
+  return { promise, resolve };
 }
 
-function lockRow(name = 'scheduler') {
-  return getDb().prepare('SELECT owner_id, owner_token, expires_at FROM runtime_locks WHERE name = ?').get(name) as
-    | { owner_id: string; owner_token: string; expires_at: string }
-    | undefined;
-}
+describe('runtime locks (in-process)', () => {
+  beforeEach(() => {
+    vi.useRealTimers();
+    clearStaleRuntimeLocks();
+  });
 
-function insertLock(name: string, ownerId: string, ownerToken: string, expiresAt: string): void {
-  const now = new Date(Date.now()).toISOString();
-  getDb()
-    .prepare(
-      `INSERT INTO runtime_locks (name, owner_id, owner_token, expires_at, acquired_at, renewed_at)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-    )
-    .run(name, ownerId, ownerToken, expiresAt, now, now);
-}
+  afterEach(() => {
+    vi.useRealTimers();
+    clearStaleRuntimeLocks();
+  });
 
-beforeEach(() => {
-  vi.useRealTimers();
-  const db = initTestDb();
-  runMigrations(db);
-});
-
-afterEach(() => {
-  vi.useRealTimers();
-  closeDb();
-});
-
-describe('runtime locks', () => {
   it('rejects a second unexpired independent owner', async () => {
-    const entered = deferred<RuntimeLockOwner>();
-    const release = deferred();
-    const first = withRuntimeLock('scheduler', 10_000, async (owner) => {
-      entered.resolve(owner);
-      await release.promise;
+    const gate = deferred<void>();
+    const first = withRuntimeLock('scheduler', 10_000, async () => {
+      await gate.promise;
+      return 'first';
     });
-    await entered.promise;
 
+    await expect(withRuntimeLock('scheduler', 10_000, async () => 'second')).rejects.toThrow(/already held/);
+
+    gate.resolve(undefined);
+    await expect(first).resolves.toBe('first');
+  });
+
+  it('throws RuntimeLockHeldError with the exact message callers string-match on', () => {
+    const owner = acquireRuntimeLock('scheduler-mutator', 10_000);
     try {
-      await expect(withRuntimeLock('scheduler', 10_000, async () => undefined)).rejects.toThrow(/already held/);
+      expect(() => acquireRuntimeLock('scheduler-mutator', 10_000)).toThrow(RuntimeLockHeldError);
+      expect(() => acquireRuntimeLock('scheduler-mutator', 10_000)).toThrow(
+        'Runtime lock "scheduler-mutator" is already held by an unexpired owner',
+      );
     } finally {
-      release.resolve();
-      await first;
+      releaseRuntimeLock(owner);
     }
   });
 
-  it('nested same-context lock reuses owner token', async () => {
+  it('nested same-context lock reuses the owner token', async () => {
     await withRuntimeLock('scheduler', 10_000, async (outer) => {
       await withRuntimeLock('scheduler', 10_000, async (inner) => {
         expect(inner).toEqual(outer);
@@ -75,126 +63,121 @@ describe('runtime locks', () => {
     });
   });
 
-  it('independent same-process concurrent lock does not reuse existing owner token', async () => {
-    const entered = deferred<RuntimeLockOwner>();
-    const release = deferred();
+  it('independent same-process concurrent lock does not run its fn', async () => {
+    const gate = deferred<void>();
     let secondEntered = false;
-    const first = withRuntimeLock('scheduler', 10_000, async (owner) => {
-      entered.resolve(owner);
-      await release.promise;
+    const first = withRuntimeLock('scheduler', 10_000, async () => {
+      await gate.promise;
     });
-    const firstOwner = await entered.promise;
 
-    try {
-      await expect(
-        withRuntimeLock('scheduler', 10_000, async (owner) => {
-          secondEntered = true;
-          expect(owner.ownerToken).not.toBe(firstOwner.ownerToken);
-        }),
-      ).rejects.toThrow(/already held/);
-      expect(secondEntered).toBe(false);
-    } finally {
-      release.resolve();
-      await first;
-    }
+    await expect(
+      withRuntimeLock('scheduler', 10_000, async () => {
+        secondEntered = true;
+      }),
+    ).rejects.toThrow(/already held/);
+    expect(secondEntered).toBe(false);
+
+    gate.resolve(undefined);
+    await first;
   });
 
-  it('expired lock can be stolen', async () => {
-    insertLock('scheduler', 'old-owner', 'old-token', new Date(Date.now() - 1).toISOString());
+  it('expired lock can be stolen', () => {
+    vi.useFakeTimers();
+    const first = acquireRuntimeLock('scheduler', 1_000);
+    vi.advanceTimersByTime(1_001);
 
-    await withRuntimeLock('scheduler', 10_000, async (owner) => {
-      const row = lockRow('scheduler');
-      expect(row?.owner_token).toBe(owner.ownerToken);
-      expect(row?.owner_token).not.toBe('old-token');
-      assertRuntimeLockOwner(owner);
-    });
+    const second = acquireRuntimeLock('scheduler', 10_000);
+    expect(second.ownerToken).not.toBe(first.ownerToken);
+    expect(() => assertRuntimeLockOwner(second)).not.toThrow();
+    expect(() => assertRuntimeLockOwner(first)).toThrow(/owner token/);
   });
 
-  it('exports direct acquire and renewal helpers', () => {
+  it('exports direct acquire, renewal, and release helpers', () => {
+    vi.useFakeTimers();
     const owner = acquireRuntimeLock('scheduler', 10_000);
-    const initialExpiry = lockRow('scheduler')?.expires_at;
-    expect(initialExpiry).toBeDefined();
-
+    vi.advanceTimersByTime(9_000);
     renewRuntimeLock(owner, 20_000);
-
-    const renewedExpiry = lockRow('scheduler')?.expires_at;
-    expect(Date.parse(renewedExpiry ?? '')).toBeGreaterThan(Date.parse(initialExpiry ?? ''));
-    assertRuntimeLockOwner(owner);
+    vi.advanceTimersByTime(15_000); // 24s after acquire; renewed expiry is 9s+20s=29s
+    expect(() => assertRuntimeLockOwner(owner)).not.toThrow();
+    releaseRuntimeLock(owner);
+    expect(() => assertRuntimeLockOwner(owner)).toThrow(/not held/);
   });
 
   it('renew extends expiry during a long async operation', async () => {
     vi.useFakeTimers();
-    vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
-
-    const entered = deferred();
-    const release = deferred();
-    const locked = withRuntimeLock('scheduler', 100, async () => {
-      entered.resolve();
-      await release.promise;
+    const gate = deferred<void>();
+    const operation = withRuntimeLock('scheduler', 100, async (owner) => {
+      await gate.promise;
+      return owner;
     });
-    await entered.promise;
-    const initialExpiry = lockRow('scheduler')?.expires_at;
-    expect(initialExpiry).toBeDefined();
 
-    await vi.advanceTimersByTimeAsync(60);
-    const renewedExpiry = lockRow('scheduler')?.expires_at;
-    expect(Date.parse(renewedExpiry ?? '')).toBeGreaterThan(Date.parse(initialExpiry ?? ''));
+    // ttl/2 = 50ms renewal interval. At 120ms the ORIGINAL 100ms ttl has
+    // long expired -- the lock is only still held because the renewals at
+    // 50ms and 100ms extended it. (Advancing only 60ms would prove nothing:
+    // the original ttl would still cover it.)
+    await vi.advanceTimersByTimeAsync(120);
+    expect(acquireAttemptFails()).toBe(true);
 
-    release.resolve();
-    await locked;
-  });
+    gate.resolve(undefined);
+    await expect(operation).resolves.toBeDefined();
 
-  it('assertRuntimeLockOwner fails after row deletion or token loss', async () => {
-    await withRuntimeLock('scheduler', 10_000, async (owner) => {
-      assertRuntimeLockOwner(owner);
-
-      getDb().prepare('DELETE FROM runtime_locks WHERE name = ?').run(owner.name);
-      expect(() => assertRuntimeLockOwner(owner)).toThrow(/not held/);
-
-      insertLock(owner.name, 'other-owner', 'other-token', new Date(Date.now() + 10_000).toISOString());
-      expect(() => assertRuntimeLockOwner(owner)).toThrow(/owner token/);
-    });
-  });
-
-  it('throws RuntimeLockHeldError when the lock is held by an unexpired owner', () => {
-    insertLock('scheduler-mutator', 'other-host:999999', 'other-token', new Date(Date.now() + 120_000).toISOString());
-    let thrown: unknown;
-    try {
-      acquireRuntimeLock('scheduler-mutator', 1_000);
-    } catch (err) {
-      thrown = err;
+    function acquireAttemptFails(): boolean {
+      try {
+        const owner = acquireRuntimeLock('scheduler', 100);
+        releaseRuntimeLock(owner);
+        return false;
+      } catch (err) {
+        return err instanceof RuntimeLockHeldError;
+      }
     }
-    expect(thrown).toBeInstanceOf(RuntimeLockHeldError);
-    expect((thrown as Error).message).toMatch(/already held by an unexpired owner/);
   });
 
-  it('clearStaleRuntimeLocks removes rows from previous process instances', async () => {
-    // Simulate locks left behind by a killed prior process (different pid).
-    insertLock('scheduler-mutator', 'other-host:999999', 'stale-token-1', new Date(Date.now() + 120_000).toISOString());
-    insertLock('another-lock', 'other-host:999998', 'stale-token-2', new Date(Date.now() - 1_000).toISOString());
+  it('assertRuntimeLockOwner fails after release, token loss, or expiry', () => {
+    vi.useFakeTimers();
+    const released = acquireRuntimeLock('scheduler', 10_000);
+    releaseRuntimeLock(released);
+    expect(() => assertRuntimeLockOwner(released)).toThrow(/not held/);
 
-    const cleared = clearStaleRuntimeLocks();
-    expect(cleared).toBe(2);
-    expect(lockRow('scheduler-mutator')).toBeUndefined();
-    expect(lockRow('another-lock')).toBeUndefined();
+    const original = acquireRuntimeLock('scheduler', 1_000);
+    vi.advanceTimersByTime(1_001);
+    acquireRuntimeLock('scheduler', 10_000); // steal
+    expect(() => assertRuntimeLockOwner(original)).toThrow(/owner token/);
 
-    // The previously "held" lock is immediately acquirable again.
-    await withRuntimeLock('scheduler-mutator', 1_000, () => {});
+    clearStaleRuntimeLocks();
+    const expiring = acquireRuntimeLock('scheduler', 1_000);
+    vi.advanceTimersByTime(1_001);
+    expect(() => assertRuntimeLockOwner(expiring)).toThrow(/has expired/);
   });
 
-  it('clearStaleRuntimeLocks preserves locks held by the current process', async () => {
-    const entered = deferred();
-    const release = deferred();
-    const locked = withRuntimeLock('scheduler', 10_000, async () => {
-      entered.resolve();
-      await release.promise;
+  it('rejects the caller when lock ownership is lost mid-operation (renewal abort)', async () => {
+    vi.useFakeTimers();
+    const gate = deferred<void>();
+    const operation = withRuntimeLock('scheduler', 1_000, async (owner) => {
+      // Simulate ownership loss (e.g. steal after expiry) while fn is running.
+      releaseRuntimeLock(owner);
+      await gate.promise;
+      return 'never surfaces';
     });
-    await entered.promise;
+    const assertion = expect(operation).rejects.toThrow(/ownership was lost before renewal/);
 
+    // Advance past the ttl/2 = 500ms renewal tick, which must now fail.
+    await vi.advanceTimersByTimeAsync(600);
+    await assertion;
+    gate.resolve(undefined);
+  });
+
+  it('clearStaleRuntimeLocks clears held locks and reports the count', () => {
+    acquireRuntimeLock('scheduler', 120_000);
+    acquireRuntimeLock('not-the-scheduler', 120_000);
+    expect(clearStaleRuntimeLocks()).toBe(2);
     expect(clearStaleRuntimeLocks()).toBe(0);
-    expect(lockRow('scheduler')).toBeDefined();
+    // Immediately re-acquirable after the clear.
+    const owner = acquireRuntimeLock('scheduler', 120_000);
+    expect(() => assertRuntimeLockOwner(owner)).not.toThrow();
+  });
 
-    release.resolve();
-    await locked;
+  it('validates ttl in withRuntimeLock', async () => {
+    await expect(withRuntimeLock('scheduler', 0, async () => 'x')).rejects.toThrow(/positive finite/);
+    await expect(withRuntimeLock('scheduler', Number.NaN, async () => 'x')).rejects.toThrow(/positive finite/);
   });
 });

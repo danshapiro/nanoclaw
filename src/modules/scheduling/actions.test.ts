@@ -6,11 +6,10 @@ import {
   createAgentGroup,
   createMessagingGroup,
   createMessagingGroupAgent,
-  getDb,
   initTestDb,
   runMigrations,
 } from '../../db/index.js';
-import { acquireRuntimeLock } from '../../db/runtime-locks.js';
+import { acquireRuntimeLock, releaseRuntimeLock } from '../../db/runtime-locks.js';
 import { clearDeliveryAdapterForTest } from '../../delivery.js';
 import { openInboundDb, resolveSession } from '../../session-manager.js';
 import { getScheduledTask } from './ledger.js';
@@ -69,9 +68,7 @@ describe('scheduling delivery actions', () => {
 
       await sleep(50);
       expect(getScheduledTask('ag-yente', 'task-retry')).toBeUndefined();
-      getDb()
-        .prepare('DELETE FROM runtime_locks WHERE name = ? AND owner_token = ?')
-        .run(blocker.name, blocker.ownerToken);
+      releaseRuntimeLock(blocker);
 
       await action;
 
@@ -85,9 +82,7 @@ describe('scheduling delivery actions', () => {
         { id: 'task-task-retry-g1', series_id: 'task-retry', status: 'pending' },
       ]);
     } finally {
-      getDb()
-        .prepare('DELETE FROM runtime_locks WHERE name = ? AND owner_token = ?')
-        .run(blocker.name, blocker.ownerToken);
+      releaseRuntimeLock(blocker);
       inDb.close();
     }
   });
