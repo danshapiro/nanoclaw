@@ -15,6 +15,7 @@ import {
   hostGwsCorrelationIpcDir,
   processAuthenticatedGwsCorrelationRequest,
   registerGwsCorrelationLaunchLease,
+  releaseAcceptedGwsCorrelation,
   setGwsCorrelationIpcRootForTests,
   type AuthenticatedGwsCorrelationRequest,
   type GwsCorrelationLaunchControl,
@@ -706,5 +707,333 @@ describe('GWS acceptance lifecycle barriers', () => {
       }),
     ).toThrow(/another host process|still active/i);
     expect(JSON.parse(fs.readFileSync(markerPath, 'utf8'))).toEqual(existing);
+  });
+});
+
+describe('durable re-acceptance after an ended interval', () => {
+  let root: string;
+  let dbPath: string;
+  let correlationPath: string;
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-reacceptance-'));
+    dbPath = path.join(root, 'inbound.db');
+    correlationPath = path.join(root, 'host-correlation', 'current.json');
+    const db = new Database(dbPath);
+    db.exec(INBOUND_SCHEMA);
+    db.close();
+  });
+
+  afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  function insertRow(opts: {
+    id: string;
+    seq: number;
+    hostInputId: string;
+    routeKey: string;
+    acceptedInputId?: string;
+    acceptedAt?: string;
+    endedAt?: string;
+    leaseId?: string;
+    claimToken?: string;
+    sequence?: number;
+  }): void {
+    const db = new Database(dbPath);
+    db.prepare(
+      `INSERT INTO messages_in
+         (id, seq, kind, timestamp, content, trigger, host_input_id, host_route_key, host_received_at,
+          host_accepted_input_id, host_accepted_route_key, host_accepted_at, host_acceptance_ended_at,
+          host_acceptance_claim_token, host_acceptance_lease_id, host_acceptance_sequence)
+       VALUES (?, ?, 'chat', '2026-08-01T00:00:00.000Z', '{}', 1, ?, ?, '2026-08-01T00:00:00.000Z',
+               ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      opts.id,
+      opts.seq,
+      opts.hostInputId,
+      opts.routeKey,
+      opts.acceptedInputId ?? null,
+      opts.acceptedInputId ? opts.routeKey : null,
+      opts.acceptedAt ?? null,
+      opts.endedAt ?? null,
+      opts.claimToken ?? null,
+      opts.leaseId ?? null,
+      opts.sequence ?? null,
+    );
+    db.close();
+  }
+
+  function readRow(id: string): Record<string, unknown> {
+    const db = new Database(dbPath, { readonly: true });
+    const row = db.prepare('SELECT * FROM messages_in WHERE id = ?').get(id) as Record<string, unknown>;
+    db.close();
+    return row;
+  }
+
+  it('re-binds the same input with a fresh acceptedAt when the prior interval ended (crashed-container re-bind)', () => {
+    insertRow({
+      id: 'm-1',
+      seq: 1,
+      hostInputId: 'in-1',
+      routeKey: 'route-1',
+      acceptedInputId: 'in-1',
+      acceptedAt: '2026-08-01T00:00:01.000Z',
+      endedAt: '2026-08-01T00:00:05.000Z',
+      claimToken: 'claim-old',
+      leaseId: 'lease-old',
+      sequence: 3,
+    });
+
+    bindAcceptedGwsCorrelation({
+      dbPath,
+      correlationPath,
+      sessionId: 'sess-1',
+      inputId: 'in-1',
+      routeKey: 'route-1',
+      messageIds: ['m-1'],
+      acceptedAt: '2026-08-01T09:00:00.000Z', // fresh now() from a fresh container
+      closedAt: '2026-08-01T09:00:00.000Z', // the request's current time
+      claimToken: 'claim-new',
+      leaseId: 'lease-new',
+      sequence: 1,
+    });
+
+    const row = readRow('m-1');
+    expect(row.host_accepted_input_id).toBe('in-1');
+    expect(row.host_accepted_at).toBe('2026-08-01T00:00:01.000Z'); // first acceptance immutable
+    expect(row.host_acceptance_ended_at).toBeNull(); // interval reopened
+    expect(row.host_acceptance_claim_token).toBe('claim-new');
+    expect(row.host_acceptance_lease_id).toBe('lease-new');
+    expect(row.host_acceptance_sequence).toBe(1);
+    const pointer = JSON.parse(fs.readFileSync(correlationPath, 'utf8')) as { inputId: string };
+    expect(pointer.inputId).toBe('in-1');
+  });
+
+  it('adopts previously-accepted-and-ended rows into a new input batch (mixed batch, hinda signature)', () => {
+    insertRow({
+      id: 'm-stale',
+      seq: 1,
+      hostInputId: 'in-old',
+      routeKey: 'route-1',
+      acceptedInputId: 'in-old',
+      acceptedAt: '2026-08-01T00:00:01.000Z',
+      endedAt: '2026-08-01T00:00:05.000Z',
+      claimToken: 'claim-old',
+      leaseId: 'lease-old',
+      sequence: 2,
+    });
+    insertRow({ id: 'm-new', seq: 2, hostInputId: 'in-new', routeKey: 'route-1' });
+
+    bindAcceptedGwsCorrelation({
+      dbPath,
+      correlationPath,
+      sessionId: 'sess-1',
+      inputId: 'in-new',
+      routeKey: 'route-1',
+      messageIds: ['m-stale', 'm-new'],
+      acceptedAt: '2026-08-01T09:00:00.000Z',
+      closedAt: '2026-08-01T09:00:00.000Z',
+      claimToken: 'claim-b',
+      leaseId: 'lease-b',
+      sequence: 1,
+    });
+
+    const stale = readRow('m-stale');
+    expect(stale.host_accepted_input_id).toBe('in-old'); // immutable original
+    expect(stale.host_accepted_at).toBe('2026-08-01T00:00:01.000Z');
+    expect(stale.host_acceptance_ended_at).toBeNull(); // adopted into the new turn
+    expect(stale.host_acceptance_claim_token).toBe('claim-b');
+    expect(stale.host_acceptance_lease_id).toBe('lease-b');
+    const fresh = readRow('m-new');
+    expect(fresh.host_accepted_input_id).toBe('in-new');
+    expect(fresh.host_accepted_at).toBe('2026-08-01T09:00:00.000Z');
+    expect(fresh.host_acceptance_ended_at).toBeNull();
+    const pointer = JSON.parse(fs.readFileSync(correlationPath, 'utf8')) as { inputId: string };
+    expect(pointer.inputId).toBe('in-new');
+  });
+
+  it('still rejects a conflicting bind while the prior acceptance interval is LIVE', () => {
+    insertRow({
+      id: 'm-live',
+      seq: 1,
+      hostInputId: 'in-old',
+      routeKey: 'route-1',
+      acceptedInputId: 'in-old',
+      acceptedAt: '2026-08-01T00:00:01.000Z',
+      // endedAt omitted -> interval LIVE, and no pointer exists to advance from
+      claimToken: 'claim-old',
+      leaseId: 'lease-old',
+      sequence: 2,
+    });
+    insertRow({ id: 'm-new', seq: 2, hostInputId: 'in-new', routeKey: 'route-1' });
+
+    expect(() =>
+      bindAcceptedGwsCorrelation({
+        dbPath,
+        correlationPath,
+        sessionId: 'sess-1',
+        inputId: 'in-new',
+        routeKey: 'route-1',
+        messageIds: ['m-live', 'm-new'],
+        acceptedAt: '2026-08-01T09:00:00.000Z',
+        closedAt: '2026-08-01T09:00:00.000Z',
+        claimToken: 'claim-b',
+        leaseId: 'lease-b',
+        sequence: 1,
+      }),
+    ).toThrow('accepted batch conflicts with immutable original acceptance');
+    const live = readRow('m-live');
+    expect(live.host_acceptance_claim_token).toBe('claim-old'); // untouched (transaction rolled back)
+    expect(live.host_acceptance_ended_at).toBeNull();
+  });
+
+  it('advancing the pointer closes every open interval, enabling within-life mixed-batch adoption', () => {
+    insertRow({ id: 'm-a', seq: 1, hostInputId: 'in-a', routeKey: 'route-1' });
+    bindAcceptedGwsCorrelation({
+      dbPath,
+      correlationPath,
+      sessionId: 'sess-1',
+      inputId: 'in-a',
+      routeKey: 'route-1',
+      messageIds: ['m-a'],
+      acceptedAt: '2026-08-01T09:00:00.000Z',
+      closedAt: '2026-08-01T09:00:00.000Z',
+      claimToken: 'claim-a',
+      leaseId: 'lease-x',
+      sequence: 1,
+    });
+    // m-a's interval is now LIVE and the pointer names in-a. A new trigger
+    // arrives and the (still-pending) m-a is included in the new batch.
+    insertRow({ id: 'm-b', seq: 2, hostInputId: 'in-b', routeKey: 'route-1' });
+    bindAcceptedGwsCorrelation({
+      dbPath,
+      correlationPath,
+      sessionId: 'sess-1',
+      inputId: 'in-b',
+      routeKey: 'route-1',
+      messageIds: ['m-a', 'm-b'],
+      acceptedAt: '2026-08-01T09:05:00.000Z',
+      closedAt: '2026-08-01T09:05:00.000Z',
+      claimToken: 'claim-b2',
+      leaseId: 'lease-x',
+      sequence: 2,
+    });
+    const a = readRow('m-a');
+    expect(a.host_accepted_input_id).toBe('in-a'); // immutable
+    expect(a.host_acceptance_ended_at).toBeNull(); // closed on advance, then reopened by adoption
+    expect(a.host_acceptance_claim_token).toBe('claim-b2');
+  });
+
+  it('never stamps or reopens rows outside the exact batch', () => {
+    insertRow({
+      id: 'm-outside',
+      seq: 1,
+      hostInputId: 'in-out',
+      routeKey: 'route-1',
+      acceptedInputId: 'in-out',
+      acceptedAt: '2026-08-01T00:00:01.000Z',
+      endedAt: '2026-08-01T00:00:05.000Z',
+      claimToken: 'claim-old',
+      leaseId: 'lease-old',
+      sequence: 2,
+    });
+    insertRow({ id: 'm-in', seq: 2, hostInputId: 'in-x', routeKey: 'route-1' });
+    bindAcceptedGwsCorrelation({
+      dbPath,
+      correlationPath,
+      sessionId: 'sess-1',
+      inputId: 'in-x',
+      routeKey: 'route-1',
+      messageIds: ['m-in'],
+      acceptedAt: '2026-08-01T09:00:00.000Z',
+      closedAt: '2026-08-01T09:00:00.000Z',
+      claimToken: 'claim-x',
+      leaseId: 'lease-x',
+      sequence: 1,
+    });
+    const outside = readRow('m-outside');
+    expect(outside.host_acceptance_ended_at).toBe('2026-08-01T00:00:05.000Z'); // stays closed
+    expect(outside.host_acceptance_claim_token).toBe('claim-old');
+  });
+
+  it('stamps the explicit closedAt on pointer-advance closes, never the (possibly derived-old) acceptedAt', () => {
+    insertRow({ id: 'm-old', seq: 1, hostInputId: 'in-old', routeKey: 'route-1' });
+    bindAcceptedGwsCorrelation({
+      dbPath,
+      correlationPath,
+      sessionId: 'sess-1',
+      inputId: 'in-old',
+      routeKey: 'route-1',
+      messageIds: ['m-old'],
+      acceptedAt: '2026-08-01T09:00:00.000Z',
+      closedAt: '2026-08-01T09:00:00.000Z',
+      claimToken: 'claim-old2',
+      leaseId: 'lease-x',
+      sequence: 1,
+    });
+    // The next bind carries a derived-OLD acceptedAt (the Task 2 shape) while
+    // m-old's interval is live and NOT part of the new batch. The advance must
+    // close m-old at the request time (closedAt), not the derived time — a
+    // past-dated ended_at would hard-fail recoverAfterKill (host-sweep.ts:1085
+    // clamp + :1122–1126 throw, V3 probe C).
+    insertRow({ id: 'm-next', seq: 2, hostInputId: 'in-next', routeKey: 'route-1' });
+    bindAcceptedGwsCorrelation({
+      dbPath,
+      correlationPath,
+      sessionId: 'sess-1',
+      inputId: 'in-next',
+      routeKey: 'route-1',
+      messageIds: ['m-next'],
+      acceptedAt: '2026-07-25T10:00:00.000Z', // derived-old: predates m-old's acceptance
+      closedAt: '2026-08-01T09:05:00.000Z', // the request's current time
+      claimToken: 'claim-next',
+      leaseId: 'lease-x',
+      sequence: 2,
+    });
+    const old = readRow('m-old');
+    expect(old.host_acceptance_ended_at).toBe('2026-08-01T09:05:00.000Z'); // closedAt, not acceptedAt
+    // The invariant every close must uphold: ended_at >= the closed row's host_accepted_at.
+    expect(Date.parse(old.host_acceptance_ended_at as string)).toBeGreaterThanOrEqual(
+      Date.parse(old.host_accepted_at as string),
+    );
+  });
+
+  it('release after adoption closes the adopted row (broadened, not input-keyed)', () => {
+    insertRow({
+      id: 'm-adopted',
+      seq: 1,
+      hostInputId: 'in-prior',
+      routeKey: 'route-1',
+      acceptedInputId: 'in-prior',
+      acceptedAt: '2026-08-01T00:00:01.000Z',
+      endedAt: '2026-08-01T00:00:05.000Z',
+      claimToken: 'claim-old',
+      leaseId: 'lease-old',
+      sequence: 1,
+    });
+    insertRow({ id: 'm-turn', seq: 2, hostInputId: 'in-turn', routeKey: 'route-1' });
+    bindAcceptedGwsCorrelation({
+      dbPath,
+      correlationPath,
+      sessionId: 'sess-1',
+      inputId: 'in-turn',
+      routeKey: 'route-1',
+      messageIds: ['m-adopted', 'm-turn'],
+      acceptedAt: '2026-08-01T09:00:00.000Z',
+      closedAt: '2026-08-01T09:00:00.000Z',
+      claimToken: 'claim-turn',
+      leaseId: 'lease-x',
+      sequence: 1,
+    });
+    releaseAcceptedGwsCorrelation({
+      dbPath,
+      correlationPath,
+      inputId: 'in-turn',
+      endedAt: '2026-08-01T10:00:00.000Z',
+    });
+    const adopted = readRow('m-adopted');
+    expect(adopted.host_accepted_input_id).toBe('in-prior'); // immutable original untouched
+    expect(adopted.host_acceptance_ended_at).toBe('2026-08-01T10:00:00.000Z'); // closed by the broadened release
+    const turn = readRow('m-turn');
+    expect(turn.host_acceptance_ended_at).toBe('2026-08-01T10:00:00.000Z');
   });
 });

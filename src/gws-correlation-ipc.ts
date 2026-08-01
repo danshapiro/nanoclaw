@@ -148,6 +148,7 @@ interface AcceptedRow {
   host_accepted_input_id: string | null;
   host_accepted_route_key: string | null;
   host_accepted_at: string | null;
+  host_acceptance_ended_at: string | null;
 }
 
 export interface BindAcceptedGwsCorrelationOptions {
@@ -158,6 +159,8 @@ export interface BindAcceptedGwsCorrelationOptions {
   routeKey: string;
   messageIds: string[];
   acceptedAt?: string;
+  /** Close time for pointer-advance interval closes; the CURRENT request time. Defaults to now. */
+  closedAt?: string;
   requestId?: string;
   claimToken?: string;
   leaseId?: string;
@@ -586,6 +589,7 @@ export function bindAcceptedGwsCorrelation(opts: BindAcceptedGwsCorrelationOptio
   const inputId = canonicalCorrelation(opts.inputId, 'inputId');
   const routeKey = canonicalCorrelation(opts.routeKey, 'routeKey');
   const acceptedAt = canonicalTimestamp(opts.acceptedAt ?? new Date().toISOString(), 'acceptedAt');
+  const closedAt = canonicalTimestamp(opts.closedAt ?? new Date().toISOString(), 'closedAt');
   const messageIds = [...new Set(opts.messageIds)];
   if (messageIds.length === 0 || messageIds.some((id) => !id)) throw new Error('messageIds must name an exact batch');
 
@@ -598,16 +602,28 @@ export function bindAcceptedGwsCorrelation(opts: BindAcceptedGwsCorrelationOptio
     db.transaction(() => {
       const currentInput = priorCurrent?.inputId;
       if (typeof currentInput === 'string' && currentInput !== inputId) {
+        // The pointer names the outgoing turn; the pointer is singular, so every
+        // open interval belongs to that turn (rows first-accepted under it OR
+        // rows adopted into it, which keep their immutable original
+        // host_accepted_input_id). Close them all — an input-keyed close would
+        // leave adopted rows' reopened intervals dangling.
+        // Stamp closedAt (the CURRENT request time), never acceptedAt: after the
+        // durable-derivation companion, acceptedAt can be a derived OLD value,
+        // and a past-dated ended_at trips host-sweep's upperMs < acceptedMs
+        // clamp (host-sweep.ts:1085) and its malformed-acceptance throw
+        // (:1122–1126), hard-failing recoverAfterKill. Invariant: the ended_at
+        // stamped by any close is >= every closed row's host_accepted_at.
         db.prepare(
           `UPDATE messages_in
              SET host_acceptance_ended_at = ?
-           WHERE host_accepted_input_id = ? AND host_acceptance_ended_at IS NULL`,
-        ).run(acceptedAt, currentInput);
+           WHERE host_accepted_at IS NOT NULL AND host_acceptance_ended_at IS NULL`,
+        ).run(closedAt);
       }
 
       const lookup = db.prepare(
         `SELECT id, seq, status, trigger, host_input_id, host_route_key,
-                host_accepted_input_id, host_accepted_route_key, host_accepted_at
+                host_accepted_input_id, host_accepted_route_key, host_accepted_at,
+                host_acceptance_ended_at
            FROM messages_in WHERE id = ?`,
       );
       const rows = messageIds.map((id) => lookup.get(id) as AcceptedRow | undefined);
@@ -627,11 +643,19 @@ export function bindAcceptedGwsCorrelation(opts: BindAcceptedGwsCorrelationOptio
         exactRows.some(
           (row) =>
             row.host_accepted_input_id !== null &&
+            row.host_acceptance_ended_at === null &&
             (row.host_accepted_input_id !== inputId ||
               row.host_accepted_route_key !== routeKey ||
               row.host_accepted_at !== acceptedAt),
         )
       ) {
+        // A mismatched LIVE interval is a genuinely concurrent acceptance and
+        // must fail closed. A row whose interval has ENDED is re-acceptable —
+        // but the safety carrier is LEASE ADMISSION: this function is reachable
+        // only through a live host-issued lease (in-memory lease map deleted
+        // only by verified revoke, 'wx' active-lease.json, startup barrier only
+        // after confirmed orphan stop). ended_at is the row-level marker of a
+        // closed interval, not by itself proof the prior life is over (A1).
         throw new Error('accepted batch conflicts with immutable original acceptance');
       }
       const triggerRows = exactRows
@@ -651,6 +675,13 @@ export function bindAcceptedGwsCorrelation(opts: BindAcceptedGwsCorrelationOptio
                 host_acceptance_sequence = ?
           WHERE id = ? AND host_accepted_at IS NULL`,
       );
+      const reopen = db.prepare(
+        `UPDATE messages_in
+            SET host_acceptance_ended_at = NULL,
+                host_acceptance_claim_token = ?, host_acceptance_lease_id = ?,
+                host_acceptance_sequence = ?
+          WHERE id = ? AND host_accepted_at IS NOT NULL AND host_acceptance_ended_at IS NOT NULL`,
+      );
       for (const row of exactRows) {
         if (row.host_accepted_at === null) {
           update.run(
@@ -662,6 +693,14 @@ export function bindAcceptedGwsCorrelation(opts: BindAcceptedGwsCorrelationOptio
             opts.sequence ?? null,
             row.id,
           );
+        } else {
+          // First-acceptance columns are immutable. Track the CURRENT interval
+          // by re-stamping claim/lease/sequence and clearing ended_at. Rows the
+          // in-transaction pointer-advance close just ended read as ended here
+          // because the lookup ran after that close; rows with a live matching
+          // interval (same-lease followup) are already current — the WHERE
+          // clause makes the reopen a no-op for them.
+          reopen.run(opts.claimToken ?? null, opts.leaseId ?? null, opts.sequence ?? null, row.id);
         }
       }
     })();
@@ -692,10 +731,20 @@ export function releaseAcceptedGwsCorrelation(opts: {
   if (readCurrent(opts.correlationPath)?.inputId === inputId) unlinkIfPresent(opts.correlationPath);
   const db = openInboundDb(opts.dbPath);
   try {
+    // Close EVERY open interval, not just rows first-accepted under the
+    // released input: adopted rows keep their immutable OLD
+    // host_accepted_input_id, and an input-keyed close leaves their reopened
+    // intervals live past the turn boundary. Same single-live-actor
+    // justification as the bind-side broadened close (A2): one lease per
+    // session, one container per session, so every open interval at release
+    // time belongs to the turn being released. endedAt here is the request's
+    // release time, which is >= every open row's host_accepted_at (the
+    // authenticated handler validates releasedAt against the accepted
+    // interval), preserving the ended_at >= accepted_at invariant.
     db.prepare(
       `UPDATE messages_in SET host_acceptance_ended_at = ?
-        WHERE host_accepted_input_id = ? AND host_acceptance_ended_at IS NULL`,
-    ).run(endedAt, inputId);
+        WHERE host_accepted_at IS NOT NULL AND host_acceptance_ended_at IS NULL`,
+    ).run(endedAt);
   } finally {
     db.close();
   }
