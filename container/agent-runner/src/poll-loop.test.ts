@@ -27,6 +27,7 @@ import {
   getContinuation,
   listRecoveryEntries,
   markRecoveryInFlight,
+  readProviderRetrySchedule,
   resolveRecoveryEntry,
   scheduleProviderRetry,
   setContinuation,
@@ -4593,6 +4594,105 @@ describe('provider finalization barriers', () => {
     await expect(loopPromise).rejects.toBeInstanceOf(ProviderQuiescenceError);
     expect(bindCalls).toBe(1);
     expect(getAckStatus('postcommit-quiescence-init')).toBe('recovery'); // accepted work stays recovery-owned (A7)
+    controller.abort();
+  });
+
+  it('persists a bounded pre-accept retry schedule before a fatal quiescence exit', async () => {
+    insertMessage(
+      'preaccept-quiescence-schedule-init',
+      'chat',
+      { sender: 'User', text: 'fail teardown before any acceptance' },
+      { platformId: 'chan-preaccept-quiescence-schedule', channelType: 'discord' },
+    );
+    // The gated runPollLoop wrapper host-commits via its default succeeding
+    // bind (its events iterator awaits acceptInput() first), which the guard
+    // must treat as no-schedule -- so run the loop via runProductionPollLoop
+    // DIRECTLY with explicit no-op bindGwsCorrelation/releaseGwsCorrelation
+    // and this RAW provider, whose event stream rejects with
+    // ProviderQuiescenceError BEFORE acceptInput is ever called -- so nothing
+    // is observed AND nothing is host-committed (boundGwsInputs stays empty).
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query(_input) {
+        return {
+          push() {},
+          end() {},
+          abort: async () => {},
+          events: (async function* (): AsyncGenerator<ProviderEvent> {
+            throw new ProviderQuiescenceError('teardown failed before any acceptance');
+          })(),
+        };
+      },
+    };
+    const controller = new AbortController();
+    const loopPromise = runProductionPollLoop({
+      provider,
+      providerName: 'test',
+      cwd: '/tmp',
+      signal: controller.signal,
+      bindGwsCorrelation: async () => {},
+      releaseGwsCorrelation: async () => {},
+    });
+    void loopPromise.catch(() => {});
+    await expect(loopPromise).rejects.toBeInstanceOf(ProviderQuiescenceError);
+    // NEW: the durable schedule exists for the next runner incarnation.
+    const routeKey = normalizeRoute('test', {
+      platformId: 'chan-preaccept-quiescence-schedule',
+      channelType: 'discord',
+      threadId: null,
+      messagingGroupId: null,
+      isGroup: null,
+    }).routeKey;
+    const schedule = readProviderRetrySchedule('test', routeKey);
+    expect(schedule?.attempts).toBe(1);
+    expect(schedule?.status).toBe('scheduled');
+    controller.abort();
+  });
+
+  it('does NOT persist a retry schedule when the bind host-committed (echo missing) before the quiescence exit', async () => {
+    insertMessage(
+      'postcommit-quiescence-no-schedule-init',
+      'chat',
+      { sender: 'User', text: 'run once' },
+      { platformId: 'chan-postcommit-quiescence-no-schedule', channelType: 'discord' },
+    );
+    // The falsified-A11 shape: gated runPollLoop wrapper, default succeeding
+    // bind, events throw a plain Error before any input-accepted echo, abort
+    // rejects ProviderQuiescenceError. The loop still exits fatally
+    // (host-committed work stays fatal) and the rows are recovery-owned --
+    // the guard must not add a duplicate-work schedule.
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query() {
+        return {
+          push() {},
+          end() {},
+          abort: async () => {
+            throw new ProviderQuiescenceError('abort quiescence unproven');
+          },
+          events: (async function* (): AsyncGenerator<ProviderEvent> {
+            // The gated wrapper already awaited acceptInput() (bind committed).
+            // Fail BEFORE any input-accepted echo: acceptanceObserved stays
+            // false while boundGwsInputs is nonempty.
+            throw new Error('stream died after the host commit');
+          })(),
+        };
+      },
+    };
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+    void loopPromise.catch(() => {});
+    await expect(loopPromise).rejects.toBeInstanceOf(ProviderQuiescenceError);
+    const routeKey = normalizeRoute('test', {
+      platformId: 'chan-postcommit-quiescence-no-schedule',
+      channelType: 'discord',
+      threadId: null,
+      messagingGroupId: null,
+      isGroup: null,
+    }).routeKey;
+    expect(readProviderRetrySchedule('test', routeKey)).toBeUndefined();
     controller.abort();
   });
 

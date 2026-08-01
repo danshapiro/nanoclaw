@@ -740,7 +740,36 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // These failures mean accepted work may still be live or host-committed.
       // Leaving the process is intentional: host stop proof and recovery own
       // the correlation from here. Never release/retry inside this runner.
-      if (err instanceof TrustedInputLifecycleError || err instanceof ProviderQuiescenceError) throw err;
+      if (err instanceof TrustedInputLifecycleError || err instanceof ProviderQuiescenceError) {
+        if (
+          err instanceof ProviderQuiescenceError &&
+          initialClaim?.acceptanceObserved === false &&
+          acceptanceContext.boundGwsInputs.size === 0
+        ) {
+          // Belt-and-braces: nothing was observed AND nothing was host-committed,
+          // so this fatal exit must leave a durable, bounded retry schedule
+          // behind for the next runner incarnation instead of an unbounded
+          // crash loop on the route. acceptanceObserved alone is NOT a
+          // host-commit discriminator (bind success sets state='accepted' +
+          // boundGwsInputs.add without setting it — A11); retrying a
+          // host-committed input from a fresh container is the duplicate-work
+          // case, and its rows are already recovery-owned. Same discriminator
+          // as processQuery's pre-accept unmask branch.
+          await withSqliteRetry(
+            () => scheduleProviderRetry(config.providerName, activeRouteKey, Date.now(), topLevelInputId),
+            { label: 'scheduleProviderRetry' },
+          );
+          log(
+            JSON.stringify({
+              severity: 'warn',
+              event: 'provider_quiescence_failure_preaccept_retry_persisted',
+              route_key: activeRouteKey,
+              error: errMsg,
+            }),
+          );
+        }
+        throw err;
+      }
 
       if (err instanceof TrustedInputAcceptanceError) {
         log(
