@@ -822,6 +822,8 @@ describe('host sweep wake decision excludes recovery-owned rows', () => {
     expect(countDueMessagesExcludingRecovery(inDb, outDb, { nowMs: BASE, recoveryWakeTtlMs: 3 * 60 * 60 * 1000 })).toBe(
       0,
     );
+    inDb.close();
+    outDb.close();
   });
 
   it('counts a genuinely pending row (no recovery ack) as due (wake fires)', () => {

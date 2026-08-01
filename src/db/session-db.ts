@@ -314,15 +314,6 @@ export function hasSchedulerTaskRows(db: Database.Database): boolean {
 }
 
 /**
- * Outbound-aware due count: like countDueMessages, but excludes rows whose
- * outbound processing_ack is recovery-owned (status='recovery'). Those rows are
- * already owned by route-scoped recovery, so they must not trip a fresh wake.
- * This reads processing_ack READ-ONLY and never completes/resets those rows.
- *
- * New behavior: the legacy countDueMessages never opened the outbound DB, so
- * this is a new outbound-aware due check, not a tweak to an existing filter.
- */
-/**
  * Parse a session-DB timestamp to epoch ms. processing_ack.status_changed is
  * written with SQLite datetime('now') ('YYYY-MM-DD HH:MM:SS', UTC, no zone
  * marker); tests and some writers use ISO strings. Returns NaN if unparseable.
@@ -339,6 +330,17 @@ export interface RecoveryWakeOptions {
   recoveryWakeTtlMs: number;
 }
 
+/**
+ * Outbound-aware due count: like countDueMessages, but excludes rows whose
+ * outbound processing_ack is recovery-owned (status='recovery'). Those rows are
+ * already owned by route-scoped recovery, so they must not trip a fresh wake.
+ * This reads processing_ack READ-ONLY and never completes/resets those rows.
+ *
+ * New behavior: the legacy countDueMessages never opened the outbound DB, so
+ * this is a new outbound-aware due check, not a tweak to an existing filter.
+ *
+ * Rows whose recovery ownership is older than wake.recoveryWakeTtlMs count as due again (R1) — the bounded escape from the deliberate recovery exclusion.
+ */
 export function countDueMessagesExcludingRecovery(
   inDb: Database.Database,
   outDb: Database.Database,
