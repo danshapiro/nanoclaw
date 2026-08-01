@@ -39,7 +39,12 @@ vi.mock('./yente/scheduler-alerts.js', () => ({
 }));
 
 import { releaseOrEscalateExpiredRecoveryAcks } from './recovery-escalation.js';
-import { countDueMessagesExcludingRecovery, getRecoveryWakeAttempts, syncProcessingAcks } from './db/session-db.js';
+import {
+  countDueMessagesExcludingRecovery,
+  getRecoveryWakeAttempts,
+  listGwsUncertainInputIds,
+  syncProcessingAcks,
+} from './db/session-db.js';
 
 const session = {
   id: 'sess-1',
@@ -241,6 +246,74 @@ describe('releaseOrEscalateExpiredRecoveryAcks', () => {
     expect(outcome).toEqual({ released: [], escalated: [] });
     expect(outDb.prepare("SELECT status FROM processing_ack WHERE message_id = 'm-u'").get()).toMatchObject({
       status: 'recovery',
+    });
+  });
+
+  it('defers the whole pass loudly when an incident record has a missing audit_id (gate fails CLOSED)', async () => {
+    const { inDb, outDb } = makeDbs();
+    inDb
+      .prepare(
+        "INSERT INTO messages_in (id, channel_type, platform_id, host_accepted_input_id) VALUES ('m-a', 'discord', 'chan-1', 'input-7')",
+      )
+      .run();
+    reOwn(outDb, 'm-a');
+    // Incident record with NO audit_id: unmatchable against resolutions, so it
+    // must throw/defer -- never fall out of the uncertain set and release.
+    const storePath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'recon-')), 'store.jsonl');
+    fs.writeFileSync(
+      storePath,
+      `${JSON.stringify({ schema_version: 2, outcome: 'outcome_unknown', input_id: 'input-7' })}\n`,
+    );
+    const outcome = await releaseOrEscalateExpiredRecoveryAcks({
+      session,
+      inDb,
+      outDb,
+      nowMs: NOW,
+      ttlMs: TTL,
+      maxAttempts: 3,
+      reconciliationStorePath: storePath,
+    });
+    // Deferred like the unreadable-store case: ack untouched, retried next sweep.
+    expect(outcome).toEqual({ released: [], escalated: [] });
+    expect(outDb.prepare("SELECT status FROM processing_ack WHERE message_id = 'm-a'").get()).toMatchObject({
+      status: 'recovery',
+    });
+  });
+
+  it('listGwsUncertainInputIds fails closed on duplicate incident audit_ids (never overwrites)', () => {
+    const storePath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'recon-')), 'store.jsonl');
+    fs.writeFileSync(
+      storePath,
+      `${JSON.stringify({ audit_id: 'a-1', input_id: 'input-1' })}\n${JSON.stringify({ audit_id: 'a-1', input_id: 'input-2' })}\n`,
+    );
+    expect(() => listGwsUncertainInputIds(storePath)).toThrow(/duplicate incident records for audit_id/);
+  });
+
+  it('releases normally when the original input has an incident WITH a matching resolution (happy path)', async () => {
+    const { inDb, outDb } = makeDbs();
+    inDb
+      .prepare(
+        "INSERT INTO messages_in (id, channel_type, platform_id, host_accepted_input_id) VALUES ('m-r', 'discord', 'chan-1', 'input-9')",
+      )
+      .run();
+    reOwn(outDb, 'm-r');
+    const storePath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'recon-')), 'store.jsonl');
+    fs.writeFileSync(
+      storePath,
+      `${JSON.stringify({ schema_version: 2, audit_id: 'a-1', outcome: 'outcome_unknown', input_id: 'input-9' })}\n${JSON.stringify({ record_type: 'resolution', audit_id: 'a-1' })}\n`,
+    );
+    const outcome = await releaseOrEscalateExpiredRecoveryAcks({
+      session,
+      inDb,
+      outDb,
+      nowMs: NOW,
+      ttlMs: TTL,
+      maxAttempts: 3,
+      reconciliationStorePath: storePath,
+    });
+    expect(outcome).toEqual({ released: ['m-r'], escalated: [] });
+    expect(outDb.prepare("SELECT COUNT(*) AS n FROM processing_ack WHERE message_id = 'm-r'").get()).toMatchObject({
+      n: 0,
     });
   });
 

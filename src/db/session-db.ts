@@ -458,7 +458,8 @@ export function getHostAcceptedInputId(inDb: Database.Database, messageId: strin
  * Standalone lightweight scan (independent of the Task 6 reader rework).
  * undefined path => empty set (GWS reconciliation not configured).
  * Fail closed on unreadability: configured-but-missing file, truncated tail,
- * unparseable line, or an incident whose input_id is not a non-empty string
+ * unparseable line, an incident whose input_id or audit_id is not a
+ * non-empty string, or duplicate incident audit_ids
  * => THROW (callers defer their pass loudly rather than releasing).
  */
 export function listGwsUncertainInputIds(reconciliationStorePath: string | undefined): Set<string> {
@@ -482,7 +483,20 @@ export function listGwsUncertainInputIds(reconciliationStorePath: string | undef
         `GWS reconciliation store has an incident record without a non-empty input_id: ${reconciliationStorePath}`,
       );
     }
-    incidentInputByAudit.set(String(record.audit_id), record.input_id);
+    // ... and a usable, unique audit_id: a missing/non-string audit_id would
+    // collide on a coerced key and a duplicate would overwrite — either way a
+    // GWS-uncertain input could silently drop out of the set (failing OPEN).
+    if (typeof record.audit_id !== 'string' || record.audit_id.length === 0) {
+      throw new Error(
+        `GWS reconciliation store has an incident record without a non-empty audit_id: ${reconciliationStorePath}`,
+      );
+    }
+    if (incidentInputByAudit.has(record.audit_id)) {
+      throw new Error(
+        `GWS reconciliation store has duplicate incident records for audit_id '${record.audit_id}': ${reconciliationStorePath}`,
+      );
+    }
+    incidentInputByAudit.set(record.audit_id, record.input_id);
   }
   const uncertain = new Set<string>();
   for (const [auditId, inputId] of incidentInputByAudit) {

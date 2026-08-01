@@ -65,6 +65,7 @@ export async function releaseOrEscalateExpiredRecoveryAcks(opts: {
   let gwsUncertainInputIds: Set<string>;
   try {
     gwsUncertainInputIds = listGwsUncertainInputIds(opts.reconciliationStorePath);
+    // eslint-disable-next-line no-catch-all/no-catch-all -- deliberate: ANY gate-read failure must defer the pass loudly (fail closed), never release
   } catch (err) {
     // Configured store unreadable: neither release (unsafe) nor terminally
     // escalate (unfair to the message) — defer the whole pass LOUDLY and let
@@ -179,6 +180,7 @@ function supersedeRecoveryEntriesForMessage(outDbRw: Database.Database, messageI
       let entries: unknown;
       try {
         entries = JSON.parse(row.value);
+        // eslint-disable-next-line no-catch-all/no-catch-all -- deliberate: advisory path skips unparseable entries (fail-open per contract)
       } catch {
         continue;
       }
@@ -201,6 +203,7 @@ function supersedeRecoveryEntriesForMessage(outDbRw: Database.Database, messageI
           .run(JSON.stringify(entries), new Date().toISOString(), row.key);
       }
     }
+    // eslint-disable-next-line no-catch-all/no-catch-all -- deliberate: supersede is best-effort advisory cleanup; log and swallow (fail-open)
   } catch (err) {
     log.warn('Best-effort recovery-entry supersede failed', { messageId, err });
   }
