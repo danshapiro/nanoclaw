@@ -73,6 +73,7 @@ function testDbs() {
       id            TEXT PRIMARY KEY,
       status        TEXT DEFAULT 'pending',
       tries         INTEGER DEFAULT 0,
+      recovery_wake_attempts INTEGER NOT NULL DEFAULT 0,
       trigger       INTEGER DEFAULT 1,
       process_after TEXT
     );
@@ -83,7 +84,9 @@ function testDbs() {
     CREATE TABLE processing_ack (
       message_id     TEXT PRIMARY KEY,
       status         TEXT NOT NULL,
-      status_changed TEXT NOT NULL
+      status_changed TEXT NOT NULL,
+      notice_message_out_id TEXT,
+      claim_token    TEXT
     );
     CREATE TABLE container_state (
       id                       INTEGER PRIMARY KEY,
@@ -372,7 +375,9 @@ describe('resetStuckProcessingRows', () => {
   it('clears orphan processing claims when retrying a stale pending message', () => {
     const { inDb, outDb } = testDbs();
     inDb.prepare("INSERT INTO messages_in (id, status, tries) VALUES ('m-1', 'pending', 0)").run();
-    outDb.prepare("INSERT INTO processing_ack VALUES ('m-1', 'processing', ?)").run('2026-04-20 11:00:00');
+    outDb
+      .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-1', 'processing', ?)")
+      .run('2026-04-20 11:00:00');
 
     resetStuckProcessingRows(inDb, outDb, fakeSession(), 'absolute-ceiling', outDb);
 
@@ -394,7 +399,9 @@ describe('resetStuckProcessingRows', () => {
     inDb
       .prepare("INSERT INTO messages_in (id, status, tries, process_after) VALUES ('m-2', 'pending', 1, ?)")
       .run(future);
-    outDb.prepare("INSERT INTO processing_ack VALUES ('m-2', 'processing', ?)").run('2026-04-20 11:00:00');
+    outDb
+      .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-2', 'processing', ?)")
+      .run('2026-04-20 11:00:00');
 
     resetStuckProcessingRows(inDb, outDb, fakeSession(), 'claim-stuck', outDb);
 
@@ -541,7 +548,9 @@ describe('recoverInterruptedTurn (kill/reset ordering)', () => {
   function processingDbs() {
     const { inDb, outDb } = testDbs();
     inDb.prepare("INSERT INTO messages_in (id, status, tries) VALUES ('m-1', 'pending', 0)").run();
-    outDb.prepare("INSERT INTO processing_ack VALUES ('m-1', 'processing', ?)").run('2026-04-20 11:00:00');
+    outDb
+      .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-1', 'processing', ?)")
+      .run('2026-04-20 11:00:00');
     outDb
       .prepare(
         "INSERT INTO container_state (id, current_tool, tool_declared_timeout_ms, tool_started_at) VALUES (1, 'opencode-long-tool', 7200000, '2026-04-20 11:00:00')",
@@ -771,8 +780,12 @@ describe('host wake/sync preserves recovery-owned acks', () => {
     // One recovery-owned row, one orphan processing row.
     inDb.prepare("INSERT INTO messages_in (id, status, tries, trigger) VALUES ('m-rec', 'pending', 0, 1)").run();
     inDb.prepare("INSERT INTO messages_in (id, status, tries, trigger) VALUES ('m-proc', 'pending', 0, 1)").run();
-    outDb.prepare("INSERT INTO processing_ack VALUES ('m-rec', 'recovery', ?)").run('2026-04-20 11:00:00');
-    outDb.prepare("INSERT INTO processing_ack VALUES ('m-proc', 'processing', ?)").run('2026-04-20 11:00:00');
+    outDb
+      .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-rec', 'recovery', ?)")
+      .run('2026-04-20 11:00:00');
+    outDb
+      .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-proc', 'processing', ?)")
+      .run('2026-04-20 11:00:00');
 
     // resetStuckProcessingRows must only touch the orphan 'processing' row.
     resetStuckProcessingRows(inDb, outDb, fakeSession(), 'container not running', outDb);
@@ -798,7 +811,9 @@ describe('host sweep wake decision excludes recovery-owned rows', () => {
     const { inDb, outDb } = testDbs();
     // Only row is pending in inbound but recovery-owned in outbound.
     inDb.prepare("INSERT INTO messages_in (id, status, tries, trigger) VALUES ('m-rec', 'pending', 0, 1)").run();
-    outDb.prepare("INSERT INTO processing_ack VALUES ('m-rec', 'recovery', ?)").run('2026-04-20 11:00:00');
+    outDb
+      .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-rec', 'recovery', ?)")
+      .run('2026-04-20 11:00:00');
 
     // sweepSession uses countDueMessagesExcludingRecovery(inDb, outDb) when outDb
     // is available. Verify: due count is 0 → wakeContainer must not be triggered.
@@ -843,7 +858,9 @@ describe('host sweep wake decision excludes recovery-owned rows', () => {
     // m-rec is recovery-owned; m-new is a normal pending message.
     inDb.prepare("INSERT INTO messages_in (id, status, tries, trigger) VALUES ('m-rec', 'pending', 0, 1)").run();
     inDb.prepare("INSERT INTO messages_in (id, status, tries, trigger) VALUES ('m-new', 'pending', 0, 1)").run();
-    outDb.prepare("INSERT INTO processing_ack VALUES ('m-rec', 'recovery', ?)").run('2026-04-20 11:00:00');
+    outDb
+      .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-rec', 'recovery', ?)")
+      .run('2026-04-20 11:00:00');
 
     // Only m-new should be counted as due.
     const dueCount = countDueMessagesExcludingRecovery(inDb, outDb);

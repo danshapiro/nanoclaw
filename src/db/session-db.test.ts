@@ -16,10 +16,16 @@ import { INBOUND_SCHEMA, OUTBOUND_SCHEMA } from './schema.js';
 import {
   countDueMessages,
   countDueMessagesExcludingRecovery,
+  deleteRecoveryAcks,
   discoverGwsCrashWindowDrafts,
   ensureSchema,
+  failRecoveryAck,
+  getMessageRouting,
+  getRecoveryWakeAttempts,
   importHostSideEffects,
+  incrementRecoveryWakeAttempts,
   insertMessage,
+  listRecoveryAcks,
   migrateMessagesInTable,
   migrateOutboundRouteColumns,
   openInboundDb,
@@ -1021,5 +1027,105 @@ describe('importHostSideEffects with a durable empty ledger', () => {
         strictGwsScopes: [strictScope()],
       }),
     ).toThrow(/ledger|missing/i);
+  });
+});
+
+// ── Task 2: recovery wake attempt tracking and recovery-ack release helpers ──
+
+describe('recovery wake attempt tracking (R2)', () => {
+  it('self-heals the recovery_wake_attempts column on an old inbound DB and increments it', () => {
+    freshDir();
+    // Simulate an OLD inbound DB without the column. CAUTION: openInboundDb's
+    // migrations ADD many columns but ASSUME others pre-exist — the
+    // platform_message_id backfill (session-db.ts ~:1457-1466) runs
+    // `UPDATE messages_in ... WHERE channel_type = 'discord'` and the
+    // migration never ADDs `channel_type`, so `id` and `channel_type` MUST be
+    // in the legacy fixture; migrateSessionRoutingTable unguardedly ALTERs
+    // `session_routing`, so that table must exist too. `content` is NOT NULL
+    // in the real schema, so the INSERT must supply it.
+    const legacy = new Database(path.join(TEST_DIR, 'inbound.db'));
+    legacy.exec(`CREATE TABLE messages_in (
+      id TEXT PRIMARY KEY, seq INTEGER UNIQUE, kind TEXT NOT NULL, timestamp TEXT NOT NULL,
+      status TEXT DEFAULT 'pending', process_after TEXT, recurrence TEXT,
+      tries INTEGER DEFAULT 0, platform_id TEXT, channel_type TEXT, thread_id TEXT,
+      content TEXT NOT NULL);
+      CREATE TABLE session_routing (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        channel_type TEXT, platform_id TEXT, thread_id TEXT);`);
+    legacy
+      .prepare(
+        "INSERT INTO messages_in (id, kind, timestamp, content) VALUES ('m-1', 'chat', datetime('now'), 'hello')",
+      )
+      .run();
+    legacy.close();
+
+    const inDb = openInboundDb(path.join(TEST_DIR, 'inbound.db')); // runs migrateMessagesInTable
+    expect(getRecoveryWakeAttempts(inDb, 'm-1')).toBe(0);
+    incrementRecoveryWakeAttempts(inDb, ['m-1']);
+    incrementRecoveryWakeAttempts(inDb, ['m-1']);
+    expect(getRecoveryWakeAttempts(inDb, 'm-1')).toBe(2);
+    expect(getRecoveryWakeAttempts(inDb, 'missing')).toBe(0);
+    inDb.close();
+  });
+
+  it('lists, releases, and fails recovery acks', () => {
+    freshDir();
+    const outDb = outboundDb();
+    outDb
+      .prepare(
+        "INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-a', 'recovery', '2026-04-20 10:00:00')",
+      )
+      .run();
+    outDb
+      .prepare(
+        "INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-b', 'completed', '2026-04-20 10:00:00')",
+      )
+      .run();
+
+    const acks = listRecoveryAcks(outDb);
+    expect(acks).toHaveLength(1);
+    expect(acks[0].messageId).toBe('m-a');
+    expect(acks[0].statusChangedMs).toBe(Date.parse('2026-04-20T10:00:00Z'));
+
+    failRecoveryAck(outDb, 'm-a', 'notice-1');
+    const failed = outDb
+      .prepare("SELECT status, notice_message_out_id FROM processing_ack WHERE message_id = 'm-a'")
+      .get() as {
+      status: string;
+      notice_message_out_id: string;
+    };
+    expect(failed).toMatchObject({ status: 'failed', notice_message_out_id: 'notice-1' });
+
+    // deleteRecoveryAcks only touches rows still in recovery.
+    deleteRecoveryAcks(outDb, ['m-a', 'm-b']);
+    expect(outDb.prepare('SELECT COUNT(*) AS n FROM processing_ack').get()).toMatchObject({ n: 2 });
+    outDb
+      .prepare(
+        "INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-c', 'recovery', datetime('now'))",
+      )
+      .run();
+    deleteRecoveryAcks(outDb, ['m-c']);
+    expect(outDb.prepare("SELECT COUNT(*) AS n FROM processing_ack WHERE message_id = 'm-c'").get()).toMatchObject({
+      n: 0,
+    });
+    outDb.close();
+  });
+
+  it('returns routing columns for a message and null when missing', () => {
+    freshDir();
+    const inDb = inboundDb();
+    inDb
+      .prepare(
+        "INSERT INTO messages_in (id, kind, timestamp, channel_type, platform_id, thread_id, content) VALUES ('m-r', 'chat', datetime('now'), 'discord', 'chan-1', 'thread-1', 'hi')",
+      )
+      .run();
+    expect(getMessageRouting(inDb, 'm-r')).toEqual({
+      kind: 'chat',
+      channelType: 'discord',
+      platformId: 'chan-1',
+      threadId: 'thread-1',
+    });
+    expect(getMessageRouting(inDb, 'missing')).toBeNull();
+    inDb.close();
   });
 });

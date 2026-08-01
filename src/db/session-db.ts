@@ -374,6 +374,76 @@ export function countDueMessagesExcludingRecovery(
   return due.filter((r) => !recoveryOwned.has(r.id)).length;
 }
 
+/** A recovery-owned processing_ack row, with its parsed transition time. */
+export interface RecoveryAckRow {
+  messageId: string;
+  statusChanged: string;
+  statusChangedMs: number; // NaN when unparseable
+}
+
+export function listRecoveryAcks(outDb: Database.Database): RecoveryAckRow[] {
+  const rows = outDb
+    .prepare("SELECT message_id, status_changed FROM processing_ack WHERE status = 'recovery'")
+    .all() as Array<{ message_id: string; status_changed: string }>;
+  return rows.map((r) => ({
+    messageId: r.message_id,
+    statusChanged: r.status_changed,
+    statusChangedMs: parseSqliteUtcMs(r.status_changed),
+  }));
+}
+
+export function getRecoveryWakeAttempts(inDb: Database.Database, messageId: string): number {
+  const row = inDb.prepare('SELECT recovery_wake_attempts AS n FROM messages_in WHERE id = ?').get(messageId) as
+    | { n: number }
+    | undefined;
+  return row?.n ?? 0;
+}
+
+export function incrementRecoveryWakeAttempts(inDb: Database.Database, messageIds: string[]): void {
+  if (messageIds.length === 0) return;
+  const stmt = inDb.prepare('UPDATE messages_in SET recovery_wake_attempts = recovery_wake_attempts + 1 WHERE id = ?');
+  const tx = inDb.transaction((ids: string[]) => {
+    for (const id of ids) stmt.run(id);
+  });
+  tx(messageIds);
+}
+
+/** Delete ONLY still-recovery acks, returning their rows to normal pending visibility. */
+export function deleteRecoveryAcks(outDbRw: Database.Database, messageIds: string[]): void {
+  if (messageIds.length === 0) return;
+  const stmt = outDbRw.prepare("DELETE FROM processing_ack WHERE message_id = ? AND status = 'recovery'");
+  const tx = outDbRw.transaction((ids: string[]) => {
+    for (const id of ids) stmt.run(id);
+  });
+  tx(messageIds);
+}
+
+/** Flip a recovery ack to failed with its terminal-notice pointer (R2 escalation). */
+export function failRecoveryAck(outDbRw: Database.Database, messageId: string, noticeMessageOutId: string): void {
+  outDbRw
+    .prepare(
+      "UPDATE processing_ack SET status = 'failed', status_changed = datetime('now'), notice_message_out_id = ? WHERE message_id = ? AND status = 'recovery'",
+    )
+    .run(noticeMessageOutId, messageId);
+}
+
+export interface MessageRoutingRow {
+  kind: string;
+  channelType: string | null;
+  platformId: string | null;
+  threadId: string | null;
+}
+
+export function getMessageRouting(inDb: Database.Database, messageId: string): MessageRoutingRow | null {
+  const row = inDb
+    .prepare('SELECT kind, channel_type, platform_id, thread_id FROM messages_in WHERE id = ?')
+    .get(messageId) as
+    | { kind: string; channel_type: string | null; platform_id: string | null; thread_id: string | null }
+    | undefined;
+  if (!row) return null;
+  return { kind: row.kind, channelType: row.channel_type, platformId: row.platform_id, threadId: row.thread_id };
+}
+
 export function markMessageFailed(db: Database.Database, messageId: string): void {
   db.prepare("UPDATE messages_in SET status = 'failed' WHERE id = ?").run(messageId);
 }
@@ -1533,5 +1603,8 @@ export function migrateMessagesInTable(db: Database.Database): void {
   }
   if (!cols.has('host_acceptance_sequence')) {
     db.prepare('ALTER TABLE messages_in ADD COLUMN host_acceptance_sequence INTEGER').run();
+  }
+  if (!cols.has('recovery_wake_attempts')) {
+    db.prepare('ALTER TABLE messages_in ADD COLUMN recovery_wake_attempts INTEGER NOT NULL DEFAULT 0').run();
   }
 }

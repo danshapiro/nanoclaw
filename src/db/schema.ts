@@ -294,6 +294,9 @@ CREATE TABLE IF NOT EXISTS messages_in (
   recurrence     TEXT,
   series_id      TEXT,
   tries          INTEGER DEFAULT 0,
+  -- R2: host-side count of TTL-expired recovery wakes granted to this row.
+  -- Distinct from \`tries\` (processing retries) so the two policies never mix.
+  recovery_wake_attempts INTEGER NOT NULL DEFAULT 0,
   trigger        INTEGER NOT NULL DEFAULT 1,
                  -- 0 = accumulated context (don't wake), 1 = wake agent
   platform_id    TEXT,
