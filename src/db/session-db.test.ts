@@ -8,7 +8,7 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 
 import { generateKeyPairSync, sign as edSign } from 'crypto';
 
@@ -29,6 +29,7 @@ import {
   migrateMessagesInTable,
   migrateOutboundRouteColumns,
   openInboundDb,
+  openOutboundDbReadOnlyHealing,
   parseSqliteUtcMs,
   syncProcessingAcks,
   transliterateToAscii,
@@ -1190,5 +1191,64 @@ describe('recovery wake attempt tracking (R2)', () => {
     });
     expect(getMessageRouting(inDb, 'missing')).toBeNull();
     inDb.close();
+  });
+});
+
+/**
+ * R9 fixture: materialize a REAL hot rollback journal. Copy the live journal
+ * aside mid-transaction (AFTER forcing a spill+sync so the header magic is
+ * written), commit, then restore the copy — a valid-header journal with no
+ * owning process is precisely SQLite's "hot" condition.
+ */
+function plantHotJournal(dbPath: string): void {
+  const db = new Database(dbPath);
+  db.pragma('journal_mode = DELETE');
+  // Tiny pager cache forces a mid-transaction journal spill+sync, which is
+  // what writes the journal header magic. Without this the journal FILE
+  // exists but its header is zeroed and SQLite ignores it (not hot).
+  db.pragma('cache_size = 10');
+  db.exec('CREATE TABLE IF NOT EXISTS filler (id INTEGER PRIMARY KEY, data BLOB)');
+  db.exec('BEGIN IMMEDIATE');
+  db.prepare('INSERT INTO filler (data) VALUES (?)').run(Buffer.alloc(1024 * 1024));
+  const journalPath = `${dbPath}-journal`;
+  if (!fs.existsSync(journalPath) || fs.statSync(journalPath).size === 0) {
+    throw new Error('test setup failed to materialize a rollback journal');
+  }
+  fs.copyFileSync(journalPath, `${journalPath}.saved`);
+  db.exec('COMMIT');
+  db.close();
+  fs.copyFileSync(`${journalPath}.saved`, journalPath);
+  fs.rmSync(`${journalPath}.saved`);
+}
+
+describe('openOutboundDbReadOnlyHealing (R9)', () => {
+  it('rolls back a hot journal via one guarded write-mode open and reopens read-only', () => {
+    freshDir();
+    const outDb = outboundDb();
+    outDb
+      .prepare(
+        "INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-1', 'completed', datetime('now'))",
+      )
+      .run();
+    outDb.close();
+    const dbPath = path.join(TEST_DIR, 'outbound.db');
+    plantHotJournal(dbPath);
+
+    // Sanity: this IS the incident failure mode — a plain read-only open cannot read.
+    const ro = new Database(dbPath, { readonly: true });
+    expect(() => ro.prepare('SELECT 1 FROM sqlite_master LIMIT 1').get()).toThrow();
+    ro.close();
+
+    const onHotJournal = vi.fn();
+    const healed = openOutboundDbReadOnlyHealing(dbPath, onHotJournal);
+    expect(onHotJournal).toHaveBeenCalledTimes(1);
+    expect((healed.prepare('SELECT COUNT(*) AS n FROM processing_ack').get() as { n: number }).n).toBe(1);
+    healed.close();
+    expect(fs.existsSync(`${dbPath}-journal`)).toBe(false);
+
+    // Clean DB path: no callback, plain read-only handle.
+    const clean = openOutboundDbReadOnlyHealing(dbPath, onHotJournal);
+    expect(onHotJournal).toHaveBeenCalledTimes(1);
+    clean.close();
   });
 });

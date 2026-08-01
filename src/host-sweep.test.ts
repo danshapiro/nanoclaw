@@ -41,10 +41,43 @@ import {
   recoverInterruptedTurnBounded,
   resetStuckProcessingRows,
   sealAndDrainAcceptedGwsClaims,
+  sweepSessionForTest,
   writeHostInterruptedRecovery,
 } from './host-sweep.js';
-import { readSpawnSkillGeneration, skillGenerationPath, writeSpawnSkillGeneration } from './session-manager.js';
+import {
+  initSessionFolder,
+  outboundDbPath,
+  readSpawnSkillGeneration,
+  skillGenerationPath,
+  writeSpawnSkillGeneration,
+} from './session-manager.js';
+import { closeDb, createAgentGroup, initTestDb, runMigrations } from './db/index.js';
+import { isContainerRunning } from './container-runner.js';
 import type { Session } from './types.js';
+
+// R9 heal-gate harness: the gate under test is host-local container knowledge,
+// so isContainerRunning must be controllable; everything else stays inert.
+// No other test in this file reaches container-runner (the functions they
+// exercise are pure or take collaborators as parameters), so the file-level
+// mock is behavior-neutral for them.
+vi.mock('./container-runner.js', () => ({
+  wakeContainer: vi.fn().mockResolvedValue(undefined),
+  isContainerRunning: vi.fn().mockReturnValue(false),
+  getActiveContainerCount: vi.fn().mockReturnValue(0),
+  getContainerStartedAtMs: vi.fn().mockReturnValue(null),
+  killContainer: vi.fn(),
+  cleanupContainerForSession: vi.fn().mockResolvedValue(true),
+  stopContainerAndVerify: vi.fn().mockResolvedValue(true),
+  isSessionOutboundWriterRunning: vi.fn().mockResolvedValue(false),
+}));
+
+// sweepSession resolves session DB paths under DATA_DIR; point it at a
+// dedicated tmp root. No other test in this file touches DATA_DIR (they all
+// pass explicit tmp paths).
+vi.mock('./config.js', async () => {
+  const actual = await vi.importActual('./config.js');
+  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-host-sweep-r9' };
+});
 
 const BASE = Date.parse('2026-04-20T12:00:00.000Z');
 
@@ -2686,5 +2719,90 @@ describe('recoverInterruptedTurnBounded (quarantine wiring for wedged side-effec
 
     inDb.close();
     outDb.close();
+  });
+});
+
+/**
+ * R9 fixture (deliberate test-island duplicate of the session-db.test.ts
+ * helper): materialize a REAL hot rollback journal. Copy the live journal
+ * aside mid-transaction (AFTER forcing a spill+sync so the header magic is
+ * written), commit, then restore the copy — a valid-header journal with no
+ * owning process is precisely SQLite's "hot" condition.
+ */
+function plantHotJournal(dbPath: string): void {
+  const db = new Database(dbPath);
+  db.pragma('journal_mode = DELETE');
+  // Tiny pager cache forces a mid-transaction journal spill+sync, which is
+  // what writes the journal header magic. Without this the journal FILE
+  // exists but its header is zeroed and SQLite ignores it (not hot).
+  db.pragma('cache_size = 10');
+  db.exec('CREATE TABLE IF NOT EXISTS filler (id INTEGER PRIMARY KEY, data BLOB)');
+  db.exec('BEGIN IMMEDIATE');
+  db.prepare('INSERT INTO filler (data) VALUES (?)').run(Buffer.alloc(1024 * 1024));
+  const journalPath = `${dbPath}-journal`;
+  if (!fs.existsSync(journalPath) || fs.statSync(journalPath).size === 0) {
+    throw new Error('test setup failed to materialize a rollback journal');
+  }
+  fs.copyFileSync(journalPath, `${journalPath}.saved`);
+  db.exec('COMMIT');
+  db.close();
+  fs.copyFileSync(`${journalPath}.saved`, journalPath);
+  fs.rmSync(`${journalPath}.saved`);
+}
+
+describe('sweepSession hot-journal heal gate (R9)', () => {
+  const R9_DATA_DIR = '/tmp/nanoclaw-test-host-sweep-r9';
+
+  function r9Session(): Session {
+    return {
+      id: 'sess-r9',
+      agent_group_id: 'ag-r9',
+      messaging_group_id: null,
+      thread_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: new Date().toISOString(),
+      created_at: new Date().toISOString(),
+    };
+  }
+
+  beforeEach(() => {
+    fs.rmSync(R9_DATA_DIR, { recursive: true, force: true });
+    fs.mkdirSync(R9_DATA_DIR, { recursive: true });
+    runMigrations(initTestDb());
+    createAgentGroup({
+      id: 'ag-r9',
+      name: 'R9 Agent',
+      folder: 'r9-agent',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    initSessionFolder('ag-r9', 'sess-r9');
+  });
+
+  afterEach(() => {
+    vi.mocked(isContainerRunning).mockReturnValue(false);
+    closeDb();
+    fs.rmSync(R9_DATA_DIR, { recursive: true, force: true });
+  });
+
+  it('heals a hot outbound journal only when the container is verified not running (R9 gate)', async () => {
+    const session = r9Session();
+    const journalPath = `${outboundDbPath('ag-r9', 'sess-r9')}-journal`;
+
+    // 1) Container running: no write-mode heal may happen. The hot journal
+    // surfaces as the incident failure mode (first outbound read throws) and
+    // the journal file MUST survive untouched.
+    plantHotJournal(outboundDbPath('ag-r9', 'sess-r9'));
+    vi.mocked(isContainerRunning).mockReturnValue(true);
+    await expect(sweepSessionForTest(session)).rejects.toThrow();
+    expect(fs.existsSync(journalPath)).toBe(true); // no RW heal while a writer may be live
+
+    // 2) Container verified not running: the gated heal runs at the outbound
+    // open — before any wake — and the sweep completes normally.
+    vi.mocked(isContainerRunning).mockReturnValue(false);
+    await expect(sweepSessionForTest(session)).resolves.toBeUndefined();
+    expect(fs.existsSync(journalPath)).toBe(false); // gated heal rolled the journal back
   });
 });

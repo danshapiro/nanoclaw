@@ -160,6 +160,63 @@ export function openOutboundDb(dbPath: string): Database.Database {
   return db;
 }
 
+/** R9: a crashed writer's hot rollback journal makes read-only opens throw this. */
+export function isHotJournalError(err: unknown): boolean {
+  return (
+    !!err && typeof err === 'object' && 'code' in err && (err as { code?: unknown }).code === 'SQLITE_READONLY_ROLLBACK'
+  );
+}
+
+/**
+ * R9: read-only outbound open that heals a crashed writer's hot journal.
+ * better-sqlite3 constructors don't read the file, so we PROBE with one
+ * statement; on SQLITE_READONLY_ROLLBACK we perform ONE write-mode open
+ * whose first read rolls the journal back, then reopen read-only. Callers
+ * log via onHotJournal.
+ *
+ * SAFETY CONTRACT: the caller must have verified that no container writer
+ * can be live on this DB (host-local `!isContainerRunning` knowledge).
+ * Cross-mount fcntl lock propagation between host and container is
+ * UNVERIFIED (validator-V2), so SQLite locking must not be trusted to stop
+ * a concurrent rollback against a live writer — rolling back a live
+ * transaction is SQLite's documented corruption class.
+ */
+export function openOutboundDbReadOnlyHealing(
+  dbPath: string,
+  onHotJournal?: (dbPath: string) => void,
+): Database.Database {
+  const probe = (db: Database.Database): void => {
+    db.prepare('SELECT 1 FROM sqlite_master LIMIT 1').get();
+  };
+  const openReadOnly = (): Database.Database => {
+    const db = new Database(dbPath, { readonly: true });
+    db.pragma('busy_timeout = 5000');
+    return db;
+  };
+
+  let db = openReadOnly();
+  try {
+    probe(db);
+    return db;
+  } catch (err) {
+    db.close();
+    if (!isHotJournalError(err)) throw err;
+  }
+
+  onHotJournal?.(dbPath);
+  const rw = new Database(dbPath);
+  try {
+    rw.pragma('busy_timeout = 5000');
+    probe(rw); // the read triggers the rollback
+  } finally {
+    rw.close();
+  }
+
+  db = openReadOnly();
+  probe(db);
+  return db;
+}
+
 /** Open the outbound DB for a session with write access. Only safe to call when no container is running. */
 export function openOutboundDbRw(dbPath: string): Database.Database {
   const db = new Database(dbPath);

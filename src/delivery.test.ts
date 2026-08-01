@@ -35,7 +35,7 @@ import {
   createMessagingGroupAgent,
 } from './db/index.js';
 import { archiveSession } from './db/sessions.js';
-import { resolveSession, outboundDbPath, inboundDbPath } from './session-manager.js';
+import { resolveSession, openOutboundDbHealing, outboundDbPath, inboundDbPath } from './session-manager.js';
 import {
   deliverSessionMessages,
   dropInactiveSessionOutbound,
@@ -109,6 +109,34 @@ function insertSchedulingOutbound(
      VALUES (?, datetime('now'), 'system', 'telegram:123', 'telegram', NULL, ?)`,
   ).run(msgId, JSON.stringify(action));
   db.close();
+}
+
+/**
+ * R9 fixture (deliberate test-island duplicate of the session-db.test.ts
+ * helper): materialize a REAL hot rollback journal. Copy the live journal
+ * aside mid-transaction (AFTER forcing a spill+sync so the header magic is
+ * written), commit, then restore the copy — a valid-header journal with no
+ * owning process is precisely SQLite's "hot" condition.
+ */
+function plantHotJournal(dbPath: string): void {
+  const db = new Database(dbPath);
+  db.pragma('journal_mode = DELETE');
+  // Tiny pager cache forces a mid-transaction journal spill+sync, which is
+  // what writes the journal header magic. Without this the journal FILE
+  // exists but its header is zeroed and SQLite ignores it (not hot).
+  db.pragma('cache_size = 10');
+  db.exec('CREATE TABLE IF NOT EXISTS filler (id INTEGER PRIMARY KEY, data BLOB)');
+  db.exec('BEGIN IMMEDIATE');
+  db.prepare('INSERT INTO filler (data) VALUES (?)').run(Buffer.alloc(1024 * 1024));
+  const journalPath = `${dbPath}-journal`;
+  if (!fs.existsSync(journalPath) || fs.statSync(journalPath).size === 0) {
+    throw new Error('test setup failed to materialize a rollback journal');
+  }
+  fs.copyFileSync(journalPath, `${journalPath}.saved`);
+  db.exec('COMMIT');
+  db.close();
+  fs.copyFileSync(`${journalPath}.saved`, journalPath);
+  fs.rmSync(`${journalPath}.saved`);
 }
 
 function deliveredRows(
@@ -278,6 +306,41 @@ describe('deliverSessionMessages — concurrent invocations', () => {
       },
     ]);
   }, 10_000);
+
+  it('defers a hot-journal session without healing inline, and delivers after the gated heal (R9)', async () => {
+    // Arrange exactly like the transient-lock test: session + outbound.db with
+    // one due message and a capturing adapter.
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-hot-journal');
+
+    const delivered: string[] = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        delivered.push(JSON.parse(content).text as string);
+        return 'platform-message';
+      },
+    });
+
+    plantHotJournal(outboundDbPath('ag-1', session.id));
+    // The 1s poll must NOT perform the RW heal (a live container writer cannot
+    // be ruled out here): contained, no throw, journal untouched.
+    await expect(deliverSessionMessages(session)).resolves.toBeUndefined();
+    expect(delivered).toEqual([]);
+    expect(fs.existsSync(`${outboundDbPath('ag-1', session.id)}-journal`)).toBe(true); // NOT healed inline
+    // The gated sweep path (container verified not running) performs the heal:
+    openOutboundDbHealing('ag-1', session.id).close();
+    expect(fs.existsSync(`${outboundDbPath('ag-1', session.id)}-journal`)).toBe(false); // healed
+    await deliverSessionMessages(session);
+    expect(delivered.length).toBeGreaterThan(0); // and delivery proceeds
+  });
+
+  it('contains a non-transient per-session failure instead of throwing (R9)', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    fs.writeFileSync(outboundDbPath('ag-1', session.id), 'this is not a sqlite database');
+    await expect(deliverSessionMessages(session)).resolves.toBeUndefined();
+  });
 
   it('does not re-deliver when retried after a successful send (cleanup-after-send safety)', async () => {
     // If something post-send throws (e.g. outbox cleanup), the message has

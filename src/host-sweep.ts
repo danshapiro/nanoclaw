@@ -52,6 +52,7 @@ import {
   getProcessingClaims,
   hasSchedulerTaskRows,
   importHostSideEffects,
+  isHotJournalError,
   markMessageFailed,
   readGwsReconciliationRecords,
   retryWithBackoff,
@@ -79,6 +80,7 @@ import {
 import {
   openInboundDb,
   openOutboundDb,
+  openOutboundDbHealing,
   openOutboundDbRw,
   inboundDbPath,
   heartbeatPath,
@@ -436,9 +438,29 @@ async function sweepSession(session: Session): Promise<void> {
   }
 
   try {
-    outDb = openOutboundDb(agentGroup.id, session.id);
-  } catch {
-    // outbound.db might not exist yet (container hasn't started)
+    // R9a: the write-mode healing open runs ONLY when the host knows no
+    // container writer can be live (cross-mount SQLite locking is unverified
+    // and must not be the guard). This site also covers the post-crash
+    // window: a nonzero exit schedules recoverSessionAfterUnexpectedExit ->
+    // sweepSession (container-runner.ts:545,593), and it always runs BEFORE
+    // the wake gate below.
+    outDb = !isContainerRunning(session.id)
+      ? openOutboundDbHealing(agentGroup.id, session.id)
+      : openOutboundDb(agentGroup.id, session.id);
+  } catch (err) {
+    // outbound.db might not exist yet (container hasn't started). Anything
+    // else deserves a log line: this bare swallow hid the hot-journal wedge.
+    outDb = null;
+    if (isHotJournalError(err)) {
+      // Hot journal while the container is (or may be) running: defer — a
+      // healthy container rolls its own journal back at startup, and the
+      // next sweep after it stops takes the gated heal path above.
+      log.warn('Hot outbound journal with container running; deferring heal to a gated sweep', {
+        sessionId: session.id,
+      });
+    } else if ((err as { code?: string }).code !== 'SQLITE_CANTOPEN') {
+      log.warn('Outbound DB unavailable during sweep', { sessionId: session.id, err });
+    }
   }
 
   try {

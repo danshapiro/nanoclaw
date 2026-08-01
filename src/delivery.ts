@@ -16,6 +16,7 @@ import { getMessagingGroupByPlatform, isAgentChannelWired } from './db/messaging
 import {
   getDueOutboundMessages,
   getDeliveredIds,
+  isHotJournalError,
   markDelivered,
   markDeliveryFailed,
   migrateDeliveredTable,
@@ -170,20 +171,29 @@ export async function deliverSessionMessages(session: Session): Promise<void> {
   try {
     await delivery;
     deliveryContentionStreaks.delete(session.id);
+    // eslint-disable-next-line no-catch-all/no-catch-all -- deliberate R9 containment: pollActive/pollSweep wrap the whole session loop in one try, so an escaped error would starve every later session each tick; contain per session (transient defers WARN/ERROR, the rest log.error)
   } catch (err) {
-    if (!isSqliteBusyError(err)) throw err;
-
-    const streak = (deliveryContentionStreaks.get(session.id) ?? 0) + 1;
-    deliveryContentionStreaks.set(session.id, streak);
-    const context = {
-      sessionId: session.id,
-      agentGroupId: session.agent_group_id,
-      consecutiveDeferrals: streak,
-    };
-    if (streak >= DELIVERY_CONTENTION_ERROR_THRESHOLD) {
-      log.error('Session delivery repeatedly deferred by SQLite contention', context);
+    if (isSqliteBusyError(err) || isHotJournalError(err)) {
+      const streak = (deliveryContentionStreaks.get(session.id) ?? 0) + 1;
+      deliveryContentionStreaks.set(session.id, streak);
+      const context = {
+        sessionId: session.id,
+        agentGroupId: session.agent_group_id,
+        consecutiveDeferrals: streak,
+      };
+      if (streak >= DELIVERY_CONTENTION_ERROR_THRESHOLD) {
+        log.error('Session delivery repeatedly deferred by SQLite contention', context);
+      } else {
+        log.warn('Session delivery deferred by transient SQLite contention', context);
+      }
     } else {
-      log.warn('Session delivery deferred by transient SQLite contention', context);
+      // R9: pollActive/pollSweep wrap the WHOLE session loop in one try — a
+      // rethrow here starves every session ordered after this one, every tick.
+      log.error('Session delivery failed', {
+        sessionId: session.id,
+        agentGroupId: session.agent_group_id,
+        err,
+      });
     }
   } finally {
     if (inflightDeliveries.get(session.id) === delivery) {
