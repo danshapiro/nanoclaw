@@ -69,18 +69,18 @@ Recovery-owned rows (`processing_ack.status='recovery'`) are deliberately exclud
 
 - [ ] **Step 1: Write the failing tests**
 
-In `src/db/session-db.test.ts`, inside the existing `describe('countDueMessagesExcludingRecovery')` block (uses the file's `freshDir()`/`inboundDb()`/`outboundDb()` helpers with real `INBOUND_SCHEMA`/`OUTBOUND_SCHEMA`; mirror the insert style of the existing test at ~390 — check the exact `messages_in` NOT NULL columns and copy that test's INSERT column list if it differs from below):
+In `src/db/session-db.test.ts`, inside the existing `describe('countDueMessagesExcludingRecovery')` block (uses the file's `freshDir()`/`inboundDb()`/`outboundDb()` helpers with real `INBOUND_SCHEMA`/`OUTBOUND_SCHEMA`). The existing tests in this describe (~:389-433) insert inbound rows via the imported `insertMessage` helper (import at :22), NOT raw SQL — the real `messages_in` schema has `content TEXT NOT NULL` with no default (`src/db/schema.ts:322`), so a raw INSERT that omits `content` fails the NOT NULL constraint. `insertMessage` supplies `content`, hardcodes `status = 'pending'`, defaults `trigger` to 1, and auto-assigns `seq` — exactly the due-gate shape these tests need. Use it here too:
 
 ```ts
 it('counts a recovery-owned row as due again once its ack is older than the wake TTL', () => {
   freshDir();
   const inDb = inboundDb();
   const outDb = outboundDb();
-  inDb
-    .prepare(
-      `INSERT INTO messages_in (id, kind, timestamp, status, trigger) VALUES ('m-old', 'chat', datetime('now'), 'pending', 1)`,
-    )
-    .run();
+  insertMessage(inDb, {
+    id: 'm-old', kind: 'chat', timestamp: new Date().toISOString(),
+    platformId: null, channelType: null, threadId: null,
+    content: '{"text":"a"}', processAfter: null, recurrence: null,
+  });
   // Recovery ack last transitioned 45 minutes ago.
   outDb
     .prepare(
@@ -100,11 +100,11 @@ it('keeps excluding a recovery-owned row younger than the wake TTL', () => {
   freshDir();
   const inDb = inboundDb();
   const outDb = outboundDb();
-  inDb
-    .prepare(
-      `INSERT INTO messages_in (id, kind, timestamp, status, trigger) VALUES ('m-fresh', 'chat', datetime('now'), 'pending', 1)`,
-    )
-    .run();
+  insertMessage(inDb, {
+    id: 'm-fresh', kind: 'chat', timestamp: new Date().toISOString(),
+    platformId: null, channelType: null, threadId: null,
+    content: '{"text":"a"}', processAfter: null, recurrence: null,
+  });
   outDb
     .prepare(
       `INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-fresh', 'recovery', datetime('now', '-5 minutes'))`,
@@ -120,11 +120,11 @@ it('treats an unparseable status_changed as expired (fails toward waking)', () =
   freshDir();
   const inDb = inboundDb();
   const outDb = outboundDb();
-  inDb
-    .prepare(
-      `INSERT INTO messages_in (id, kind, timestamp, status, trigger) VALUES ('m-bad', 'chat', datetime('now'), 'pending', 1)`,
-    )
-    .run();
+  insertMessage(inDb, {
+    id: 'm-bad', kind: 'chat', timestamp: new Date().toISOString(),
+    platformId: null, channelType: null, threadId: null,
+    content: '{"text":"a"}', processAfter: null, recurrence: null,
+  });
   outDb
     .prepare(
       `INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-bad', 'recovery', 'garbage')`,
@@ -1810,13 +1810,20 @@ it('keeps quarantine (not file-fatal) for corrupted record_type or mangled audit
 
 Update the existing table-driven suites in place:
 - `keeps an interrupted turn blocked when the reconciliation evidence is %s` (~:1071-1101, cases missing/truncated/malformed): these are FILE-level and must keep throwing — only rename the imported function and destructure nothing (the call still throws before returning).
-- `fails closed on malformed manual reconciliation: %s` (~:1245-1292, cases 'resolution before incident', 'wrong exact binding'): these are now RECORD-level quarantines. Change the assertions from `expect(() => …).toThrow(…)` to:
+- `fails closed on malformed manual reconciliation: %s` (~:1245-1292, cases 'resolution before incident', 'wrong exact binding'): under the reworked reader these two cases DIVERGE, so the shared `.toThrow(/reconciliation|resolution|incident|binding/i)` assertion (~:1291) cannot survive as an it.each — split the table into two plain `it` blocks (keep the existing fixtures verbatim):
+  - **'resolution before incident'** (store contains ONLY the malformed resolution `{schema_version: 2, record_type: 'resolution', audit_id: 'a'}` — no incident line at all): this becomes a RECORD-level quarantine with an empty `incidents` map, so the scope pass has nothing to throw about and the reader RETURNS. Replace its throw assertion with:
 
 ```ts
   const { reconciliations, quarantined } = readGwsReconciliationRecords({ reconciliationStorePath, scopes });
   expect(reconciliations).toEqual([]);
   expect(quarantined).toHaveLength(1);
-  expect(quarantined[0].reason).toMatch(/resolution|binding/i);
+  expect(quarantined[0].reason).toMatch(/resolution/i);
+```
+
+  - **'wrong exact binding'** (store contains a VALID incident whose `input_id` `'in-strict'` IS in `scopes`, plus a resolution bound to `input_id` `'other-input'`): KEEP this as a throw test. The mis-bound resolution is quarantined at record level, but the incident passes every record-level check and is accepted into `incidents`; the scope pass — whose `requires manual reconciliation` throw Step 3 explicitly KEEPS — then throws because the in-scope, complete incident has no accepted resolution. Only rename the imported function, and TIGHTEN the matcher to `/requires manual reconciliation/i` so the test can no longer pass via the removed record-level throw:
+
+```ts
+  expect(() => readGwsReconciliationRecords({ reconciliationStorePath, scopes })).toThrow(/requires manual reconciliation/i);
 ```
 
   …and note the scope-side effect: if the quarantined record's `input_id` matches a scope, `recoverGwsClaimPartitions` must block (covered next).
@@ -2107,7 +2114,7 @@ In `recoverAfterKill` (~:1352-1420), at the `recoverGwsClaimPartitions` call sit
 - [ ] **Step 5: Run tests to verify they pass**
 
 Run: `pnpm exec vitest run src/host-sweep.test.ts src/db/session-db.test.ts src/yente/operator-gws-session.test.ts`
-Expected: PASS — including the updated it.each tables. The `does not reset or wake after a crash with a durable manual-only outcome` test (~:1103) must still pass unchanged (missing-resolution throw preserved).
+Expected: PASS — including the updated evidence it.each table and the two split malformed-reconciliation tests. The `does not reset or wake after a crash with a durable manual-only outcome` test (~:1103) must still pass unchanged (missing-resolution throw preserved).
 
 - [ ] **Step 6: Commit**
 
