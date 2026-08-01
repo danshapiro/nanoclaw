@@ -431,6 +431,98 @@ describe('authenticated GWS correlation acceptance lease', () => {
 
     expect(() => process(release)).toThrow(/replay|sequence|consumed/i);
   });
+
+  it('re-binds an input whose durable acceptance ended in a prior life, deriving the original acceptance time', () => {
+    const priorAcceptedAt = '2026-05-28T23:00:00.000Z';
+    const db = new Database(dbPath);
+    db.prepare(
+      `UPDATE messages_in
+          SET host_accepted_input_id = 'in-active', host_accepted_route_key = ?,
+              host_accepted_at = ?, host_acceptance_ended_at = '2026-05-28T23:30:00.000Z',
+              host_acceptance_claim_token = 'claim-prior', host_acceptance_lease_id = 'lease-prior',
+              host_acceptance_sequence = 9
+        WHERE id = 'm-active'`,
+    ).run(routeKey, priorAcceptedAt);
+    db.close();
+
+    // A fresh container has no durable source: it sends originalAcceptedAt = providerAcceptance.acceptedAt = now.
+    process(request());
+
+    const check = new Database(dbPath, { readonly: true });
+    const row = check.prepare('SELECT * FROM messages_in WHERE id = ?').get('m-active') as Record<string, unknown>;
+    check.close();
+    expect(row.host_accepted_at).toBe(priorAcceptedAt); // immutable first acceptance
+    expect(row.host_acceptance_ended_at).toBeNull(); // reopened
+    expect(row.host_acceptance_lease_id).toBe('lease-host-issued-1');
+    expect(row.host_acceptance_claim_token).toBe('claim-active');
+    // The published pointer carries the DERIVED original acceptance, not now().
+    const pointer = JSON.parse(fs.readFileSync(correlationPath, 'utf8')) as { acceptedAt: string; inputId: string };
+    expect(pointer.acceptedAt).toBe(priorAcceptedAt);
+    expect(pointer.inputId).toBe('in-active');
+
+    // A followup bind in the same lease must stay consistent (durable value memoized).
+    process(request({ requestId: '22222222-2222-4222-8222-222222222222', sequence: 2 }));
+    const check2 = new Database(dbPath, { readonly: true });
+    const row2 = check2.prepare('SELECT host_accepted_at FROM messages_in WHERE id = ?').get('m-active') as {
+      host_accepted_at: string;
+    };
+    check2.close();
+    expect(row2.host_accepted_at).toBe(priorAcceptedAt);
+  });
+
+  it('adopts a mixed batch of stale ended-acceptance rows plus a new trigger under the new input (dvora/hinda regression)', () => {
+    const db = new Database(dbPath);
+    // m-active becomes the stale leftover: accepted under a DIFFERENT prior input, interval ended.
+    db.prepare(
+      `UPDATE messages_in
+          SET host_accepted_input_id = 'in-prior', host_accepted_route_key = ?,
+              host_accepted_at = '2026-05-28T23:00:00.000Z', host_acceptance_ended_at = '2026-05-28T23:30:00.000Z',
+              host_acceptance_lease_id = 'lease-prior'
+        WHERE id = 'm-active'`,
+    ).run(routeKey);
+    // A new user message arrives as the new trigger.
+    db.prepare(
+      `INSERT INTO messages_in
+         (id, seq, kind, timestamp, content, trigger, host_input_id, host_route_key, host_received_at)
+       VALUES ('m-trigger', 3, 'chat', ?, '{}', 1, 'in-trigger', ?, ?)`,
+    ).run('2026-05-29T00:00:00.900Z', routeKey, '2026-05-29T00:00:00.900Z');
+    db.close();
+    const outDb = new Database(outDbPath);
+    outDb
+      .prepare(
+        "INSERT INTO processing_ack (message_id, status, status_changed, claim_token) VALUES (?, 'processing', ?, ?)",
+      )
+      .run('m-trigger', '2026-05-29T00:00:00.950Z', 'claim-mixed');
+    outDb.prepare("UPDATE processing_ack SET claim_token = 'claim-mixed' WHERE message_id = 'm-active'").run();
+    outDb.close();
+
+    process(
+      request({
+        inputId: 'in-trigger',
+        claimToken: 'claim-mixed',
+        messageIds: ['m-active', 'm-trigger'],
+      }),
+    );
+
+    const check = new Database(dbPath, { readonly: true });
+    const stale = check.prepare('SELECT * FROM messages_in WHERE id = ?').get('m-active') as Record<string, unknown>;
+    const fresh = check.prepare('SELECT * FROM messages_in WHERE id = ?').get('m-trigger') as Record<string, unknown>;
+    check.close();
+    expect(stale.host_accepted_input_id).toBe('in-prior'); // immutable original
+    expect(stale.host_acceptance_ended_at).toBeNull(); // adopted
+    expect(stale.host_acceptance_lease_id).toBe('lease-host-issued-1');
+    expect(stale.host_acceptance_claim_token).toBe('claim-mixed');
+    expect(fresh.host_accepted_input_id).toBe('in-trigger');
+    expect(fresh.host_accepted_at).toBe(acceptedAt); // new input: original == provider acceptance time
+    const pointer = JSON.parse(fs.readFileSync(correlationPath, 'utf8')) as { inputId: string };
+    expect(pointer.inputId).toBe('in-trigger');
+  });
+
+  it('still requires a truly new input to preserve its provider acceptance time', () => {
+    expect(() => process(request({ originalAcceptedAt: '2026-05-29T00:00:00.500Z' }))).toThrow(
+      'new GWS correlation bind must preserve its original provider acceptance time',
+    );
+  });
 });
 
 describe('bounded GWS correlation socket transport', () => {

@@ -97,6 +97,8 @@ export type AuthenticatedGwsCorrelationRequest =
 
 interface AcceptedLeaseInput {
   originalAcceptedAt: string;
+  /** The durable acceptance time used for DB stamping; may predate this lease when derived from a prior life's row. */
+  durableAcceptedAt: string;
   routeKey: string;
   messageIds: string[];
   lastClaimToken: string;
@@ -860,6 +862,22 @@ function exactProcessingClaim(outDbPath: string, claimToken: string, messageIds:
   }
 }
 
+/** Durable original acceptance for an input the DB already knows, if any. */
+function readDurableOriginalAcceptance(dbPath: string, inputId: string): string | undefined {
+  const db = openInboundDb(dbPath);
+  try {
+    const row = db
+      .prepare(
+        `SELECT MIN(host_accepted_at) AS accepted_at FROM messages_in
+          WHERE host_accepted_input_id = ? AND host_accepted_at IS NOT NULL`,
+      )
+      .get(inputId) as { accepted_at: string | null } | undefined;
+    return row?.accepted_at ?? undefined;
+  } finally {
+    db.close();
+  }
+}
+
 export function processAuthenticatedGwsCorrelationRequest(opts: {
   agentGroupId: string;
   mountedSessionId: string;
@@ -905,15 +923,33 @@ export function processAuthenticatedGwsCorrelationRequest(opts: {
 
   const existing = state.acceptedInputs.get(request.inputId);
   if (request.action === 'bind') {
+    let effectiveOriginalAcceptedAt = request.originalAcceptedAt;
     if (existing) {
       if (existing.originalAcceptedAt !== request.originalAcceptedAt || existing.routeKey !== request.routeKey) {
         throw new Error('GWS correlation bind conflicts with immutable original acceptance');
       }
-    } else if (request.originalAcceptedAt !== request.providerAcceptance.acceptedAt) {
-      throw new Error('new GWS correlation bind must preserve its original provider acceptance time');
+      effectiveOriginalAcceptedAt = existing.durableAcceptedAt;
+    } else {
+      const durable = readDurableOriginalAcceptance(opts.dbPath, request.inputId);
+      if (durable !== undefined) {
+        // The DB already knows this input: its first acceptance is immutable
+        // and durable. A fresh container has no durable source and can only
+        // send now(); adopt the durable original instead of requiring the
+        // request to carry it.
+        effectiveOriginalAcceptedAt = durable;
+      } else if (request.originalAcceptedAt !== request.providerAcceptance.acceptedAt) {
+        throw new Error('new GWS correlation bind must preserve its original provider acceptance time');
+      }
     }
     exactProcessingClaim(opts.outDbPath, request.claimToken, request.messageIds);
     const combinedMessageIds = [...new Set([...(existing?.messageIds ?? []), ...request.messageIds])].sort();
+    // For DB-known inputs the signed originalAcceptedAt becomes advisory: the
+    // host stamps its own durable value. Anti-replay/authenticity are carried
+    // by the MAC + per-lease sequence + active-lease marker +
+    // exactProcessingClaim + the freshness window above (A13) — none of which
+    // this weakens. closedAt is the request's current time so a pointer-advance
+    // close can never be past-dated by a derived-old acceptedAt (a past-dated
+    // ended_at would hard-fail host-sweep recovery — see bindAcceptedGwsCorrelation).
     bindAcceptedGwsCorrelation({
       dbPath: opts.dbPath,
       correlationPath: opts.correlationPath,
@@ -921,7 +957,8 @@ export function processAuthenticatedGwsCorrelationRequest(opts: {
       inputId: request.inputId,
       routeKey: request.routeKey,
       messageIds: combinedMessageIds,
-      acceptedAt: request.originalAcceptedAt,
+      acceptedAt: effectiveOriginalAcceptedAt,
+      closedAt: request.providerAcceptance.acceptedAt,
       requestId: request.requestId,
       claimToken: request.claimToken,
       leaseId: request.leaseId,
@@ -929,6 +966,7 @@ export function processAuthenticatedGwsCorrelationRequest(opts: {
     });
     state.acceptedInputs.set(request.inputId, {
       originalAcceptedAt: request.originalAcceptedAt,
+      durableAcceptedAt: effectiveOriginalAcceptedAt,
       routeKey: request.routeKey,
       messageIds: combinedMessageIds,
       lastClaimToken: request.claimToken,
