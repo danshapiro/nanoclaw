@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 
 import {
   assertHostGwsSideEffectsReconciled,
-  assertNoUnresolvedGwsReconciliationRecords,
+  readGwsReconciliationRecords,
   discoverGwsCrashWindowDrafts,
   ensureSchema,
   importHostSideEffects,
@@ -210,10 +210,19 @@ export function finalizeOperatorGwsSession(opts: {
     requireCompleteLedger: true,
     strictGwsScope,
   });
-  assertNoUnresolvedGwsReconciliationRecords({
+  // R8: the operator flow has exactly one scope, so it keeps its fail-closed
+  // posture: a quarantined record for THIS scope's input aborts finalization.
+  // An incident with unreadable input_id makes readGwsReconciliationRecords
+  // throw at file level, so this path never matches null against its scope.
+  const scopes = [strictGwsScope];
+  const { quarantined } = readGwsReconciliationRecords({
     reconciliationStorePath: opts.reconciliationStorePath,
-    scopes: [strictGwsScope],
+    scopes,
   });
+  const blocked = quarantined.filter((q) => scopes.some((s) => s.inputId === q.inputId));
+  if (blocked.length > 0) {
+    throw new Error(`GWS reconciliation record quarantined for this operator scope: ${blocked[0].reason}`);
+  }
   const auditResult = discoverGwsCrashWindowDrafts({
     sessionDir: opts.operator.root,
     containerStopped: true,

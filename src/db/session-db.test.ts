@@ -31,6 +31,7 @@ import {
   openInboundDb,
   parseSqliteUtcMs,
   syncProcessingAcks,
+  transliterateToAscii,
   upsertSessionRouting,
 } from './session-db.js';
 import { canonicalSideEffectPayload } from './side-effects-verify.js';
@@ -396,6 +397,18 @@ describe('parseSqliteUtcMs', () => {
     expect(parseSqliteUtcMs('2026-04-20 11:00:00')).toBe(Date.parse('2026-04-20T11:00:00Z'));
     expect(parseSqliteUtcMs('2026-04-20T11:00:00.000Z')).toBe(Date.parse('2026-04-20T11:00:00.000Z'));
     expect(Number.isNaN(parseSqliteUtcMs('garbage'))).toBe(true);
+  });
+});
+
+// ── Task 6 (R8): advisory-field sanitizer ──────────────────────────────────────
+
+describe('transliterateToAscii', () => {
+  it('maps common unicode punctuation, replaces the rest, trims, and caps AFTER substitution', () => {
+    expect(transliterateToAscii('inspect — do not retry', 2048)).toBe('inspect - do not retry');
+    expect(transliterateToAscii('“smart” ‘quotes’ and… more', 2048)).toBe(`"smart" 'quotes' and... more`);
+    expect(transliterateToAscii('日本語', 2048)).toBe('???');
+    expect(transliterateToAscii('\u00A0', 2048)).toBe('?'); // whitespace-only input never returns empty
+    expect(transliterateToAscii('ab…', 4)).toBe('ab..'); // cap applied after '…' -> '...' expansion
   });
 });
 

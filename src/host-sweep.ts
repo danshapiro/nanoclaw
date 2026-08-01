@@ -42,7 +42,6 @@ import { getAgentGroup } from './db/agent-groups.js';
 import { RuntimeLockHeldError, withRuntimeLock } from './db/runtime-locks.js';
 import {
   assertHostGwsSideEffectsReconciledForScopes,
-  assertNoUnresolvedGwsReconciliationRecords,
   countDueMessages,
   countDueMessagesExcludingRecovery,
   deleteOrphanProcessingClaims,
@@ -54,10 +53,12 @@ import {
   hasSchedulerTaskRows,
   importHostSideEffects,
   markMessageFailed,
+  readGwsReconciliationRecords,
   retryWithBackoff,
   syncProcessingAcks,
   type ContainerState,
   type ProcessingClaim,
+  type QuarantinedGwsReconciliationRecord,
   type ImportSideEffectsResult,
   type GwsManualReconciliation,
 } from './db/session-db.js';
@@ -784,8 +785,12 @@ export async function recoverInterruptedTurn(opts: {
   sealAndDrainAcceptedInputs: () => Promise<void>;
   /** Import staged side effects (must run before recovery is written). */
   importSideEffects: (args: { containerStopped: boolean }) => void;
-  /** Write route-scoped recovery / fallback for the active processing rows. */
-  writeRecovery: () => void;
+  /**
+   * Write route-scoped recovery / fallback for the active processing rows.
+   * Resolving `blocked: true` (R8 reconciliation quarantine for one of THIS
+   * session's accepted inputs) stops recovery before any reset or wake.
+   */
+  writeRecovery: () => Promise<{ blocked: boolean }>;
   /** Wake a replacement container (must run only after recovery is written). */
   wakeContainer: () => Promise<void>;
 }): Promise<void> {
@@ -808,7 +813,14 @@ export async function recoverInterruptedTurn(opts: {
   opts.importSideEffects({ containerStopped: true });
 
   // Recovery/fallback BEFORE we reset rows or wake anything.
-  opts.writeRecovery();
+  const recovery = await opts.writeRecovery();
+  if (recovery.blocked) {
+    // R8 fail-closed per input_id: a quarantined reconciliation record covers
+    // one of THIS session's accepted inputs. Claims stay processing, no reset,
+    // no wake -- waking would let container startup clear the processing acks
+    // and re-run a GWS-uncertain input.
+    return;
+  }
 
   // Clear stale tool state and reset the interrupted processing rows.
   const useDb = opts.writableOutDb ?? opts.outDb;
@@ -871,7 +883,7 @@ export async function recoverInterruptedTurnBounded(opts: {
   verifyContainerStopped: () => Promise<boolean>;
   sealAndDrainAcceptedInputs: () => Promise<void>;
   importSideEffects: (args: { containerStopped: boolean }) => void;
-  writeRecovery: () => void;
+  writeRecovery: () => Promise<{ blocked: boolean }>;
   wakeContainer: () => Promise<void>;
   /** Override for tests; production uses QUARANTINE_THRESHOLD. */
   quarantineThreshold?: number;
@@ -1319,7 +1331,12 @@ export function recoverGwsClaimPartitions(opts: {
   auditStorePath: string | undefined;
   reconciliationStorePath: string | undefined;
   gwsPublicKey?: string;
-}): { recoveryIds: string[]; returnedUnacceptedClaimIds: string[] } {
+}): {
+  recoveryIds: string[];
+  returnedUnacceptedClaimIds: string[];
+  quarantinedReconciliation: QuarantinedGwsReconciliationRecord[];
+  blockedInputIds: string[];
+} {
   const plan = strictAcceptedGwsRecoveryPlan(opts.inDb, opts.outDb, opts.stoppedAt ?? new Date().toISOString());
   if (plan.unacceptedClaimIds.length > 0) {
     const remove = opts.outDb.prepare("DELETE FROM processing_ack WHERE message_id = ? AND status = 'processing'");
@@ -1332,14 +1349,37 @@ export function recoverGwsClaimPartitions(opts: {
     })();
   }
   if (plan.partitions.length === 0) {
-    return { recoveryIds: [], returnedUnacceptedClaimIds: plan.unacceptedClaimIds };
+    return {
+      recoveryIds: [],
+      returnedUnacceptedClaimIds: plan.unacceptedClaimIds,
+      quarantinedReconciliation: [],
+      blockedInputIds: [],
+    };
   }
   const scopes = plan.partitions.map((partition) => partition.scope);
 
-  const manualReconciliations = assertNoUnresolvedGwsReconciliationRecords({
+  const { reconciliations: manualReconciliations, quarantined } = readGwsReconciliationRecords({
     reconciliationStorePath: opts.reconciliationStorePath,
     scopes,
   });
+  const quarantinedInputIds = new Set(
+    quarantined.map((q) => q.inputId).filter((v): v is string => typeof v === 'string'),
+  );
+  const blockedInputIds = plan.partitions
+    .map((partition) => partition.scope.inputId)
+    .filter((inputId) => quarantinedInputIds.has(inputId));
+  if (blockedInputIds.length > 0) {
+    // R8 fail-closed per input_id: THIS session's recovery stops (claims stay
+    // processing, no reset, no wake -- waking would let container startup
+    // clear the acks and re-run a GWS-uncertain input). Other sessions are
+    // unaffected. The caller records the loud incidents.
+    return {
+      recoveryIds: [],
+      returnedUnacceptedClaimIds: plan.unacceptedClaimIds,
+      quarantinedReconciliation: quarantined,
+      blockedInputIds,
+    };
+  }
 
   for (const partition of plan.partitions) {
     discoverGwsCrashWindowDraftsScoped({
@@ -1376,7 +1416,12 @@ export function recoverGwsClaimPartitions(opts: {
     }
     recoveryIds.push(recoveryId);
   }
-  return { recoveryIds, returnedUnacceptedClaimIds: plan.unacceptedClaimIds };
+  return {
+    recoveryIds,
+    returnedUnacceptedClaimIds: plan.unacceptedClaimIds,
+    quarantinedReconciliation: quarantined,
+    blockedInputIds: [],
+  };
 }
 
 /**
@@ -1431,7 +1476,7 @@ export async function recoverAfterKill(inDb: Database.Database, session: Session
           allowedArtifactRoots,
         });
       },
-      writeRecovery: () => {
+      writeRecovery: async () => {
         const recovered = recoverGwsClaimPartitions({
           sessionDir: dir,
           inDb,
@@ -1443,11 +1488,44 @@ export async function recoverAfterKill(inDb: Database.Database, session: Session
           reconciliationStorePath: process.env.NANOCLAW_GWS_RECONCILIATION_STORE,
           gwsPublicKey,
         });
+        if (recovered.quarantinedReconciliation.length > 0) {
+          const { reportSchedulerIncident } = await import('./yente/scheduler-alerts.js');
+          for (const q of recovered.quarantinedReconciliation) {
+            log.error('Quarantined GWS reconciliation record', { sessionId: session.id, ...q });
+            // Permanent dedupe means repeats on later sweeps are free.
+            await reportSchedulerIncident({
+              dedupeKey: `gws-reconciliation-quarantine:${q.auditId ?? `line-${q.lineNumber}`}`,
+              severity: 'error',
+              sessionId: session.id,
+              agentGroupId: session.agent_group_id,
+              message: `GWS reconciliation record quarantined (${q.reason}); ${
+                q.inputId
+                  ? `input ${q.inputId} is blocked from recovery`
+                  : 'resolution-side record -- its incident stays unresolved and remains blocked'
+              }. Fix the store record to unblock.`,
+              details: {
+                reason: 'gws-reconciliation-quarantine',
+                lineNumber: q.lineNumber,
+                auditId: q.auditId,
+                inputId: q.inputId,
+                quarantineReason: q.reason,
+              },
+            });
+          }
+        }
+        if (recovered.blockedInputIds.length > 0) {
+          log.error('GWS reconciliation quarantine blocks recovery for this session', {
+            sessionId: session.id,
+            blockedInputIds: recovered.blockedInputIds,
+          });
+          return { blocked: true }; // no reset, no wake
+        }
         log.info('Partitioned interrupted claims before reset', {
           sessionId: session.id,
           recoveryCount: recovered.recoveryIds.length,
           returnedUnacceptedCount: recovered.returnedUnacceptedClaimIds.length,
         });
+        return { blocked: false };
       },
       wakeContainer: async () => {
         shouldWake = true;

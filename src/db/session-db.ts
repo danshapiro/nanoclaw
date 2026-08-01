@@ -1078,17 +1078,81 @@ export interface GwsManualReconciliation {
   accountEmail: string;
 }
 
+const ASCII_SUBSTITUTIONS: Record<string, string> = {
+  '\u2014': '-', // em dash — the dvora incident byte
+  '\u2013': '-',
+  '\u2012': '-',
+  '\u2011': '-',
+  '\u2010': '-',
+  '\u2018': "'",
+  '\u2019': "'",
+  '\u201A': "'",
+  '\u2032': "'",
+  '\u201C': '"',
+  '\u201D': '"',
+  '\u201E': '"',
+  '\u2033': '"',
+  '\u2026': '...',
+  '\u00A0': ' ',
+  '\u200B': '',
+  '\uFEFF': '',
+};
+
+/**
+ * R8: advisory-field sanitizer. Transliterates common Unicode punctuation to
+ * ASCII, replaces every other non-printable-ASCII code point with '?', trims,
+ * enforces the length cap AFTER substitution ('…' expands to '...'), and never
+ * returns an empty string. Advisory hint text must never fail validation.
+ */
+export function transliterateToAscii(value: string, maximum: number): string {
+  let out = '';
+  for (const ch of value) {
+    if (ch >= '\x20' && ch <= '\x7e') {
+      out += ch;
+      continue;
+    }
+    out += ASCII_SUBSTITUTIONS[ch] ?? '?';
+  }
+  out = out.trim();
+  if (out.length === 0) out = '?';
+  return out.slice(0, maximum);
+}
+
+export interface QuarantinedGwsReconciliationRecord {
+  lineNumber: number; // 1-based line in the store file
+  auditId: string | null;
+  inputId: string | null;
+  reason: string;
+}
+
+export interface GwsReconciliationReadResult {
+  reconciliations: GwsManualReconciliation[];
+  quarantined: QuarantinedGwsReconciliationRecord[];
+}
+
 /**
  * Consume the proxy's root-owned durable reconciliation journal before an
  * interrupted accepted input can run again. Every current proxy record is a
  * manual-reconciliation receipt; in particular outcome_unknown corresponds to
  * the proxy response's retry=manual_only sentinel. Historical records are
  * excluded by their unique host input id, never merely by the stable route.
+ *
+ * R8 blast-radius rework (replaces whole-file fail-closed validation):
+ *   - ADVISORY fields (`outcome`, `resource_type`, `search_hints` elements,
+ *     resolution `operator`/`note`) are sanitized via transliterateToAscii and
+ *     can never fail validation on content.
+ *   - LOAD-BEARING field failures QUARANTINE that record only; its readable
+ *     input_id lets the caller fail closed for exactly that input.
+ *   - Whole-file fail-closed remains ONLY for file-level corruption (missing
+ *     store, truncated tail, unparseable JSON) and for records that could be
+ *     an INCIDENT with unreadable identity (input_id): such a record cannot
+ *     contribute to any blocked-input accounting, so quarantining it would let
+ *     recovery re-run a GWS-uncertain input (A12).
  */
-export function assertNoUnresolvedGwsReconciliationRecords(opts: {
+export function readGwsReconciliationRecords(opts: {
   reconciliationStorePath: string | undefined;
   scopes: StrictGwsSideEffectScope[];
-}): GwsManualReconciliation[] {
+}): GwsReconciliationReadResult {
   if (!opts.reconciliationStorePath || !fs.existsSync(opts.reconciliationStorePath)) {
     throw new Error('GWS reconciliation store is missing or inaccessible');
   }
@@ -1140,22 +1204,52 @@ export function assertNoUnresolvedGwsReconciliationRecords(opts: {
     /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/.test(value) &&
     Number.isFinite(Date.parse(value));
 
+  const quarantined: QuarantinedGwsReconciliationRecord[] = [];
+  const quarantinedAuditIds = new Set<string>();
+  // The `inputId: string | null` tolerance below exists for RESOLUTION records
+  // only; incidents with unreadable identity never reach `quarantine` (they
+  // fail the whole file closed first).
+  const quarantine = (lineNumber: number, record: Record<string, unknown>, reason: string): void => {
+    const auditId = typeof record.audit_id === 'string' ? record.audit_id : null;
+    const inputId = typeof record.input_id === 'string' ? record.input_id : null;
+    if (auditId) quarantinedAuditIds.add(auditId);
+    quarantined.push({ lineNumber, auditId, inputId, reason });
+  };
+
+  let lineNumber = 0;
   for (const line of raw.split('\n')) {
+    lineNumber += 1;
     if (!line.trim()) continue;
-    let entry: GwsReconciliationStoreEntry | GwsReconciliationResolutionEntry;
+    let parsed: unknown;
     try {
-      entry = JSON.parse(line) as GwsReconciliationStoreEntry;
+      parsed = JSON.parse(line);
     } catch (error) {
       throw new Error('GWS reconciliation store contains an invalid complete JSONL record', { cause: error });
     }
-    if (!entry || typeof entry !== 'object') {
+    if (!parsed || typeof parsed !== 'object') {
       throw new Error('GWS reconciliation store contains an invalid complete JSONL record');
     }
+    const record = parsed as Record<string, unknown>;
+    const entry = parsed as GwsReconciliationStoreEntry | GwsReconciliationResolutionEntry;
     if (entry.record_type === 'resolution') {
       const resolution = entry as GwsReconciliationResolutionEntry;
       if (Object.keys(resolution).some((key) => !resolutionFields.has(key))) {
-        throw new Error('GWS reconciliation resolution contains an unknown field');
+        quarantine(lineNumber, record, 'resolution contains an unknown field');
+        continue;
       }
+      // ADVISORY content: operator/note are human text — sanitize, never reject
+      // their content. Structural absence is still uncertainty -> quarantine.
+      if (
+        typeof resolution.operator !== 'string' ||
+        resolution.operator.length === 0 ||
+        typeof resolution.note !== 'string' ||
+        resolution.note.length === 0
+      ) {
+        quarantine(lineNumber, record, 'resolution operator/note missing');
+        continue;
+      }
+      resolution.operator = transliterateToAscii(resolution.operator, 256);
+      resolution.note = transliterateToAscii(resolution.note, 2048);
       const incident = typeof resolution.audit_id === 'string' ? incidents.get(resolution.audit_id) : undefined;
       const resolvedMs = typeof resolution.resolved_at === 'string' ? Date.parse(resolution.resolved_at) : NaN;
       const endedMs = typeof incident?.ended_at === 'string' ? Date.parse(incident.ended_at) : NaN;
@@ -1166,42 +1260,79 @@ export function assertNoUnresolvedGwsReconciliationRecords(opts: {
         resolution.input_id !== incident.input_id ||
         resolution.route_key !== incident.route_key ||
         (resolution.disposition !== 'completed' && resolution.disposition !== 'not_completed') ||
-        !canonicalAscii(resolution.operator, 256) ||
-        !canonicalAscii(resolution.note, 2048) ||
         !canonicalTimestamp(resolution.resolved_at) ||
         !Number.isFinite(endedMs) ||
         resolvedMs < endedMs
       ) {
-        throw new Error('GWS reconciliation resolution is malformed or outside its exact incident binding');
+        quarantine(
+          lineNumber,
+          record,
+          typeof resolution.audit_id === 'string' && quarantinedAuditIds.has(resolution.audit_id)
+            ? 'resolution references a quarantined incident'
+            : 'resolution is malformed or outside its exact incident binding',
+        );
+        continue;
       }
       resolutions.set(resolution.audit_id!, resolution);
       continue;
     }
     if (entry.record_type !== undefined) {
-      throw new Error('GWS reconciliation store contains an unknown record type');
+      // A12: an unknown record_type could be a corrupted INCIDENT. Quarantining
+      // it with unreadable identity would drop it from blockedInputIds — so
+      // identity must be readable BEFORE this quarantine is allowed.
+      if (!canonicalAscii(record.input_id, 512)) {
+        throw new Error(
+          `GWS reconciliation store line ${lineNumber}: unknown record_type with missing or unreadable input_id — failing closed`,
+        );
+      }
+      quarantine(lineNumber, record, 'unknown record type');
+      continue;
     }
     const incident = entry as GwsReconciliationStoreEntry;
-    if (Object.keys(incident).some((key) => !incidentFields.has(key))) {
-      throw new Error('GWS reconciliation incident contains an unknown field');
+    // IDENTITY validation FIRST — before ANY quarantine path in this branch —
+    // FILE-level fatal, NOT quarantine (A12, validator-V7): an incident whose
+    // input_id is unreadable structurally cannot contribute to
+    // blockedInputIds; quarantining it (e.g. as 'unknown field' when mojibake
+    // mangles field names and values together) would let recovery re-run a
+    // GWS-uncertain input. Same class as unparseable JSON.
+    if (!canonicalAscii(incident.input_id, 512)) {
+      throw new Error(
+        `GWS reconciliation store line ${lineNumber}: incident identity (input_id) is missing or unreadable — failing closed`,
+      );
     }
+    if (Object.keys(incident).some((key) => !incidentFields.has(key))) {
+      quarantine(lineNumber, record, 'incident contains an unknown field');
+      continue;
+    }
+    // ADVISORY sanitization: hint text must never fail validation.
+    if (typeof incident.outcome === 'string') incident.outcome = transliterateToAscii(incident.outcome, 256);
+    if (typeof incident.resource_type === 'string') {
+      incident.resource_type = transliterateToAscii(incident.resource_type, 512);
+    }
+    incident.search_hints = Array.isArray(incident.search_hints)
+      ? incident.search_hints
+          .filter((hint): hint is string => typeof hint === 'string')
+          .map((hint) => transliterateToAscii(hint, 2048))
+      : []; // hints are never consumed downstream; absence is tolerated
+    // LOAD-BEARING validation: failure quarantines THIS record only (its
+    // readable input_id still blocks the matching scope via the caller gate).
     if (
       incident.schema_version !== 2 ||
       !canonicalAscii(incident.audit_id, 256) ||
       incidents.has(incident.audit_id!) ||
-      !canonicalAscii(incident.outcome, 256) ||
+      typeof incident.outcome !== 'string' ||
+      incident.outcome.length === 0 ||
+      typeof incident.resource_type !== 'string' ||
+      incident.resource_type.length === 0 ||
       !canonicalAscii(incident.account, 512) ||
-      !canonicalAscii(incident.input_id, 512) ||
       !canonicalAscii(incident.route_key, 512) ||
       !canonicalAscii(incident.operation, 512) ||
-      !canonicalAscii(incident.resource_type, 512) ||
       !canonicalTimestamp(incident.started_at) ||
       !canonicalTimestamp(incident.ended_at) ||
-      Date.parse(incident.ended_at!) < Date.parse(incident.started_at!) ||
-      !Array.isArray(incident.search_hints) ||
-      incident.search_hints.length === 0 ||
-      incident.search_hints.some((hint) => !canonicalAscii(hint, 2048))
+      Date.parse(incident.ended_at!) < Date.parse(incident.started_at!)
     ) {
-      throw new Error('GWS reconciliation incident is malformed or incomplete');
+      quarantine(lineNumber, record, 'incident is malformed or incomplete');
+      continue;
     }
     incidents.set(incident.audit_id!, incident);
   }
@@ -1227,8 +1358,6 @@ export function assertNoUnresolvedGwsReconciliationRecords(opts: {
       entry.operation.length > 0 &&
       typeof entry.resource_type === 'string' &&
       entry.resource_type.length > 0 &&
-      Array.isArray(entry.search_hints) &&
-      entry.search_hints.length > 0 &&
       Number.isFinite(startedMs) &&
       Number.isFinite(endedMs) &&
       Number.isFinite(notBeforeMs) &&
@@ -1261,7 +1390,7 @@ export function assertNoUnresolvedGwsReconciliationRecords(opts: {
       accountEmail: entry.account!,
     });
   }
-  return accepted;
+  return { reconciliations: accepted, quarantined };
 }
 
 export interface DiscoverCrashWindowResult {
