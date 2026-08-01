@@ -444,6 +444,53 @@ export function getMessageRouting(inDb: Database.Database, messageId: string): M
   return { kind: row.kind, channelType: row.channel_type, platformId: row.platform_id, threadId: row.thread_id };
 }
 
+/** R2: the ORIGINAL accepted input id for a row (re-acceptance overwrites it). */
+export function getHostAcceptedInputId(inDb: Database.Database, messageId: string): string | null {
+  const row = inDb.prepare('SELECT host_accepted_input_id AS v FROM messages_in WHERE id = ?').get(messageId) as
+    | { v: string | null }
+    | undefined;
+  return row?.v ?? null;
+}
+
+/**
+ * R2 release gate: input_ids with GWS-uncertain evidence in the reconciliation
+ * store — incident records lacking a resolution record for their audit_id.
+ * Standalone lightweight scan (independent of the Task 6 reader rework).
+ * undefined path => empty set (GWS reconciliation not configured).
+ * Fail closed on unreadability: configured-but-missing file, truncated tail,
+ * unparseable line, or an incident whose input_id is not a non-empty string
+ * => THROW (callers defer their pass loudly rather than releasing).
+ */
+export function listGwsUncertainInputIds(reconciliationStorePath: string | undefined): Set<string> {
+  if (!reconciliationStorePath) return new Set();
+  const raw = fs.readFileSync(reconciliationStorePath, 'utf8'); // throws when missing/unreadable
+  if (raw.length > 0 && !raw.endsWith('\n')) {
+    throw new Error(`GWS reconciliation store has a truncated tail (no trailing newline): ${reconciliationStorePath}`);
+  }
+  const resolvedAuditIds = new Set<string>();
+  const incidentInputByAudit = new Map<string, string>();
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    const record = JSON.parse(line) as { record_type?: unknown; audit_id?: unknown; input_id?: unknown };
+    if (record.record_type === 'resolution') {
+      if (typeof record.audit_id === 'string') resolvedAuditIds.add(record.audit_id);
+      continue;
+    }
+    // Every non-resolution record is an incident and must carry a usable input_id.
+    if (typeof record.input_id !== 'string' || record.input_id.length === 0) {
+      throw new Error(
+        `GWS reconciliation store has an incident record without a non-empty input_id: ${reconciliationStorePath}`,
+      );
+    }
+    incidentInputByAudit.set(String(record.audit_id), record.input_id);
+  }
+  const uncertain = new Set<string>();
+  for (const [auditId, inputId] of incidentInputByAudit) {
+    if (!resolvedAuditIds.has(auditId)) uncertain.add(inputId);
+  }
+  return uncertain;
+}
+
 export function markMessageFailed(db: Database.Database, messageId: string): void {
   db.prepare("UPDATE messages_in SET status = 'failed' WHERE id = ?").run(messageId);
 }
@@ -490,24 +537,33 @@ export function syncProcessingAcks(inDb: Database.Database, outDb: Database.Data
   if (acks.length === 0) return;
 
   const noticeExistsStmt = outDb.prepare('SELECT 1 AS ok FROM messages_out WHERE id = ?');
-  const toComplete: string[] = [];
+  // Track which ack status put each id here: ids from 'failed' acks must not
+  // overwrite a host-escalated terminal 'failed' inbound status (R2 durability),
+  // while ids from 'completed' acks keep the historical always-complete behavior.
+  const toComplete: Array<{ id: string; fromFailedAck: boolean }> = [];
   for (const ack of acks) {
     if (ack.status === 'completed') {
-      toComplete.push(ack.message_id);
+      toComplete.push({ id: ack.message_id, fromFailedAck: false });
       continue;
     }
     // status === 'failed'
     if (!ack.notice_message_out_id) continue; // invalid: no notice proof
     const exists = noticeExistsStmt.get(ack.notice_message_out_id) as { ok: number } | undefined;
-    if (exists) toComplete.push(ack.message_id);
+    if (exists) toComplete.push({ id: ack.message_id, fromFailedAck: true });
     // else dangling notice id — invalid, leave the inbound row as-is.
   }
 
   if (toComplete.length === 0) return;
 
   const updateStmt = inDb.prepare("UPDATE messages_in SET status = 'completed' WHERE id = ? AND status != 'completed'");
+  // Status precedence for failed acks: a pending row behind a failed ack still
+  // completes (exactly as today), but a terminal 'failed' inbound status — set
+  // by host-side recovery escalation — is never silently rewritten.
+  const updateFromFailedStmt = inDb.prepare(
+    "UPDATE messages_in SET status = 'completed' WHERE id = ? AND status NOT IN ('completed', 'failed')",
+  );
   inDb.transaction(() => {
-    for (const id of toComplete) updateStmt.run(id);
+    for (const item of toComplete) (item.fromFailedAck ? updateFromFailedStmt : updateStmt).run(item.id);
   })();
 }
 

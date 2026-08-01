@@ -99,6 +99,7 @@ import {
   resolveProjectionContext,
   syncSessionSchedulerState,
 } from './modules/scheduling/sync.js';
+import { releaseOrEscalateExpiredRecoveryAcks } from './recovery-escalation.js';
 import type { Session } from './types.js';
 
 /**
@@ -141,6 +142,8 @@ export const IDLE_REAP_MS = Number(process.env.NANOCLAW_IDLE_REAP_MS) || 10 * 60
 export const IDLE_RECYCLE_GRACE_MS = 60 * 1000;
 // R1: recovery-owned rows older than this count as due again in the wake gate.
 export const RECOVERY_WAKE_TTL_MS = Number(process.env.NANOCLAW_RECOVERY_WAKE_TTL_MS) || 30 * 60 * 1000;
+/** R2: failed resume attempts tolerated before a recovery ack escalates to terminal failure. */
+export const RECOVERY_MAX_WAKE_ATTEMPTS = Number(process.env.NANOCLAW_RECOVERY_MAX_WAKE_ATTEMPTS) || 3;
 const MAX_TRIES = 5;
 const BACKOFF_BASE_MS = 5000;
 
@@ -491,6 +494,34 @@ async function sweepSession(session: Session): Promise<void> {
     // a replacement can repeat an already-completed external mutation.
     if (!isContainerRunning(session.id) && outDb && getProcessingClaims(outDb).length > 0) {
       await recoverAfterKill(inDb, session, 'container not running');
+    }
+
+    // 3.5 R1/R2: bounded lifecycle for recovery-owned rows. Requires the
+    // container-stopped guard (RW outbound open inside). Errors are contained
+    // per session: a failed pass must never block the wake below (the TTL-aware
+    // due count still fires, which only ADDS wakes).
+    if (outDb && !isContainerRunning(session.id)) {
+      try {
+        const outcome = await releaseOrEscalateExpiredRecoveryAcks({
+          session,
+          inDb,
+          outDb,
+          nowMs: Date.now(),
+          ttlMs: RECOVERY_WAKE_TTL_MS,
+          maxAttempts: RECOVERY_MAX_WAKE_ATTEMPTS,
+          // GWS-cleanliness release gate — same env source as recoverAfterKill.
+          reconciliationStorePath: process.env.NANOCLAW_GWS_RECONCILIATION_STORE,
+        });
+        if (outcome.released.length > 0 || outcome.escalated.length > 0) {
+          log.info('Recovery wake TTL pass acted', {
+            sessionId: session.id,
+            released: outcome.released,
+            escalated: outcome.escalated,
+          });
+        }
+      } catch (err) {
+        log.error('Recovery wake TTL pass failed', { sessionId: session.id, err });
+      }
     }
 
     // 4. Wake a container if work is due and nothing is running.

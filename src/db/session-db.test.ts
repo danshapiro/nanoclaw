@@ -595,6 +595,56 @@ describe('syncProcessingAcks failed-ack notice gate', () => {
     inDb.close();
     outDb.close();
   });
+
+  // Task 3 (R2 durability): a failed ack must not rewrite a host-escalated
+  // terminal 'failed' inbound status, while a pending row behind a failed ack
+  // still completes exactly as before.
+  it("preserves a terminal 'failed' inbound status under a failed ack, but still completes pending rows", () => {
+    freshDir();
+    const inDb = inboundDb();
+    const outDb = outboundDb();
+    const now = new Date().toISOString();
+
+    for (const id of ['escalated-failed', 'still-pending']) {
+      insertMessage(inDb, {
+        id,
+        kind: 'chat',
+        timestamp: now,
+        platformId: null,
+        channelType: null,
+        threadId: null,
+        content: '{"text":"x"}',
+        processAfter: null,
+        recurrence: null,
+      });
+    }
+    // Host-side recovery escalation already marked this row terminally failed.
+    inDb.prepare("UPDATE messages_in SET status = 'failed' WHERE id = 'escalated-failed'").run();
+
+    outDb
+      .prepare(
+        `INSERT INTO messages_out (id, seq, timestamp, kind, content) VALUES ('notice-2', 1, datetime('now'), 'chat', '{"text":"gave up"}')`,
+      )
+      .run();
+    for (const id of ['escalated-failed', 'still-pending']) {
+      outDb
+        .prepare(
+          "INSERT INTO processing_ack (message_id, status, status_changed, notice_message_out_id) VALUES (?, 'failed', datetime('now'), 'notice-2')",
+        )
+        .run(id);
+    }
+
+    syncProcessingAcks(inDb, outDb);
+
+    const statusOf = (id: string) =>
+      (inDb.prepare('SELECT status FROM messages_in WHERE id = ?').get(id) as { status: string }).status;
+
+    expect(statusOf('escalated-failed')).toBe('failed'); // terminal, never silently rewritten
+    expect(statusOf('still-pending')).toBe('completed'); // failed ack with notice still completes pending rows
+
+    inDb.close();
+    outDb.close();
+  });
 });
 
 // ── Task 1: host side-effect import requires verified container stop ─────────

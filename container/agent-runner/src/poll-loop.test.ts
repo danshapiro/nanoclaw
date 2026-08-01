@@ -3295,6 +3295,90 @@ describe('poll-loop accepted-but-unresolved terminal recovery', () => {
     controller.abort();
     await loopPromise.catch(() => {});
   });
+
+  // Task 3 (R2 release path, V5 N2): the released row can be its OWN wake
+  // trigger — after the host deletes an expired recovery ack, the row is plain
+  // pending work again and may be the only due message on its route. The turn
+  // it wakes must still get the pending recovery entry's context injected
+  // (same scope keying as the different-trigger sibling above).
+  it('injects pending recovery context when the released row itself is the wake trigger', async () => {
+    insertChannelDestination('discord-current', 'chan-1');
+    const routeKey = normalizeRoute('test', {
+      platformId: 'chan-1',
+      channelType: 'discord',
+      threadId: null,
+      messagingGroupId: 'mg-self',
+      isGroup: 0,
+    }).routeKey;
+    const scope = recoveryScope(routeKey, 'mg-self', 0);
+
+    // Seed a pending recovery entry that owns m-1 itself. Post-release state:
+    // the host deleted m-1's recovery ack, so m-1 is pending and UN-acked, and
+    // nothing else is due on the route.
+    const now = new Date().toISOString();
+    const seed: ProviderRecoveryEntry = {
+      id: 'rec-self-1',
+      status: 'pending',
+      classification: 'terminal_interruption_accepted_unresolved',
+      agentMessage: 'I was interrupted mid-turn and will resume this work.',
+      fallbackUserMessage: 'I still have your earlier request.',
+      originalTasks: [{ messageId: 'm-1', text: 'finish the interrupted request', timestamp: now }],
+      acceptedUnresolvedInputs: [
+        { inputId: 'in-self', messageIds: ['m-1'], prompt: 'finish the interrupted request' },
+      ],
+      pendingFollowups: [],
+      priorProgress: [
+        {
+          messageOutId: 'mo-self',
+          text: 'I had already sent the first draft.',
+          source: 'provider_progress',
+          timestamp: now,
+        },
+      ],
+      observations: [],
+      sideEffects: [],
+      continuationPolicy: 'preserve',
+      createdAt: now,
+      updatedAt: now,
+    };
+    getOutboundDb()
+      .prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
+      .run(`recovery:test:${routeKey}`, JSON.stringify([seed]), now);
+
+    // The released row: pending, un-acked, the ONLY due work on the route.
+    insertMessage(
+      'm-1',
+      'chat',
+      { sender: 'User', text: 'finish the interrupted request' },
+      {
+        platformId: 'chan-1',
+        channelType: 'discord',
+        messagingGroupId: 'mg-self',
+        isGroup: 0,
+      },
+    );
+
+    let seenPrompt = '';
+    const provider = new ScriptedProvider(async function* (input) {
+      seenPrompt = input.prompt;
+      yield { type: 'init', continuation: 'sess-self-resume' };
+      yield { type: 'result', text: '<message to="discord-current">Resumed and finished it.</message>' };
+    });
+
+    const controller = new AbortController();
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+    await waitFor(() => getAckStatus('m-1') === 'completed', 3000);
+
+    // The recovery context for the entry owning m-1 was injected into the very
+    // turn that m-1 itself woke.
+    expect(seenPrompt).toContain('<recovery>');
+    expect(seenPrompt).toContain('finish the interrupted request');
+    expect(seenPrompt).toContain('I had already sent the first draft.');
+
+    controller.abort();
+    await loopPromise.catch(() => {});
+  });
 });
 
 describe('poll-loop pre-query failure recovery (Step 4 lines 557-559)', () => {
