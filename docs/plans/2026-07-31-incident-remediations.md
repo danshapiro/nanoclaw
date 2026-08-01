@@ -490,8 +490,16 @@ Expected: PASS.
 
 `src/host-sweep.test.ts`'s `testDbs()` (~:67-93) uses hand-written minimal schemas. In the `messages_in` CREATE add `recovery_wake_attempts INTEGER NOT NULL DEFAULT 0,` and in the `processing_ack` CREATE add `notice_message_out_id TEXT, claim_token TEXT` (aligning the harness with the prod columns — a known divergence).
 
+Widening `processing_ack` to 5 columns breaks the file's seven POSITIONAL inserts: `INSERT INTO processing_ack VALUES (...)` with no column list supplies 3 values against 5 columns, and better-sqlite3 throws at prepare time (`table processing_ack has 5 columns but 3 values were supplied`). In the same edit, rewrite ALL seven to the explicit-column form the rest of the file already uses:
+
+```sql
+INSERT INTO processing_ack (message_id, status, status_changed) VALUES (...)
+```
+
+They are at ~:375, ~:397, ~:544, ~:774, ~:775, ~:801, ~:829 — locate by content with `grep -n "INSERT INTO processing_ack VALUES" src/host-sweep.test.ts` (exactly seven hits, all in this file; rewrite every hit until that grep returns none). Note ~:544 sits inside the shared `processingDbs()` helper (~:541-551), which gates the entire kill/reset-ordering describe block, so missing it fails far more than one test. The file's other `processing_ack` inserts already use explicit column lists (they run against the real `OUTBOUND_SCHEMA`) and are unaffected.
+
 Run: `pnpm exec vitest run src/host-sweep.test.ts`
-Expected: PASS (schema additions are backward compatible).
+Expected: PASS (the added columns are nullable; after the rewrite every insert names its columns).
 
 - [ ] **Step 6: Commit**
 
@@ -1002,7 +1010,7 @@ export function listGwsUncertainInputIds(reconciliationStorePath: string | undef
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `pnpm exec vitest run src/recovery-escalation.test.ts`
-Expected: PASS (7 tests).
+Expected: 6 of 7 PASS. The durability test (`keeps the escalated inbound status 'failed' after syncProcessingAcks runs`) MUST still FAIL at its final assertion: at this point the real `syncProcessingAcks` still funnels a failed ack that has a valid notice row into the same `UPDATE messages_in SET status = 'completed' ...` as completed acks (`src/db/session-db.ts` ~:407), rewriting the escalated `'failed'` back to `'completed'` — the exact V6 residue. That red is the failing half of Step 5b's TDD gate; do NOT fix it in this step and do NOT weaken the assertion. If it passes here, something is off — investigate (the precedence guard may already exist, or the escalation's notice row never landed so the failed-ack branch never funneled).
 
 - [ ] **Step 5: Wire into `sweepSession` in `src/host-sweep.ts`**
 
@@ -1055,7 +1063,7 @@ Without a guard, `syncProcessingAcks` (`src/db/session-db.ts` ~:366-411) flips t
   "UPDATE messages_in SET status = 'completed' WHERE id = ? AND status NOT IN ('completed', 'failed')"
 ```
 
-so a host-escalated terminal `'failed'` is never silently rewritten (rows from `'completed'` acks keep the existing statement; a `pending` row behind a failed ack still completes, exactly as today). The durability test in Step 1 (`keeps the escalated inbound status 'failed' after syncProcessingAcks runs`) is the proof; also add a plain unit test beside the existing `syncProcessingAcks` suite in `src/db/session-db.test.ts`: a failed ack with a valid notice over an inbound row already `'failed'` leaves it `'failed'`, while one over a `'pending'` row still completes it.
+so a host-escalated terminal `'failed'` is never silently rewritten (rows from `'completed'` acks keep the existing statement; a `pending` row behind a failed ack still completes, exactly as today). The durability test in Step 1 (`keeps the escalated inbound status 'failed' after syncProcessingAcks runs`) is the proof — it was deliberately left RED at Step 4 and must turn green here; also add a plain unit test beside the existing `syncProcessingAcks` suite in `src/db/session-db.test.ts`: a failed ack with a valid notice over an inbound row already `'failed'` leaves it `'failed'`, while one over a `'pending'` row still completes it.
 
 Run: `pnpm exec vitest run src/db/session-db.test.ts src/recovery-escalation.test.ts`
 Expected: PASS.
