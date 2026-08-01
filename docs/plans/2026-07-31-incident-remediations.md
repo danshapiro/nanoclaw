@@ -13,9 +13,9 @@
 
 ## Global Constraints
 
-- **Inbound-message durability writes are untouchable.** No change may cause a message to be dropped or double-processed; the claim/dedupe semantics from the catch-up work must hold. Recovery-ack release (Task 3) reuses the existing container resume machinery (recovery context injection + input-ledger dedupe) — it returns rows to `pending`, it never deletes `messages_in` rows.
+- **Inbound-message durability writes are untouchable.** No change may cause a message to be dropped or double-processed; the claim/dedupe semantics from the catch-up work must hold. Recovery-ack release (Task 3) reuses the existing container resume machinery — it returns rows to `pending`, it never deletes `messages_in` rows. Be precise about what protects a re-run: message/row-level dedupe is HARD (the `delivered` table, `INSERT OR IGNORE`); NEW external side effects on the resumed turn are protected only ADVISORILY by the injected recovery context (the input ledger is per-turn in-memory and cannot dedupe across a release) — hence Task 3's GWS-cleanliness release gate and the accepted, K-bounded residual for ordinary chat side effects.
 - **Messages must NEVER be silently dropped.** Every terminal failure produces a user-visible notice row in `messages_out` AND an error-severity incident.
-- **All new behavior is configurable via env with safe defaults** (idiom: `Number(process.env.NANOCLAW_X) || default`, declared next to the consumer). New knobs: `NANOCLAW_RECOVERY_WAKE_TTL_MS` (1800000), `NANOCLAW_RECOVERY_MAX_WAKE_ATTEMPTS` (3), `NANOCLAW_SCHEDULER_ACK_STALE_ESCALATION_MS` (3600000), `NANOCLAW_INCIDENT_DEDUPE_LOG_INTERVAL_MS` (3600000), `NANOCLAW_CONTAINER_STDERR_TAIL_KB` (64), `NANOCLAW_CONTAINER_STDERR_EVENTS_PER_MIN` (30), `NANOCLAW_CONTAINER_STDERR_KEEP_FILES` (5), `NANOCLAW_CONTAINER_SQLITE_BUSY_TIMEOUT_MS` (30000).
+- **All new behavior is configurable via env with safe defaults** (idiom: `Number(process.env.NANOCLAW_X) || default`, declared next to the consumer). New knobs: `NANOCLAW_RECOVERY_WAKE_TTL_MS` (1800000), `NANOCLAW_RECOVERY_MAX_WAKE_ATTEMPTS` (3), `NANOCLAW_SCHEDULER_ACK_STALE_ESCALATION_MS` (3600000), `NANOCLAW_INCIDENT_DEDUPE_LOG_INTERVAL_MS` (3600000), `NANOCLAW_CONTAINER_STDERR_TAIL_KB` (64), `NANOCLAW_CONTAINER_STDERR_EVENTS_PER_MIN` (30), `NANOCLAW_CONTAINER_STDERR_KEEP_FILES` (5, clean-exit tails), `NANOCLAW_CONTAINER_STDERR_KEEP_CRASH_FILES` (5, crash tails — rotated separately), `NANOCLAW_CONTAINER_SQLITE_BUSY_TIMEOUT_MS` (30000).
 - **Fail-open for anything advisory, fail-loud for anything uncertain.**
 - **Session DBs stay `journal_mode = DELETE`** — a sacred cross-mount invariant (`src/session-manager.ts:1-12`). Never propose WAL for `inbound.db`/`outbound.db`.
 - **R1 must only ADD wakes, never suppress any.** Unparseable timestamps count as expired (fail toward waking).
@@ -31,20 +31,20 @@
 | File | Role |
 |---|---|
 | `src/db/schema.ts` | Modify: add `recovery_wake_attempts` to `messages_in` in `INBOUND_SCHEMA` |
-| `src/db/session-db.ts` | Modify: TTL-aware due count, recovery-ack list/release/fail helpers, `parseSqliteUtcMs`, reconciliation reader rework (`readGwsReconciliationRecords`), `transliterateToAscii`, hot-journal healing open |
-| `src/host-sweep.ts` | Modify: TTL consts, release/escalate step + TTL-aware wake gate in `sweepSession`, healing outbound open, reconciliation quarantine plumbing in `recoverGwsClaimPartitions`/`recoverAfterKill` |
-| `src/recovery-escalation.ts` | Create: release-or-escalate pass for expired recovery acks (R1/R2 core) |
+| `src/db/session-db.ts` | Modify: TTL-aware due count, recovery-ack list/release/fail helpers, `parseSqliteUtcMs`, GWS release-gate helpers (`getHostAcceptedInputId`, `listGwsUncertainInputIds`), `syncProcessingAcks` failed-status precedence guard, reconciliation reader rework (`readGwsReconciliationRecords`, identity fail-closed), `transliterateToAscii`, hot-journal healing open |
+| `src/host-sweep.ts` | Modify: TTL consts, release/escalate step + TTL-aware wake gate in `sweepSession`, GATED healing outbound open (`!isContainerRunning` only), reconciliation quarantine plumbing in `recoverGwsClaimPartitions`/`recoverAfterKill` (incl. async `writeRecovery` restructuring) |
+| `src/recovery-escalation.ts` | Create: release-or-escalate pass for expired recovery acks, with GWS-cleanliness release gate (R1/R2 core) |
 | `src/modules/scheduling/sync.ts` | Modify: plumb `status_changed`, stale-ack error escalation (R3) |
 | `src/yente/scheduler-alerts.ts` | Modify: rate-limit the `scheduler_incident_deduped` log (R3) |
-| `src/container-stderr.ts` | Create: stderr tail buffer, chunk line-splitter, rate limiter, persist-with-rotation (R6, pure/unit-testable) |
-| `src/container-runner.ts` | Modify: stderr handler rewrite, `ActiveContainer` fields, persist tail on exit (R6); env passthrough for container busy timeout (R9) |
-| `src/delivery.ts` | Modify: healing open, transient-error classification, per-session error containment (R9) |
-| `src/session-manager.ts` | Modify: `openOutboundDbHealing` session-scoped wrapper (R9) |
+| `src/container-stderr.ts` | Create: stderr tail buffer, chunk line-splitter, rate limiter, persist with carry flush + crash-privileged rotation (R6, pure/unit-testable) |
+| `src/container-runner.ts` | Modify: stderr handler rewrite, `ActiveContainer` fields, persist tail to host-side `v2-container-logs` on exit (pinned anchor) (R6); env passthrough for container busy timeout (R9) |
+| `src/delivery.ts` | Modify: transient hot-journal/busy classification (defer only — no inline heal), per-session error containment (R9) |
+| `src/session-manager.ts` | Modify: `openOutboundDbHealing` session-scoped wrapper (R9, gated callers only); `containerLogsDir` host-side log tree (R6) |
 | `src/yente/operator-gws-session.ts` | Modify: adopt new reconciliation reader return shape (R8) |
 | `container/agent-runner/src/db/sqlite-retry.ts` | Create: busy classification + bounded retry helper (R9) |
 | `container/agent-runner/src/db/connection.ts` | Modify: configurable busy_timeout (R9) |
-| `container/agent-runner/src/index.ts`, `container/agent-runner/src/poll-loop.ts` | Modify: wrap unguarded DB touchpoints with retry (R9) |
-| Tests | `src/db/session-db.test.ts`, `src/host-sweep.test.ts`, `src/recovery-escalation.test.ts` (new), `src/modules/scheduling/sync.test.ts`, `src/yente/scheduler-alerts.test.ts`, `src/container-stderr.test.ts` (new), `src/container-runner.test.ts`, `src/delivery.test.ts`, `container/agent-runner/src/db/sqlite-retry.test.ts` (new) |
+| `container/agent-runner/src/index.ts`, `container/agent-runner/src/poll-loop.ts` | Modify: wrap the FULL unguarded DB touchpoint surface with retry (incl. catch handlers + `pollFollowups`) (R9) |
+| Tests | `src/db/session-db.test.ts`, `src/host-sweep.test.ts`, `src/recovery-escalation.test.ts` (new), `src/modules/scheduling/sync.test.ts`, `src/yente/scheduler-alerts.test.ts`, `src/container-stderr.test.ts` (new), `src/container-runner.test.ts`, `src/delivery.test.ts`, `container/agent-runner/src/db/sqlite-retry.test.ts` (new), `container/agent-runner/src/poll-loop.test.ts` (self-trigger injection) |
 
 Background reading (do not edit): incident findings at `/home/dan/code/shapiroserver2/docs/plans/2026-07-30-nanoclaw-write-stream-findings-and-ssd-plan.md`. Recon reports with verbatim current code live at `/home/dan/code/nanoclaw-reboot-resilience/.worktrees/.the-usual-logs/incident-remediations/reports/*.md`.
 
@@ -493,7 +493,7 @@ git commit -m "feat(db): track recovery wake attempts and add recovery-ack relea
 
 ### Task 3: R2b — release-or-escalate pass for expired recovery acks
 
-The policy core of R1/R2. Past-TTL recovery acks with attempts < K are **released** (attempt++ and the recovery ack deleted — the row returns to normal pending visibility, so the wake actually results in a turn, and the container's existing resume machinery injects the still-pending recovery context into that turn). Past-TTL acks with attempts >= K are **escalated**: user-visible notice, ack → `failed` with the notice pointer, `messages_in` → `failed`, best-effort supersede of the owning `session_state` recovery entries, error incident. The existing `syncProcessingAcks` failed-ack notice gate and the scheduler sync `ack.status === 'failed'` branch (which calls `failScheduledTask`) then consume the failed ack with zero new code.
+The policy core of R1/R2. Past-TTL recovery acks with attempts < K are **released** (attempt++ and the recovery ack deleted — the row returns to normal pending visibility, so the wake actually results in a turn, and the container's existing resume machinery injects the still-pending recovery context into that turn). Release is additionally gated on GWS cleanliness: a row whose ORIGINAL accepted input has unresolved GWS reconciliation evidence (e.g. `outcome_unknown` incidents without a durable resolution) is NEVER auto-released — it escalates directly, regardless of remaining attempts (validator-V5: the release path otherwise never re-checks the reconciliation store, and the re-run's acceptance mints a NEW input_id, so R8's fail-closed machinery structurally cannot catch it). Past-TTL acks with attempts >= K (or GWS-uncertain ones) are **escalated**: user-visible notice, ack → `failed` with the notice pointer, `messages_in` → `failed`, best-effort supersede of the owning `session_state` recovery entries, error incident. The existing `syncProcessingAcks` failed-ack notice gate and the scheduler sync `ack.status === 'failed'` branch (which calls `failScheduledTask`) then consume the failed ack with zero new code.
 
 Design notes the implementer must not "simplify" away:
 - Release (not just wake) is required because the container hides ANY acked row from `getPendingMessages` and only resumes recovery entries **within a turn** — a wake with no visible pending work is a no-op idle. Deleting the recovery ack is the host-side twin of the container's own (unwired) `clearRecoveryOwnership` escape hatch; the `session_state` recovery entries remain `pending`, so the resumed turn still gets the "do NOT repeat completed side effects" context. Input-ledger dedupe semantics are untouched.
@@ -501,18 +501,23 @@ Design notes the implementer must not "simplify" away:
 - `failScheduledTask` posts nothing to the user; our notice row IS the user-visible part, and it doubles as the `failedAckHasTerminalNotice` proof (`sync.ts:103-112` checks that `notice_message_out_id` points at an existing `messages_out` row).
 - Notice ids are deterministic (`recovery-escalation-<messageId>`) and `writeOutboundDirect` uses `INSERT OR IGNORE`, so a sweep that crashes mid-escalation converges on retry instead of duplicating notices.
 - If the inbound row has null routing columns, the notice row will be dropped by delivery with a warn — acceptable: the error incident still reaches the user's channel via the incident->alert route.
+- The GWS-cleanliness gate reads the row's ORIGINAL `messages_in.host_accepted_input_id` (the re-run would mint a new one) against the reconciliation store. If the store is configured but unreadable, the pass defers LOUDLY (neither release — unsafe — nor terminal escalation — unfair to the message); R3's stale-ack escalation keeps alerting while that persists.
+- Accepted residual (A8, recorded in the load-bearing ledger): ordinary chat-turn external side effects (sent messages, scheduled tasks, agent sends) remain ADVISORILY protected on rerun — the injected recovery-context prompt, the same exposure class as today's natural container resume — bounded by K=3 and loudly escalated on exhaustion. The GWS-uncertain class (the truly dangerous one) is excluded from auto-release by the gate. Do not describe this anywhere as a hard guarantee: no cross-turn idempotency key exists.
 
 **Files:**
 - Create: `src/recovery-escalation.ts`
 - Modify: `src/host-sweep.ts` (const block; `sweepSession` between crash-recovery step 3 at ~:481-486 and the wake gate at ~:493)
-- Test: `src/recovery-escalation.test.ts` (new)
+- Modify: `src/db/session-db.ts` (`getHostAcceptedInputId`, `listGwsUncertainInputIds`; `syncProcessingAcks` failed-status precedence guard at ~:393-407)
+- Test: `src/recovery-escalation.test.ts` (new), `src/db/session-db.test.ts` (failed-status durability), `container/agent-runner/src/poll-loop.test.ts` (self-trigger injection)
 
 **Interfaces:**
 - Consumes (Task 2): `listRecoveryAcks`, `getRecoveryWakeAttempts`, `incrementRecoveryWakeAttempts`, `deleteRecoveryAcks`, `failRecoveryAck`, `getMessageRouting`, plus existing `markMessageFailed(db, messageId)` (`src/db/session-db.ts:346`), `writeOutboundDirect(agentGroupId, sessionId, {id, kind, platformId, channelType, threadId, content})` and `openOutboundDbRw(agentGroupId, sessionId)` (`src/session-manager.ts`), `reportSchedulerIncident(args): Promise<boolean>` (`src/yente/scheduler-alerts.ts:54` — the lock-acquiring wrapper; safe here because `sweepSession` does not hold the scheduler-mutator lock at this point).
 - Produces:
   - `export interface RecoveryReleaseOutcome { released: string[]; escalated: string[]; }`
-  - `export async function releaseOrEscalateExpiredRecoveryAcks(opts: { session: Session; inDb: Database.Database; outDb: Database.Database; nowMs: number; ttlMs: number; maxAttempts: number; }): Promise<RecoveryReleaseOutcome>`
+  - `export async function releaseOrEscalateExpiredRecoveryAcks(opts: { session: Session; inDb: Database.Database; outDb: Database.Database; nowMs: number; ttlMs: number; maxAttempts: number; reconciliationStorePath?: string; }): Promise<RecoveryReleaseOutcome>`
   - `export const RECOVERY_MAX_WAKE_ATTEMPTS: number` in `src/host-sweep.ts`.
+  - `export function getHostAcceptedInputId(inDb: Database.Database, messageId: string): string | null` in `src/db/session-db.ts` — `SELECT host_accepted_input_id FROM messages_in WHERE id = ?` (column exists, `src/db/schema.ts:315`; self-healed at session-db.ts ~:1485).
+  - `export function listGwsUncertainInputIds(reconciliationStorePath: string | undefined): Set<string>` in `src/db/session-db.ts` — lightweight standalone scan (independent of Task 6's reader rework): undefined path OR missing file ⇒ empty set (GWS reconciliation not configured); otherwise parse the JSONL store and return the `input_id` of every incident record lacking a resolution record for its `audit_id`. Fail closed on unreadability: truncated tail, a line that fails `JSON.parse`, or an incident whose `input_id` is not a non-empty string ⇒ THROW (the caller defers the pass loudly).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -572,7 +577,7 @@ function makeDbs() {
     id TEXT PRIMARY KEY, kind TEXT NOT NULL DEFAULT 'chat', timestamp TEXT NOT NULL DEFAULT (datetime('now')),
     status TEXT DEFAULT 'pending', trigger INTEGER NOT NULL DEFAULT 1, process_after TEXT,
     tries INTEGER DEFAULT 0, recovery_wake_attempts INTEGER NOT NULL DEFAULT 0,
-    channel_type TEXT, platform_id TEXT, thread_id TEXT)`);
+    channel_type TEXT, platform_id TEXT, thread_id TEXT, host_accepted_input_id TEXT)`);
   const outDb = new Database(':memory:');
   outDb.exec(`CREATE TABLE processing_ack (
       message_id TEXT PRIMARY KEY, status TEXT NOT NULL, status_changed TEXT NOT NULL,
@@ -678,8 +683,57 @@ describe('releaseOrEscalateExpiredRecoveryAcks', () => {
     expect(written).toHaveLength(1);
     expect(JSON.parse(written[0].content as string).text).toContain('scheduled task');
   });
+
+  it('escalates (never releases) an expired ack whose original input is GWS-uncertain, at attempts=0', async () => {
+    const { inDb, outDb } = makeDbs();
+    inDb
+      .prepare(
+        "INSERT INTO messages_in (id, channel_type, platform_id, host_accepted_input_id) VALUES ('m-g', 'discord', 'chan-1', 'input-9')",
+      )
+      .run();
+    reOwn(outDb, 'm-g');
+    // Reconciliation store: one outcome_unknown incident for input-9, no resolution.
+    const storePath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'recon-')), 'store.jsonl');
+    fs.writeFileSync(
+      storePath,
+      `${JSON.stringify({ schema_version: 2, audit_id: 'a-1', outcome: 'outcome_unknown', input_id: 'input-9', route_key: 'r', account: 'acct', operation: 'op', resource_type: 'doc', started_at: '2026-04-20T09:00:00Z', ended_at: '2026-04-20T09:00:01Z' })}\n`,
+    );
+    const outcome = await releaseOrEscalateExpiredRecoveryAcks({
+      session, inDb, outDb, nowMs: NOW, ttlMs: TTL, maxAttempts: 3, reconciliationStorePath: storePath,
+    });
+    // The gate, not exhaustion: attempts were 0 and it still escalated.
+    expect(outcome).toEqual({ released: [], escalated: ['m-g'] });
+    expect(outDb.prepare("SELECT status FROM processing_ack WHERE message_id = 'm-g'").get()).toMatchObject({ status: 'failed' });
+    expect(incidents[0].details).toMatchObject({ gwsUncertainInputId: 'input-9' });
+  });
+
+  it('defers the whole pass loudly when a configured reconciliation store is unreadable', async () => {
+    const { inDb, outDb } = makeDbs();
+    inDb.prepare("INSERT INTO messages_in (id) VALUES ('m-u')").run();
+    reOwn(outDb, 'm-u');
+    const outcome = await releaseOrEscalateExpiredRecoveryAcks({
+      session, inDb, outDb, nowMs: NOW, ttlMs: TTL, maxAttempts: 3,
+      reconciliationStorePath: '/nonexistent-but-configured/store.jsonl',
+    });
+    // Neither released (unsafe) nor escalated (unfair): ack untouched, retried next sweep.
+    expect(outcome).toEqual({ released: [], escalated: [] });
+    expect(outDb.prepare("SELECT status FROM processing_ack WHERE message_id = 'm-u'").get()).toMatchObject({ status: 'recovery' });
+  });
+
+  it("keeps the escalated inbound status 'failed' after syncProcessingAcks runs (durability, V6 residue)", async () => {
+    const { inDb, outDb } = makeDbs();
+    inDb.prepare("INSERT INTO messages_in (id, channel_type, platform_id, recovery_wake_attempts) VALUES ('m-1', 'discord', 'chan-1', 3)").run();
+    reOwn(outDb, 'm-1');
+    await releaseOrEscalateExpiredRecoveryAcks({ session, inDb, outDb, nowMs: NOW, ttlMs: TTL, maxAttempts: 3 });
+    expect(inDb.prepare("SELECT status FROM messages_in WHERE id = 'm-1'").get()).toMatchObject({ status: 'failed' });
+    // One sweep later, step 1 must NOT rewrite the terminal 'failed' to 'completed'.
+    syncProcessingAcks(inDb, outDb);
+    expect(inDb.prepare("SELECT status FROM messages_in WHERE id = 'm-1'").get()).toMatchObject({ status: 'failed' });
+  });
 });
 ```
+
+(Add `syncProcessingAcks` and the fs/os/path imports to the test file's import lists. Note: `deferring` semantics apply only when `reconciliationStorePath` is DEFINED but unreadable; an undefined path — GWS reconciliation not configured — means an empty uncertain set. If the store path is defined but the file legitimately does not exist yet, decide the direction by content: mirror whatever `recoverGwsClaimPartitions` treats as "missing store" — fail toward deferral, never toward release.)
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -714,9 +768,11 @@ import type Database from 'better-sqlite3';
 import {
   deleteRecoveryAcks,
   failRecoveryAck,
+  getHostAcceptedInputId,
   getMessageRouting,
   getRecoveryWakeAttempts,
   incrementRecoveryWakeAttempts,
+  listGwsUncertainInputIds,
   listRecoveryAcks,
   markMessageFailed,
 } from './db/session-db.js';
@@ -738,6 +794,8 @@ export async function releaseOrEscalateExpiredRecoveryAcks(opts: {
   nowMs: number;
   ttlMs: number;
   maxAttempts: number;
+  /** GWS reconciliation store (env NANOCLAW_GWS_RECONCILIATION_STORE); undefined = GWS not configured. */
+  reconciliationStorePath?: string;
 }): Promise<RecoveryReleaseOutcome> {
   const expired = listRecoveryAcks(opts.outDb).filter(
     // Unparseable timestamps count as expired: fail loud, never fail hidden.
@@ -745,12 +803,41 @@ export async function releaseOrEscalateExpiredRecoveryAcks(opts: {
   );
   if (expired.length === 0) return { released: [], escalated: [] };
 
+  // R2 GWS-cleanliness gate (A8, validator-V5 N1): a row whose ORIGINAL
+  // accepted input has unresolved GWS reconciliation evidence must NEVER be
+  // auto-released — the re-run would repeat a GWS write whose outcome is
+  // unknown, and re-acceptance mints a NEW input_id so R8's fail-closed
+  // machinery structurally cannot catch it. Such rows escalate directly.
+  let gwsUncertainInputIds: Set<string>;
+  try {
+    gwsUncertainInputIds = listGwsUncertainInputIds(opts.reconciliationStorePath);
+  } catch (err) {
+    // Configured store unreadable: neither release (unsafe) nor terminally
+    // escalate (unfair to the message) — defer the whole pass LOUDLY and let
+    // the next sweep retry; R3's stale-ack escalation keeps alerting.
+    log.error('Recovery release pass deferred: GWS reconciliation store unreadable', {
+      sessionId: opts.session.id,
+      err,
+    });
+    return { released: [], escalated: [] };
+  }
+
   const toRelease: string[] = [];
   const toEscalate: string[] = [];
+  const gatedInputIds = new Map<string, string>();
   for (const ack of expired) {
-    (getRecoveryWakeAttempts(opts.inDb, ack.messageId) >= opts.maxAttempts ? toEscalate : toRelease).push(
-      ack.messageId,
-    );
+    const inputId = getHostAcceptedInputId(opts.inDb, ack.messageId);
+    const gwsUncertain = inputId !== null && gwsUncertainInputIds.has(inputId);
+    const exhausted = getRecoveryWakeAttempts(opts.inDb, ack.messageId) >= opts.maxAttempts;
+    (gwsUncertain || exhausted ? toEscalate : toRelease).push(ack.messageId);
+    if (gwsUncertain) {
+      gatedInputIds.set(ack.messageId, inputId!);
+      log.error('Recovery release blocked by unresolved GWS reconciliation; escalating', {
+        sessionId: opts.session.id,
+        messageId: ack.messageId,
+        inputId,
+      });
+    }
   }
 
   // Notices first (writeOutboundDirect owns its own short-lived write handle).
@@ -815,6 +902,8 @@ export async function releaseOrEscalateExpiredRecoveryAcks(opts: {
         messageId,
         maxAttempts: opts.maxAttempts,
         ttlMs: opts.ttlMs,
+        // Distinguishes gate escalations from attempt exhaustion for operators.
+        ...(gatedInputIds.has(messageId) ? { gwsUncertainInputId: gatedInputIds.get(messageId) } : {}),
       },
     });
   }
@@ -866,10 +955,42 @@ function supersedeRecoveryEntriesForMessage(outDbRw: Database.Database, messageI
 
 Adjust the `Session` import and the `log` import path to match the file's neighbors (`src/host-sweep.ts` imports both — copy its import specifiers).
 
+Also add the two gate helpers to `src/db/session-db.ts` (near the Task 2 helpers):
+
+```ts
+/** R2: the ORIGINAL accepted input id for a row (re-acceptance overwrites it). */
+export function getHostAcceptedInputId(inDb: Database.Database, messageId: string): string | null {
+  const row = inDb.prepare('SELECT host_accepted_input_id AS v FROM messages_in WHERE id = ?').get(messageId) as
+    | { v: string | null }
+    | undefined;
+  return row?.v ?? null;
+}
+
+/**
+ * R2 release gate: input_ids with GWS-uncertain evidence in the reconciliation
+ * store — incident records lacking a resolution record for their audit_id.
+ * Standalone lightweight scan (independent of the Task 6 reader rework).
+ * undefined path => empty set (GWS reconciliation not configured).
+ * Fail closed on unreadability: configured-but-missing file, truncated tail,
+ * unparseable line, or an incident whose input_id is not a non-empty string
+ * => THROW (callers defer their pass loudly rather than releasing).
+ */
+export function listGwsUncertainInputIds(reconciliationStorePath: string | undefined): Set<string> {
+  if (!reconciliationStorePath) return new Set();
+  // read file (throw if missing); enforce trailing-newline tail; JSON.parse each
+  // non-empty line (throw on failure); records with record_type === 'resolution'
+  // collect their audit_id; all other records are incidents: require a non-empty
+  // string input_id (throw otherwise), map audit_id -> input_id. Return the
+  // input_ids of incidents whose audit_id has no collected resolution.
+}
+```
+
+(Implement the sketched body — it deliberately reuses no Task 6 machinery so Task 3 lands first; Task 6's reader rework does not change this store format.)
+
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `pnpm exec vitest run src/recovery-escalation.test.ts`
-Expected: PASS (4 tests).
+Expected: PASS (7 tests).
 
 - [ ] **Step 5: Wire into `sweepSession` in `src/host-sweep.ts`**
 
@@ -896,6 +1017,8 @@ Insert between step 3 (crash recovery, ~:481-486) and step 4 (wake gate, ~:493):
           nowMs: Date.now(),
           ttlMs: RECOVERY_WAKE_TTL_MS,
           maxAttempts: RECOVERY_MAX_WAKE_ATTEMPTS,
+          // GWS-cleanliness release gate — same env source as recoverAfterKill.
+          reconciliationStorePath: process.env.NANOCLAW_GWS_RECONCILIATION_STORE,
         });
         if (outcome.released.length > 0 || outcome.escalated.length > 0) {
           log.info('Recovery wake TTL pass acted', {
@@ -912,6 +1035,26 @@ Insert between step 3 (crash recovery, ~:481-486) and step 4 (wake gate, ~:493):
 
 Import `releaseOrEscalateExpiredRecoveryAcks` from `./recovery-escalation.js`.
 
+- [ ] **Step 5b: Make the escalated 'failed' inbound status durable (V6 residue)**
+
+Without a guard, `syncProcessingAcks` (`src/db/session-db.ts` ~:366-411) flips the escalated row's inbound status back to `'completed'` one sweep later: the failed-ack branch funnels into the same `UPDATE messages_in SET status = 'completed' WHERE id = ? AND status != 'completed'` (~:407) as completed acks — the Task 3 tests would assert a status that does not survive production. Fix with status precedence: track which ack status put each id in the to-complete list, and for ids coming from `'failed'` acks use
+
+```ts
+  "UPDATE messages_in SET status = 'completed' WHERE id = ? AND status NOT IN ('completed', 'failed')"
+```
+
+so a host-escalated terminal `'failed'` is never silently rewritten (rows from `'completed'` acks keep the existing statement; a `pending` row behind a failed ack still completes, exactly as today). The durability test in Step 1 (`keeps the escalated inbound status 'failed' after syncProcessingAcks runs`) is the proof; also add a plain unit test beside the existing `syncProcessingAcks` suite in `src/db/session-db.test.ts`: a failed ack with a valid notice over an inbound row already `'failed'` leaves it `'failed'`, while one over a `'pending'` row still completes it.
+
+Run: `pnpm exec vitest run src/db/session-db.test.ts src/recovery-escalation.test.ts`
+Expected: PASS.
+
+- [ ] **Step 5c: Container-side proof that recovery context injects on a self-triggered wake (V5 N2)**
+
+The release path's safety story depends on the resumed turn seeing the `<recovery>` context — but the existing container test (`container/agent-runner/src/poll-loop.test.ts` ~:3217) only proves injection when a DIFFERENT due message wakes the route. Add a sibling test in that file for the released-row-as-its-own-wake-trigger case: arrange a `session_state` recovery entry (`pending`) whose `originalTasks` reference message `m-1`, leave `m-1` itself pending and UN-acked (exactly the post-release state — no other due message), run the poll loop turn, and assert the provider prompt contains the injected recovery context for that entry. Mirror the arrange/assert style of the ~:3217 test; only the wake trigger differs. If injection misses (route/provider scope key mismatch), that is a REAL bug in the release design — fix the scope keying, do not weaken the test.
+
+Run: `cd container/agent-runner && bun test src/poll-loop.test.ts`
+Expected: PASS.
+
 - [ ] **Step 6: Run the full host suite**
 
 Run: `pnpm test`
@@ -920,8 +1063,8 @@ Expected: PASS. If `src/host-sweep.test.ts` suites that drive `sweepSession` (re
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/recovery-escalation.ts src/recovery-escalation.test.ts src/host-sweep.ts
-git commit -m "feat(sweep): release or escalate recovery-owned rows past the wake TTL (R2)"
+git add src/recovery-escalation.ts src/recovery-escalation.test.ts src/host-sweep.ts src/db/session-db.ts src/db/session-db.test.ts container/agent-runner/src/poll-loop.test.ts
+git commit -m "feat(sweep): release or escalate recovery-owned rows past the wake TTL, gated on GWS cleanliness (R2)"
 ```
 
 ---
@@ -1113,23 +1256,26 @@ git commit -m "feat(scheduler): escalate stale unresolved acks to error incident
 
 ### Task 5: R6 — capture and persist container stderr
 
-Containers run with `--rm`; their stderr is logged at `log.debug` (below the prod threshold) and vanishes on exit — the dvora root error was permanently lost this way. Capture a byte-capped tail per container, log structured agent-runner events at info (rate-limited, truncated), and persist the tail into the session directory on every container exit.
+Containers run with `--rm`; their stderr is logged at `log.debug` (below the prod threshold) and vanishes on exit — the dvora root error was permanently lost this way. Capture a byte-capped tail per container, log structured agent-runner events at info (rate-limited, truncated), and persist the tail on every container exit into a HOST-SIDE sibling tree (`DATA_DIR/v2-container-logs/<ag>/<sid>/` — the `hostCorrelationDir` precedent, `src/session-manager.ts:78-80`), NEVER into the agent-writable `/workspace` session dir: crash evidence written where the incriminated agent can forge it is worthless, and host-privileged `mkdir`/`write`/`rm` inside an agent-owned tree without the repo's `O_NOFOLLOW`/`lstat` discipline would hand the agent a symlink-redirected host write/delete primitive (validator-V8). Retention is crash-privileged: clean-exit tails and crash tails rotate on SEPARATE budgets, so routine clean exits can never rotate away crash evidence before an operator looks (in the incident, operator latency was ~4 days; keep-newest-5-regardless would have recycled all slots within ~a day).
 
 **Files:**
 - Create: `src/container-stderr.ts` (pure helpers — no container-runner imports)
-- Modify: `src/container-runner.ts` (consts; `ActiveContainer` ~:95; stderr handler ~:413-421; `finalizeVerifiedContainerStop` ~:490)
+- Modify: `src/session-manager.ts` (export `containerLogsDir` next to `hostCorrelationDir` ~:78-80)
+- Modify: `src/container-runner.ts` (consts; `ActiveContainer` ~:95; stderr handler ~:413-421; `finalizeVerifiedContainerStop` ~:490-527, persist pinned after the LAST early return)
 - Test: `src/container-stderr.test.ts` (new), `src/container-runner.test.ts`
 
 **Interfaces:**
-- Consumes: `sessionDir(agentGroupId, sessionId)` from `src/session-manager.ts:59` (= `DATA_DIR/v2-sessions/<ag>/<sid>`; export it if not already exported); the container spawn scope (`agentGroup`, the `ActiveContainer` instance); exit scope in `finalizeVerifiedContainerStop` (`sessionId`, `code`, `current: ActiveContainer` — note: NO agent group in scope today, hence the new `agentGroupId` field).
-- Produces (all in `src/container-stderr.ts`):
+- Consumes: `hostCorrelationDir` precedent at `src/session-manager.ts:78-80` (host-owned per-session state OUTSIDE the agent-writable tree; created `mode: 0o700`); the container spawn scope (`agentGroup`, the `ActiveContainer` instance); exit scope in `finalizeVerifiedContainerStop` (`sessionId`, `code`, `current: ActiveContainer` — note: NO agent group in scope today, hence the new `agentGroupId` field).
+- Produces:
+  - `export function containerLogsDir(agentGroupId: string, sessionId: string): string` in `src/session-manager.ts` (next to `hostCorrelationDir`) = `path.join(DATA_DIR, 'v2-container-logs', agentGroupId, sessionId)` — host-owned, never mounted into any container.
+  - (all below in `src/container-stderr.ts`)
   - `export function splitStderrChunk(carry: string, chunk: string): { lines: string[]; carry: string }`
   - `export function parseStructuredStderrEvent(line: string): Record<string, unknown> | null` — accepts bare JSON lines and `[poll-loop] `-prefixed JSON lines; requires a string `event` field.
   - `export class StderrTail { constructor(maxBytes: number); append(line: string): void; contents(): string; }`
   - `export class MinuteRateLimiter { constructor(maxPerMinute: number); allow(nowMs: number): boolean; suppressed: number; }`
   - `export function truncateForLog(line: string, max?: number): string`
-  - `export function persistStderrTail(opts: { sessionDirPath: string; tail: StderrTail; exitCode: number | null; keep?: number; nowMs?: number }): string | null` — best-effort, never throws; writes `<sessionDirPath>/.nanoclaw/container-stderr/<iso-stamp>-exit-<code>.log`, keeps the newest `keep` files.
-  - `ActiveContainer` gains `agentGroupId: string; stderrTail: StderrTail; stderrEventLimiter: MinuteRateLimiter;`
+  - `export function persistStderrTail(opts: { logDir: string; tail: StderrTail; carry?: string; exitCode: number | null; keepClean?: number; keepCrash?: number; nowMs?: number }): string | null` — best-effort, never throws; flushes the final unterminated `carry` line into the tail, writes `<logDir>/<iso-stamp>-exit-<code>.log` (a null code is labeled `unknown`, never `null`), then rotates CLEAN tails (`-exit-0.log`) down to `keepClean` and CRASH tails (everything else) down to `keepCrash` INDEPENDENTLY.
+  - `ActiveContainer` gains `agentGroupId: string; stderrTail: StderrTail; stderrEventLimiter: MinuteRateLimiter; stderrState: { carry: string }; observedExitCode?: number | null;`
 
 - [ ] **Step 1: Write the failing unit tests**
 
@@ -1197,30 +1343,48 @@ describe('MinuteRateLimiter', () => {
 });
 
 describe('persistStderrTail', () => {
-  it('writes the tail into the session dir and rotates old files', () => {
+  function writeOne(dir: string, exitCode: number | null, text: string, second: number): string | null {
+    const tail = new StderrTail(4096);
+    tail.append(text);
+    return persistStderrTail({ logDir: dir, tail, exitCode, keepClean: 5, keepCrash: 5, nowMs: Date.UTC(2026, 6, 31, 12, 0, second) });
+  }
+
+  it('rotates clean and crash tails on SEPARATE budgets — clean exits never evict crash evidence', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stderr-tail-'));
-    for (let i = 0; i < 7; i++) {
-      const tail = new StderrTail(4096);
-      tail.append(`crash output ${i}`);
-      const file = persistStderrTail({
-        sessionDirPath: dir,
-        tail,
-        exitCode: 1,
-        keep: 5,
-        nowMs: Date.UTC(2026, 6, 31, 12, 0, i),
-      });
-      expect(file).not.toBeNull();
-    }
-    const files = fs.readdirSync(path.join(dir, '.nanoclaw', 'container-stderr'));
-    expect(files).toHaveLength(5);
-    const newest = files.sort().at(-1)!;
-    expect(fs.readFileSync(path.join(dir, '.nanoclaw', 'container-stderr', newest), 'utf8')).toContain('crash output 6');
+    writeOne(dir, 1, 'crash output A', 0);
+    writeOne(dir, null, 'crash output B (verify path, unknown code)', 1);
+    for (let i = 0; i < 9; i++) writeOne(dir, 0, `clean output ${i}`, 2 + i);
+    const files = fs.readdirSync(dir).sort();
+    const clean = files.filter((f) => f.endsWith('-exit-0.log'));
+    const crash = files.filter((f) => !f.endsWith('-exit-0.log'));
+    expect(clean).toHaveLength(5); // newest 5 clean kept
+    expect(crash).toHaveLength(2); // BOTH crash tails survive 9 clean exits
+    expect(crash.some((f) => f.endsWith('-exit-unknown.log'))).toBe(true); // never '-exit-null'
+    expect(fs.readFileSync(path.join(dir, crash[0]), 'utf8')).toContain('crash output A');
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  it('never throws and returns null for an empty tail or unwritable dir', () => {
+  it('rotates crash tails down to keepCrash among themselves', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stderr-tail-'));
+    for (let i = 0; i < 7; i++) writeOne(dir, 1, `crash output ${i}`, i);
+    const files = fs.readdirSync(dir).sort();
+    expect(files).toHaveLength(5);
+    expect(fs.readFileSync(path.join(dir, files.at(-1)!), 'utf8')).toContain('crash output 6');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('flushes the final unterminated carry line into the persisted tail', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stderr-tail-'));
+    const tail = new StderrTail(4096);
+    tail.append('complete line');
+    const file = persistStderrTail({ logDir: dir, tail, carry: 'FATAL: last words with no newline', exitCode: 1 });
+    expect(fs.readFileSync(file!, 'utf8')).toContain('FATAL: last words with no newline');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('never throws and returns null for an empty tail+carry or unwritable dir', () => {
     expect(
-      persistStderrTail({ sessionDirPath: '/nonexistent/no-perms', tail: new StderrTail(64), exitCode: 0 }),
+      persistStderrTail({ logDir: '/nonexistent/no-perms/x', tail: new StderrTail(64), exitCode: 0 }),
     ).toBeNull();
   });
 });
@@ -1319,37 +1483,61 @@ export function truncateForLog(line: string, max = 2000): string {
 }
 
 /**
- * Persist a stderr tail under <sessionDirPath>/.nanoclaw/container-stderr/,
- * keeping the newest `keep` files. Best-effort: returns the written path or
+ * Persist a stderr tail into the HOST-OWNED per-session log dir (a sibling
+ * tree outside the agent-writable workspace — see containerLogsDir; the
+ * hostCorrelationDir precedent). Never write these files into /workspace:
+ * the agent could forge or symlink-redirect its own crash evidence.
+ *
+ * Flushes the final unterminated `carry` line first (a crash's last line
+ * often lacks a trailing newline — plausibly the most important line).
+ * Labels a null exit code 'unknown' (verified stop), never 'null'.
+ * Rotation is crash-privileged: clean tails (-exit-0.log) and crash tails
+ * (everything else) rotate on SEPARATE budgets, so routine clean exits can
+ * never evict crash evidence. Best-effort: returns the written path or
  * null; NEVER throws (post-mortem capture must not break container teardown).
  */
 export function persistStderrTail(opts: {
-  sessionDirPath: string;
+  logDir: string;
   tail: StderrTail;
+  carry?: string;
   exitCode: number | null;
-  keep?: number;
+  keepClean?: number;
+  keepCrash?: number;
   nowMs?: number;
 }): string | null {
   try {
+    if (opts.carry) opts.tail.append(opts.carry);
     const contents = opts.tail.contents();
     if (!contents) return null;
-    const dir = path.join(opts.sessionDirPath, '.nanoclaw', 'container-stderr');
-    fs.mkdirSync(dir, { recursive: true });
+    fs.mkdirSync(opts.logDir, { recursive: true, mode: 0o700 });
     const stamp = new Date(opts.nowMs ?? Date.now()).toISOString().replace(/[:.]/g, '-');
-    const file = path.join(dir, `${stamp}-exit-${opts.exitCode ?? 'null'}.log`);
+    const file = path.join(opts.logDir, `${stamp}-exit-${opts.exitCode ?? 'unknown'}.log`);
     fs.writeFileSync(file, `${contents}\n`);
-    const keep = opts.keep ?? 5;
+    const isClean = (f: string): boolean => f.endsWith('-exit-0.log');
     const entries = fs
-      .readdirSync(dir)
+      .readdirSync(opts.logDir)
       .filter((f) => f.endsWith('.log'))
       .sort();
-    for (const stale of entries.slice(0, Math.max(0, entries.length - keep))) {
-      fs.rmSync(path.join(dir, stale), { force: true });
-    }
+    const prune = (names: string[], keep: number): void => {
+      for (const stale of names.slice(0, Math.max(0, names.length - keep))) {
+        fs.rmSync(path.join(opts.logDir, stale), { force: true });
+      }
+    };
+    prune(entries.filter(isClean), opts.keepClean ?? 5);
+    prune(entries.filter((f) => !isClean(f)), opts.keepCrash ?? 5);
     return file;
   } catch {
     return null;
   }
+}
+```
+
+Add to `src/session-manager.ts` (next to `hostCorrelationDir`, ~:78-80):
+
+```ts
+/** R6: host-owned per-session container stderr tails — OUTSIDE the agent-writable session tree, never mounted. */
+export function containerLogsDir(agentGroupId: string, sessionId: string): string {
+  return path.join(DATA_DIR, 'v2-container-logs', agentGroupId, sessionId);
 }
 ```
 
@@ -1366,7 +1554,10 @@ Add consts near the file's other config reads:
 /** R6: byte cap for the per-container stderr tail persisted on exit. */
 export const CONTAINER_STDERR_TAIL_BYTES = (Number(process.env.NANOCLAW_CONTAINER_STDERR_TAIL_KB) || 64) * 1024;
 export const CONTAINER_STDERR_EVENTS_PER_MIN = Number(process.env.NANOCLAW_CONTAINER_STDERR_EVENTS_PER_MIN) || 30;
+/** Clean-exit (-exit-0) tails kept per session. */
 export const CONTAINER_STDERR_KEEP_FILES = Number(process.env.NANOCLAW_CONTAINER_STDERR_KEEP_FILES) || 5;
+/** Crash tails (nonzero/unknown exit) kept per session — rotated SEPARATELY so clean exits never evict crash evidence. */
+export const CONTAINER_STDERR_KEEP_CRASH_FILES = Number(process.env.NANOCLAW_CONTAINER_STDERR_KEEP_CRASH_FILES) || 5;
 ```
 
 Extend the `ActiveContainer` interface (~:95) with:
@@ -1375,6 +1566,10 @@ Extend the `ActiveContainer` interface (~:95) with:
   agentGroupId: string;
   stderrTail: StderrTail;
   stderrEventLimiter: MinuteRateLimiter;
+  /** Mutable holder for the final unterminated stderr line (flushed at persist time). */
+  stderrState: { carry: string };
+  /** Real exit code recorded by the 'close' handler — the verify path finalizes with code=null. */
+  observedExitCode?: number | null;
 ```
 
 and initialize them where the `ActiveContainer` object is constructed in `spawnContainer` (`agentGroup` is in scope there):
@@ -1383,15 +1578,16 @@ and initialize them where the `ActiveContainer` object is constructed in `spawnC
   agentGroupId: agentGroup.id,
   stderrTail: new StderrTail(CONTAINER_STDERR_TAIL_BYTES),
   stderrEventLimiter: new MinuteRateLimiter(CONTAINER_STDERR_EVENTS_PER_MIN),
+  stderrState: { carry: '' },
 ```
 
-Replace the stderr handler (~:413-421 — currently `for (const line of data.toString().trim().split('\n')) { if (line) log.debug(...) }`). If the handler is attached before the `ActiveContainer` object exists, create the tail/limiter as locals first and reference the same instances from the `ActiveContainer` initializer:
+Replace the stderr handler (~:413-421 — currently `for (const line of data.toString().trim().split('\n')) { if (line) log.debug(...) }`). If the handler is attached before the `ActiveContainer` object exists, create the tail/limiter/state as locals first and reference the SAME instances from the `ActiveContainer` initializer (the shared `stderrState` object is what lets finalize flush the last partial line):
 
 ```ts
-  let stderrCarry = '';
+  const stderrState = { carry: '' };
   container.stderr?.on('data', (data) => {
-    const { lines, carry } = splitStderrChunk(stderrCarry, data.toString());
-    stderrCarry = carry;
+    const { lines, carry } = splitStderrChunk(stderrState.carry, data.toString());
+    stderrState.carry = carry;
     for (const line of lines) {
       stderrTail.append(line);
       const event = parseStructuredStderrEvent(line);
@@ -1413,22 +1609,30 @@ Replace the stderr handler (~:413-421 — currently `for (const line of data.toS
   });
 ```
 
-In `finalizeVerifiedContainerStop` (~:490 — has `sessionId`, `code`, and the `ActiveContainer` as `current` or similar; match the local variable name), add before the container bookkeeping is torn down:
+Record the real exit code where the `close` handler calls into finalization (~:428-439): set `current.observedExitCode = code` before invoking `finalizeContainerProcess` — the verify path (`verifyContainerProcessExited`, ~:727-748) finalizes with `code = null`, and a verified stop must not be stamped as `-exit-null`.
+
+In `finalizeVerifiedContainerStop` (~:490-527 — has `sessionId`, `code`, and the `ActiveContainer` as `current`; match the local variable name), the placement is PINNED: immediately AFTER the second `activeContainers.get(sessionId) !== current` recheck (~:524) and BEFORE `activeMcpBridges.delete(sessionId)` (~:526). The function has FOUR early `return false` exits before that point (no daemon-stop proof ~:496-503, owner mismatch ~:504, revocation failure ~:520-523, second mismatch ~:524); each failed attempt retains the `ActiveContainer` (and its in-memory tail) and finalization is retried, so this placement persists EXACTLY ONE tail per successful finalization — a top-of-function placement would write a new file per retry and rotate genuine crash tails away (validator-V8). Add there:
 
 ```ts
   // R6: containers are --rm; this tail is the only surviving copy of stderr.
+  // Placement pinned after the last early return: exactly one file per
+  // successful finalization, no retry-driven rotation pressure.
+  const exitCode = code ?? current.observedExitCode ?? null; // null persists as '-exit-unknown'
   const persisted = persistStderrTail({
-    sessionDirPath: sessionDir(current.agentGroupId, sessionId),
+    logDir: containerLogsDir(current.agentGroupId, sessionId),
     tail: current.stderrTail,
-    exitCode: code,
-    keep: CONTAINER_STDERR_KEEP_FILES,
+    carry: current.stderrState.carry, // flush the final unterminated line
+    exitCode,
+    keepClean: CONTAINER_STDERR_KEEP_FILES,
+    keepCrash: CONTAINER_STDERR_KEEP_CRASH_FILES,
   });
+  current.stderrState.carry = '';
   if (persisted) {
-    log.info('Persisted container stderr tail', { sessionId, exitCode: code, file: persisted });
+    log.info('Persisted container stderr tail', { sessionId, exitCode, file: persisted });
   }
 ```
 
-Import `sessionDir` from `./session-manager.js` (export it there if it is currently module-private) and the helpers from `./container-stderr.js`.
+Import `containerLogsDir` from `./session-manager.js` and the helpers from `./container-stderr.js`. Do NOT write anything under `sessionDir(…)`/`/workspace` — no mkdir, write, or rm in agent-owned paths (symlink-redirect hazard; the repo's `O_NOFOLLOW` discipline in `session-manager.ts:331-351` exists for exactly this reason).
 
 - [ ] **Step 6: Write the integration test**
 
@@ -1436,11 +1640,12 @@ In `src/container-runner.test.ts`, using the existing `loadContainerRunnerHarnes
 
 ```ts
 describe('container stderr capture (R6)', () => {
-  it('logs structured events at info, survives chunk splits, and persists the tail on exit', async () => {
+  it('logs structured events at info, survives chunk splits, flushes the last partial line, and persists the tail on exit', async () => {
     // Arrange: spawn a session container via the harness (copy the wake
     // fixture from the lifecycle suite), grab the fake child process.
     child.stderr.emit('data', Buffer.from('{"severity":"error","ev'));
-    child.stderr.emit('data', Buffer.from('ent":"fatal_error","error":"boom"}\nplain noise\n'));
+    child.stderr.emit('data', Buffer.from('ent":"fatal_error","error":"boom"}\nplain noise\nFATAL last words'));
+    // (note: 'FATAL last words' has NO trailing newline — it exercises the carry flush)
     // Assert the structured event was logged at info with the reassembled line.
     // (Spy on log.info via the harness's mocked log module, or capture stdout —
     // match how neighboring tests assert log output.)
@@ -1448,19 +1653,23 @@ describe('container stderr capture (R6)', () => {
     // Act: drive the fake process exit the same way the lifecycle tests do
     // (emit 'close' with code 1 and let finalization run).
 
-    // Assert: the tail file exists under the harness DATA_DIR.
-    const dir = path.join(DATA_DIR, 'v2-sessions', 'ag-1', sessionId, '.nanoclaw', 'container-stderr');
+    // Assert: the tail file exists in the HOST-SIDE log tree — NOT under
+    // v2-sessions (nothing may be written into the agent-writable workspace).
+    const dir = path.join(DATA_DIR, 'v2-container-logs', 'ag-1', sessionId);
     const files = fs.readdirSync(dir);
     expect(files).toHaveLength(1);
     const contents = fs.readFileSync(path.join(dir, files[0]), 'utf8');
     expect(contents).toContain('"event":"fatal_error"');
     expect(contents).toContain('plain noise');
+    expect(contents).toContain('FATAL last words'); // carry flushed at persist time
     expect(files[0]).toContain('-exit-1');
+    // Negative: the agent-writable session dir got NOTHING new.
+    expect(fs.existsSync(path.join(DATA_DIR, 'v2-sessions', 'ag-1', sessionId, '.nanoclaw'))).toBe(false);
   });
 });
 ```
 
-Fill the arrange/act sections by copying the closest existing lifecycle test in the file — the harness owns spawn wiring, DATA_DIR, and exit finalization; this test only adds stderr emissions and the file assertions. The exit path must reach `finalizeVerifiedContainerStop` (the lifecycle suite already exercises it).
+Fill the arrange/act sections by copying the closest existing lifecycle test in the file — the harness owns spawn wiring, DATA_DIR, and exit finalization; this test only adds stderr emissions and the file assertions. The exit path must reach `finalizeVerifiedContainerStop` (the lifecycle suite already exercises it) — and because the persist is pinned after the LAST early return, the harness fixture must let finalization SUCCEED (daemon-stop proof + revocation), same as the passing lifecycle tests.
 
 - [ ] **Step 7: Run the suites**
 
@@ -1470,8 +1679,8 @@ Expected: PASS.
 - [ ] **Step 8: Commit**
 
 ```bash
-git add src/container-stderr.ts src/container-stderr.test.ts src/container-runner.ts src/container-runner.test.ts
-git commit -m "feat(container): surface structured stderr events and persist a stderr tail per exit (R6)"
+git add src/container-stderr.ts src/container-stderr.test.ts src/container-runner.ts src/container-runner.test.ts src/session-manager.ts
+git commit -m "feat(container): surface structured stderr events and persist crash-privileged stderr tails host-side (R6)"
 ```
 
 
@@ -1482,11 +1691,12 @@ git commit -m "feat(container): surface structured stderr events and persist a s
 One GWS reconciliation record with an em dash (U+2014) in `search_hints[0]` blocked `recoverGwsClaimPartitions` for EVERY session host-wide for 4 days, because the reader validates the whole shared JSONL store before any scope filtering. Rework (Dan's decision): (i) ADVISORY fields are sanitized on read, never a validation failure; (ii) LOAD-BEARING fields keep strict validation but a failing record is QUARANTINED individually — fail-closed for that record's `input_id` only, with a loud error incident; (iii) whole-file fail-closed remains ONLY for file-level corruption (unparseable JSON, truncated tail, missing store).
 
 Field classification (from the reader at `src/db/session-db.ts:917-1094`):
-- LOAD-BEARING (strict `canonicalAscii`/timestamp validation, quarantine on failure): `schema_version`, `record_type`, `audit_id`, `account`, `input_id`, `route_key`, `operation`, `started_at`, `ended_at`, `disposition`, `resolved_at`; unknown fields and duplicate `audit_id` also quarantine (same fail-closed class, now scoped).
+- IDENTITY (fail-closed at FILE level, validator-V7 / A12): an INCIDENT record's `input_id`. If it is missing, non-string, or fails `canonicalAscii(·, 512)`, the record structurally cannot contribute to `blockedInputIds` — quarantining it would let recovery re-run a GWS-uncertain input (a regression vs today's whole-file fail-closed). Unreadable identity is therefore FILE-level fatal, the same class as unparseable JSON. (Resolution-record identity corruption stays quarantine-safe: its incident remains unresolved and the retained missing-resolution throw backstops it — V7 cases 8-10.)
+- LOAD-BEARING (strict `canonicalAscii`/timestamp validation, quarantine on failure): `schema_version`, `record_type`, `audit_id`, `account`, `route_key`, `operation`, `started_at`, `ended_at`, `disposition`, `resolved_at`; unknown fields and duplicate `audit_id` also quarantine (same fail-closed class, now scoped).
 - ADVISORY (sanitize via transliteration, never fail): `outcome`, `resource_type`, `search_hints` elements, resolution `operator` and `note`. `search_hints` is validated-then-discarded today (never emitted) — absence/non-array is tolerated as `[]`. `operator`/`note`/`outcome`/`resource_type` must still be present strings (structural absence = uncertainty = quarantine), but their CONTENT can never fail.
 - Already-unvalidated allow-listed fields (`account_label`, `account_email`, `service`, `method`, `requested_title`, `parent`, `workspace`, `returned_id`, `profile`, `payload`, `signature`) stay as they are.
 
-Blast-radius semantics after this task: a malformed record belonging to ANOTHER session's input quarantines quietly (error incident, everything else proceeds). A malformed record matching one of THIS session's in-flight accepted inputs blocks THIS session's recovery only (claims stay `processing`, no reset, no wake — identical safety to today's freeze, because waking would let container startup clear the processing acks and re-run a GWS-uncertain input). The missing-resolution throw (`requires manual reconciliation before accepted input … can resume`) keeps its existing per-scope throw semantics.
+Blast-radius semantics after this task: a malformed record belonging to ANOTHER session's input quarantines quietly (error incident, everything else proceeds). A malformed record matching one of THIS session's in-flight accepted inputs blocks THIS session's recovery only (claims stay `processing`, no reset, no wake — identical safety to today's freeze, because waking would let container startup clear the processing acks and re-run a GWS-uncertain input). "Matching" presumes the identity field survives — which is exactly why an incident with UNREADABLE `input_id` cannot be scoped and stays FILE-level fatal (whole store rejected, all sessions blocked — the correct narrow residue of today's behavior). The missing-resolution throw (`requires manual reconciliation before accepted input … can resume`) keeps its existing per-scope throw semantics.
 
 **Files:**
 - Modify: `src/db/session-db.ts` (`transliterateToAscii`; reader rename + rework at ~:917-1094)
@@ -1547,6 +1757,35 @@ it('quarantines an unknown-field record instead of halting all recovery host-wid
   const { reconciliations, quarantined } = readGwsReconciliationRecords({ reconciliationStorePath, scopes });
   expect(reconciliations).toHaveLength(1);
   expect(quarantined[0].reason).toContain('unknown field');
+});
+
+// A12 fail-closed (validator-V7): identity corruption on an INCIDENT record
+// must be FILE-level fatal — a quarantined-and-skipped record with unreadable
+// input_id structurally cannot contribute to blockedInputIds, so recovery
+// would re-run a GWS-uncertain input.
+it.each([
+  ['non-ASCII byte in input_id', (incident: Record<string, unknown>) => { incident.input_id = 'input-\u00e91'; }],
+  ['missing input_id', (incident: Record<string, unknown>) => { delete incident.input_id; }],
+  ['non-string input_id', (incident: Record<string, unknown>) => { incident.input_id = 42; }],
+])('fails the whole store closed on an incident with unreadable identity: %s', (_name, mutate) => {
+  // Happy-path incident fixture with `mutate(incident)` applied, written to the store.
+  expect(() => readGwsReconciliationRecords({ reconciliationStorePath, scopes })).toThrow(/identity|input_id/i);
+});
+
+it('fails the whole store closed on non-UTF8 bytes inside input_id', () => {
+  // Write the incident line with raw bytes: replace a byte of the input_id value
+  // with 0xFF via Buffer surgery before writeFileSync. readFileSync(..., 'utf8')
+  // turns it into U+FFFD, which fails canonicalAscii -> unreadable identity.
+  expect(() => readGwsReconciliationRecords({ reconciliationStorePath, scopes })).toThrow(/identity|input_id/i);
+});
+
+it('keeps quarantine (not file-fatal) for corrupted record_type or mangled audit_id with INTACT input_id', () => {
+  // Two out-of-scope records: one with record_type 'resoluti\u00f8n' + intact ids,
+  // one incident with audit_id 'a-\u00e9' + intact input_id 'other-input'.
+  const { reconciliations, quarantined } = readGwsReconciliationRecords({ reconciliationStorePath, scopes });
+  expect(reconciliations).toHaveLength(1); // in-scope work proceeds
+  expect(quarantined.length).toBeGreaterThanOrEqual(2);
+  expect(quarantined.every((q) => typeof q.inputId === 'string' || q.reason.includes('resolution'))).toBe(true);
 });
 ```
 
@@ -1647,7 +1886,7 @@ export interface GwsReconciliationReadResult {
 }
 ```
 
-Rename `assertNoUnresolvedGwsReconciliationRecords` → `readGwsReconciliationRecords`, return type `GwsReconciliationReadResult`, and rework the parse loop. Keep UNCHANGED: the missing-path throw, the truncated-tail throw, the per-line `JSON.parse` throw and non-object throw (file-level corruption), `canonicalAscii`, `canonicalTimestamp`, the allow-list sets. Restructure the rest of the loop (currently :972-1036) as follows — a line counter and quarantine helper first:
+Rename `assertNoUnresolvedGwsReconciliationRecords` → `readGwsReconciliationRecords`, return type `GwsReconciliationReadResult`, and rework the parse loop. Keep UNCHANGED: the missing-path throw, the truncated-tail throw, the per-line `JSON.parse` throw and non-object throw (file-level corruption), `canonicalAscii`, `canonicalTimestamp`, the allow-list sets. NEW file-level throw (A12): an INCIDENT record with unreadable identity (see the incident branch below) — same class as unparseable JSON. Restructure the rest of the loop (currently :972-1036) as follows — a line counter and quarantine helper first (the `inputId: string | null` tolerance in the helper exists for RESOLUTION records only; incidents with unreadable identity never reach `quarantine`):
 
 ```ts
   const quarantined: QuarantinedGwsReconciliationRecord[] = [];
@@ -1728,7 +1967,17 @@ Incident branch:
           .filter((hint): hint is string => typeof hint === 'string')
           .map((hint) => transliterateToAscii(hint, 2048))
       : []; // hints are never consumed downstream; absence is tolerated
-    // LOAD-BEARING validation: failure quarantines THIS record only.
+    // IDENTITY validation FIRST — FILE-level fatal, NOT quarantine (A12,
+    // validator-V7): an incident whose input_id is unreadable structurally
+    // cannot contribute to blockedInputIds; quarantining it would let
+    // recovery re-run a GWS-uncertain input. Same class as unparseable JSON.
+    if (!canonicalAscii(incident.input_id, 512)) {
+      throw new Error(
+        `GWS reconciliation store line ${lineNumber}: incident identity (input_id) is missing or unreadable — failing closed`,
+      );
+    }
+    // LOAD-BEARING validation: failure quarantines THIS record only (its
+    // readable input_id still blocks the matching scope via the caller gate).
     if (
       incident.schema_version !== 2 ||
       !canonicalAscii(incident.audit_id, 256) ||
@@ -1738,7 +1987,6 @@ Incident branch:
       typeof incident.resource_type !== 'string' ||
       incident.resource_type.length === 0 ||
       !canonicalAscii(incident.account, 512) ||
-      !canonicalAscii(incident.input_id, 512) ||
       !canonicalAscii(incident.route_key, 512) ||
       !canonicalAscii(incident.operation, 512) ||
       !canonicalTimestamp(incident.started_at) ||
@@ -1792,7 +2040,9 @@ In `recoverAfterKill` (~:1352-1420), at the `recoverGwsClaimPartitions` call sit
           sessionId: session.id,
           agentGroupId: session.agent_group_id,
           message: `GWS reconciliation record quarantined (${q.reason}); ${
-            q.inputId ? `input ${q.inputId} is blocked from recovery` : 'no in-flight input affected'
+            q.inputId
+              ? `input ${q.inputId} is blocked from recovery`
+              : 'resolution-side record — its incident stays unresolved and remains blocked'
           }. Fix the store record to unblock.`,
           details: { reason: 'gws-reconciliation-quarantine', ...q },
         });
@@ -1802,11 +2052,16 @@ In `recoverAfterKill` (~:1352-1420), at the `recoverGwsClaimPartitions` call sit
           sessionId: session.id,
           blockedInputIds: result.blockedInputIds,
         });
-        return; // exactly the old throw path's observable behavior: no reset, no wake
+        return { blocked: true }; // no reset, no wake — see the async restructuring below
       }
 ```
 
-Match the surrounding control flow: today a reader throw propagates out of the recovery pass so the session is not reset and not woken — the `return` above must land at the equivalent point (before any ack reset / `shouldWake` assignment). Read the function before placing it.
+(With the A12 fail-closed rule, a quarantined record with `inputId === null` can only be a RESOLUTION record — incident identity corruption throws at file level before quarantine — so the message must not claim "no in-flight input affected": the system cannot know that; the unresolved incident keeps its input blocked via the missing-resolution throw.)
+
+**Async restructuring (REQUIRED — A11-N1, validator-V6):** the snippet above cannot be dropped verbatim into the current wiring. `recoverGwsClaimPartitions` is called inside the `writeRecovery: () => {…}` callback (`src/host-sweep.ts` ~:1396-1413), which is SYNCHRONOUS and invoked WITHOUT await at ~:773 (`opts.writeRecovery();` inside `recoverInterruptedTurn`). Placed there verbatim, (a) the `await reportSchedulerIncident(...)` calls become floating promises, and (b) the bare `return` exits only the callback — `clearProviderToolState` + `resetStuckProcessingRows` + the wake (~:777-781) STILL run, the exact opposite of "no reset, no wake". Restructure explicitly:
+- Change the `writeRecovery` option type (in `recoverInterruptedTurn` and `recoverInterruptedTurnBounded`'s opts) to `writeRecovery: () => Promise<{ blocked: boolean }>`.
+- Make the callback `async`, put the quarantine incident loop + blocked check above INSIDE it, and return `{ blocked: blockedInputIds.length > 0 }`.
+- At the invocation site (~:773): `const recovery = await opts.writeRecovery(); if (recovery.blocked) return;` — placed BEFORE `clearProviderToolState`/`resetStuckProcessingRows` and the wake, so a quarantine-blocked session is genuinely not reset and not woken (the enclosing function is already async). Update every other `writeRecovery` provider (tests included) to the new async signature.
 
 `src/yente/operator-gws-session.ts` (~:213-216): destructure the new shape; the operator flow has exactly one scope, so keep its fail-closed posture:
 
@@ -1818,7 +2073,7 @@ Match the surrounding control flow: today a reader throw propagates out of the r
     }
 ```
 
-(and use `reconciliations` wherever the old return value was used).
+(and use `reconciliations` wherever the old return value was used). The same identity rule protects this path with no extra code: an incident with unreadable `input_id` makes `readGwsReconciliationRecords` THROW at file level (A12 fix above), so the operator flow fails closed rather than matching `null` against its scope — do NOT add a null-tolerant branch here.
 
 - [ ] **Step 5: Run tests to verify they pass**
 
@@ -1836,37 +2091,40 @@ git commit -m "fix(gws): sanitize advisory reconciliation fields and quarantine 
 
 ### Task 7: R9a — host-side hot-journal recovery + delivery loop containment
 
-A crashed container leaves a hot `outbound.db-journal`. Session DBs are `journal_mode = DELETE` by invariant, and the host's steady-state opens are read-only — which CANNOT roll a hot journal back: every first statement throws `SQLITE_READONLY_ROLLBACK` ("attempt to write a readonly database"). Nothing classifies that code, so delivery's `pollActive`/`pollSweep` (whose try wraps the whole for-loop) abort the remaining sessions every tick, and the sweep throws at `syncProcessingAcks` before recovery/wake/SLA — a self-sustaining wedge (the only routine RW opener is the container, which only starts if the sweep wakes it). Fix: probe on read-only open; on `SQLITE_READONLY_ROLLBACK` perform ONE guarded write-mode open to roll the journal back (loudly logged — the guard is intrinsic: a hot journal means the writer is dead, so no live lock exists), then reopen read-only. Also contain delivery errors per session.
+A crashed container leaves a hot `outbound.db-journal`. Session DBs are `journal_mode = DELETE` by invariant, and the host's steady-state opens are read-only — which CANNOT roll a hot journal back: every first statement throws `SQLITE_READONLY_ROLLBACK` ("attempt to write a readonly database"). Nothing classifies that code, so delivery's `pollActive`/`pollSweep` (whose try wraps the whole for-loop) abort the remaining sessions every tick, and the sweep throws at `syncProcessingAcks` before recovery/wake/SLA — a self-sustaining wedge (the only routine RW opener is the container, which only starts if the sweep wakes it). Fix: probe on read-only open; on `SQLITE_READONLY_ROLLBACK` perform ONE gated write-mode open to roll the journal back (loudly logged), then reopen read-only. The guard is EXTRINSIC and host-local, NOT SQLite locking: cross-mount fcntl lock propagation between host and container is unverifiable (validator-V2), so "hot journal ⇒ dead writer" must not be trusted against a possibly-live container writer. The healing RW open therefore runs ONLY where the host has verified the session's container is not running: `sweepSession`'s outbound open, gated on `!isContainerRunning(session.id)` and always before the wake gate (~:501-504). That gated open also covers the post-crash window — a nonzero container exit schedules `scheduleUnexpectedExitRecovery` (`src/container-runner.ts:545,593`) → `recoverSessionAfterUnexpectedExit` → `sweepSession`, so a crashed container's journal is healed on the next sweep, before any wake. The 1s delivery poll NEVER heals inline: on `SQLITE_READONLY_ROLLBACK` it treats the session as transiently contained and defers healing to the gated sweep path. Detection stays keyed on the exact code `SQLITE_READONLY_ROLLBACK` (verified 16/16 trials: the message text is the generic "attempt to write a readonly database", so code-keyed detection is both necessary and correct). Also contain delivery errors per session.
 
 **Files:**
 - Modify: `src/db/session-db.ts` (`isHotJournalError`, `openOutboundDbReadOnlyHealing`)
 - Modify: `src/session-manager.ts` (`openOutboundDbHealing` wrapper)
-- Modify: `src/delivery.ts` (`drainSession` open at ~:293; `deliverSessionMessages` catch at ~:163-199)
-- Modify: `src/host-sweep.ts` (`sweepSession` outbound open at ~:429-436)
-- Test: `src/db/session-db.test.ts`, `src/delivery.test.ts`
+- Modify: `src/delivery.ts` (`deliverSessionMessages` catch at ~:163-199 — `drainSession`'s plain read-only open at ~:293 stays as-is: no inline heal)
+- Modify: `src/host-sweep.ts` (`sweepSession` outbound open at ~:429-436, gated on `!isContainerRunning`)
+- Test: `src/db/session-db.test.ts`, `src/delivery.test.ts`, `src/host-sweep.test.ts` (heal gate)
 
 **Interfaces:**
 - Consumes: better-sqlite3 facts — the constructor does NOT read the DB file (a hot journal throws on the FIRST statement, not at open); errors are `SqliteError` with string `.code`; `{ readonly: true }` opens read-only.
 - Produces:
   - `export function isHotJournalError(err: unknown): boolean` (session-db.ts) — `.code === 'SQLITE_READONLY_ROLLBACK'`.
-  - `export function openOutboundDbReadOnlyHealing(dbPath: string, onHotJournal?: (dbPath: string) => void): Database.Database` (session-db.ts) — pure DB layer; callers supply the logger via callback.
-  - `export function openOutboundDbHealing(agentGroupId: string, sessionId: string): Database.Database` (session-manager.ts) — wrapper that logs `log.error('Hot outbound journal detected; performing guarded write-mode rollback', …)` in the callback.
+  - `export function openOutboundDbReadOnlyHealing(dbPath: string, onHotJournal?: (dbPath: string) => void): Database.Database` (session-db.ts) — pure DB layer; callers supply the logger via callback. SAFETY CONTRACT: the caller must have verified no container writer can be live on this DB.
+  - `export function openOutboundDbHealing(agentGroupId: string, sessionId: string): Database.Database` (session-manager.ts) — wrapper that logs `log.error('Hot outbound journal detected; performing gated write-mode rollback', …)` in the callback. Call ONLY from sites that hold the container-not-running guard (the gated sweep open below); never from the delivery poll.
 
 - [ ] **Step 1: Write the failing unit test (with the hot-journal fixture)**
 
-Add to `src/db/session-db.test.ts`. The `plantHotJournal` helper materializes a REAL hot journal deterministically: copy the live rollback journal aside mid-transaction, commit, then restore the copied journal — the restored journal has a valid header and no owning process, which is precisely SQLite's "hot" condition.
+Add to `src/db/session-db.test.ts`. The `plantHotJournal` helper materializes a REAL hot journal: copy the live rollback journal aside mid-transaction (AFTER forcing a journal spill/sync so the header magic is written), commit, then restore the copied journal — the restored journal has a valid header and no owning process, which is precisely SQLite's "hot" condition. The `cache_size = 10` pragma is load-bearing: SQLite writes the 8-byte journal header magic only at SYNC time (commit or cache spill); with the default pager cache a ~1MB write leaves the on-disk journal header ZEROED, and the copied journal is a dud SQLite silently ignores (verified failing 5/5 without the pragma; hot 5/5 with it — validator-V1).
 
 ```ts
 function plantHotJournal(dbPath: string): void {
   const db = new Database(dbPath);
   db.pragma('journal_mode = DELETE');
+  // Tiny pager cache forces a mid-transaction journal spill+sync, which is
+  // what writes the journal header magic. Without this the journal FILE
+  // exists but its header is zeroed and SQLite ignores it (not hot).
+  db.pragma('cache_size = 10');
   db.exec('CREATE TABLE IF NOT EXISTS filler (id INTEGER PRIMARY KEY, data BLOB)');
   db.exec('BEGIN IMMEDIATE');
-  // A large write forces journal spill to disk before COMMIT.
   db.prepare('INSERT INTO filler (data) VALUES (?)').run(Buffer.alloc(1024 * 1024));
   const journalPath = `${dbPath}-journal`;
   if (!fs.existsSync(journalPath) || fs.statSync(journalPath).size === 0) {
-    throw new Error('test setup failed to materialize a rollback journal — increase the blob size');
+    throw new Error('test setup failed to materialize a rollback journal');
   }
   fs.copyFileSync(journalPath, `${journalPath}.saved`);
   db.exec('COMMIT');
@@ -1904,7 +2162,7 @@ describe('openOutboundDbReadOnlyHealing (R9)', () => {
 });
 ```
 
-If the sanity assertion ever fails (SQLite ignoring the planted journal), strengthen `plantHotJournal` (larger blob, or copy the journal later in the transaction) until the sanity assertion passes — the sanity assertion is the definition of "hot" here. If `filler` collides with the outbound schema, use any new table name.
+The RO-probe sanity assertion is the DEFINITION of "hot" here — the fixture's `existsSync`/`size>0` guard cannot detect a dud journal (the file exists either way; only the header magic differs). If the sanity assertion ever fails, the spill did not happen: shrink `cache_size` further or grow the blob until it passes ("copy the journal later in the transaction" does NOT help — magic is written at sync, not later in wall-clock time). If `filler` collides with the outbound schema, use any new table name. Note for every journal assertion in this plan: a healing (or any RW) open leaves a NON-hot dud journal IN PLACE — `existsSync(…-journal) === false` assertions are only valid when the fixture planted a genuinely hot journal.
 
 - [ ] **Step 2: Run to verify it fails**
 
@@ -1927,10 +2185,16 @@ export function isHotJournalError(err: unknown): boolean {
 /**
  * R9: read-only outbound open that heals a crashed writer's hot journal.
  * better-sqlite3 constructors don't read the file, so we PROBE with one
- * statement; on SQLITE_READONLY_ROLLBACK we perform ONE guarded write-mode
- * open (safe: a hot journal means no live writer holds the lock — a live
- * writer would surface as SQLITE_BUSY instead) whose first read rolls the
- * journal back, then reopen read-only. Callers log via onHotJournal.
+ * statement; on SQLITE_READONLY_ROLLBACK we perform ONE write-mode open
+ * whose first read rolls the journal back, then reopen read-only. Callers
+ * log via onHotJournal.
+ *
+ * SAFETY CONTRACT: the caller must have verified that no container writer
+ * can be live on this DB (host-local `!isContainerRunning` knowledge).
+ * Cross-mount fcntl lock propagation between host and container is
+ * UNVERIFIED (validator-V2), so SQLite locking must not be trusted to stop
+ * a concurrent rollback against a live writer — rolling back a live
+ * transaction is SQLite's documented corruption class.
  */
 export function openOutboundDbReadOnlyHealing(
   dbPath: string,
@@ -1972,10 +2236,14 @@ export function openOutboundDbReadOnlyHealing(
 In `src/session-manager.ts` (next to `openOutboundDb` at ~:611):
 
 ```ts
-/** R9: read-only outbound open that heals a crashed container's hot journal. */
+/**
+ * R9: read-only outbound open that heals a crashed container's hot journal.
+ * CALLER CONTRACT: only call from sites that verified the session's container
+ * is not running (gated sweep path) — never from the 1s delivery poll.
+ */
 export function openOutboundDbHealing(agentGroupId: string, sessionId: string): Database.Database {
   return openOutboundDbReadOnlyHealing(outboundDbPath(agentGroupId, sessionId), (dbPath) => {
-    log.error('Hot outbound journal detected; performing guarded write-mode rollback', {
+    log.error('Hot outbound journal detected; performing gated write-mode rollback', {
       agentGroupId,
       sessionId,
       dbPath,
@@ -1993,26 +2261,41 @@ Expected: PASS.
 
 - [ ] **Step 5: Wire the sweep and delivery, contain delivery errors**
 
-`src/host-sweep.ts` `sweepSession` (~:429-436) — replace the bare-swallow outbound open:
+`src/host-sweep.ts` `sweepSession` (~:429-436) — replace the bare-swallow outbound open with the GATED healing open:
 
 ```ts
   try {
-    outDb = openOutboundDbHealing(agentGroup.id, session.id);
+    // R9a: the write-mode healing open runs ONLY when the host knows no
+    // container writer can be live (cross-mount SQLite locking is unverified
+    // and must not be the guard). This site also covers the post-crash
+    // window: a nonzero exit schedules recoverSessionAfterUnexpectedExit ->
+    // sweepSession (container-runner.ts:545,593), and it always runs BEFORE
+    // the wake gate below.
+    outDb = !isContainerRunning(session.id)
+      ? openOutboundDbHealing(agentGroup.id, session.id)
+      : openOutboundDb(agentGroup.id, session.id);
   } catch (err) {
     // outbound.db might not exist yet (container hasn't started). Anything
     // else deserves a log line: this bare swallow hid the hot-journal wedge.
     outDb = null;
-    if ((err as { code?: string }).code !== 'SQLITE_CANTOPEN') {
+    if (isHotJournalError(err)) {
+      // Hot journal while the container is (or may be) running: defer — a
+      // healthy container rolls its own journal back at startup, and the
+      // next sweep after it stops takes the gated heal path above.
+      log.warn('Hot outbound journal with container running; deferring heal to a gated sweep', {
+        sessionId: session.id,
+      });
+    } else if ((err as { code?: string }).code !== 'SQLITE_CANTOPEN') {
       log.warn('Outbound DB unavailable during sweep', { sessionId: session.id, err });
     }
   }
 ```
 
-(Import `openOutboundDbHealing` alongside the existing `openOutboundDb` import from `./session-manager.js`. If the not-yet-created case surfaces as a different code in practice, key the silence on file non-existence instead — the point is: silence ONLY the brand-new-session case.)
+(Import `openOutboundDbHealing` alongside the existing `openOutboundDb` import from `./session-manager.js`, and `isHotJournalError` from `./db/session-db.js`; `isContainerRunning` is already imported. If the not-yet-created case surfaces as a different code in practice, key the silence on file non-existence instead — the point is: silence ONLY the brand-new-session case.)
 
-`src/delivery.ts` `drainSession` (~:293): replace `openOutboundDb(agentGroup.id, session.id)` with `openOutboundDbHealing(agentGroup.id, session.id)` (adjust the import).
+`src/delivery.ts` `drainSession` (~:293): KEEP the plain `openOutboundDb` — the 1s delivery poll must NOT perform an inline RW heal (a live container writer cannot be ruled out there; delivery runs regardless of container state). On `.code === 'SQLITE_READONLY_ROLLBACK'` the session is treated as transient/contained for this tick (catch below) and healing is deferred to the gated sweep path.
 
-`src/delivery.ts` `deliverSessionMessages` (~:163-199): extend the catch so a non-transient error defers THIS session instead of poisoning the whole poll loop, and treat hot-journal residue as transient:
+`src/delivery.ts` `deliverSessionMessages` (~:163-199): extend the catch so a non-transient error defers THIS session instead of poisoning the whole poll loop, and treat hot-journal residue as transient/contained (deferral only — the heal itself happens on the gated sweep):
 
 ```ts
   } catch (err) {
@@ -2045,14 +2328,19 @@ Import `isHotJournalError` from `./db/session-db.js`.
 
 - [ ] **Step 6: Write the delivery-level test**
 
-In `src/delivery.test.ts`, next to the existing contention test (~:246-281 — reuse its session/outbound fixture and captured-adapter `delivered` array), add the same `plantHotJournal` helper verbatim (test files are separate compilation islands; duplicating the 20-line helper is deliberate) and:
+In `src/delivery.test.ts`, next to the existing contention test (~:246-281 — reuse its session/outbound fixture and captured-adapter `delivered` array), add the same `plantHotJournal` helper verbatim (test files are separate compilation islands; duplicating the ~25-line helper is deliberate) and:
 
 ```ts
-it('heals a crashed container hot journal and keeps delivering (R9)', async () => {
+it('defers a hot-journal session without healing inline, and delivers after the gated heal (R9)', async () => {
   // Arrange exactly like the transient-lock test: session + outbound.db with
   // one due message and a capturing adapter.
   plantHotJournal(outboundDbPath('ag-1', session.id));
-  await expect(deliverSessionMessages(session)).resolves.toBeUndefined(); // never throws
+  // The 1s poll must NOT perform the RW heal (a live container writer cannot
+  // be ruled out here): contained, no throw, journal untouched.
+  await expect(deliverSessionMessages(session)).resolves.toBeUndefined();
+  expect(fs.existsSync(`${outboundDbPath('ag-1', session.id)}-journal`)).toBe(true); // NOT healed inline
+  // The gated sweep path (container verified not running) performs the heal:
+  openOutboundDbHealing('ag-1', session.id).close();
   expect(fs.existsSync(`${outboundDbPath('ag-1', session.id)}-journal`)).toBe(false); // healed
   await deliverSessionMessages(session);
   expect(delivered.length).toBeGreaterThan(0); // and delivery proceeds
@@ -2064,7 +2352,19 @@ it('contains a non-transient per-session failure instead of throwing (R9)', asyn
 });
 ```
 
-(First `deliverSessionMessages` after healing may or may not deliver in the same call depending on where the heal lands — the assertion only requires that a subsequent poll delivers.)
+(Import `openOutboundDbHealing` from `./session-manager.js`; the journal-gone assertion is valid because `plantHotJournal` plants a genuinely hot journal — see the Step 1 note.)
+
+Also add the sweep-side gate test in `src/host-sweep.test.ts`, using the on-disk `setupSession()` fixture the reconciliation suites use (~:1665) and the file's existing container-runner mocking for `isContainerRunning`:
+
+```ts
+it('heals a hot outbound journal only when the container is verified not running (R9 gate)', async () => {
+  // Arrange: setupSession() with a hot journal planted on outbound.db.
+  // 1) isContainerRunning mocked TRUE  -> run sweepSession -> journal still exists (no RW heal).
+  // 2) isContainerRunning mocked FALSE -> run sweepSession -> journal gone (gated heal ran, before any wake).
+});
+```
+
+(If the harness cannot drive `sweepSession` against an on-disk outbound DB, cover the gate by asserting `openOutboundDbHealing` is called/not-called via a `session-manager.js` spy — the load-bearing assertion is: no write-mode open while `isContainerRunning` is true.)
 
 - [ ] **Step 7: Run the suites**
 
@@ -2082,12 +2382,12 @@ git commit -m "fix(db): heal hot outbound journals with a guarded write-mode ope
 
 ### Task 8: R9b — container-side busy tolerance
 
-The 07-31 crash cluster (8 exits code=1 in 10 min): the container has NO try/catch between the poll-loop `while` (poll-loop.ts:360) and the first inner `try` (:520); `getPendingMessages()` (:366) reads both session DBs. Host delivery held an `outbound.db` lock for 17s; the container's 5s `busy_timeout` expired; the `SQLITE_BUSY` throw unwound `runPollLoop` → `main().catch` → `process.exit(1)` (index.ts:123-134). Two pre-loop writes are equally unguarded (index.ts:64 `clearStaleContainerToolState`, poll-loop.ts:357 `clearStaleProcessingAcks`). Fix: raise busy_timeout (configurable, default 30s — longer than any observed host lock hold) AND wrap the three unguarded touchpoints in a bounded busy-retry. Turn-internal errors already route through the provider-failure/recovery machinery — leave them alone.
+The 07-31 crash cluster (8 exits code=1 in 10 min) is MECHANISM-CONSISTENT with a host lock hold outlasting the container's 5s `busy_timeout` and `SQLITE_BUSY` unwinding `runPollLoop` → `main().catch` → `process.exit(1)` (index.ts:123-134) — but that root cause is a hypothesis, not proven: the container stderr that would prove it was destroyed (the very gap R6 closes), and the lock-hold figures are untraceable to the findings doc (validator-V4). What IS verified in the current tree: the container has NO try/catch between the poll-loop `while` (poll-loop.ts:360) and the first inner `try` (:520); `getPendingMessages()` (:366) reads both session DBs; both handles carry `busy_timeout = 5000`; and the unguarded-DB-on-exit(1) surface is far wider than three sites (V4's 20-row touchpoint table — pre-loop writes, idle-loop sites, the catch handlers' own DB writes, and the 500ms `pollFollowups` path whose voided promise can reject unhandled). R9b is defense-in-depth: raise busy_timeout (configurable, default 30s — a defensible knob, not a proven ceiling) AND route EVERY DB touchpoint reachable from the poll/turn loops through a bounded busy-retry that fails LOUD (rethrows) on exhaustion. Turn-internal provider errors already route through the provider-failure/recovery machinery — leave that machinery alone; wrap only the session-DB statements around it.
 
 **Files:**
 - Create: `container/agent-runner/src/db/sqlite-retry.ts`
 - Modify: `container/agent-runner/src/db/connection.ts` (~:23-56)
-- Modify: `container/agent-runner/src/index.ts` (~:64), `container/agent-runner/src/poll-loop.ts` (~:357, ~:366)
+- Modify: `container/agent-runner/src/index.ts` (~:64, ~:72), `container/agent-runner/src/poll-loop.ts` (~:349, ~:357, ~:366, ~:423-486, ~:568, catch handlers ~:620/~:717, `pollFollowups` ~:1167-1189)
 - Modify: `src/container-runner.ts` (`buildContainerArgs` ~:1491 — env passthrough)
 - Test: `container/agent-runner/src/db/sqlite-retry.test.ts` (new, bun:test)
 
@@ -2103,9 +2403,11 @@ Read and confirm in the current tree (record what you find in the commit body):
 - `container/agent-runner/src/index.ts` ~:123-134: `main().catch` → `process.exit(1)` for anything except `ProviderContainerStopRequired`.
 - `container/agent-runner/src/poll-loop.ts`: no try/catch between the `while` at ~:360 and the first inner `try` at ~:520; `getPendingMessages()` at ~:366 reads `messages_in` (read-only inbound) AND `processing_ack` (outbound).
 - `container/agent-runner/src/db/connection.ts` ~:23-56: both handles get `PRAGMA busy_timeout = 5000`; no `.code` inspection anywhere container-side.
+- `container/agent-runner/src/poll-loop.ts` ~:1167-1179: `void pollFollowups().finally(…)` fires every 500ms during EVERY active turn; `pollFollowups` calls `getPendingMessages()` (:1179), `markProcessing`/`markCompleted` (:1185-1186), `writeRoutedMessage` (:1189) with no try/catch — a throw there becomes an unhandled rejection on a voided promise.
+- The catch handlers at poll-loop.ts ~:620 and ~:717 themselves WRITE the session DBs (`scheduleProviderRetry`, `appendRecoveryEntry`/`ownExhaustedPreacceptRetry`, `returnProcessingToPending`, `writeMessageOut`, `markProviderRetryUserErrorEmitted`, `clearContinuation`) — a busy throw inside the handler escapes it and still unwinds to exit(1).
 - Host lock producers on `outbound.db` while a container runs: `writeOutboundDirect` (`src/session-manager.ts:625`, unguarded, reachable from `src/router.ts:559,593`) and recovery-path `openOutboundDbRw` (`src/host-sweep.ts:1359`).
 
-If any of these have materially changed, adapt the touchpoint list below to the actual unguarded sites — the fix targets "DB touched outside any try/catch on the exit(1) path".
+If any of these have materially changed, adapt the touchpoint list below to the actual unguarded sites — the fix targets "DB touched outside any try/catch on the exit(1) path (or on a voided-promise path)". Also note in the commit body that the crash cluster's cause remains a mechanism-consistent hypothesis — do NOT restate it as proven.
 
 - [ ] **Step 2: Write the failing tests**
 
@@ -2209,8 +2511,11 @@ Expected: FAIL (module missing).
 /**
  * R9: bounded busy-retry for session-DB access. The host legitimately takes
  * short write locks on outbound.db (direct notices, recovery); a lock hold
- * longer than busy_timeout must NOT crash the container mid-turn (the 07-31
- * crash cluster: SQLITE_BUSY unwound runPollLoop straight into process.exit(1)).
+ * longer than busy_timeout must NOT crash the container mid-turn (the
+ * hypothesized 07-31 crash-cluster mechanism: SQLITE_BUSY unwinding
+ * runPollLoop straight into process.exit(1) — mechanism-consistent, but the
+ * stderr that would prove it was lost; R6 closes that gap). Defense-in-depth:
+ * retries are bounded and exhaustion RETHROWS — fail loud, never swallow.
  */
 
 export function isSqliteBusyError(err: unknown): boolean {
@@ -2247,12 +2552,16 @@ export async function withSqliteRetry<T>(
 }
 ```
 
-- [ ] **Step 4: Raise the busy timeout and wrap the touchpoints**
+- [ ] **Step 4: Raise the busy timeout and wrap the FULL touchpoint surface**
 
 `container/agent-runner/src/db/connection.ts` — add at module scope and use in BOTH open paths (~:35, ~:45):
 
 ```ts
-/** R9: must exceed any legitimate host write-lock hold (17s observed on 07-31). */
+/**
+ * R9: must exceed legitimate host write-lock holds. The 07-31 holds were
+ * never measured (stderr destroyed); 30s is a defensible default, not a
+ * proven ceiling — hence configurable, and backed by the bounded retries.
+ */
 const BUSY_TIMEOUT_MS = Number(process.env.NANOCLAW_CONTAINER_SQLITE_BUSY_TIMEOUT_MS) || 30_000;
 ```
 
@@ -2282,7 +2591,18 @@ const BUSY_TIMEOUT_MS = Number(process.env.NANOCLAW_CONTAINER_SQLITE_BUSY_TIMEOU
     ).filter((m) => m.kind !== 'system');
 ```
 
-Import `withSqliteRetry` from `./db/sqlite-retry.js` (adjust relative path per file). Do NOT wrap turn-internal code — errors there already route through the provider-failure/recovery machinery, and blanket retries around side-effectful turn code would risk the dedupe semantics.
+**Coverage policy (A7 falsified — the three sites above do NOT cover the surface, validator-V4):** every DB touchpoint reachable from the poll/turn loops on a path that can terminate the process (uncaught throw on the `main().catch` → exit(1) chain, or an unhandled rejection on a voided promise) goes through `withSqliteRetry`. In addition to the three sites above, wrap (line numbers are anchors — locate every call by content):
+
+- `container/agent-runner/src/index.ts` ~:72 — `buildSystemPromptAddendum` (inbound destination reads via destinations.ts).
+- `poll-loop.ts` ~:349 — `migrateLegacyContinuation` (session-state reads/writes).
+- The idle-loop naked sites at ~:423-486 — `markCompleted` (:423), `writeRoutedMessage` (:424), `clearProviderRetrySchedule` (:433/:464), `readProviderRetrySchedule` (:440), `ownExhaustedPreacceptRetry` (:450), `listRecoveryEntries` (:486).
+- `markProcessing` at ~:568 (turn-start claim write).
+- The catch-handler DB writes at ~:620 and ~:717 — `scheduleProviderRetry`, `appendRecoveryEntry`/`ownExhaustedPreacceptRetry`, `returnProcessingToPending`, `writeMessageOut`, `markProviderRetryUserErrorEmitted`, `clearContinuation`: a busy throw INSIDE a catch handler escapes it and still reaches exit(1), so the handlers need the same wrapping as the code they guard.
+- The **pollFollowups** path (~:1167-1189, fires every 500ms during EVERY active turn — exactly when host delivery lock activity peaks): wrap its DB calls (the second `getPendingMessages` at :1179, `markProcessing`/`markCompleted` at :1185-1186, `writeRoutedMessage` at :1189, and the later `markProcessing`/`returnProcessingToPending`/`countOutboundVisibleReplyMessages` calls in the same function), AND make the voided `void pollFollowups().finally(…)` promise rejection-proof: add a `.catch` that emits a structured stderr event — a rejected voided promise is an unhandled rejection (process-fatal under Bun's default; even if it merely warned, follow-up claiming would silently die).
+
+Where several wrapped calls are adjacent, wrapping the enclosing helper's body once is preferable to per-statement wrapping — the POLICY is the unit ("every DB touchpoint reachable from the poll/turn loops goes through the retry helper"); the list above is the checklist, cross-checked against validator-V4's touchpoint table.
+
+Import `withSqliteRetry` from `./db/sqlite-retry.js` (adjust relative path per file). Do NOT blanket-retry turn-internal PROVIDER logic (the LLM turn itself) — provider errors already route through the provider-failure/recovery machinery, and retrying side-effectful turn code would risk the dedupe semantics. The wraps above target session-DB statements only: a busy failure means the statement did NOT execute, so retrying it is side-effect-safe. On exhaustion `withSqliteRetry` rethrows into the existing loud paths — never swallow.
 
 `src/container-runner.ts` `buildContainerArgs` (~:1491) — pass the knob through to the container (follow the function's existing arg-array style; add next to the other `-e`/env plumbing, or after the `--cap-drop=ALL` args if none exists):
 
@@ -2346,8 +2666,8 @@ git commit -m "style: apply formatter across incident remediation changes"
 
 ## Cross-task ordering and interplay notes (for reviewers)
 
-- `sweepSession` step order after this plan: open DBs → syncProcessingAcks → scheduler sync → crash recovery → **3.5 release/escalate expired recovery acks (Task 3)** → TTL-aware due count + wake (Task 1) → SLA. Escalated/released rows change state BEFORE the due count reads it, so an exhausted row never triggers a pointless wake and a released row wakes through the normal path.
-- The escalation notice (Task 3) is what makes the scheduler path work: `syncProcessingAcks` accepts a `failed` ack only with a valid `notice_message_out_id`, and the scheduler sync's `ack.status === 'failed'` branch then calls `failScheduledTask` + `recordTerminalFailureIncident`. No scheduler-module changes are needed for R2.
+- `sweepSession` step order after this plan: open DBs (outbound via the GATED healing open — write-mode journal rollback ONLY when `!isContainerRunning`, so the heal always lands in a container-not-running window and strictly BEFORE the wake gate) → syncProcessingAcks (which never overwrites a terminal inbound `'failed'` — the Task 3 status-precedence guard) → scheduler sync → crash recovery → **3.5 release/escalate expired recovery acks (Task 3, release gated on GWS cleanliness)** → TTL-aware due count + wake (Task 1) → SLA. Escalated/released rows change state BEFORE the due count reads it, so an exhausted row never triggers a pointless wake and a released row wakes through the normal path.
+- The escalation notice (Task 3) is what makes the scheduler path work: `syncProcessingAcks` accepts a `failed` ack only with a valid `notice_message_out_id`, and the scheduler sync's `ack.status === 'failed'` branch then calls `failScheduledTask` + `recordTerminalFailureIncident`. No scheduler-module changes are needed for R2. Task 3's release gate keeps GWS-uncertain rows out of auto-release entirely (they escalate directly), and its `syncProcessingAcks` guard keeps the escalated inbound `'failed'` durable across later sweeps.
 - R3's stale threshold (60 min default) intentionally fires before R2's terminal escalation (TTL*K = 90 min default): operators get an error alert while the system is still retrying, then a second alert if it terminally fails.
 - R8's reader no longer throws for record-level problems; every caller decision (block vs proceed) is keyed on `quarantined[].inputId` versus the caller's scopes. File-level corruption still throws everywhere.
-- R9's two halves close the loop from both sides: the host heals the journal a crashed container leaves behind (so the sweep can wake a fresh container), and the container survives the host's lock holds (so it stops crashing and leaving journals).
+- R9's two halves close the loop from both sides: the host heals the journal a crashed container leaves behind — but ONLY in the gated container-not-running window inside the sweep (which the post-crash recovery path funnels into), always before any wake; the 1s delivery loop never heals inline, it defers the affected session to the sweep. The container half survives the host's lock holds (so it stops crashing and leaving journals) — and, since the gated heal can race a fresh container's own startup rollback only through the wake that follows it, heal-before-wake ordering is what keeps that window closed.
