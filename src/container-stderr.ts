@@ -8,11 +8,25 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-/** Split a stderr chunk into complete lines, carrying partial tails across chunks. */
-export function splitStderrChunk(carry: string, chunk: string): { lines: string[]; carry: string } {
+/**
+ * Split a stderr chunk into complete lines, carrying partial tails across chunks.
+ * The carry is byte-capped (same budget as the tail buffer): an adversarial
+ * container emitting a long newline-free stream must not grow host memory
+ * without bound. When over budget, keep the TAIL END of the data — the most
+ * recent bytes are the evidence that matters for crash forensics.
+ */
+export function splitStderrChunk(
+  carry: string,
+  chunk: string,
+  maxCarryBytes = 64 * 1024,
+): { lines: string[]; carry: string } {
   const text = carry + chunk;
   const parts = text.split('\n');
-  const nextCarry = parts.pop() ?? '';
+  let nextCarry = parts.pop() ?? '';
+  if (Buffer.byteLength(nextCarry, 'utf8') > maxCarryBytes) {
+    const buf = Buffer.from(nextCarry, 'utf8');
+    nextCarry = buf.subarray(buf.length - maxCarryBytes).toString('utf8');
+  }
   return { lines: parts.filter((l) => l.length > 0), carry: nextCarry };
 }
 
@@ -28,6 +42,7 @@ export function parseStructuredStderrEvent(line: string): Record<string, unknown
       return parsed as Record<string, unknown>;
     }
     return null;
+    // eslint-disable-next-line no-catch-all/no-catch-all -- fail-open: agent-controlled stderr routinely contains malformed JSON; non-events are noise, not errors.
   } catch {
     return null;
   }
@@ -83,6 +98,8 @@ export function truncateForLog(line: string, max = 2000): string {
  *
  * Flushes the final unterminated `carry` line first (a crash's last line
  * often lacks a trailing newline — plausibly the most important line).
+ * NOTE: this MUTATES the caller's `tail` by appending `carry` to it — call
+ * at most once per tail instance or the carry line is double-appended.
  * Labels a null exit code 'unknown' (verified stop), never 'null'.
  * Rotation is crash-privileged: clean tails (-exit-0.log) and crash tails
  * (everything else) rotate on SEPARATE budgets, so routine clean exits can
@@ -122,6 +139,7 @@ export function persistStderrTail(opts: {
       opts.keepCrash ?? 5,
     );
     return file;
+    // eslint-disable-next-line no-catch-all/no-catch-all -- fail-open: post-mortem capture is best-effort and must never break container teardown.
   } catch {
     return null;
   }

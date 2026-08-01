@@ -19,6 +19,19 @@ describe('splitStderrChunk', () => {
     expect(second.lines).toEqual(['{"severity":"error","event":"boom"}', 'plain line']);
     expect(second.carry).toBe('partial');
   });
+
+  it('caps a newline-free carry at the byte budget, keeping the tail end', () => {
+    const cap = 1024;
+    const huge = 'A'.repeat(cap) + 'B'.repeat(cap); // 2x the cap, no newline anywhere
+    const first = splitStderrChunk('', huge, cap);
+    expect(first.lines).toEqual([]);
+    expect(Buffer.byteLength(first.carry, 'utf8')).toBeLessThanOrEqual(cap); // bounded
+    expect(first.carry).toBe('B'.repeat(cap)); // tail end kept — most recent bytes are the evidence
+    // A subsequent normal line is reassembled from the truncated carry without corruption.
+    const second = splitStderrChunk(first.carry, '-end\nnext line\n', cap);
+    expect(second.lines).toEqual(['B'.repeat(cap) + '-end', 'next line']);
+    expect(second.carry).toBe('');
+  });
 });
 
 describe('parseStructuredStderrEvent', () => {

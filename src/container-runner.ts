@@ -445,7 +445,7 @@ async function spawnContainer(session: Session): Promise<void> {
   writeSpawnSkillGeneration(sessionDir(agentGroup.id, session.id), skillGeneration);
 
   container.stderr?.on('data', (data) => {
-    const { lines, carry } = splitStderrChunk(stderrState.carry, data.toString());
+    const { lines, carry } = splitStderrChunk(stderrState.carry, data.toString(), CONTAINER_STDERR_TAIL_BYTES);
     stderrState.carry = carry;
     for (const line of lines) {
       stderrTail.append(line);

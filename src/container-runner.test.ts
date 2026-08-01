@@ -2672,6 +2672,12 @@ describe('container stderr capture (R6)', () => {
       child.emit('close', 1);
       await vi.advanceTimersByTimeAsync(harness.containerRunner.UNEXPECTED_EXIT_RECOVERY_BASE_MS);
       expect(harness.containerRunner.getActiveContainerCount()).toBe(0);
+      // The non-zero exit was surfaced at warn, not swallowed.
+      expect(
+        warnSpy.mock.calls.filter(
+          ([msg]) => msg === 'Agent container exited unexpectedly; scheduling targeted recovery',
+        ),
+      ).toHaveLength(1);
 
       // The tail file exists in the HOST-SIDE log tree — NOT under v2-sessions
       // (nothing may be written into the agent-writable workspace).
