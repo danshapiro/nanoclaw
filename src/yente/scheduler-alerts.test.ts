@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { closeDb, createAgentGroup, createMessagingGroup, getDb, initTestDb, runMigrations } from '../db/index.js';
 import { createSession } from '../db/sessions.js';
@@ -8,6 +8,7 @@ import {
   deliverDueSchedulerIncidents,
   deliverPendingSchedulerIncident,
   reportSchedulerIncident,
+  resetDedupeLogRateLimitForTest,
 } from './scheduler-alerts.js';
 
 const ORIGINAL_ENV = { ...process.env };
@@ -214,6 +215,27 @@ describe('scheduler alerts', () => {
     ).toEqual({
       count: 1,
     });
+  });
+
+  it('rate-limits the scheduler_incident_deduped log line (R3)', async () => {
+    const writes: string[] = [];
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation(((chunk: unknown) => {
+      writes.push(String(chunk));
+      return true;
+    }) as never);
+    resetDedupeLogRateLimitForTest();
+    const args = {
+      dedupeKey: 'test:dedupe-rate-limit',
+      severity: 'warn' as const,
+      message: 'x',
+      details: {},
+    };
+    await reportSchedulerIncident(args); // inserts
+    await reportSchedulerIncident(args); // duplicate #1 -> logs deduped
+    await reportSchedulerIncident(args); // duplicate #2 -> suppressed (inside window)
+    spy.mockRestore();
+    const dedupedLines = writes.filter((w) => w.includes('scheduler_incident_deduped'));
+    expect(dedupedLines).toHaveLength(1);
   });
 
   it('keeps routed incidents pending when the adapter is missing', async () => {

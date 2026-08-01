@@ -51,6 +51,14 @@ interface AlertRoute {
 
 const LOCK_NAME = 'scheduler-mutator';
 
+/** R3: the deduped-incident info line fired ~1000x/day during the dvora incident. */
+const DEDUPE_LOG_INTERVAL_MS = Number(process.env.NANOCLAW_INCIDENT_DEDUPE_LOG_INTERVAL_MS) || 60 * 60 * 1000;
+const dedupeLogState = new Map<string, { lastEmitMs: number; suppressed: number }>();
+
+export function resetDedupeLogRateLimitForTest(): void {
+  dedupeLogState.clear();
+}
+
 export async function reportSchedulerIncident(args: SchedulerIncidentInput): Promise<boolean> {
   return await withSchedulerMutation((owner) => recordSchedulerIncidentWithOwner(args, owner));
 }
@@ -117,7 +125,17 @@ export function recordSchedulerIncidentWithOwner(args: SchedulerIncidentInput, o
   })();
 
   if (inserted.changes === 0) {
-    logSchedulerEvent('info', 'scheduler_incident_deduped', { dedupeKey: args.dedupeKey });
+    const now = Date.now();
+    const state = dedupeLogState.get(args.dedupeKey) ?? { lastEmitMs: 0, suppressed: 0 };
+    if (now - state.lastEmitMs >= DEDUPE_LOG_INTERVAL_MS) {
+      logSchedulerEvent('info', 'scheduler_incident_deduped', {
+        dedupeKey: args.dedupeKey,
+        suppressedSinceLastEmit: state.suppressed,
+      });
+      dedupeLogState.set(args.dedupeKey, { lastEmitMs: now, suppressed: 0 });
+    } else {
+      dedupeLogState.set(args.dedupeKey, { lastEmitMs: state.lastEmitMs, suppressed: state.suppressed + 1 });
+    }
     return false;
   }
 

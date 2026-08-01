@@ -421,6 +421,47 @@ describe('syncSessionSchedulerState', () => {
     outDb.close();
   });
 
+  it('escalates a stale recovery ack to an error incident with a distinct dedupe key (R3)', async () => {
+    const { inDb, outDb } = freshDbs();
+    const s = session();
+
+    await withSchedulerLock((owner) => {
+      const messageId = seedProjectedTask(inDb, owner, s, { recurrence: '0 9 * * *' });
+      insertAck(outDb, messageId, 'recovery');
+      outDb
+        .prepare("UPDATE processing_ack SET status_changed = datetime('now', '-2 hours') WHERE message_id = ?")
+        .run(messageId);
+
+      syncSessionSchedulerState(inDb, outDb, s, owner);
+    });
+
+    const keys = incidentRows().map((r) => r.dedupe_key);
+    expect(keys.some((k) => k.endsWith(':unresolved-ack:recovery'))).toBe(true);
+    expect(keys.some((k) => k.endsWith(':unresolved-ack:recovery:stale-escalated'))).toBe(true);
+    const escalated = incidentRows().find((r) => r.dedupe_key.endsWith(':stale-escalated'));
+    expect(escalated).toMatchObject({ severity: 'error', status: 'pending' });
+    inDb.close();
+    outDb.close();
+  });
+
+  it('does not escalate a fresh recovery ack (R3)', async () => {
+    const { inDb, outDb } = freshDbs();
+    const s = session();
+
+    await withSchedulerLock((owner) => {
+      const messageId = seedProjectedTask(inDb, owner, s, { recurrence: '0 9 * * *' });
+      insertAck(outDb, messageId, 'recovery');
+
+      syncSessionSchedulerState(inDb, outDb, s, owner);
+    });
+
+    const keys = incidentRows().map((r) => r.dedupe_key);
+    expect(keys.some((k) => k.endsWith(':unresolved-ack:recovery'))).toBe(true);
+    expect(keys.some((k) => k.endsWith(':stale-escalated'))).toBe(false);
+    inDb.close();
+    outDb.close();
+  });
+
   it('leaves processing acks alone for ordinary stuck-turn recovery', async () => {
     const { inDb, outDb } = freshDbs();
     const s = session();
