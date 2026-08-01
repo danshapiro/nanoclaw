@@ -459,7 +459,7 @@ export interface CodexCompactCompletionNotification {
  * Wait for Codex to report that a `thread/compact/start` operation finished.
  *
  * Codex emits the legacy `thread/compacted` notification to some clients, but
- * the pinned 0.139.0 app-server sends the canonical v2 signal instead:
+ * the pinned 0.144.1 app-server sends the canonical v2 signal instead:
  * either an `item/completed` whose item has `type: 'contextCompaction'`, or a
  * `turn/completed` whose turn contains such an item. We accept any of these
  * signals so the code remains correct across protocol versions.
@@ -581,12 +581,12 @@ export function waitForCodexCompactionComplete(
 // writes/exec/network for a relay would let it bypass the read-only boundary
 // the moment the model attempts a side effect, so in relay mode we REFUSE every
 // side-effecting approval. The Codex app-server's `ReviewDecision` enum (verified
-// against the bundled codex-cli 0.139.0 native binary's embedded protocol types
+// against the bundled codex-cli 0.144.1 native binary's embedded protocol types
 // — `ReviewDecision.ts`: `approved`, `approved_for_session`, `denied`, `abort`)
 // accepts `denied` as the explicit refusal, and the `item/*/requestApproval`
 // family accepts `reject`. We use those real values — never an invented one.
 
-// Shapes verified with `codex app-server generate-ts` from codex-cli 0.139.0:
+// Shapes verified with `codex app-server generate-ts` from codex-cli 0.144.1:
 // ToolRequestUserInputResponse and McpServerElicitationRequestResponse.
 function codexRequestUserInputDecline(params: unknown): { answers: Record<string, { answers: string[] }> } {
   const answers: Record<string, { answers: string[] }> = {};

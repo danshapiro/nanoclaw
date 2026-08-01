@@ -740,7 +740,36 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // These failures mean accepted work may still be live or host-committed.
       // Leaving the process is intentional: host stop proof and recovery own
       // the correlation from here. Never release/retry inside this runner.
-      if (err instanceof TrustedInputLifecycleError || err instanceof ProviderQuiescenceError) throw err;
+      if (err instanceof TrustedInputLifecycleError || err instanceof ProviderQuiescenceError) {
+        if (
+          err instanceof ProviderQuiescenceError &&
+          initialClaim?.acceptanceObserved === false &&
+          acceptanceContext.boundGwsInputs.size === 0
+        ) {
+          // Belt-and-braces: nothing was observed AND nothing was host-committed,
+          // so this fatal exit must leave a durable, bounded retry schedule
+          // behind for the next runner incarnation instead of an unbounded
+          // crash loop on the route. acceptanceObserved alone is NOT a
+          // host-commit discriminator (bind success sets state='accepted' +
+          // boundGwsInputs.add without setting it — A11); retrying a
+          // host-committed input from a fresh container is the duplicate-work
+          // case, and its rows are already recovery-owned. Same discriminator
+          // as processQuery's pre-accept unmask branch.
+          await withSqliteRetry(
+            () => scheduleProviderRetry(config.providerName, activeRouteKey, Date.now(), topLevelInputId),
+            { label: 'scheduleProviderRetry' },
+          );
+          log(
+            JSON.stringify({
+              severity: 'warn',
+              event: 'provider_quiescence_failure_preaccept_retry_persisted',
+              route_key: activeRouteKey,
+              error: errMsg,
+            }),
+          );
+        }
+        throw err;
+      }
 
       if (err instanceof TrustedInputAcceptanceError) {
         log(
@@ -1731,6 +1760,46 @@ async function processQuery(
       throw ledgerCtx.acceptanceContext.lifecycleFault;
     }
     if (quiescenceFailure) {
+      // PRE-ACCEPT UNMASK (companion to the provider-level unmask): when a
+      // non-quiescence body error is in flight and NOTHING was host-committed
+      // for this query, the abort-await's rejection must not replace it — the
+      // outer catch's designed pre-accept routing (TrustedInputAcceptanceError
+      // → return-to-pending + poll backoff; other pre-accept errors → durable
+      // retry schedule) is the correct disposition. boundGwsInputs is the
+      // host-commit discriminator: entries are added on bind success and
+      // lifecycle fault and removed only by successful release —
+      // acceptanceObserved is NOT reliable here (bind success does not set it).
+      // The rows were already returned to pending above and STAY pending: no
+      // provider_quiescence_unproven recovery entry for this case. Accepted
+      // work keeps the fatal path below — that protection is intentional.
+      const bodyErrorInFlight =
+        providerStreamFailure !== undefined && !(providerStreamFailure instanceof ProviderQuiescenceError);
+      if (bodyErrorInFlight && boundGwsInputs.size === 0) {
+        const failure =
+          quiescenceFailure instanceof ProviderQuiescenceError
+            ? quiescenceFailure
+            : new ProviderQuiescenceError('provider did not prove quiescence before correlation release', {
+                cause: quiescenceFailure,
+              });
+        if (providerStreamFailure instanceof Error && providerStreamFailure.cause === undefined) {
+          (providerStreamFailure as Error & { cause?: unknown }).cause = failure;
+        } else if (providerStreamFailure instanceof Error) {
+          (providerStreamFailure as Error & { quiescenceFailure?: unknown }).quiescenceFailure = failure;
+        }
+        log(
+          JSON.stringify({
+            severity: 'warn',
+            event: 'preaccept_body_error_kept_over_quiescence_failure',
+            error:
+              providerStreamFailure instanceof Error ? providerStreamFailure.message : String(providerStreamFailure),
+            quiescence_error: failure.message,
+          }),
+        );
+        // Rethrow the ORIGINAL body error: throwing from this finally replaces
+        // the in-flight copy with the same object — identity preserved, so the
+        // outer catch's instanceof routing works (Tasks 4/5 contract).
+        throw providerStreamFailure;
+      }
       const uncertainEntries = [...ledger.values()].filter((entry) =>
         entry.claims.some((claim) => claim.state === 'returned' || claim.state === 'queued'),
       );

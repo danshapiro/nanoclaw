@@ -468,6 +468,8 @@ export class CodexProvider implements AgentProvider {
         settleQuiescence();
         return;
       }
+      let bodyError: unknown;
+      let bodyErrorCaptured = false;
       // One app-server per query invocation. The poll-loop keeps a single
       // query active per batch of pending messages and ends it on idle, so
       // spawn-per-query matches that cadence naturally.
@@ -603,6 +605,10 @@ export class CodexProvider implements AgentProvider {
           // the loop continues to drain the next pending input.
           if (terminal) return;
         }
+      } catch (err) {
+        bodyError = err;
+        bodyErrorCaptured = true;
+        throw err;
       } finally {
         unsubscribeQueryAbort?.();
         unsubscribeQueryAbort = undefined;
@@ -619,7 +625,22 @@ export class CodexProvider implements AgentProvider {
             settleQuiescence();
           }
         } catch (err) {
-          throw failQuiescence(err);
+          const quiescenceFailure = failQuiescence(err);
+          if (bodyErrorCaptured) {
+            // The body error is the real failure (e.g. a trusted-acceptance
+            // rejection with designed graceful handling in the poll-loop). The
+            // always-throwing post-spawn teardown must not replace it: rethrow
+            // the original, type-preserved, with the quiescence failure
+            // attached so nothing is lost. failQuiescence above still rejects
+            // the quiescence promise for abort waiters.
+            if (bodyError instanceof Error && bodyError.cause === undefined) {
+              (bodyError as Error & { cause?: unknown }).cause = quiescenceFailure;
+            } else if (bodyError instanceof Error) {
+              (bodyError as Error & { quiescenceFailure?: unknown }).quiescenceFailure = quiescenceFailure;
+            }
+            throw bodyError;
+          }
+          throw quiescenceFailure;
         }
       }
     }

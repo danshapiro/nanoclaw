@@ -42,6 +42,7 @@ export function acquireProcessSingletonLock(lockDbPath: string): void {
       throw new Error(
         `Another nanoclaw process already holds the singleton lock at ${lockDbPath}; ` +
           'refusing to start a second writer against the same v2.db',
+        { cause: err },
       );
     }
     throw err;

@@ -102,6 +102,7 @@ interface ControlResponse {
   action?: unknown;
   requestId?: unknown;
   error?: unknown;
+  acceptedAt?: unknown;
 }
 
 function canonicalString(value: unknown, name: string): string {
@@ -216,10 +217,25 @@ function readCurrent(): CurrentCorrelation | null {
   }
 }
 
+/**
+ * Exact host-commit evidence: the published pointer names this precise bind.
+ *
+ * `expectedAcceptedAt` selects one of two verification modes:
+ * - string: a success response was received and carries the host's effective
+ *   accepted time (the host derives a durable original acceptance for inputs
+ *   the DB already knows, which can be older than this request's
+ *   originalAcceptedAt); the pointer must advertise exactly that value.
+ * - undefined: the response was lost, so the host's effective value is
+ *   unknowable; require only that acceptedAt is present. The remaining
+ *   compared fields — requestId (a fresh randomUUID per bind), sessionId,
+ *   inputId, routeKey, leaseId, and the exact sorted messageIds — already
+ *   prove this exact bind committed.
+ */
 function currentMatchesAcceptedBind(
   current: CurrentCorrelation | null,
   request: AuthenticatedRequest,
   expectedMessageIds: string[],
+  expectedAcceptedAt: string | undefined,
 ): boolean {
   const currentIds = Array.isArray(current?.messageIds) ? [...current.messageIds].sort() : [];
   return (
@@ -228,7 +244,9 @@ function currentMatchesAcceptedBind(
     current.sessionId === request.sessionId &&
     current.inputId === request.inputId &&
     current.routeKey === request.routeKey &&
-    current.acceptedAt === request.originalAcceptedAt &&
+    (typeof expectedAcceptedAt === 'string'
+      ? current.acceptedAt === expectedAcceptedAt
+      : typeof current.acceptedAt === 'string') &&
     current.leaseId === request.leaseId &&
     JSON.stringify(currentIds) === JSON.stringify(expectedMessageIds)
   );
@@ -394,15 +412,16 @@ export async function bindHostGwsCorrelation(
   );
   const combinedIds = [...new Set([...(existing?.messageIds ?? []), ...expectedIds])].sort();
   const operation = lease.requestTail.then(async () => {
+    let response: ControlResponse;
     try {
-      await sendControlFrame(lease, request.requestId, request);
+      response = await sendControlFrame(lease, request.requestId, request);
     } catch (err) {
       // The authenticated response can be lost after the host transaction and
       // pointer publication have committed. Exact pointer evidence proves that
       // this claim crossed the acceptance boundary, but not that the provider
       // observed the response. Record it locally and force recovery ownership;
       // retrying the bind/input could duplicate tool work.
-      if (!currentMatchesAcceptedBind(readCurrent(), request, combinedIds)) throw err;
+      if (!currentMatchesAcceptedBind(readCurrent(), request, combinedIds, undefined)) throw err;
       lease.acceptedInputs.set(inputId, {
         originalAcceptedAt: request.originalAcceptedAt,
         routeKey,
@@ -417,7 +436,10 @@ export async function bindHostGwsCorrelation(
       );
     }
 
-    if (!currentMatchesAcceptedBind(readCurrent(), request, combinedIds)) {
+    // Hosts that do not echo acceptedAt publish the request's value verbatim;
+    // fall back to it so legacy hosts keep verifying.
+    const hostAcceptedAt = typeof response.acceptedAt === 'string' ? response.acceptedAt : request.originalAcceptedAt;
+    if (!currentMatchesAcceptedBind(readCurrent(), request, combinedIds, hostAcceptedAt)) {
       // An authenticated success response is itself host-commit evidence. If
       // the exact pointer cannot be observed, the lifecycle is ambiguous; do
       // not revoke or retry from inside the still-running container.

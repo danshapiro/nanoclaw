@@ -97,6 +97,8 @@ export type AuthenticatedGwsCorrelationRequest =
 
 interface AcceptedLeaseInput {
   originalAcceptedAt: string;
+  /** The durable acceptance time used for DB stamping; may predate this lease when derived from a prior life's row. */
+  durableAcceptedAt: string;
   routeKey: string;
   messageIds: string[];
   lastClaimToken: string;
@@ -148,6 +150,7 @@ interface AcceptedRow {
   host_accepted_input_id: string | null;
   host_accepted_route_key: string | null;
   host_accepted_at: string | null;
+  host_acceptance_ended_at: string | null;
 }
 
 export interface BindAcceptedGwsCorrelationOptions {
@@ -158,6 +161,8 @@ export interface BindAcceptedGwsCorrelationOptions {
   routeKey: string;
   messageIds: string[];
   acceptedAt?: string;
+  /** Close time for pointer-advance interval closes; the CURRENT request time. Defaults to now. */
+  closedAt?: string;
   requestId?: string;
   claimToken?: string;
   leaseId?: string;
@@ -368,9 +373,28 @@ function startLeaseSocket(control: GwsCorrelationLaunchControl, state: GwsCorrel
         }
         state.mutationTail = state.mutationTail.then(async () => {
           try {
-            processGwsCorrelationRequest(control.agentGroupId, control.sessionId, value);
-            send({ schemaVersion: 1, ok: true, requestId: value?.requestId });
+            const acceptedAt = processGwsCorrelationRequest(control.agentGroupId, control.sessionId, value);
+            // A successful bind echoes the effective accepted time so the
+            // container can verify the published pointer even when the host
+            // derived a durable original acceptance older than the request's
+            // value. Release responses keep the original shape. Container-side
+            // response validation has no key whitelist, so the extra field is
+            // backward/forward compatible.
+            send(
+              acceptedAt !== undefined
+                ? { schemaVersion: 1, ok: true, requestId: value?.requestId, acceptedAt }
+                : { schemaVersion: 1, ok: true, requestId: value?.requestId },
+            );
           } catch (err) {
+            const frame = value as { requestId?: unknown; inputId?: unknown; action?: unknown } | undefined;
+            log.warn('GWS correlation request rejected', {
+              agentGroupId: control.agentGroupId,
+              sessionId: control.sessionId,
+              action: typeof frame?.action === 'string' ? frame.action : undefined,
+              inputId: typeof frame?.inputId === 'string' ? frame.inputId : undefined,
+              requestId: typeof frame?.requestId === 'string' ? frame.requestId : undefined,
+              error: err instanceof Error ? err.message : String(err),
+            });
             send({
               schemaVersion: 1,
               ok: false,
@@ -586,6 +610,7 @@ export function bindAcceptedGwsCorrelation(opts: BindAcceptedGwsCorrelationOptio
   const inputId = canonicalCorrelation(opts.inputId, 'inputId');
   const routeKey = canonicalCorrelation(opts.routeKey, 'routeKey');
   const acceptedAt = canonicalTimestamp(opts.acceptedAt ?? new Date().toISOString(), 'acceptedAt');
+  const closedAt = canonicalTimestamp(opts.closedAt ?? new Date().toISOString(), 'closedAt');
   const messageIds = [...new Set(opts.messageIds)];
   if (messageIds.length === 0 || messageIds.some((id) => !id)) throw new Error('messageIds must name an exact batch');
 
@@ -598,16 +623,28 @@ export function bindAcceptedGwsCorrelation(opts: BindAcceptedGwsCorrelationOptio
     db.transaction(() => {
       const currentInput = priorCurrent?.inputId;
       if (typeof currentInput === 'string' && currentInput !== inputId) {
+        // The pointer names the outgoing turn; the pointer is singular, so every
+        // open interval belongs to that turn (rows first-accepted under it OR
+        // rows adopted into it, which keep their immutable original
+        // host_accepted_input_id). Close them all — an input-keyed close would
+        // leave adopted rows' reopened intervals dangling.
+        // Stamp closedAt (the CURRENT request time), never acceptedAt: after the
+        // durable-derivation companion, acceptedAt can be a derived OLD value,
+        // and a past-dated ended_at trips host-sweep's upperMs < acceptedMs
+        // clamp (host-sweep.ts:1085) and its malformed-acceptance throw
+        // (:1122–1126), hard-failing recoverAfterKill. Invariant: the ended_at
+        // stamped by any close is >= every closed row's host_accepted_at.
         db.prepare(
           `UPDATE messages_in
              SET host_acceptance_ended_at = ?
-           WHERE host_accepted_input_id = ? AND host_acceptance_ended_at IS NULL`,
-        ).run(acceptedAt, currentInput);
+           WHERE host_accepted_at IS NOT NULL AND host_acceptance_ended_at IS NULL`,
+        ).run(closedAt);
       }
 
       const lookup = db.prepare(
         `SELECT id, seq, status, trigger, host_input_id, host_route_key,
-                host_accepted_input_id, host_accepted_route_key, host_accepted_at
+                host_accepted_input_id, host_accepted_route_key, host_accepted_at,
+                host_acceptance_ended_at
            FROM messages_in WHERE id = ?`,
       );
       const rows = messageIds.map((id) => lookup.get(id) as AcceptedRow | undefined);
@@ -627,11 +664,19 @@ export function bindAcceptedGwsCorrelation(opts: BindAcceptedGwsCorrelationOptio
         exactRows.some(
           (row) =>
             row.host_accepted_input_id !== null &&
+            row.host_acceptance_ended_at === null &&
             (row.host_accepted_input_id !== inputId ||
               row.host_accepted_route_key !== routeKey ||
               row.host_accepted_at !== acceptedAt),
         )
       ) {
+        // A mismatched LIVE interval is a genuinely concurrent acceptance and
+        // must fail closed. A row whose interval has ENDED is re-acceptable —
+        // but the safety carrier is LEASE ADMISSION: this function is reachable
+        // only through a live host-issued lease (in-memory lease map deleted
+        // only by verified revoke, 'wx' active-lease.json, startup barrier only
+        // after confirmed orphan stop). ended_at is the row-level marker of a
+        // closed interval, not by itself proof the prior life is over (A1).
         throw new Error('accepted batch conflicts with immutable original acceptance');
       }
       const triggerRows = exactRows
@@ -651,6 +696,13 @@ export function bindAcceptedGwsCorrelation(opts: BindAcceptedGwsCorrelationOptio
                 host_acceptance_sequence = ?
           WHERE id = ? AND host_accepted_at IS NULL`,
       );
+      const reopen = db.prepare(
+        `UPDATE messages_in
+            SET host_acceptance_ended_at = NULL,
+                host_acceptance_claim_token = ?, host_acceptance_lease_id = ?,
+                host_acceptance_sequence = ?
+          WHERE id = ? AND host_accepted_at IS NOT NULL AND host_acceptance_ended_at IS NOT NULL`,
+      );
       for (const row of exactRows) {
         if (row.host_accepted_at === null) {
           update.run(
@@ -662,6 +714,14 @@ export function bindAcceptedGwsCorrelation(opts: BindAcceptedGwsCorrelationOptio
             opts.sequence ?? null,
             row.id,
           );
+        } else {
+          // First-acceptance columns are immutable. Track the CURRENT interval
+          // by re-stamping claim/lease/sequence and clearing ended_at. Rows the
+          // in-transaction pointer-advance close just ended read as ended here
+          // because the lookup ran after that close; rows with a live matching
+          // interval (same-lease followup) are already current — the WHERE
+          // clause makes the reopen a no-op for them.
+          reopen.run(opts.claimToken ?? null, opts.leaseId ?? null, opts.sequence ?? null, row.id);
         }
       }
     })();
@@ -692,10 +752,20 @@ export function releaseAcceptedGwsCorrelation(opts: {
   if (readCurrent(opts.correlationPath)?.inputId === inputId) unlinkIfPresent(opts.correlationPath);
   const db = openInboundDb(opts.dbPath);
   try {
+    // Close EVERY open interval, not just rows first-accepted under the
+    // released input: adopted rows keep their immutable OLD
+    // host_accepted_input_id, and an input-keyed close leaves their reopened
+    // intervals live past the turn boundary. Same single-live-actor
+    // justification as the bind-side broadened close (A2): one lease per
+    // session, one container per session, so every open interval at release
+    // time belongs to the turn being released. endedAt here is the request's
+    // release time, which is >= every open row's host_accepted_at (the
+    // authenticated handler validates releasedAt against the accepted
+    // interval), preserving the ended_at >= accepted_at invariant.
     db.prepare(
       `UPDATE messages_in SET host_acceptance_ended_at = ?
-        WHERE host_accepted_input_id = ? AND host_acceptance_ended_at IS NULL`,
-    ).run(endedAt, inputId);
+        WHERE host_accepted_at IS NOT NULL AND host_acceptance_ended_at IS NULL`,
+    ).run(endedAt);
   } finally {
     db.close();
   }
@@ -811,6 +881,22 @@ function exactProcessingClaim(outDbPath: string, claimToken: string, messageIds:
   }
 }
 
+/** Durable original acceptance for an input the DB already knows, if any. */
+function readDurableOriginalAcceptance(dbPath: string, inputId: string): string | undefined {
+  const db = openInboundDb(dbPath);
+  try {
+    const row = db
+      .prepare(
+        `SELECT MIN(host_accepted_at) AS accepted_at FROM messages_in
+          WHERE host_accepted_input_id = ? AND host_accepted_at IS NOT NULL`,
+      )
+      .get(inputId) as { accepted_at: string | null } | undefined;
+    return row?.accepted_at ?? undefined;
+  } finally {
+    db.close();
+  }
+}
+
 export function processAuthenticatedGwsCorrelationRequest(opts: {
   agentGroupId: string;
   mountedSessionId: string;
@@ -819,7 +905,7 @@ export function processAuthenticatedGwsCorrelationRequest(opts: {
   correlationPath: string;
   request: unknown;
   now?: string;
-}): void {
+}): string | undefined {
   const request = authenticatedRequest(opts.request);
   const state = launchLeases.get(launchLeaseKey(opts.agentGroupId, opts.mountedSessionId));
   if (
@@ -855,16 +941,35 @@ export function processAuthenticatedGwsCorrelationRequest(opts: {
   }
 
   const existing = state.acceptedInputs.get(request.inputId);
+  let boundAcceptedAt: string | undefined;
   if (request.action === 'bind') {
+    let effectiveOriginalAcceptedAt = request.originalAcceptedAt;
     if (existing) {
       if (existing.originalAcceptedAt !== request.originalAcceptedAt || existing.routeKey !== request.routeKey) {
         throw new Error('GWS correlation bind conflicts with immutable original acceptance');
       }
-    } else if (request.originalAcceptedAt !== request.providerAcceptance.acceptedAt) {
-      throw new Error('new GWS correlation bind must preserve its original provider acceptance time');
+      effectiveOriginalAcceptedAt = existing.durableAcceptedAt;
+    } else {
+      const durable = readDurableOriginalAcceptance(opts.dbPath, request.inputId);
+      if (durable !== undefined) {
+        // The DB already knows this input: its first acceptance is immutable
+        // and durable. A fresh container has no durable source and can only
+        // send now(); adopt the durable original instead of requiring the
+        // request to carry it.
+        effectiveOriginalAcceptedAt = durable;
+      } else if (request.originalAcceptedAt !== request.providerAcceptance.acceptedAt) {
+        throw new Error('new GWS correlation bind must preserve its original provider acceptance time');
+      }
     }
     exactProcessingClaim(opts.outDbPath, request.claimToken, request.messageIds);
     const combinedMessageIds = [...new Set([...(existing?.messageIds ?? []), ...request.messageIds])].sort();
+    // For DB-known inputs the signed originalAcceptedAt becomes advisory: the
+    // host stamps its own durable value. Anti-replay/authenticity are carried
+    // by the MAC + per-lease sequence + active-lease marker +
+    // exactProcessingClaim + the freshness window above (A13) — none of which
+    // this weakens. closedAt is the request's current time so a pointer-advance
+    // close can never be past-dated by a derived-old acceptedAt (a past-dated
+    // ended_at would hard-fail host-sweep recovery — see bindAcceptedGwsCorrelation).
     bindAcceptedGwsCorrelation({
       dbPath: opts.dbPath,
       correlationPath: opts.correlationPath,
@@ -872,7 +977,8 @@ export function processAuthenticatedGwsCorrelationRequest(opts: {
       inputId: request.inputId,
       routeKey: request.routeKey,
       messageIds: combinedMessageIds,
-      acceptedAt: request.originalAcceptedAt,
+      acceptedAt: effectiveOriginalAcceptedAt,
+      closedAt: request.providerAcceptance.acceptedAt,
       requestId: request.requestId,
       claimToken: request.claimToken,
       leaseId: request.leaseId,
@@ -880,11 +986,13 @@ export function processAuthenticatedGwsCorrelationRequest(opts: {
     });
     state.acceptedInputs.set(request.inputId, {
       originalAcceptedAt: request.originalAcceptedAt,
+      durableAcceptedAt: effectiveOriginalAcceptedAt,
       routeKey: request.routeKey,
       messageIds: combinedMessageIds,
       lastClaimToken: request.claimToken,
       lastProviderAcceptance: request.providerAcceptance,
     });
+    boundAcceptedAt = effectiveOriginalAcceptedAt;
   } else {
     if (
       !existing ||
@@ -910,15 +1018,20 @@ export function processAuthenticatedGwsCorrelationRequest(opts: {
     state.acceptedInputs.delete(request.inputId);
   }
   state.nextSequence++;
+  return boundAcceptedAt;
 }
 
-export function processGwsCorrelationRequest(agentGroupId: string, mountedSessionId: string, request: unknown): void {
+export function processGwsCorrelationRequest(
+  agentGroupId: string,
+  mountedSessionId: string,
+  request: unknown,
+): string | undefined {
   const group = getAgentGroup(agentGroupId);
   const session = getSession(mountedSessionId);
   if (!group || !session || session.agent_group_id !== group.id || session.status !== 'active') {
     throw new Error('GWS correlation request does not belong to its isolated active-session mount');
   }
-  processAuthenticatedGwsCorrelationRequest({
+  return processAuthenticatedGwsCorrelationRequest({
     agentGroupId: group.id,
     mountedSessionId: session.id,
     dbPath: inboundDbPath(group.id, session.id),

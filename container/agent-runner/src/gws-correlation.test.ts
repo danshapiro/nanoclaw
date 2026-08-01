@@ -28,63 +28,95 @@ function frame(value: unknown): Buffer {
   return framed;
 }
 
+/** The host derives a durable original acceptance for DB-known inputs; a fresh container can only send now(). */
+const DERIVED_OLD_ACCEPTED_AT = '2026-07-21T00:00:01.000Z';
+
+function writePointer(currentFile: string, request: Record<string, unknown>, acceptedAt: unknown): void {
+  fs.writeFileSync(
+    currentFile,
+    JSON.stringify({
+      schemaVersion: 1,
+      requestId: request.requestId,
+      sessionId: request.sessionId,
+      inputId: request.inputId,
+      routeKey: request.routeKey,
+      acceptedAt,
+      messageIds: request.messageIds,
+      leaseId: request.leaseId,
+    }),
+  );
+}
+
+async function startFakeHost(opts: {
+  tag: string;
+  onBind: (request: Record<string, unknown>, socket: net.Socket, currentFile: string) => void;
+}): Promise<{ stop: () => Promise<void>; currentFile: string }> {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `gws-correlation-${opts.tag}-`));
+  tempRoots.push(root);
+  const socketName = 'lease.sock';
+  const currentFile = path.join(root, 'current.json');
+  process.env.NANOCLAW_GWS_CORRELATION_IPC_ROOT = root;
+  process.env.NANOCLAW_HOST_CORRELATION_FILE = currentFile;
+
+  const connections = new Set<net.Socket>();
+  const server = net.createServer((socket) => {
+    connections.add(socket);
+    socket.on('close', () => connections.delete(socket));
+    let buffered = Buffer.alloc(0);
+    socket.on('data', (chunk) => {
+      buffered = Buffer.concat([buffered, chunk]);
+      while (buffered.length >= 4) {
+        const length = buffered.readUInt32BE(0);
+        if (buffered.length < length + 4) return;
+        const request = JSON.parse(buffered.subarray(4, length + 4).toString('utf8')) as Record<string, unknown>;
+        buffered = buffered.subarray(length + 4);
+        if (request.action === 'hello') {
+          socket.write(frame({ schemaVersion: 1, ok: true, action: 'hello' }));
+          continue;
+        }
+        if (request.action === 'bind') {
+          opts.onBind(request, socket, currentFile);
+        }
+      }
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(path.join(root, socketName), resolve);
+  });
+
+  initializeGwsCorrelationLaunchControl({
+    schemaVersion: 1,
+    agentGroupId: 'ag-test',
+    sessionId: 'sess-test',
+    providerName: 'codex',
+    leaseId: 'lease-test',
+    issuedAt: '2026-07-21T00:00:00.000Z',
+    secret: Buffer.alloc(32, 7).toString('base64url'),
+    socketName,
+  });
+  // server.close() waits for live connections, so destroy them first.
+  const stop = async (): Promise<void> => {
+    for (const socket of connections) socket.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  };
+  return { stop, currentFile };
+}
+
 describe('GWS correlation lifecycle faults', () => {
   it('classifies a lost bind response as fatal when the exact host pointer proves commit', async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-correlation-response-loss-'));
-    tempRoots.push(root);
-    const socketName = 'lease.sock';
-    const currentFile = path.join(root, 'current.json');
-    process.env.NANOCLAW_GWS_CORRELATION_IPC_ROOT = root;
-    process.env.NANOCLAW_HOST_CORRELATION_FILE = currentFile;
-
-    const server = net.createServer((socket) => {
-      let buffered = Buffer.alloc(0);
-      socket.on('data', (chunk) => {
-        buffered = Buffer.concat([buffered, chunk]);
-        while (buffered.length >= 4) {
-          const length = buffered.readUInt32BE(0);
-          if (buffered.length < length + 4) return;
-          const request = JSON.parse(buffered.subarray(4, length + 4).toString('utf8')) as Record<string, unknown>;
-          buffered = buffered.subarray(length + 4);
-          if (request.action === 'hello') {
-            socket.write(frame({ schemaVersion: 1, ok: true, action: 'hello' }));
-            continue;
-          }
-          if (request.action === 'bind') {
-            fs.writeFileSync(
-              currentFile,
-              JSON.stringify({
-                schemaVersion: 1,
-                requestId: request.requestId,
-                sessionId: request.sessionId,
-                inputId: request.inputId,
-                routeKey: request.routeKey,
-                acceptedAt: request.originalAcceptedAt,
-                messageIds: request.messageIds,
-                leaseId: request.leaseId,
-              }),
-            );
-            // Simulate the only ambiguous window: the host commit and pointer
-            // publication succeeded, then the authenticated response vanished.
-            socket.destroy();
-          }
-        }
-      });
-    });
-    await new Promise<void>((resolve, reject) => {
-      server.once('error', reject);
-      server.listen(path.join(root, socketName), resolve);
-    });
-
-    initializeGwsCorrelationLaunchControl({
-      schemaVersion: 1,
-      agentGroupId: 'ag-test',
-      sessionId: 'sess-test',
-      providerName: 'codex',
-      leaseId: 'lease-test',
-      issuedAt: '2026-07-21T00:00:00.000Z',
-      secret: Buffer.alloc(32, 7).toString('base64url'),
-      socketName,
+    // The host may have derived the durable original acceptance from a prior
+    // life, so the pointer's acceptedAt legitimately differs from the fresh
+    // container's now(). With the response lost there is no way to learn the
+    // derived value; the remaining exact fields still prove host commitment.
+    const { stop } = await startFakeHost({
+      tag: 'response-loss',
+      onBind: (request, socket, currentFile) => {
+        writePointer(currentFile, request, DERIVED_OLD_ACCEPTED_AT);
+        // Simulate the only ambiguous window: the host commit and pointer
+        // publication succeeded, then the authenticated response vanished.
+        socket.destroy();
+      },
     });
     try {
       await connectGwsCorrelationControlSocket();
@@ -92,7 +124,47 @@ describe('GWS correlation lifecycle faults', () => {
         bindHostGwsCorrelation('input-test', 'route-test', ['m-2', 'm-1'], 'claim-test', 'initial'),
       ).rejects.toBeInstanceOf(GwsCorrelationLifecycleFault);
     } finally {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await stop();
+    }
+  });
+
+  it('verifies a successful bind against the derived acceptedAt echoed by the host response', async () => {
+    const { stop } = await startFakeHost({
+      tag: 'derived-success',
+      onBind: (request, socket, currentFile) => {
+        writePointer(currentFile, request, DERIVED_OLD_ACCEPTED_AT);
+        socket.write(
+          frame({ schemaVersion: 1, ok: true, requestId: request.requestId, acceptedAt: DERIVED_OLD_ACCEPTED_AT }),
+        );
+      },
+    });
+    try {
+      await connectGwsCorrelationControlSocket();
+      await expect(
+        bindHostGwsCorrelation('input-test', 'route-test', ['m-2', 'm-1'], 'claim-test', 'initial'),
+      ).resolves.toBeUndefined();
+    } finally {
+      await stop();
+    }
+  });
+
+  it('still verifies a successful bind against a legacy host that does not echo acceptedAt', async () => {
+    const { stop } = await startFakeHost({
+      tag: 'legacy-success',
+      onBind: (request, socket, currentFile) => {
+        // A legacy host publishes the request's originalAcceptedAt verbatim
+        // and its response carries no acceptedAt field.
+        writePointer(currentFile, request, request.originalAcceptedAt);
+        socket.write(frame({ schemaVersion: 1, ok: true, requestId: request.requestId }));
+      },
+    });
+    try {
+      await connectGwsCorrelationControlSocket();
+      await expect(
+        bindHostGwsCorrelation('input-test', 'route-test', ['m-2', 'm-1'], 'claim-test', 'initial'),
+      ).resolves.toBeUndefined();
+    } finally {
+      await stop();
     }
   });
 });
