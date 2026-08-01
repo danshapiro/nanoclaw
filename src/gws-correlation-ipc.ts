@@ -376,6 +376,15 @@ function startLeaseSocket(control: GwsCorrelationLaunchControl, state: GwsCorrel
             processGwsCorrelationRequest(control.agentGroupId, control.sessionId, value);
             send({ schemaVersion: 1, ok: true, requestId: value?.requestId });
           } catch (err) {
+            const frame = value as { requestId?: unknown; inputId?: unknown; action?: unknown } | undefined;
+            log.warn('GWS correlation request rejected', {
+              agentGroupId: control.agentGroupId,
+              sessionId: control.sessionId,
+              action: typeof frame?.action === 'string' ? frame.action : undefined,
+              inputId: typeof frame?.inputId === 'string' ? frame.inputId : undefined,
+              requestId: typeof frame?.requestId === 'string' ? frame.requestId : undefined,
+              error: err instanceof Error ? err.message : String(err),
+            });
             send({
               schemaVersion: 1,
               ok: false,

@@ -5,7 +5,7 @@ import net, { type Socket } from 'net';
 import { createHmac } from 'crypto';
 
 import Database from 'better-sqlite3';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   bindAcceptedGwsCorrelation,
@@ -23,6 +23,7 @@ import {
 } from './gws-correlation-ipc.js';
 import { closeDb, createAgentGroup, createSession, initTestDb, runMigrations } from './db/index.js';
 import { INBOUND_SCHEMA, OUTBOUND_SCHEMA } from './db/schema.js';
+import { log } from './log.js';
 import { hostCorrelationPath, inboundDbPath, outboundDbPath, sessionDir } from './session-manager.js';
 
 const testIpcRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gws-correlation-ipc-root-'));
@@ -694,6 +695,46 @@ describe('bounded GWS correlation socket transport', () => {
 
     expect(control.revokeAfterConfirmedStop()).toBe(true);
     expect(fs.existsSync(hostCorrelationPath(groupId, sessionId))).toBe(false);
+  });
+
+  it('logs a host-side warning when a correlation request is rejected', async () => {
+    const warnSpy = vi.spyOn(log, 'warn');
+    const control = registerGwsCorrelationLaunchLease({
+      agentGroupId: 'group-warnlog',
+      sessionId: 'sess-warnlog',
+      providerName: 'opencode',
+      issuedAt: '2026-08-01T00:00:00.000Z',
+      secret: Buffer.alloc(32, 9),
+      leaseId: 'lease-warnlog-1',
+    });
+    try {
+      const socket = await authenticateSocket(control);
+      socket.write(
+        socketFrame({
+          schemaVersion: 2,
+          action: 'bind',
+          requestId: 'req-warnlog-1',
+          inputId: 'in-warnlog',
+          sessionId: 'sess-warnlog',
+        }),
+      );
+      const response = (await readSocketFrame(socket)) as { ok: boolean; error?: string };
+      socket.destroy();
+      expect(response.ok).toBe(false);
+      expect(warnSpy).toHaveBeenCalledWith(
+        'GWS correlation request rejected',
+        expect.objectContaining({
+          agentGroupId: 'group-warnlog',
+          sessionId: 'sess-warnlog',
+          inputId: 'in-warnlog',
+          requestId: 'req-warnlog-1',
+          error: expect.any(String),
+        }),
+      );
+    } finally {
+      control.revokeAfterConfirmedStop();
+      warnSpy.mockRestore();
+    }
   });
 });
 
