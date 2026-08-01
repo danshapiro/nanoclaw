@@ -4,9 +4,18 @@ import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { getPendingMessages } from './db/messages-in.js';
 import { normalizeRoute } from './formatter.js';
+import { type AppServer } from './providers/codex-app-server.js';
+import { CodexProvider } from './providers/codex.js';
 import { MockProvider } from './providers/mock.js';
 import { runPollLoop as runProductionPollLoop, type PollLoopConfig } from './poll-loop.js';
-import type { AgentProvider, AgentQuery, ProviderEvent, QueryInput, QueryTurnInput } from './providers/types.js';
+import {
+  ProviderQuiescenceError,
+  type AgentProvider,
+  type AgentQuery,
+  type ProviderEvent,
+  type QueryInput,
+  type QueryTurnInput,
+} from './providers/types.js';
 
 function runPollLoop(config: PollLoopConfig): Promise<void> {
   return runProductionPollLoop({
@@ -233,7 +242,67 @@ describe('poll loop integration', () => {
     controller.abort();
     await loopPromise.catch(() => {});
   });
+
+  it('returns the batch to pending when a codex bind failure coincides with an always-throwing teardown', async () => {
+    // The dvora/hinda container-side signature: host rejects the bind AND the
+    // codex app-server teardown throws its designed quiescence sentinel. The
+    // real bind failure must reach the poll-loop's graceful return-to-pending
+    // path instead of exiting fatally through the quiescence rethrow.
+    let bindAttempts = 0;
+    const provider = new CodexProvider(
+      {},
+      {
+        syncManagedSkillLinks: () => [],
+        writeMcpConfig: () => {},
+        createConfigOverrides: () => [],
+        spawnServer: () => queryServer(),
+        attachAutoApproval: () => {},
+        initializeServer: async () => {},
+        startThread: async () => 'thread-abc',
+        terminateServer: async () => {
+          throw new ProviderQuiescenceError(
+            'Codex app-server exited after transport shutdown, but whole process tree quiescence is unproven until host container stop: code=0 signal=null',
+          );
+        },
+      },
+    );
+    insertMessage('m-codex-bind-fail', { sender: 'Alice', text: 'hello' });
+    const controller = new AbortController();
+    const loopPromise = runProductionPollLoop({
+      provider,
+      providerName: 'mock',
+      cwd: '/tmp',
+      signal: controller.signal,
+      bindGwsCorrelation: async () => {
+        bindAttempts += 1;
+        throw new Error('host bind unavailable');
+      },
+      releaseGwsCorrelation: async () => {},
+    });
+    // Observe rejection immediately: bun:test fails the running test on an
+    // unhandled loop rejection (V9). The loop must NOT reject with
+    // ProviderQuiescenceError — the bind failure continues gracefully.
+    void loopPromise.catch(() => {});
+
+    await waitFor(() => bindAttempts === 1, 1000);
+    await sleep(100);
+    expect(bindAttempts).toBe(1); // durable backoff, no hot retry loop
+    expect(getPendingMessages().map((m) => m.id)).toContain('m-codex-bind-fail'); // returned to pending, not fatal
+
+    controller.abort();
+    await loopPromise.catch(() => {});
+  });
 });
+
+function queryServer(): AppServer {
+  return {
+    process: {},
+    readline: { close() {} },
+    pending: new Map(),
+    notificationHandlers: [],
+    serverRequestHandlers: [],
+  } as unknown as AppServer;
+}
 
 // Helper: run poll loop until aborted or timeout
 async function runPollLoopWithTimeout(provider: AgentProvider, signal: AbortSignal, timeoutMs: number): Promise<void> {
