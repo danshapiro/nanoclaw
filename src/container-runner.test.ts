@@ -2639,3 +2639,65 @@ describe('drainAllContainers', () => {
     }
   });
 });
+
+describe('container stderr capture (R6)', () => {
+  it('logs structured events at info, survives chunk splits, flushes the last partial line, and persists the tail on exit', async () => {
+    vi.useFakeTimers();
+    const harness = await loadContainerRunnerHarness();
+    // Import log AFTER the harness's vi.resetModules() so the spied instance
+    // is the one the freshly-loaded container-runner module actually calls.
+    const { log: harnessLog } = await import('./log.js');
+    const infoSpy = vi.spyOn(harnessLog, 'info').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(harnessLog, 'warn').mockImplementation(() => {});
+    try {
+      harness.oneCliRelease.resolve();
+      await harness.containerRunner.wakeContainer(harness.session);
+      expect(harness.spawnedProcesses).toHaveLength(1);
+      const child = harness.spawnedProcesses[0];
+
+      child.stderr.emit('data', Buffer.from('{"severity":"error","ev'));
+      child.stderr.emit('data', Buffer.from('ent":"fatal_error","error":"boom"}\nplain noise\nFATAL last words'));
+      // (note: 'FATAL last words' has NO trailing newline — it exercises the carry flush)
+
+      // The structured event was logged at info with the reassembled line.
+      const eventCalls = infoSpy.mock.calls.filter(([msg]) => msg === 'Container event');
+      expect(eventCalls).toHaveLength(1);
+      expect(eventCalls[0][1]).toMatchObject({
+        container: 'agent',
+        severity: 'error',
+        line: '{"severity":"error","event":"fatal_error","error":"boom"}',
+      });
+
+      // Drive the fake process exit and let finalization run.
+      child.emit('close', 1);
+      await vi.advanceTimersByTimeAsync(harness.containerRunner.UNEXPECTED_EXIT_RECOVERY_BASE_MS);
+      expect(harness.containerRunner.getActiveContainerCount()).toBe(0);
+      // The non-zero exit was surfaced at warn, not swallowed.
+      expect(
+        warnSpy.mock.calls.filter(
+          ([msg]) => msg === 'Agent container exited unexpectedly; scheduling targeted recovery',
+        ),
+      ).toHaveLength(1);
+
+      // The tail file exists in the HOST-SIDE log tree — NOT under v2-sessions
+      // (nothing may be written into the agent-writable workspace).
+      const dir = path.join(harness.dataDir, 'v2-container-logs', 'ag-1', harness.session.id);
+      const files = fs.readdirSync(dir);
+      expect(files).toHaveLength(1);
+      const contents = fs.readFileSync(path.join(dir, files[0]), 'utf8');
+      expect(contents).toContain('"event":"fatal_error"');
+      expect(contents).toContain('plain noise');
+      expect(contents).toContain('FATAL last words'); // carry flushed at persist time
+      expect(files[0]).toContain('-exit-1');
+      // Negative: the agent-writable session dir got NOTHING new.
+      expect(fs.existsSync(path.join(harness.dataDir, 'v2-sessions', 'ag-1', harness.session.id, '.nanoclaw'))).toBe(
+        false,
+      );
+    } finally {
+      infoSpy.mockRestore();
+      warnSpy.mockRestore();
+      harness.close();
+      vi.useRealTimers();
+    }
+  });
+});

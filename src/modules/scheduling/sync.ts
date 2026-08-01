@@ -2,6 +2,7 @@ import type Database from 'better-sqlite3';
 
 import { getChannelAdapter } from '../../channels/channel-registry.js';
 import { getDb } from '../../db/connection.js';
+import { parseSqliteUtcMs } from '../../db/session-db.js';
 import { assertRuntimeLockOwner, type RuntimeLockOwner } from '../../db/runtime-locks.js';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
@@ -19,6 +20,10 @@ import {
 
 const LOCK_NAME = 'scheduler-mutator';
 
+/** R3: age past which an unresolved ack escalates from warn wallpaper to an error incident. */
+const SCHEDULER_ACK_STALE_ESCALATION_MS =
+  Number(process.env.NANOCLAW_SCHEDULER_ACK_STALE_ESCALATION_MS) || 60 * 60 * 1000;
+
 export type ProjectionSessionMode = 'shared' | 'per-thread' | 'agent-shared';
 
 export interface ProjectionContext {
@@ -31,6 +36,7 @@ export interface ProjectionContext {
 export interface SchedulerAckRow {
   message_id: string;
   status: 'processing' | 'completed' | 'failed' | 'recovery' | string;
+  status_changed: string;
   notice_message_out_id: string | null;
 }
 
@@ -87,12 +93,12 @@ export function getProcessingAcksForProjectedTasks(
   const rows = (
     hasNoticeCol
       ? outDb.prepare(
-          `SELECT message_id, status, notice_message_out_id
+          `SELECT message_id, status, status_changed, notice_message_out_id
              FROM processing_ack
             WHERE message_id IN (${placeholders})`,
         )
       : outDb.prepare(
-          `SELECT message_id, status, NULL AS notice_message_out_id
+          `SELECT message_id, status, status_changed, NULL AS notice_message_out_id
              FROM processing_ack
             WHERE message_id IN (${placeholders})`,
         )
@@ -150,6 +156,34 @@ export function recordUnresolvedSchedulerAck(
       reason: 'unresolved-scheduler-ack',
       messageId: row.id,
       ackStatus: status,
+    },
+  });
+}
+
+/**
+ * R3: distinct dedupe key (':stale-escalated' suffix) so this alerts once at
+ * error severity even though the warn-severity incident already consumed the
+ * base key. Age is derived from processing_ack.status_changed.
+ */
+export function recordStaleSchedulerAckEscalation(
+  session: Session,
+  row: ProjectionRow,
+  status: string,
+  ackAgeMs: number,
+  owner: RuntimeLockOwner,
+): void {
+  recordSchedulerIncident({
+    owner,
+    dedupeKey: `scheduler-sync:${session.agent_group_id}:${row.series_id}:${row.id}:unresolved-ack:${status}:stale-escalated`,
+    severity: 'error',
+    session,
+    seriesId: row.series_id,
+    message: `Scheduled task "${row.series_id}" has been hidden behind an unresolved ${status} ack for ${Math.round(ackAgeMs / 60000)} minutes; recovery is stalled and needs attention.`,
+    details: {
+      reason: 'stale-unresolved-scheduler-ack',
+      messageId: row.id,
+      ackStatus: status,
+      ackAgeMs,
     },
   });
 }
@@ -358,6 +392,10 @@ export function syncSessionSchedulerState(
 
       if (ack?.status === 'recovery') {
         recordUnresolvedSchedulerAck(session, row, 'recovery', owner);
+        const ackAgeMs = Date.now() - parseSqliteUtcMs(ack.status_changed);
+        if (Number.isFinite(ackAgeMs) && ackAgeMs >= SCHEDULER_ACK_STALE_ESCALATION_MS) {
+          recordStaleSchedulerAckEscalation(session, row, 'recovery', ackAgeMs, owner);
+        }
       }
     } catch (err) {
       recordProjectionSyncError(session, row, err, owner);

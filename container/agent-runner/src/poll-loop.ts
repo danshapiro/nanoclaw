@@ -18,6 +18,7 @@ import {
 } from './db/messages-in.js';
 import { writeMessageOut, harvestRouteScopedProgress } from './db/messages-out.js';
 import { touchHeartbeat, clearStaleProcessingAcks, getOutboundDb } from './db/connection.js';
+import { withSqliteRetry } from './db/sqlite-retry.js';
 import { zombieDecision } from './providers/opencode-errors.js';
 import {
   appendRecoveryEntry,
@@ -128,35 +129,33 @@ function recoveryIdFor(routeKey: string): string {
   return `rec-${routeKey}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 }
 
-function ownExhaustedPreacceptRetry(
+async function ownExhaustedPreacceptRetry(
   scope: ProviderRecoveryScope,
   messageIds: string[],
   originalTasks: ProviderRecoveryEntry['originalTasks'],
   errorMessage: string,
-): void {
+): Promise<void> {
   const now = new Date().toISOString();
   const recoveryId = recoveryIdFor(scope.routeKey);
-  appendRecoveryEntryAndOwnRows(
-    scope,
-    {
-      id: recoveryId,
-      status: 'pending',
-      classification: 'pre_accept_retry_exhausted',
-      agentMessage: 'Automatic startup retries were exhausted before this request was accepted.',
-      fallbackUserMessage: 'I could not start this request after several retries. It is saved for recovery.',
-      originalTasks,
-      acceptedUnresolvedInputs: [],
-      pendingFollowups: [],
-      priorProgress: [],
-      observations: [`pre_accept_retry_exhausted: ${errorMessage}`],
-      sideEffects: [],
-      continuationPolicy: 'preserve',
-      createdAt: now,
-      updatedAt: now,
-    },
-    messageIds,
-    { recoveryId },
-  );
+  const entry: ProviderRecoveryEntry = {
+    id: recoveryId,
+    status: 'pending',
+    classification: 'pre_accept_retry_exhausted',
+    agentMessage: 'Automatic startup retries were exhausted before this request was accepted.',
+    fallbackUserMessage: 'I could not start this request after several retries. It is saved for recovery.',
+    originalTasks,
+    acceptedUnresolvedInputs: [],
+    pendingFollowups: [],
+    priorProgress: [],
+    observations: [`pre_accept_retry_exhausted: ${errorMessage}`],
+    sideEffects: [],
+    continuationPolicy: 'preserve',
+    createdAt: now,
+    updatedAt: now,
+  };
+  await withSqliteRetry(() => appendRecoveryEntryAndOwnRows(scope, entry, messageIds, { recoveryId }), {
+    label: 'ownExhaustedPreacceptRetry',
+  });
 }
 
 /**
@@ -346,7 +345,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   // other providers may reload a thread ID, etc.). Keyed per-provider so
   // a Codex thread id never gets handed to Claude or vice versa.
   const continuationScope = config.provider.continuationScope;
-  let continuation: string | undefined = migrateLegacyContinuation(config.providerName, continuationScope);
+  let continuation: string | undefined = await withSqliteRetry(
+    () => migrateLegacyContinuation(config.providerName, continuationScope),
+    { label: 'migrateLegacyContinuation' },
+  );
 
   if (continuation) {
     log(`Resuming agent session ${continuation}`);
@@ -354,7 +356,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
   // Clear leftover 'processing' acks from a previous crashed container.
   // This lets the new container re-process those messages.
-  clearStaleProcessingAcks();
+  await withSqliteRetry(() => clearStaleProcessingAcks(), { label: 'clearStaleProcessingAcks' });
 
   let pollCount = 0;
   while (!config.signal?.aborted) {
@@ -363,7 +365,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // userErrorEmittedAt covers de-dup across wakes within one retry series.
     const userErrorEmittedRoutes = new Set<string>();
     // Skip system messages — they're responses for MCP tools (e.g., ask_user_question)
-    const messages = getPendingMessages().filter((m) => m.kind !== 'system');
+    const messages = (await withSqliteRetry(() => getPendingMessages(), { label: 'getPendingMessages' })).filter(
+      (m) => m.kind !== 'system',
+    );
     pollCount++;
 
     // Periodic heartbeat so we know the loop is alive
@@ -420,8 +424,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     if (idleStopMessages.length > 0) {
       const stopRouting = extractRouting(idleStopMessages);
       stampRoutingScope(stopRouting, activeRouteScope);
-      markCompleted(idleStopMessages.map((m) => m.id));
-      writeRoutedMessage(stopRouting, STOP_IDLE_ACK);
+      await withSqliteRetry(() => markCompleted(idleStopMessages.map((m) => m.id)), { label: 'markCompleted' });
+      await withSqliteRetry(() => writeRoutedMessage(stopRouting, STOP_IDLE_ACK), { label: 'writeRoutedMessage' });
       log(
         JSON.stringify({
           severity: 'info',
@@ -430,14 +434,18 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           message_ids: idleStopMessages.map((m) => m.id),
         }),
       );
-      clearProviderRetrySchedule(config.providerName, activeRouteKey);
+      await withSqliteRetry(() => clearProviderRetrySchedule(config.providerName, activeRouteKey), {
+        label: 'clearProviderRetrySchedule',
+      });
       activeMessages = activeMessages.filter((m) => !isStopControlMessage(m));
       if (!activeMessages.some((m) => m.trigger === 1)) {
         continue;
       }
     }
 
-    const retrySchedule = readProviderRetrySchedule(config.providerName, activeRouteKey);
+    const retrySchedule = await withSqliteRetry(() => readProviderRetrySchedule(config.providerName, activeRouteKey), {
+      label: 'readProviderRetrySchedule',
+    });
     const activeTriggerInputId = activeMessages.filter((message) => message.trigger === 1).at(-1)?.host_input_id;
     if (retrySchedule?.status === 'exhausted') {
       // Exhaustion is durable and never ages back into an automatic eleventh
@@ -447,7 +455,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         // Close the crash window between persisting attempt 10 and the atomic
         // recovery-ownership transaction. Re-entry never calls the provider;
         // it only completes the durable exhausted disposition.
-        ownExhaustedPreacceptRetry(
+        await ownExhaustedPreacceptRetry(
           activeRouteScope,
           activeMessages.map((message) => message.id),
           activeMessages
@@ -461,7 +469,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         );
         continue;
       }
-      clearProviderRetrySchedule(config.providerName, activeRouteKey);
+      await withSqliteRetry(() => clearProviderRetrySchedule(config.providerName, activeRouteKey), {
+        label: 'clearProviderRetrySchedule',
+      });
     }
     // Captured BEFORE provider acceptance clears the durable schedule
     // (onInputAccepted): the post-accept catch below must still honor the
@@ -483,9 +493,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // completed side effects + continuation policy), and they are marked in_flight
     // on acceptance and resolved (with their owned rows completed) only on a
     // successful result (Invariants 128/129/140; plan lines 743-744).
-    const resumableRecovery = listRecoveryEntries(activeRouteScope).filter(
-      (e) => e.status === 'pending' || e.status === 'in_flight',
-    );
+    const resumableRecovery = (
+      await withSqliteRetry(() => listRecoveryEntries(activeRouteScope), { label: 'listRecoveryEntries' })
+    ).filter((e) => e.status === 'pending' || e.status === 'in_flight');
     // Pre-query failures after rows are claimed are recoverable (Invariant 170):
     // a throw in pre-task script HANDLING, formatting, attachment inspection,
     // provider startup, session creation, or prompt acceptance must return the
@@ -565,7 +575,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       topLevelInputId = hostTrigger.host_input_id;
       processingIds = keep.map((message) => message.id);
       claimToken = randomUUID();
-      markProcessing(processingIds, claimToken);
+      await withSqliteRetry(() => markProcessing(processingIds, claimToken), { label: 'markProcessing' });
       routing = extractRouting(keep);
       originalTasks = finalTriggerRows.map((message) => ({
         messageId: message.id,
@@ -619,11 +629,15 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       });
     } catch (preErr) {
       const preMsg = preErr instanceof Error ? preErr.message : String(preErr);
-      const retry = scheduleProviderRetry(
-        config.providerName,
-        activeRouteKey,
-        Date.now(),
-        topLevelInputId || activeTriggerInputId || undefined,
+      const retry = await withSqliteRetry(
+        () =>
+          scheduleProviderRetry(
+            config.providerName,
+            activeRouteKey,
+            Date.now(),
+            topLevelInputId || activeTriggerInputId || undefined,
+          ),
+        { label: 'scheduleProviderRetry' },
       );
       log(
         JSON.stringify({
@@ -645,14 +659,14 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // is the correct lifecycle; recovery preserves the original-task context.
       const now = new Date().toISOString();
       if (retry.status === 'exhausted') {
-        ownExhaustedPreacceptRetry(
+        await ownExhaustedPreacceptRetry(
           activeRouteScope,
           processingIds.length > 0 ? processingIds : activeMessages.map((message) => message.id),
           originalTasks,
           preMsg,
         );
       } else {
-        appendRecoveryEntry(activeRouteScope, {
+        const recoveryEntry: ProviderRecoveryEntry = {
           id: recoveryIdFor(activeRouteScope.routeKey),
           status: 'pending',
           classification: 'pre_query_failure',
@@ -667,8 +681,13 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           continuationPolicy: 'preserve',
           createdAt: now,
           updatedAt: now,
+        };
+        await withSqliteRetry(() => appendRecoveryEntry(activeRouteScope, recoveryEntry), {
+          label: 'appendRecoveryEntry',
         });
-        returnProcessingToPending(processingIds, 'pre_query_failure');
+        await withSqliteRetry(() => returnProcessingToPending(processingIds, 'pre_query_failure'), {
+          label: 'returnProcessingToPending',
+        });
       }
       continue;
     }
@@ -677,10 +696,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const replyAccounting = {
       initialRequiresUserVisibleReply: requiresUserVisibleReply(keep),
       initialUserTriggered: isUserTriggered(keep),
-      outboundVisibleReplyCountBefore: countOutboundVisibleReplyMessages({
-        ...routing,
-        routeKey: activeRouteScope.routeKey,
-      }),
+      outboundVisibleReplyCountBefore: await withSqliteRetry(
+        () => countOutboundVisibleReplyMessages({ ...routing, routeKey: activeRouteScope.routeKey }),
+        { label: 'countOutboundVisibleReplyMessages' },
+      ),
     };
     try {
       if (!initialClaim) throw new Error('missing exact initial input claim');
@@ -741,7 +760,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
       const failedBeforeAcceptance = initialClaim?.state === 'returned' && initialClaim.acceptanceObserved === false;
       if (failedBeforeAcceptance) {
-        const retry = scheduleProviderRetry(config.providerName, activeRouteKey, Date.now(), topLevelInputId);
+        const retry = await withSqliteRetry(
+          () => scheduleProviderRetry(config.providerName, activeRouteKey, Date.now(), topLevelInputId),
+          { label: 'scheduleProviderRetry' },
+        );
         log(
           JSON.stringify({
             severity: 'warn',
@@ -756,11 +778,15 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           }),
         );
         if (!retry.userErrorEmittedAt) {
-          writeRoutedMessage(routing, `Error: ${sanitizeProviderErrorText(errMsg)}`);
-          markProviderRetryUserErrorEmitted(config.providerName, activeRouteKey);
+          await withSqliteRetry(() => writeRoutedMessage(routing, `Error: ${sanitizeProviderErrorText(errMsg)}`), {
+            label: 'writeRoutedMessage',
+          });
+          await withSqliteRetry(() => markProviderRetryUserErrorEmitted(config.providerName, activeRouteKey), {
+            label: 'markProviderRetryUserErrorEmitted',
+          });
         }
         if (retry.status === 'exhausted') {
-          ownExhaustedPreacceptRetry(activeRouteScope, processingIds, originalTasks, errMsg);
+          await ownExhaustedPreacceptRetry(activeRouteScope, processingIds, originalTasks, errMsg);
         }
         continue;
       }
@@ -771,7 +797,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       if (continuation && config.provider.isSessionInvalid(err, { attemptedContinuation: continuation })) {
         log(`Stale session detected (${continuation}) — clearing for next retry`);
         continuation = undefined;
-        clearContinuation(config.providerName, continuationScope);
+        await withSqliteRetry(() => clearContinuation(config.providerName, continuationScope), {
+          label: 'clearContinuation',
+        });
       }
 
       // Provider throw is a sanitized recoverable interruption. processQuery's
@@ -780,24 +808,33 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // to pending. Never overwrite either outcome with `completed` here.
       // User-facing text is sanitized + de-duped; the raw error stays in the
       // journal via the `Query error:` log line above.
-      const priorSchedule = readProviderRetrySchedule(config.providerName, activeRouteKey);
+      const priorSchedule = await withSqliteRetry(
+        () => readProviderRetrySchedule(config.providerName, activeRouteKey),
+        { label: 'readProviderRetrySchedule' },
+      );
       if (
         !priorSchedule?.userErrorEmittedAt &&
         !priorUserErrorEmittedAt &&
         !userErrorEmittedRoutes.has(activeRouteKey)
       ) {
-        writeMessageOut({
-          id: generateId(),
-          kind: 'chat',
-          platform_id: routing.platformId,
-          channel_type: routing.channelType,
-          thread_id: routing.threadId,
-          content: JSON.stringify({ text: `Error: ${sanitizeProviderErrorText(errMsg)}` }),
-        });
+        await withSqliteRetry(
+          () =>
+            writeMessageOut({
+              id: generateId(),
+              kind: 'chat',
+              platform_id: routing.platformId,
+              channel_type: routing.channelType,
+              thread_id: routing.threadId,
+              content: JSON.stringify({ text: `Error: ${sanitizeProviderErrorText(errMsg)}` }),
+            }),
+          { label: 'writeMessageOut' },
+        );
         userErrorEmittedRoutes.add(activeRouteKey);
         // Persists the guard when a retry schedule exists; no-ops otherwise
         // (the in-memory set covers the schedule-less case within this wake).
-        markProviderRetryUserErrorEmitted(config.providerName, activeRouteKey);
+        await withSqliteRetry(() => markProviderRetryUserErrorEmitted(config.providerName, activeRouteKey), {
+          label: 'markProviderRetryUserErrorEmitted',
+        });
       }
     }
     log(`Completed wake for route ${activeRouteKey} (${ids.length} active row(s))`);
@@ -1167,26 +1204,42 @@ async function processQuery(
   const pollHandle = setInterval(() => {
     if (done || pollingFollowups) return;
     pollingFollowups = true;
-    void pollFollowups().finally(() => {
-      pollingFollowups = false;
-    });
+    void pollFollowups()
+      .catch((err) => {
+        // A rejected voided promise is an unhandled rejection (process-fatal
+        // under Bun's default). withSqliteRetry has already retried busy
+        // errors, so anything landing here is exhausted/unexpected: log a
+        // structured event instead of silently killing follow-up claiming.
+        log(
+          JSON.stringify({
+            severity: 'error',
+            event: 'poll_followups_failed',
+            error: err instanceof Error ? err.message : String(err),
+          }),
+        );
+      })
+      .finally(() => {
+        pollingFollowups = false;
+      });
   }, ACTIVE_POLL_INTERVAL_MS);
 
   async function pollFollowups(): Promise<void> {
     // Only claim follow-ups on the ACTIVE route. Rows on other routes remain
     // pending and are excluded from this turn (route splitting also applies to
     // follow-ups, not just the initial batch).
-    const candidates = getPendingMessages().filter((m) => m.kind !== 'system');
+    const candidates = (await withSqliteRetry(() => getPendingMessages(), { label: 'getPendingMessages' })).filter(
+      (m) => m.kind !== 'system',
+    );
     const routeMessages = candidates.filter((m) => routeKeyForMessage(providerName, m) === ledgerCtx.activeRouteKey);
     const stopMessages = routeMessages.filter(isStopControlMessage);
     if (stopMessages.length > 0) {
       const stopIds = stopMessages.map((m) => m.id);
       const sameRouteIds = routeMessages.map((m) => m.id);
-      markProcessing(sameRouteIds);
-      markCompleted(sameRouteIds);
+      await withSqliteRetry(() => markProcessing(sameRouteIds), { label: 'markProcessing' });
+      await withSqliteRetry(() => markCompleted(sameRouteIds), { label: 'markCompleted' });
       if (!userStopRequested) {
         userStopRequested = true;
-        writeRoutedMessage(routing, STOP_ACTIVE_ACK);
+        await withSqliteRetry(() => writeRoutedMessage(routing, STOP_ACTIVE_ACK), { label: 'writeRoutedMessage' });
         log(
           JSON.stringify({
             severity: 'info',
@@ -1236,7 +1289,9 @@ async function processQuery(
         scope: 'followup',
         prompt: '',
         requiresUserVisibleReply: requiresUserVisibleReply(newMessages),
-        outboundVisibleReplyCountBefore: countOutboundVisibleReplyMessages(routing),
+        outboundVisibleReplyCountBefore: await withSqliteRetry(() => countOutboundVisibleReplyMessages(routing), {
+          label: 'countOutboundVisibleReplyMessages',
+        }),
         claims: [],
       };
     } else {
@@ -1249,7 +1304,9 @@ async function processQuery(
       if (!entry) return;
       followupInputId = entry.inputId;
     }
-    const outboundVisibleReplyCountBefore = countOutboundVisibleReplyMessages(routing);
+    const outboundVisibleReplyCountBefore = await withSqliteRetry(() => countOutboundVisibleReplyMessages(routing), {
+      label: 'countOutboundVisibleReplyMessages',
+    });
 
     const prompt = formatMessages(newMessages);
     const attachments = await collectQueryAttachments({
@@ -1268,7 +1325,7 @@ async function processQuery(
       prompt,
       scope: 'followup',
     });
-    markProcessing(newIds, claimToken);
+    await withSqliteRetry(() => markProcessing(newIds, claimToken), { label: 'markProcessing' });
     entry.claims.push(claim);
     entry.messageIds.push(...newIds);
     entry.prompt = [entry.prompt, newMessages.map(textOfMessage).join('\n')].filter(Boolean).join('\n');
@@ -1298,7 +1355,9 @@ async function processQuery(
       entry.claims = entry.claims.filter((candidate) => candidate !== claim);
       entry.messageIds = entry.messageIds.filter((id) => !newIds.includes(id));
       if (entry.claims.length === 0) ledger.delete(followupInputId);
-      returnProcessingToPending(newIds, 'followup_enqueue_failed');
+      await withSqliteRetry(() => returnProcessingToPending(newIds, 'followup_enqueue_failed'), {
+        label: 'returnProcessingToPending',
+      });
       return;
     }
     entry.requiresUserVisibleReply ||= requiresUserVisibleReply(newMessages);

@@ -8,7 +8,7 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 
 import { generateKeyPairSync, sign as edSign } from 'crypto';
 
@@ -16,14 +16,23 @@ import { INBOUND_SCHEMA, OUTBOUND_SCHEMA } from './schema.js';
 import {
   countDueMessages,
   countDueMessagesExcludingRecovery,
+  deleteRecoveryAcks,
   discoverGwsCrashWindowDrafts,
   ensureSchema,
+  failRecoveryAck,
+  getMessageRouting,
+  getRecoveryWakeAttempts,
   importHostSideEffects,
+  incrementRecoveryWakeAttempts,
   insertMessage,
+  listRecoveryAcks,
   migrateMessagesInTable,
   migrateOutboundRouteColumns,
   openInboundDb,
+  openOutboundDbReadOnlyHealing,
+  parseSqliteUtcMs,
   syncProcessingAcks,
+  transliterateToAscii,
   upsertSessionRouting,
 } from './session-db.js';
 import { canonicalSideEffectPayload } from './side-effects-verify.js';
@@ -384,6 +393,26 @@ describe('side_effect_ledger schema-v2 host migration', () => {
   });
 });
 
+describe('parseSqliteUtcMs', () => {
+  it('parses sqlite and ISO timestamps as UTC and returns NaN for garbage', () => {
+    expect(parseSqliteUtcMs('2026-04-20 11:00:00')).toBe(Date.parse('2026-04-20T11:00:00Z'));
+    expect(parseSqliteUtcMs('2026-04-20T11:00:00.000Z')).toBe(Date.parse('2026-04-20T11:00:00.000Z'));
+    expect(Number.isNaN(parseSqliteUtcMs('garbage'))).toBe(true);
+  });
+});
+
+// ── Task 6 (R8): advisory-field sanitizer ──────────────────────────────────────
+
+describe('transliterateToAscii', () => {
+  it('maps common unicode punctuation, replaces the rest, trims, and caps AFTER substitution', () => {
+    expect(transliterateToAscii('inspect — do not retry', 2048)).toBe('inspect - do not retry');
+    expect(transliterateToAscii('“smart” ‘quotes’ and… more', 2048)).toBe(`"smart" 'quotes' and... more`);
+    expect(transliterateToAscii('日本語', 2048)).toBe('???');
+    expect(transliterateToAscii('\u00A0', 2048)).toBe('?'); // whitespace-only input never returns empty
+    expect(transliterateToAscii('ab…', 4)).toBe('ab..'); // cap applied after '…' -> '...' expansion
+  });
+});
+
 // ── Task 1: host due-count excludes recovery-owned rows ──────────────────────
 
 describe('countDueMessagesExcludingRecovery', () => {
@@ -427,6 +456,88 @@ describe('countDueMessagesExcludingRecovery', () => {
     // Outbound-aware count excludes the recovery-owned row.
     expect(countDueMessagesExcludingRecovery(inDb, outDb)).toBe(1);
 
+    inDb.close();
+    outDb.close();
+  });
+
+  it('counts a recovery-owned row as due again once its ack is older than the wake TTL', () => {
+    freshDir();
+    const inDb = inboundDb();
+    const outDb = outboundDb();
+    insertMessage(inDb, {
+      id: 'm-old',
+      kind: 'chat',
+      timestamp: new Date().toISOString(),
+      platformId: null,
+      channelType: null,
+      threadId: null,
+      content: '{"text":"a"}',
+      processAfter: null,
+      recurrence: null,
+    });
+    // Recovery ack last transitioned 45 minutes ago.
+    outDb
+      .prepare(
+        `INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-old', 'recovery', datetime('now', '-45 minutes'))`,
+      )
+      .run();
+    const wake = { nowMs: Date.now(), recoveryWakeTtlMs: 30 * 60 * 1000 };
+    // Legacy call (no options): still excluded — R1 must not change callers that opt out.
+    expect(countDueMessagesExcludingRecovery(inDb, outDb)).toBe(0);
+    // TTL-aware call: expired recovery ownership no longer suppresses the wake.
+    expect(countDueMessagesExcludingRecovery(inDb, outDb, wake)).toBe(1);
+    inDb.close();
+    outDb.close();
+  });
+
+  it('keeps excluding a recovery-owned row younger than the wake TTL', () => {
+    freshDir();
+    const inDb = inboundDb();
+    const outDb = outboundDb();
+    insertMessage(inDb, {
+      id: 'm-fresh',
+      kind: 'chat',
+      timestamp: new Date().toISOString(),
+      platformId: null,
+      channelType: null,
+      threadId: null,
+      content: '{"text":"a"}',
+      processAfter: null,
+      recurrence: null,
+    });
+    outDb
+      .prepare(
+        `INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-fresh', 'recovery', datetime('now', '-5 minutes'))`,
+      )
+      .run();
+    const wake = { nowMs: Date.now(), recoveryWakeTtlMs: 30 * 60 * 1000 };
+    expect(countDueMessagesExcludingRecovery(inDb, outDb, wake)).toBe(0);
+    inDb.close();
+    outDb.close();
+  });
+
+  it('treats an unparseable status_changed as expired (fails toward waking)', () => {
+    freshDir();
+    const inDb = inboundDb();
+    const outDb = outboundDb();
+    insertMessage(inDb, {
+      id: 'm-bad',
+      kind: 'chat',
+      timestamp: new Date().toISOString(),
+      platformId: null,
+      channelType: null,
+      threadId: null,
+      content: '{"text":"a"}',
+      processAfter: null,
+      recurrence: null,
+    });
+    outDb
+      .prepare(
+        `INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-bad', 'recovery', 'garbage')`,
+      )
+      .run();
+    const wake = { nowMs: Date.now(), recoveryWakeTtlMs: 30 * 60 * 1000 };
+    expect(countDueMessagesExcludingRecovery(inDb, outDb, wake)).toBe(1);
     inDb.close();
     outDb.close();
   });
@@ -494,6 +605,56 @@ describe('syncProcessingAcks failed-ack notice gate', () => {
     expect(statusOf('has-notice')).toBe('completed');
     expect(statusOf('no-notice')).toBe('pending'); // invalid failed ack, not completed
     expect(statusOf('recovery-row')).toBe('pending'); // recovery-owned, never synced to completed
+
+    inDb.close();
+    outDb.close();
+  });
+
+  // Task 3 (R2 durability): a failed ack must not rewrite a host-escalated
+  // terminal 'failed' inbound status, while a pending row behind a failed ack
+  // still completes exactly as before.
+  it("preserves a terminal 'failed' inbound status under a failed ack, but still completes pending rows", () => {
+    freshDir();
+    const inDb = inboundDb();
+    const outDb = outboundDb();
+    const now = new Date().toISOString();
+
+    for (const id of ['escalated-failed', 'still-pending']) {
+      insertMessage(inDb, {
+        id,
+        kind: 'chat',
+        timestamp: now,
+        platformId: null,
+        channelType: null,
+        threadId: null,
+        content: '{"text":"x"}',
+        processAfter: null,
+        recurrence: null,
+      });
+    }
+    // Host-side recovery escalation already marked this row terminally failed.
+    inDb.prepare("UPDATE messages_in SET status = 'failed' WHERE id = 'escalated-failed'").run();
+
+    outDb
+      .prepare(
+        `INSERT INTO messages_out (id, seq, timestamp, kind, content) VALUES ('notice-2', 1, datetime('now'), 'chat', '{"text":"gave up"}')`,
+      )
+      .run();
+    for (const id of ['escalated-failed', 'still-pending']) {
+      outDb
+        .prepare(
+          "INSERT INTO processing_ack (message_id, status, status_changed, notice_message_out_id) VALUES (?, 'failed', datetime('now'), 'notice-2')",
+        )
+        .run(id);
+    }
+
+    syncProcessingAcks(inDb, outDb);
+
+    const statusOf = (id: string) =>
+      (inDb.prepare('SELECT status FROM messages_in WHERE id = ?').get(id) as { status: string }).status;
+
+    expect(statusOf('escalated-failed')).toBe('failed'); // terminal, never silently rewritten
+    expect(statusOf('still-pending')).toBe('completed'); // failed ack with notice still completes pending rows
 
     inDb.close();
     outDb.close();
@@ -930,5 +1091,164 @@ describe('importHostSideEffects with a durable empty ledger', () => {
         strictGwsScopes: [strictScope()],
       }),
     ).toThrow(/ledger|missing/i);
+  });
+});
+
+// ── Task 2: recovery wake attempt tracking and recovery-ack release helpers ──
+
+describe('recovery wake attempt tracking (R2)', () => {
+  it('self-heals the recovery_wake_attempts column on an old inbound DB and increments it', () => {
+    freshDir();
+    // Simulate an OLD inbound DB without the column. CAUTION: openInboundDb's
+    // migrations ADD many columns but ASSUME others pre-exist — the
+    // platform_message_id backfill (session-db.ts ~:1457-1466) runs
+    // `UPDATE messages_in ... WHERE channel_type = 'discord'` and the
+    // migration never ADDs `channel_type`, so `id` and `channel_type` MUST be
+    // in the legacy fixture; migrateSessionRoutingTable unguardedly ALTERs
+    // `session_routing`, so that table must exist too. `content` is NOT NULL
+    // in the real schema, so the INSERT must supply it.
+    const legacy = new Database(path.join(TEST_DIR, 'inbound.db'));
+    legacy.exec(`CREATE TABLE messages_in (
+      id TEXT PRIMARY KEY, seq INTEGER UNIQUE, kind TEXT NOT NULL, timestamp TEXT NOT NULL,
+      status TEXT DEFAULT 'pending', process_after TEXT, recurrence TEXT,
+      tries INTEGER DEFAULT 0, platform_id TEXT, channel_type TEXT, thread_id TEXT,
+      content TEXT NOT NULL);
+      CREATE TABLE session_routing (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        channel_type TEXT, platform_id TEXT, thread_id TEXT);`);
+    legacy
+      .prepare(
+        "INSERT INTO messages_in (id, kind, timestamp, content) VALUES ('m-1', 'chat', datetime('now'), 'hello')",
+      )
+      .run();
+    legacy.close();
+
+    const inDb = openInboundDb(path.join(TEST_DIR, 'inbound.db')); // runs migrateMessagesInTable
+    expect(getRecoveryWakeAttempts(inDb, 'm-1')).toBe(0);
+    incrementRecoveryWakeAttempts(inDb, ['m-1']);
+    incrementRecoveryWakeAttempts(inDb, ['m-1']);
+    expect(getRecoveryWakeAttempts(inDb, 'm-1')).toBe(2);
+    expect(getRecoveryWakeAttempts(inDb, 'missing')).toBe(0);
+    inDb.close();
+  });
+
+  it('lists, releases, and fails recovery acks', () => {
+    freshDir();
+    const outDb = outboundDb();
+    outDb
+      .prepare(
+        "INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-a', 'recovery', '2026-04-20 10:00:00')",
+      )
+      .run();
+    outDb
+      .prepare(
+        "INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-b', 'completed', '2026-04-20 10:00:00')",
+      )
+      .run();
+
+    const acks = listRecoveryAcks(outDb);
+    expect(acks).toHaveLength(1);
+    expect(acks[0].messageId).toBe('m-a');
+    expect(acks[0].statusChangedMs).toBe(Date.parse('2026-04-20T10:00:00Z'));
+
+    failRecoveryAck(outDb, 'm-a', 'notice-1');
+    const failed = outDb
+      .prepare("SELECT status, notice_message_out_id FROM processing_ack WHERE message_id = 'm-a'")
+      .get() as {
+      status: string;
+      notice_message_out_id: string;
+    };
+    expect(failed).toMatchObject({ status: 'failed', notice_message_out_id: 'notice-1' });
+
+    // deleteRecoveryAcks only touches rows still in recovery.
+    deleteRecoveryAcks(outDb, ['m-a', 'm-b']);
+    expect(outDb.prepare('SELECT COUNT(*) AS n FROM processing_ack').get()).toMatchObject({ n: 2 });
+    outDb
+      .prepare(
+        "INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-c', 'recovery', datetime('now'))",
+      )
+      .run();
+    deleteRecoveryAcks(outDb, ['m-c']);
+    expect(outDb.prepare("SELECT COUNT(*) AS n FROM processing_ack WHERE message_id = 'm-c'").get()).toMatchObject({
+      n: 0,
+    });
+    outDb.close();
+  });
+
+  it('returns routing columns for a message and null when missing', () => {
+    freshDir();
+    const inDb = inboundDb();
+    inDb
+      .prepare(
+        "INSERT INTO messages_in (id, kind, timestamp, channel_type, platform_id, thread_id, content) VALUES ('m-r', 'chat', datetime('now'), 'discord', 'chan-1', 'thread-1', 'hi')",
+      )
+      .run();
+    expect(getMessageRouting(inDb, 'm-r')).toEqual({
+      kind: 'chat',
+      channelType: 'discord',
+      platformId: 'chan-1',
+      threadId: 'thread-1',
+    });
+    expect(getMessageRouting(inDb, 'missing')).toBeNull();
+    inDb.close();
+  });
+});
+
+/**
+ * R9 fixture: materialize a REAL hot rollback journal. Copy the live journal
+ * aside mid-transaction (AFTER forcing a spill+sync so the header magic is
+ * written), commit, then restore the copy — a valid-header journal with no
+ * owning process is precisely SQLite's "hot" condition.
+ */
+function plantHotJournal(dbPath: string): void {
+  const db = new Database(dbPath);
+  db.pragma('journal_mode = DELETE');
+  // Tiny pager cache forces a mid-transaction journal spill+sync, which is
+  // what writes the journal header magic. Without this the journal FILE
+  // exists but its header is zeroed and SQLite ignores it (not hot).
+  db.pragma('cache_size = 10');
+  db.exec('CREATE TABLE IF NOT EXISTS filler (id INTEGER PRIMARY KEY, data BLOB)');
+  db.exec('BEGIN IMMEDIATE');
+  db.prepare('INSERT INTO filler (data) VALUES (?)').run(Buffer.alloc(1024 * 1024));
+  const journalPath = `${dbPath}-journal`;
+  if (!fs.existsSync(journalPath) || fs.statSync(journalPath).size === 0) {
+    throw new Error('test setup failed to materialize a rollback journal');
+  }
+  fs.copyFileSync(journalPath, `${journalPath}.saved`);
+  db.exec('COMMIT');
+  db.close();
+  fs.copyFileSync(`${journalPath}.saved`, journalPath);
+  fs.rmSync(`${journalPath}.saved`);
+}
+
+describe('openOutboundDbReadOnlyHealing (R9)', () => {
+  it('rolls back a hot journal via one guarded write-mode open and reopens read-only', () => {
+    freshDir();
+    const outDb = outboundDb();
+    outDb
+      .prepare(
+        "INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-1', 'completed', datetime('now'))",
+      )
+      .run();
+    outDb.close();
+    const dbPath = path.join(TEST_DIR, 'outbound.db');
+    plantHotJournal(dbPath);
+
+    // Sanity: this IS the incident failure mode — a plain read-only open cannot read.
+    const ro = new Database(dbPath, { readonly: true });
+    expect(() => ro.prepare('SELECT 1 FROM sqlite_master LIMIT 1').get()).toThrow();
+    ro.close();
+
+    const onHotJournal = vi.fn();
+    const healed = openOutboundDbReadOnlyHealing(dbPath, onHotJournal);
+    expect(onHotJournal).toHaveBeenCalledTimes(1);
+    expect((healed.prepare('SELECT COUNT(*) AS n FROM processing_ack').get() as { n: number }).n).toBe(1);
+    healed.close();
+    expect(fs.existsSync(`${dbPath}-journal`)).toBe(false);
+
+    // Clean DB path: no callback, plain read-only handle.
+    const clean = openOutboundDbReadOnlyHealing(dbPath, onHotJournal);
+    expect(onHotJournal).toHaveBeenCalledTimes(1);
+    clean.close();
   });
 });

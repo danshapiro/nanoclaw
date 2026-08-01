@@ -24,6 +24,14 @@ import { loadAgentMcpConfigForGroup } from './agent-mcp-config.js';
 import { AgentMcpCredentialUnavailableError, type AgentMcpBridge, startAgentMcpBridge } from './agent-mcp-bridge.js';
 import { readContainerConfig, writeContainerConfig, type ContainerConfig } from './container-config.js';
 import {
+  MinuteRateLimiter,
+  parseStructuredStderrEvent,
+  persistStderrTail,
+  splitStderrChunk,
+  StderrTail,
+  truncateForLog,
+} from './container-stderr.js';
+import {
   CONTAINER_RUNTIME_BIN,
   hostGatewayArgs,
   readonlyMountArgs,
@@ -65,6 +73,7 @@ import {
   type VolumeMount,
 } from './providers/provider-container-registry.js';
 import {
+  containerLogsDir,
   ensureSessionWorkspaceDirs,
   heartbeatPath,
   hostCorrelationDir,
@@ -81,6 +90,13 @@ const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
 export const UNEXPECTED_EXIT_RECOVERY_BASE_MS = 5_000;
 const UNEXPECTED_EXIT_RECOVERY_MAX_ATTEMPTS = 3;
 const UNEXPECTED_EXIT_RECOVERY_RESET_MS = 5 * 60_000;
+/** R6: byte cap for the per-container stderr tail persisted on exit. */
+export const CONTAINER_STDERR_TAIL_BYTES = (Number(process.env.NANOCLAW_CONTAINER_STDERR_TAIL_KB) || 64) * 1024;
+export const CONTAINER_STDERR_EVENTS_PER_MIN = Number(process.env.NANOCLAW_CONTAINER_STDERR_EVENTS_PER_MIN) || 30;
+/** Clean-exit (-exit-0) tails kept per session. */
+export const CONTAINER_STDERR_KEEP_FILES = Number(process.env.NANOCLAW_CONTAINER_STDERR_KEEP_FILES) || 5;
+/** Crash tails (nonzero/unknown exit) kept per session — rotated SEPARATELY so clean exits never evict crash evidence. */
+export const CONTAINER_STDERR_KEEP_CRASH_FILES = Number(process.env.NANOCLAW_CONTAINER_STDERR_KEEP_CRASH_FILES) || 5;
 const YENTE_ONECLI_GATEWAY_PROXY_URL_ENV = 'YENTE_ONECLI_GATEWAY_PROXY_URL';
 const ONECLI_GATEWAY_PROXY_ENV_KEYS = [
   'HTTP_PROXY',
@@ -102,6 +118,13 @@ type ActiveContainer = {
   managedSkillsRoot: string;
   finalization?: Promise<boolean>;
   finalizationFailure?: 'revocation';
+  agentGroupId: string;
+  stderrTail: StderrTail;
+  stderrEventLimiter: MinuteRateLimiter;
+  /** Mutable holder for the final unterminated stderr line (flushed at persist time). */
+  stderrState: { carry: string };
+  /** Real exit code recorded by the 'close' handler — the verify path finalizes with code=null. */
+  observedExitCode?: number | null;
 };
 const activeContainers = new Map<string, ActiveContainer>();
 const unexpectedExitRecovery = new Map<string, { attempts: number; lastExitAtMs: number; timer?: NodeJS.Timeout }>();
@@ -393,7 +416,13 @@ async function spawnContainer(session: Session): Promise<void> {
   container.once('close', removeEnvFile);
   container.once('error', removeEnvFile);
 
-  activeContainers.set(session.id, {
+  // R6: stderr capture state, created as locals and shared BY REFERENCE with
+  // the stderr handler below — the shared stderrState object is what lets
+  // finalize flush the last unterminated line at persist time.
+  const stderrTail = new StderrTail(CONTAINER_STDERR_TAIL_BYTES);
+  const stderrEventLimiter = new MinuteRateLimiter(CONTAINER_STDERR_EVENTS_PER_MIN);
+  const stderrState = { carry: '' };
+  const activeEntry: ActiveContainer = {
     process: container,
     processClosed,
     containerName,
@@ -401,7 +430,12 @@ async function spawnContainer(session: Session): Promise<void> {
     revokeGwsAfterConfirmedStop: launchControl.revokeAfterConfirmedStop,
     startedAtMs: Date.now(),
     managedSkillsRoot,
-  });
+    agentGroupId: agentGroup.id,
+    stderrTail,
+    stderrEventLimiter,
+    stderrState,
+  };
+  activeContainers.set(session.id, activeEntry);
   if (bridges.length > 0) {
     activeMcpBridges.set(session.id, bridges);
   }
@@ -410,10 +444,26 @@ async function spawnContainer(session: Session): Promise<void> {
   // can recycle it after a later skill deploy. Best-effort inside the helper.
   writeSpawnSkillGeneration(sessionDir(agentGroup.id, session.id), skillGeneration);
 
-  // Log stderr
   container.stderr?.on('data', (data) => {
-    for (const line of data.toString().trim().split('\n')) {
-      if (line) log.debug(line, { container: agentGroup.folder });
+    const { lines, carry } = splitStderrChunk(stderrState.carry, data.toString(), CONTAINER_STDERR_TAIL_BYTES);
+    stderrState.carry = carry;
+    for (const line of lines) {
+      stderrTail.append(line);
+      const event = parseStructuredStderrEvent(line);
+      if (event) {
+        // R6: structured agent-runner failure events must be visible in prod
+        // (debug is below the default log threshold) — rate-limited so a
+        // crash-looping container cannot flood the host log.
+        if (stderrEventLimiter.allow(Date.now())) {
+          log.info('Container event', {
+            container: agentGroup.folder,
+            severity: (event as { severity?: unknown }).severity ?? null,
+            line: truncateForLog(line),
+          });
+        }
+      } else {
+        log.debug(line, { container: agentGroup.folder });
+      }
     }
   });
 
@@ -427,6 +477,9 @@ async function spawnContainer(session: Session): Promise<void> {
 
   container.on('close', (code) => {
     resolveProcessClosed();
+    // R6: the verify path finalizes with code=null; keep the real exit code so
+    // the persisted tail is stamped '-exit-<code>', not '-exit-unknown'.
+    activeEntry.observedExitCode = code;
     void finalizeContainerProcess(session.id, containerName, launchControl.leaseId, code, 'docker-client-close').catch(
       (err) => {
         log.error('Failed to verify container stop after docker client close', {
@@ -522,6 +575,23 @@ async function finalizeVerifiedContainerStop(
     return false;
   }
   if (activeContainers.get(sessionId) !== current) return false;
+
+  // R6: containers are --rm; this tail is the only surviving copy of stderr.
+  // Placement pinned after the last early return: exactly one file per
+  // successful finalization, no retry-driven rotation pressure.
+  const exitCode = code ?? current.observedExitCode ?? null; // null persists as '-exit-unknown'
+  const persisted = persistStderrTail({
+    logDir: containerLogsDir(current.agentGroupId, sessionId),
+    tail: current.stderrTail,
+    carry: current.stderrState.carry, // flush the final unterminated line
+    exitCode,
+    keepClean: CONTAINER_STDERR_KEEP_FILES,
+    keepCrash: CONTAINER_STDERR_KEEP_CRASH_FILES,
+  });
+  current.stderrState.carry = '';
+  if (persisted) {
+    log.info('Persisted container stderr tail', { sessionId, exitCode, file: persisted });
+  }
 
   activeMcpBridges.delete(sessionId);
   const wasActive = activeContainers.delete(sessionId);
@@ -1526,6 +1596,12 @@ async function buildContainerArgs(
   args.push('-e', `NANOCLAW_SESSION_ID=${sessionId}`);
   args.push('-e', `NANOCLAW_AGENT_GROUP_ID=${agentGroup.id}`);
   args.push('-e', `NANOCLAW_AGENT_GROUP_FOLDER=${agentGroup.folder}`);
+
+  // R9: container-side session-DB busy-timeout knob (runner defaults to 30s).
+  const containerSqliteBusyTimeoutMs = process.env.NANOCLAW_CONTAINER_SQLITE_BUSY_TIMEOUT_MS;
+  if (containerSqliteBusyTimeoutMs) {
+    args.push('-e', `NANOCLAW_CONTAINER_SQLITE_BUSY_TIMEOUT_MS=${containerSqliteBusyTimeoutMs}`);
+  }
 
   const yenteHostEnv = requireYenteHostEnv(process.env);
   for (const [key, value] of Object.entries(yenteHostEnv.containerEnv)) {

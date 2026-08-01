@@ -34,6 +34,7 @@ import {
   ensureSchema,
   openInboundDb as openInboundDbRaw,
   openOutboundDb as openOutboundDbRaw,
+  openOutboundDbReadOnlyHealing,
   openOutboundDbRw as openOutboundDbRwRaw,
   openOutboundDbForWrite,
   upsertSessionRouting,
@@ -82,6 +83,11 @@ export function hostCorrelationDir(agentGroupId: string, sessionId: string): str
 
 export function hostCorrelationPath(agentGroupId: string, sessionId: string): string {
   return path.join(hostCorrelationDir(agentGroupId, sessionId), 'current.json');
+}
+
+/** R6: host-owned per-session container stderr tails — OUTSIDE the agent-writable session tree, never mounted. */
+export function containerLogsDir(agentGroupId: string, sessionId: string): string {
+  return path.join(DATA_DIR, 'v2-container-logs', agentGroupId, sessionId);
 }
 
 export function hostRouteKey(
@@ -610,6 +616,21 @@ export function openInboundDb(agentGroupId: string, sessionId: string): Database
 /** Open the outbound DB for a session (host reads only). */
 export function openOutboundDb(agentGroupId: string, sessionId: string): Database.Database {
   return openOutboundDbRaw(outboundDbPath(agentGroupId, sessionId));
+}
+
+/**
+ * R9: read-only outbound open that heals a crashed container's hot journal.
+ * CALLER CONTRACT: only call from sites that verified the session's container
+ * is not running (gated sweep path) — never from the 1s delivery poll.
+ */
+export function openOutboundDbHealing(agentGroupId: string, sessionId: string): Database.Database {
+  return openOutboundDbReadOnlyHealing(outboundDbPath(agentGroupId, sessionId), (dbPath) => {
+    log.error('Hot outbound journal detected; performing gated write-mode rollback', {
+      agentGroupId,
+      sessionId,
+      dbPath,
+    });
+  });
 }
 
 /** Open the outbound DB for a session with write access. Only safe to call when no container is running. */

@@ -160,6 +160,63 @@ export function openOutboundDb(dbPath: string): Database.Database {
   return db;
 }
 
+/** R9: a crashed writer's hot rollback journal makes read-only opens throw this. */
+export function isHotJournalError(err: unknown): boolean {
+  return (
+    !!err && typeof err === 'object' && 'code' in err && (err as { code?: unknown }).code === 'SQLITE_READONLY_ROLLBACK'
+  );
+}
+
+/**
+ * R9: read-only outbound open that heals a crashed writer's hot journal.
+ * better-sqlite3 constructors don't read the file, so we PROBE with one
+ * statement; on SQLITE_READONLY_ROLLBACK we perform ONE write-mode open
+ * whose first read rolls the journal back, then reopen read-only. Callers
+ * log via onHotJournal.
+ *
+ * SAFETY CONTRACT: the caller must have verified that no container writer
+ * can be live on this DB (host-local `!isContainerRunning` knowledge).
+ * Cross-mount fcntl lock propagation between host and container is
+ * UNVERIFIED (validator-V2), so SQLite locking must not be trusted to stop
+ * a concurrent rollback against a live writer — rolling back a live
+ * transaction is SQLite's documented corruption class.
+ */
+export function openOutboundDbReadOnlyHealing(
+  dbPath: string,
+  onHotJournal?: (dbPath: string) => void,
+): Database.Database {
+  const probe = (db: Database.Database): void => {
+    db.prepare('SELECT 1 FROM sqlite_master LIMIT 1').get();
+  };
+  const openReadOnly = (): Database.Database => {
+    const db = new Database(dbPath, { readonly: true });
+    db.pragma('busy_timeout = 5000');
+    return db;
+  };
+
+  let db = openReadOnly();
+  try {
+    probe(db);
+    return db;
+  } catch (err) {
+    db.close();
+    if (!isHotJournalError(err)) throw err;
+  }
+
+  onHotJournal?.(dbPath);
+  const rw = new Database(dbPath);
+  try {
+    rw.pragma('busy_timeout = 5000');
+    probe(rw); // the read triggers the rollback
+  } finally {
+    rw.close();
+  }
+
+  db = openReadOnly();
+  probe(db);
+  return db;
+}
+
 /** Open the outbound DB for a session with write access. Only safe to call when no container is running. */
 export function openOutboundDbRw(dbPath: string): Database.Database {
   const db = new Database(dbPath);
@@ -314,6 +371,23 @@ export function hasSchedulerTaskRows(db: Database.Database): boolean {
 }
 
 /**
+ * Parse a session-DB timestamp to epoch ms. processing_ack.status_changed is
+ * written with SQLite datetime('now') ('YYYY-MM-DD HH:MM:SS', UTC, no zone
+ * marker); tests and some writers use ISO strings. Returns NaN if unparseable.
+ */
+export function parseSqliteUtcMs(s: string): number {
+  if (typeof s !== 'string' || s.length === 0) return NaN;
+  if (s.includes('T') || s.endsWith('Z')) return Date.parse(s);
+  return Date.parse(`${s.replace(' ', 'T')}Z`);
+}
+
+/** TTL options for the outbound-aware due count (R1). */
+export interface RecoveryWakeOptions {
+  nowMs: number;
+  recoveryWakeTtlMs: number;
+}
+
+/**
  * Outbound-aware due count: like countDueMessages, but excludes rows whose
  * outbound processing_ack is recovery-owned (status='recovery'). Those rows are
  * already owned by route-scoped recovery, so they must not trip a fresh wake.
@@ -321,14 +395,28 @@ export function hasSchedulerTaskRows(db: Database.Database): boolean {
  *
  * New behavior: the legacy countDueMessages never opened the outbound DB, so
  * this is a new outbound-aware due check, not a tweak to an existing filter.
+ *
+ * Rows whose recovery ownership is older than wake.recoveryWakeTtlMs count as due again (R1) — the bounded escape from the deliberate recovery exclusion.
  */
-export function countDueMessagesExcludingRecovery(inDb: Database.Database, outDb: Database.Database): number {
+export function countDueMessagesExcludingRecovery(
+  inDb: Database.Database,
+  outDb: Database.Database,
+  wake?: RecoveryWakeOptions,
+): number {
+  const recoveryRows = outDb
+    .prepare("SELECT message_id, status_changed FROM processing_ack WHERE status = 'recovery'")
+    .all() as Array<{ message_id: string; status_changed: string }>;
   const recoveryOwned = new Set(
-    (
-      outDb.prepare("SELECT message_id FROM processing_ack WHERE status = 'recovery'").all() as Array<{
-        message_id: string;
-      }>
-    ).map((r) => r.message_id),
+    recoveryRows
+      .filter((r) => {
+        if (!wake) return true; // legacy behavior: exclude every recovery row
+        const changedMs = parseSqliteUtcMs(r.status_changed);
+        // Unparseable timestamps count as expired: fail toward waking, never
+        // toward hiding work (R1 must only ADD wakes).
+        if (!Number.isFinite(changedMs)) return false;
+        return wake.nowMs - changedMs < wake.recoveryWakeTtlMs; // fresh -> keep excluded
+      })
+      .map((r) => r.message_id),
   );
 
   const due = inDb
@@ -341,6 +429,137 @@ export function countDueMessagesExcludingRecovery(inDb: Database.Database, outDb
     .all() as Array<{ id: string }>;
 
   return due.filter((r) => !recoveryOwned.has(r.id)).length;
+}
+
+/** A recovery-owned processing_ack row, with its parsed transition time. */
+export interface RecoveryAckRow {
+  messageId: string;
+  statusChanged: string;
+  statusChangedMs: number; // NaN when unparseable
+}
+
+export function listRecoveryAcks(outDb: Database.Database): RecoveryAckRow[] {
+  const rows = outDb
+    .prepare("SELECT message_id, status_changed FROM processing_ack WHERE status = 'recovery'")
+    .all() as Array<{ message_id: string; status_changed: string }>;
+  return rows.map((r) => ({
+    messageId: r.message_id,
+    statusChanged: r.status_changed,
+    statusChangedMs: parseSqliteUtcMs(r.status_changed),
+  }));
+}
+
+export function getRecoveryWakeAttempts(inDb: Database.Database, messageId: string): number {
+  const row = inDb.prepare('SELECT recovery_wake_attempts AS n FROM messages_in WHERE id = ?').get(messageId) as
+    | { n: number }
+    | undefined;
+  return row?.n ?? 0;
+}
+
+export function incrementRecoveryWakeAttempts(inDb: Database.Database, messageIds: string[]): void {
+  if (messageIds.length === 0) return;
+  const stmt = inDb.prepare('UPDATE messages_in SET recovery_wake_attempts = recovery_wake_attempts + 1 WHERE id = ?');
+  const tx = inDb.transaction((ids: string[]) => {
+    for (const id of ids) stmt.run(id);
+  });
+  tx(messageIds);
+}
+
+/** Delete ONLY still-recovery acks, returning their rows to normal pending visibility. */
+export function deleteRecoveryAcks(outDbRw: Database.Database, messageIds: string[]): void {
+  if (messageIds.length === 0) return;
+  const stmt = outDbRw.prepare("DELETE FROM processing_ack WHERE message_id = ? AND status = 'recovery'");
+  const tx = outDbRw.transaction((ids: string[]) => {
+    for (const id of ids) stmt.run(id);
+  });
+  tx(messageIds);
+}
+
+/** Flip a recovery ack to failed with its terminal-notice pointer (R2 escalation). */
+export function failRecoveryAck(outDbRw: Database.Database, messageId: string, noticeMessageOutId: string): void {
+  outDbRw
+    .prepare(
+      "UPDATE processing_ack SET status = 'failed', status_changed = datetime('now'), notice_message_out_id = ? WHERE message_id = ? AND status = 'recovery'",
+    )
+    .run(noticeMessageOutId, messageId);
+}
+
+export interface MessageRoutingRow {
+  kind: string;
+  channelType: string | null;
+  platformId: string | null;
+  threadId: string | null;
+}
+
+export function getMessageRouting(inDb: Database.Database, messageId: string): MessageRoutingRow | null {
+  const row = inDb
+    .prepare('SELECT kind, channel_type, platform_id, thread_id FROM messages_in WHERE id = ?')
+    .get(messageId) as
+    | { kind: string; channel_type: string | null; platform_id: string | null; thread_id: string | null }
+    | undefined;
+  if (!row) return null;
+  return { kind: row.kind, channelType: row.channel_type, platformId: row.platform_id, threadId: row.thread_id };
+}
+
+/** R2: the ORIGINAL accepted input id for a row (re-acceptance overwrites it). */
+export function getHostAcceptedInputId(inDb: Database.Database, messageId: string): string | null {
+  const row = inDb.prepare('SELECT host_accepted_input_id AS v FROM messages_in WHERE id = ?').get(messageId) as
+    | { v: string | null }
+    | undefined;
+  return row?.v ?? null;
+}
+
+/**
+ * R2 release gate: input_ids with GWS-uncertain evidence in the reconciliation
+ * store — incident records lacking a resolution record for their audit_id.
+ * Standalone lightweight scan (independent of the Task 6 reader rework).
+ * undefined path => empty set (GWS reconciliation not configured).
+ * Fail closed on unreadability: configured-but-missing file, truncated tail,
+ * unparseable line, an incident whose input_id or audit_id is not a
+ * non-empty string, or duplicate incident audit_ids
+ * => THROW (callers defer their pass loudly rather than releasing).
+ */
+export function listGwsUncertainInputIds(reconciliationStorePath: string | undefined): Set<string> {
+  if (!reconciliationStorePath) return new Set();
+  const raw = fs.readFileSync(reconciliationStorePath, 'utf8'); // throws when missing/unreadable
+  if (raw.length > 0 && !raw.endsWith('\n')) {
+    throw new Error(`GWS reconciliation store has a truncated tail (no trailing newline): ${reconciliationStorePath}`);
+  }
+  const resolvedAuditIds = new Set<string>();
+  const incidentInputByAudit = new Map<string, string>();
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    const record = JSON.parse(line) as { record_type?: unknown; audit_id?: unknown; input_id?: unknown };
+    if (record.record_type === 'resolution') {
+      if (typeof record.audit_id === 'string') resolvedAuditIds.add(record.audit_id);
+      continue;
+    }
+    // Every non-resolution record is an incident and must carry a usable input_id.
+    if (typeof record.input_id !== 'string' || record.input_id.length === 0) {
+      throw new Error(
+        `GWS reconciliation store has an incident record without a non-empty input_id: ${reconciliationStorePath}`,
+      );
+    }
+    // ... and a usable, unique audit_id: a missing/non-string audit_id would
+    // collide on a coerced key and a duplicate would overwrite — either way a
+    // GWS-uncertain input could silently drop out of the set (failing OPEN).
+    if (typeof record.audit_id !== 'string' || record.audit_id.length === 0) {
+      throw new Error(
+        `GWS reconciliation store has an incident record without a non-empty audit_id: ${reconciliationStorePath}`,
+      );
+    }
+    if (incidentInputByAudit.has(record.audit_id)) {
+      throw new Error(
+        `GWS reconciliation store has duplicate incident records for audit_id '${record.audit_id}': ${reconciliationStorePath}`,
+      );
+    }
+    incidentInputByAudit.set(record.audit_id, record.input_id);
+  }
+  const uncertain = new Set<string>();
+  for (const [auditId, inputId] of incidentInputByAudit) {
+    if (!resolvedAuditIds.has(auditId)) uncertain.add(inputId);
+  }
+  return uncertain;
 }
 
 export function markMessageFailed(db: Database.Database, messageId: string): void {
@@ -389,24 +608,33 @@ export function syncProcessingAcks(inDb: Database.Database, outDb: Database.Data
   if (acks.length === 0) return;
 
   const noticeExistsStmt = outDb.prepare('SELECT 1 AS ok FROM messages_out WHERE id = ?');
-  const toComplete: string[] = [];
+  // Track which ack status put each id here: ids from 'failed' acks must not
+  // overwrite a host-escalated terminal 'failed' inbound status (R2 durability),
+  // while ids from 'completed' acks keep the historical always-complete behavior.
+  const toComplete: Array<{ id: string; fromFailedAck: boolean }> = [];
   for (const ack of acks) {
     if (ack.status === 'completed') {
-      toComplete.push(ack.message_id);
+      toComplete.push({ id: ack.message_id, fromFailedAck: false });
       continue;
     }
     // status === 'failed'
     if (!ack.notice_message_out_id) continue; // invalid: no notice proof
     const exists = noticeExistsStmt.get(ack.notice_message_out_id) as { ok: number } | undefined;
-    if (exists) toComplete.push(ack.message_id);
+    if (exists) toComplete.push({ id: ack.message_id, fromFailedAck: true });
     // else dangling notice id — invalid, leave the inbound row as-is.
   }
 
   if (toComplete.length === 0) return;
 
   const updateStmt = inDb.prepare("UPDATE messages_in SET status = 'completed' WHERE id = ? AND status != 'completed'");
+  // Status precedence for failed acks: a pending row behind a failed ack still
+  // completes (exactly as today), but a terminal 'failed' inbound status — set
+  // by host-side recovery escalation — is never silently rewritten.
+  const updateFromFailedStmt = inDb.prepare(
+    "UPDATE messages_in SET status = 'completed' WHERE id = ? AND status NOT IN ('completed', 'failed')",
+  );
   inDb.transaction(() => {
-    for (const id of toComplete) updateStmt.run(id);
+    for (const item of toComplete) (item.fromFailedAck ? updateFromFailedStmt : updateStmt).run(item.id);
   })();
 }
 
@@ -907,17 +1135,81 @@ export interface GwsManualReconciliation {
   accountEmail: string;
 }
 
+const ASCII_SUBSTITUTIONS: Record<string, string> = {
+  '\u2014': '-', // em dash — the dvora incident byte
+  '\u2013': '-',
+  '\u2012': '-',
+  '\u2011': '-',
+  '\u2010': '-',
+  '\u2018': "'",
+  '\u2019': "'",
+  '\u201A': "'",
+  '\u2032': "'",
+  '\u201C': '"',
+  '\u201D': '"',
+  '\u201E': '"',
+  '\u2033': '"',
+  '\u2026': '...',
+  '\u00A0': ' ',
+  '\u200B': '',
+  '\uFEFF': '',
+};
+
+/**
+ * R8: advisory-field sanitizer. Transliterates common Unicode punctuation to
+ * ASCII, replaces every other non-printable-ASCII code point with '?', trims,
+ * enforces the length cap AFTER substitution ('…' expands to '...'), and never
+ * returns an empty string. Advisory hint text must never fail validation.
+ */
+export function transliterateToAscii(value: string, maximum: number): string {
+  let out = '';
+  for (const ch of value) {
+    if (ch >= '\x20' && ch <= '\x7e') {
+      out += ch;
+      continue;
+    }
+    out += ASCII_SUBSTITUTIONS[ch] ?? '?';
+  }
+  out = out.trim();
+  if (out.length === 0) out = '?';
+  return out.slice(0, maximum);
+}
+
+export interface QuarantinedGwsReconciliationRecord {
+  lineNumber: number; // 1-based line in the store file
+  auditId: string | null;
+  inputId: string | null;
+  reason: string;
+}
+
+export interface GwsReconciliationReadResult {
+  reconciliations: GwsManualReconciliation[];
+  quarantined: QuarantinedGwsReconciliationRecord[];
+}
+
 /**
  * Consume the proxy's root-owned durable reconciliation journal before an
  * interrupted accepted input can run again. Every current proxy record is a
  * manual-reconciliation receipt; in particular outcome_unknown corresponds to
  * the proxy response's retry=manual_only sentinel. Historical records are
  * excluded by their unique host input id, never merely by the stable route.
+ *
+ * R8 blast-radius rework (replaces whole-file fail-closed validation):
+ *   - ADVISORY fields (`outcome`, `resource_type`, `search_hints` elements,
+ *     resolution `operator`/`note`) are sanitized via transliterateToAscii and
+ *     can never fail validation on content.
+ *   - LOAD-BEARING field failures QUARANTINE that record only; its readable
+ *     input_id lets the caller fail closed for exactly that input.
+ *   - Whole-file fail-closed remains ONLY for file-level corruption (missing
+ *     store, truncated tail, unparseable JSON) and for records that could be
+ *     an INCIDENT with unreadable identity (input_id): such a record cannot
+ *     contribute to any blocked-input accounting, so quarantining it would let
+ *     recovery re-run a GWS-uncertain input (A12).
  */
-export function assertNoUnresolvedGwsReconciliationRecords(opts: {
+export function readGwsReconciliationRecords(opts: {
   reconciliationStorePath: string | undefined;
   scopes: StrictGwsSideEffectScope[];
-}): GwsManualReconciliation[] {
+}): GwsReconciliationReadResult {
   if (!opts.reconciliationStorePath || !fs.existsSync(opts.reconciliationStorePath)) {
     throw new Error('GWS reconciliation store is missing or inaccessible');
   }
@@ -969,22 +1261,52 @@ export function assertNoUnresolvedGwsReconciliationRecords(opts: {
     /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/.test(value) &&
     Number.isFinite(Date.parse(value));
 
+  const quarantined: QuarantinedGwsReconciliationRecord[] = [];
+  const quarantinedAuditIds = new Set<string>();
+  // The `inputId: string | null` tolerance below exists for RESOLUTION records
+  // only; incidents with unreadable identity never reach `quarantine` (they
+  // fail the whole file closed first).
+  const quarantine = (lineNumber: number, record: Record<string, unknown>, reason: string): void => {
+    const auditId = typeof record.audit_id === 'string' ? record.audit_id : null;
+    const inputId = typeof record.input_id === 'string' ? record.input_id : null;
+    if (auditId) quarantinedAuditIds.add(auditId);
+    quarantined.push({ lineNumber, auditId, inputId, reason });
+  };
+
+  let lineNumber = 0;
   for (const line of raw.split('\n')) {
+    lineNumber += 1;
     if (!line.trim()) continue;
-    let entry: GwsReconciliationStoreEntry | GwsReconciliationResolutionEntry;
+    let parsed: unknown;
     try {
-      entry = JSON.parse(line) as GwsReconciliationStoreEntry;
+      parsed = JSON.parse(line);
     } catch (error) {
       throw new Error('GWS reconciliation store contains an invalid complete JSONL record', { cause: error });
     }
-    if (!entry || typeof entry !== 'object') {
+    if (!parsed || typeof parsed !== 'object') {
       throw new Error('GWS reconciliation store contains an invalid complete JSONL record');
     }
+    const record = parsed as Record<string, unknown>;
+    const entry = parsed as GwsReconciliationStoreEntry | GwsReconciliationResolutionEntry;
     if (entry.record_type === 'resolution') {
       const resolution = entry as GwsReconciliationResolutionEntry;
       if (Object.keys(resolution).some((key) => !resolutionFields.has(key))) {
-        throw new Error('GWS reconciliation resolution contains an unknown field');
+        quarantine(lineNumber, record, 'resolution contains an unknown field');
+        continue;
       }
+      // ADVISORY content: operator/note are human text — sanitize, never reject
+      // their content. Structural absence is still uncertainty -> quarantine.
+      if (
+        typeof resolution.operator !== 'string' ||
+        resolution.operator.length === 0 ||
+        typeof resolution.note !== 'string' ||
+        resolution.note.length === 0
+      ) {
+        quarantine(lineNumber, record, 'resolution operator/note missing');
+        continue;
+      }
+      resolution.operator = transliterateToAscii(resolution.operator, 256);
+      resolution.note = transliterateToAscii(resolution.note, 2048);
       const incident = typeof resolution.audit_id === 'string' ? incidents.get(resolution.audit_id) : undefined;
       const resolvedMs = typeof resolution.resolved_at === 'string' ? Date.parse(resolution.resolved_at) : NaN;
       const endedMs = typeof incident?.ended_at === 'string' ? Date.parse(incident.ended_at) : NaN;
@@ -995,42 +1317,79 @@ export function assertNoUnresolvedGwsReconciliationRecords(opts: {
         resolution.input_id !== incident.input_id ||
         resolution.route_key !== incident.route_key ||
         (resolution.disposition !== 'completed' && resolution.disposition !== 'not_completed') ||
-        !canonicalAscii(resolution.operator, 256) ||
-        !canonicalAscii(resolution.note, 2048) ||
         !canonicalTimestamp(resolution.resolved_at) ||
         !Number.isFinite(endedMs) ||
         resolvedMs < endedMs
       ) {
-        throw new Error('GWS reconciliation resolution is malformed or outside its exact incident binding');
+        quarantine(
+          lineNumber,
+          record,
+          typeof resolution.audit_id === 'string' && quarantinedAuditIds.has(resolution.audit_id)
+            ? 'resolution references a quarantined incident'
+            : 'resolution is malformed or outside its exact incident binding',
+        );
+        continue;
       }
       resolutions.set(resolution.audit_id!, resolution);
       continue;
     }
     if (entry.record_type !== undefined) {
-      throw new Error('GWS reconciliation store contains an unknown record type');
+      // A12: an unknown record_type could be a corrupted INCIDENT. Quarantining
+      // it with unreadable identity would drop it from blockedInputIds — so
+      // identity must be readable BEFORE this quarantine is allowed.
+      if (!canonicalAscii(record.input_id, 512)) {
+        throw new Error(
+          `GWS reconciliation store line ${lineNumber}: unknown record_type with missing or unreadable input_id — failing closed`,
+        );
+      }
+      quarantine(lineNumber, record, 'unknown record type');
+      continue;
     }
     const incident = entry as GwsReconciliationStoreEntry;
-    if (Object.keys(incident).some((key) => !incidentFields.has(key))) {
-      throw new Error('GWS reconciliation incident contains an unknown field');
+    // IDENTITY validation FIRST — before ANY quarantine path in this branch —
+    // FILE-level fatal, NOT quarantine (A12, validator-V7): an incident whose
+    // input_id is unreadable structurally cannot contribute to
+    // blockedInputIds; quarantining it (e.g. as 'unknown field' when mojibake
+    // mangles field names and values together) would let recovery re-run a
+    // GWS-uncertain input. Same class as unparseable JSON.
+    if (!canonicalAscii(incident.input_id, 512)) {
+      throw new Error(
+        `GWS reconciliation store line ${lineNumber}: incident identity (input_id) is missing or unreadable — failing closed`,
+      );
     }
+    if (Object.keys(incident).some((key) => !incidentFields.has(key))) {
+      quarantine(lineNumber, record, 'incident contains an unknown field');
+      continue;
+    }
+    // ADVISORY sanitization: hint text must never fail validation.
+    if (typeof incident.outcome === 'string') incident.outcome = transliterateToAscii(incident.outcome, 256);
+    if (typeof incident.resource_type === 'string') {
+      incident.resource_type = transliterateToAscii(incident.resource_type, 512);
+    }
+    incident.search_hints = Array.isArray(incident.search_hints)
+      ? incident.search_hints
+          .filter((hint): hint is string => typeof hint === 'string')
+          .map((hint) => transliterateToAscii(hint, 2048))
+      : []; // hints are never consumed downstream; absence is tolerated
+    // LOAD-BEARING validation: failure quarantines THIS record only (its
+    // readable input_id still blocks the matching scope via the caller gate).
     if (
       incident.schema_version !== 2 ||
       !canonicalAscii(incident.audit_id, 256) ||
       incidents.has(incident.audit_id!) ||
-      !canonicalAscii(incident.outcome, 256) ||
+      typeof incident.outcome !== 'string' ||
+      incident.outcome.length === 0 ||
+      typeof incident.resource_type !== 'string' ||
+      incident.resource_type.length === 0 ||
       !canonicalAscii(incident.account, 512) ||
-      !canonicalAscii(incident.input_id, 512) ||
       !canonicalAscii(incident.route_key, 512) ||
       !canonicalAscii(incident.operation, 512) ||
-      !canonicalAscii(incident.resource_type, 512) ||
       !canonicalTimestamp(incident.started_at) ||
       !canonicalTimestamp(incident.ended_at) ||
-      Date.parse(incident.ended_at!) < Date.parse(incident.started_at!) ||
-      !Array.isArray(incident.search_hints) ||
-      incident.search_hints.length === 0 ||
-      incident.search_hints.some((hint) => !canonicalAscii(hint, 2048))
+      Date.parse(incident.ended_at!) < Date.parse(incident.started_at!)
     ) {
-      throw new Error('GWS reconciliation incident is malformed or incomplete');
+      quarantine(lineNumber, record, 'incident is malformed or incomplete');
+      continue;
     }
     incidents.set(incident.audit_id!, incident);
   }
@@ -1056,8 +1415,6 @@ export function assertNoUnresolvedGwsReconciliationRecords(opts: {
       entry.operation.length > 0 &&
       typeof entry.resource_type === 'string' &&
       entry.resource_type.length > 0 &&
-      Array.isArray(entry.search_hints) &&
-      entry.search_hints.length > 0 &&
       Number.isFinite(startedMs) &&
       Number.isFinite(endedMs) &&
       Number.isFinite(notBeforeMs) &&
@@ -1090,7 +1447,7 @@ export function assertNoUnresolvedGwsReconciliationRecords(opts: {
       accountEmail: entry.account!,
     });
   }
-  return accepted;
+  return { reconciliations: accepted, quarantined };
 }
 
 export interface DiscoverCrashWindowResult {
@@ -1502,5 +1859,8 @@ export function migrateMessagesInTable(db: Database.Database): void {
   }
   if (!cols.has('host_acceptance_sequence')) {
     db.prepare('ALTER TABLE messages_in ADD COLUMN host_acceptance_sequence INTEGER').run();
+  }
+  if (!cols.has('recovery_wake_attempts')) {
+    db.prepare('ALTER TABLE messages_in ADD COLUMN recovery_wake_attempts INTEGER NOT NULL DEFAULT 0').run();
   }
 }

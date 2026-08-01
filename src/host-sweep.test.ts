@@ -12,9 +12,9 @@ import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
-  assertNoUnresolvedGwsReconciliationRecords,
   countDueMessagesExcludingRecovery,
   getProcessingClaims,
+  readGwsReconciliationRecords,
 } from './db/session-db.js';
 import { INBOUND_SCHEMA, OUTBOUND_SCHEMA } from './db/schema.js';
 import { clearRouteQuarantine, isRouteQuarantined } from './db/route-quarantine.js';
@@ -41,10 +41,43 @@ import {
   recoverInterruptedTurnBounded,
   resetStuckProcessingRows,
   sealAndDrainAcceptedGwsClaims,
+  sweepSessionForTest,
   writeHostInterruptedRecovery,
 } from './host-sweep.js';
-import { readSpawnSkillGeneration, skillGenerationPath, writeSpawnSkillGeneration } from './session-manager.js';
+import {
+  initSessionFolder,
+  outboundDbPath,
+  readSpawnSkillGeneration,
+  skillGenerationPath,
+  writeSpawnSkillGeneration,
+} from './session-manager.js';
+import { closeDb, createAgentGroup, initTestDb, runMigrations } from './db/index.js';
+import { isContainerRunning } from './container-runner.js';
 import type { Session } from './types.js';
+
+// R9 heal-gate harness: the gate under test is host-local container knowledge,
+// so isContainerRunning must be controllable; everything else stays inert.
+// No other test in this file reaches container-runner (the functions they
+// exercise are pure or take collaborators as parameters), so the file-level
+// mock is behavior-neutral for them.
+vi.mock('./container-runner.js', () => ({
+  wakeContainer: vi.fn().mockResolvedValue(undefined),
+  isContainerRunning: vi.fn().mockReturnValue(false),
+  getActiveContainerCount: vi.fn().mockReturnValue(0),
+  getContainerStartedAtMs: vi.fn().mockReturnValue(null),
+  killContainer: vi.fn(),
+  cleanupContainerForSession: vi.fn().mockResolvedValue(true),
+  stopContainerAndVerify: vi.fn().mockResolvedValue(true),
+  isSessionOutboundWriterRunning: vi.fn().mockResolvedValue(false),
+}));
+
+// sweepSession resolves session DB paths under DATA_DIR; point it at a
+// dedicated tmp root. No other test in this file touches DATA_DIR (they all
+// pass explicit tmp paths).
+vi.mock('./config.js', async () => {
+  const actual = await vi.importActual('./config.js');
+  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-host-sweep-r9' };
+});
 
 const BASE = Date.parse('2026-04-20T12:00:00.000Z');
 
@@ -73,6 +106,7 @@ function testDbs() {
       id            TEXT PRIMARY KEY,
       status        TEXT DEFAULT 'pending',
       tries         INTEGER DEFAULT 0,
+      recovery_wake_attempts INTEGER NOT NULL DEFAULT 0,
       trigger       INTEGER DEFAULT 1,
       process_after TEXT
     );
@@ -83,7 +117,9 @@ function testDbs() {
     CREATE TABLE processing_ack (
       message_id     TEXT PRIMARY KEY,
       status         TEXT NOT NULL,
-      status_changed TEXT NOT NULL
+      status_changed TEXT NOT NULL,
+      notice_message_out_id TEXT,
+      claim_token    TEXT
     );
     CREATE TABLE container_state (
       id                       INTEGER PRIMARY KEY,
@@ -372,7 +408,9 @@ describe('resetStuckProcessingRows', () => {
   it('clears orphan processing claims when retrying a stale pending message', () => {
     const { inDb, outDb } = testDbs();
     inDb.prepare("INSERT INTO messages_in (id, status, tries) VALUES ('m-1', 'pending', 0)").run();
-    outDb.prepare("INSERT INTO processing_ack VALUES ('m-1', 'processing', ?)").run('2026-04-20 11:00:00');
+    outDb
+      .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-1', 'processing', ?)")
+      .run('2026-04-20 11:00:00');
 
     resetStuckProcessingRows(inDb, outDb, fakeSession(), 'absolute-ceiling', outDb);
 
@@ -394,7 +432,9 @@ describe('resetStuckProcessingRows', () => {
     inDb
       .prepare("INSERT INTO messages_in (id, status, tries, process_after) VALUES ('m-2', 'pending', 1, ?)")
       .run(future);
-    outDb.prepare("INSERT INTO processing_ack VALUES ('m-2', 'processing', ?)").run('2026-04-20 11:00:00');
+    outDb
+      .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-2', 'processing', ?)")
+      .run('2026-04-20 11:00:00');
 
     resetStuckProcessingRows(inDb, outDb, fakeSession(), 'claim-stuck', outDb);
 
@@ -541,7 +581,9 @@ describe('recoverInterruptedTurn (kill/reset ordering)', () => {
   function processingDbs() {
     const { inDb, outDb } = testDbs();
     inDb.prepare("INSERT INTO messages_in (id, status, tries) VALUES ('m-1', 'pending', 0)").run();
-    outDb.prepare("INSERT INTO processing_ack VALUES ('m-1', 'processing', ?)").run('2026-04-20 11:00:00');
+    outDb
+      .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-1', 'processing', ?)")
+      .run('2026-04-20 11:00:00');
     outDb
       .prepare(
         "INSERT INTO container_state (id, current_tool, tool_declared_timeout_ms, tool_started_at) VALUES (1, 'opencode-long-tool', 7200000, '2026-04-20 11:00:00')",
@@ -572,8 +614,9 @@ describe('recoverInterruptedTurn (kill/reset ordering)', () => {
         expect(containerStopped).toBe(true);
         order.push('import-side-effects');
       },
-      writeRecovery: () => {
+      writeRecovery: async () => {
         order.push('write-recovery');
+        return { blocked: false };
       },
       wakeContainer: async () => {
         order.push('wake');
@@ -610,8 +653,9 @@ describe('recoverInterruptedTurn (kill/reset ordering)', () => {
         importSideEffects: () => {
           order.push('import-side-effects');
         },
-        writeRecovery: () => {
+        writeRecovery: async () => {
           order.push('write-recovery');
+          return { blocked: false };
         },
         wakeContainer: async () => {
           order.push('wake');
@@ -638,7 +682,7 @@ describe('recoverInterruptedTurn (kill/reset ordering)', () => {
       verifyContainerStopped: async () => true,
       sealAndDrainAcceptedInputs: async () => {},
       importSideEffects: () => {},
-      writeRecovery: () => {},
+      writeRecovery: async () => ({ blocked: false }),
       wakeContainer: async () => {},
     });
 
@@ -646,6 +690,36 @@ describe('recoverInterruptedTurn (kill/reset ordering)', () => {
       | { current_tool: string | null }
       | undefined;
     if (row) expect(row.current_tool).toBeNull();
+
+    inDb.close();
+    outDb.close();
+  });
+
+  it('does not reset rows or wake when writeRecovery reports quarantine-blocked (R8)', async () => {
+    const { inDb, outDb } = processingDbs();
+    let woke = false;
+
+    await recoverInterruptedTurn({
+      inDb,
+      outDb,
+      session: fakeSession(),
+      reason: 'claim-stuck',
+      writableOutDb: outDb,
+      verifyContainerStopped: async () => true,
+      sealAndDrainAcceptedInputs: async () => {},
+      importSideEffects: () => {},
+      writeRecovery: async () => ({ blocked: true }),
+      wakeContainer: async () => {
+        woke = true;
+      },
+    });
+
+    // Quarantine-blocked: claims stay processing, tool state untouched, no wake.
+    expect(woke).toBe(false);
+    expect(getProcessingClaims(outDb)).toEqual([{ message_id: 'm-1', status_changed: '2026-04-20 11:00:00' }]);
+    expect(outDb.prepare('SELECT current_tool FROM container_state WHERE id = 1').get()).toEqual({
+      current_tool: 'opencode-long-tool',
+    });
 
     inDb.close();
     outDb.close();
@@ -671,9 +745,10 @@ describe('recoverInterruptedTurn (kill/reset ordering)', () => {
           order.push('import');
           if (failingStep === 'import') throw new Error('incomplete ledger evidence');
         },
-        writeRecovery: () => {
+        writeRecovery: async () => {
           order.push('recovery');
           if (failingStep === 'recovery') throw new Error('incomplete audit evidence');
+          return { blocked: false };
         },
         wakeContainer: async () => {
           order.push('wake');
@@ -716,7 +791,10 @@ describe('recoverInterruptedTurn (kill/reset ordering)', () => {
         order.push('drain-complete');
       },
       importSideEffects: () => order.push('import'),
-      writeRecovery: () => order.push('recovery'),
+      writeRecovery: async () => {
+        order.push('recovery');
+        return { blocked: false };
+      },
       wakeContainer: async () => {
         order.push('wake');
       },
@@ -750,7 +828,10 @@ describe('recoverInterruptedTurn (kill/reset ordering)', () => {
           throw new Error('proxy drain timed out');
         },
         importSideEffects: () => order.push('import'),
-        writeRecovery: () => order.push('recovery'),
+        writeRecovery: async () => {
+          order.push('recovery');
+          return { blocked: false };
+        },
         wakeContainer: async () => {
           order.push('wake');
         },
@@ -771,8 +852,12 @@ describe('host wake/sync preserves recovery-owned acks', () => {
     // One recovery-owned row, one orphan processing row.
     inDb.prepare("INSERT INTO messages_in (id, status, tries, trigger) VALUES ('m-rec', 'pending', 0, 1)").run();
     inDb.prepare("INSERT INTO messages_in (id, status, tries, trigger) VALUES ('m-proc', 'pending', 0, 1)").run();
-    outDb.prepare("INSERT INTO processing_ack VALUES ('m-rec', 'recovery', ?)").run('2026-04-20 11:00:00');
-    outDb.prepare("INSERT INTO processing_ack VALUES ('m-proc', 'processing', ?)").run('2026-04-20 11:00:00');
+    outDb
+      .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-rec', 'recovery', ?)")
+      .run('2026-04-20 11:00:00');
+    outDb
+      .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-proc', 'processing', ?)")
+      .run('2026-04-20 11:00:00');
 
     // resetStuckProcessingRows must only touch the orphan 'processing' row.
     resetStuckProcessingRows(inDb, outDb, fakeSession(), 'container not running', outDb);
@@ -798,13 +883,32 @@ describe('host sweep wake decision excludes recovery-owned rows', () => {
     const { inDb, outDb } = testDbs();
     // Only row is pending in inbound but recovery-owned in outbound.
     inDb.prepare("INSERT INTO messages_in (id, status, tries, trigger) VALUES ('m-rec', 'pending', 0, 1)").run();
-    outDb.prepare("INSERT INTO processing_ack VALUES ('m-rec', 'recovery', ?)").run('2026-04-20 11:00:00');
+    outDb
+      .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-rec', 'recovery', ?)")
+      .run('2026-04-20 11:00:00');
 
     // sweepSession uses countDueMessagesExcludingRecovery(inDb, outDb) when outDb
     // is available. Verify: due count is 0 → wakeContainer must not be triggered.
     const dueCount = countDueMessagesExcludingRecovery(inDb, outDb);
     expect(dueCount).toBe(0);
 
+    inDb.close();
+    outDb.close();
+  });
+
+  it('counts a recovery-owned row as due once older than the wake TTL (R1)', () => {
+    const { inDb, outDb } = testDbs();
+    inDb.prepare("INSERT INTO messages_in (id, status, trigger) VALUES ('m-rec', 'pending', 1)").run();
+    outDb
+      .prepare(
+        "INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-rec', 'recovery', '2026-04-20 10:00:00')",
+      )
+      .run();
+    // BASE is 2026-04-20T12:00:00Z — two hours after the ack transition.
+    expect(countDueMessagesExcludingRecovery(inDb, outDb, { nowMs: BASE, recoveryWakeTtlMs: 30 * 60 * 1000 })).toBe(1);
+    expect(countDueMessagesExcludingRecovery(inDb, outDb, { nowMs: BASE, recoveryWakeTtlMs: 3 * 60 * 60 * 1000 })).toBe(
+      0,
+    );
     inDb.close();
     outDb.close();
   });
@@ -826,7 +930,9 @@ describe('host sweep wake decision excludes recovery-owned rows', () => {
     // m-rec is recovery-owned; m-new is a normal pending message.
     inDb.prepare("INSERT INTO messages_in (id, status, tries, trigger) VALUES ('m-rec', 'pending', 0, 1)").run();
     inDb.prepare("INSERT INTO messages_in (id, status, tries, trigger) VALUES ('m-new', 'pending', 0, 1)").run();
-    outDb.prepare("INSERT INTO processing_ack VALUES ('m-rec', 'recovery', ?)").run('2026-04-20 11:00:00');
+    outDb
+      .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-rec', 'recovery', ?)")
+      .run('2026-04-20 11:00:00');
 
     // Only m-new should be counted as due.
     const dueCount = countDueMessagesExcludingRecovery(inDb, outDb);
@@ -1151,7 +1257,7 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
             stoppedAt: '2026-05-29T12:00:10.000Z',
           });
         },
-        writeRecovery: () => {
+        writeRecovery: async () => {
           recoverGwsClaimPartitions({
             sessionDir: sessionPath,
             inDb,
@@ -1162,6 +1268,7 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
             auditStorePath: auditStore,
             reconciliationStorePath: reconciliationStore,
           });
+          return { blocked: false };
         },
         wakeContainer: async () => {
           woke = true;
@@ -1218,7 +1325,7 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
       fs.writeFileSync(reconciliationStore, `${JSON.stringify(incident)}\n${JSON.stringify(resolution)}\n`);
 
       expect(
-        assertNoUnresolvedGwsReconciliationRecords({
+        readGwsReconciliationRecords({
           reconciliationStorePath: reconciliationStore,
           scopes: [
             {
@@ -1228,7 +1335,7 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
               notAfter: '2026-05-29T12:00:10.000Z',
             },
           ],
-        }),
+        }).reconciliations,
       ).toEqual([
         expect.objectContaining({
           auditId: incident.audit_id,
@@ -1242,42 +1349,229 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
     },
   );
 
+  /** Canonical R8 fixture: the happy-path incident/resolution pair plus its exact scope. */
+  function reconciliationFixture() {
+    const incident = {
+      schema_version: 2,
+      audit_id: 'manual-audit-1',
+      outcome: 'outcome_unknown',
+      profile: 'nanoclaw',
+      account: 'dan@danshapiro.com',
+      account_label: 'personal',
+      account_email: 'dan@danshapiro.com',
+      input_id: 'in-strict',
+      route_key: 'opencode|discord|chan-strict|dm:mg-strict',
+      service: 'drive',
+      method: 'files.update',
+      operation: 'drive files update',
+      resource_type: 'gws mutation',
+      requested_title: '',
+      parent: '',
+      workspace: '',
+      started_at: '2026-05-29T12:00:01.000Z',
+      ended_at: '2026-05-29T12:00:04.000Z',
+      search_hints: ['inspect Google directly'],
+    };
+    const resolution = {
+      schema_version: 2,
+      record_type: 'resolution',
+      audit_id: incident.audit_id,
+      input_id: incident.input_id,
+      route_key: incident.route_key,
+      disposition: 'completed',
+      operator: 'dan',
+      note: 'inspected the exact account and resource',
+      resolved_at: '2026-05-29T12:10:00.000Z',
+    };
+    const scopes = [
+      {
+        inputId: incident.input_id,
+        routeKey: incident.route_key,
+        notBefore: '2026-05-29T12:00:00.000Z',
+        notAfter: '2026-05-29T12:00:10.000Z',
+      },
+    ];
+    return { incident, resolution, scopes };
+  }
+
+  function writeReconciliationStore(name: string, entries: object[]): string {
+    const reconciliationStorePath = path.join(tmpRoot, name);
+    fs.writeFileSync(reconciliationStorePath, `${entries.map((entry) => JSON.stringify(entry)).join('\n')}\n`);
+    return reconciliationStorePath;
+  }
+
+  it('sanitizes non-ASCII advisory hint text instead of failing the store (the dvora em-dash incident)', () => {
+    const { incident, resolution, scopes } = reconciliationFixture();
+    incident.search_hints = ['inspect Google directly \u2014 do not retry']; // em dash, U+2014
+    resolution.note = 'resolved \u2014 see thread'; // em dash
+    const reconciliationStorePath = writeReconciliationStore('advisory-em-dash.jsonl', [incident, resolution]);
+
+    const { reconciliations, quarantined } = readGwsReconciliationRecords({ reconciliationStorePath, scopes });
+    expect(quarantined).toEqual([]);
+    expect(reconciliations).toHaveLength(1);
+    expect(reconciliations[0].note).toBe('resolved - see thread');
+  });
+
+  it('quarantines an out-of-scope record with a load-bearing failure without blocking in-scope recovery', () => {
+    const { incident, resolution, scopes } = reconciliationFixture();
+    const outOfScope = { ...incident, audit_id: 'audit-\u00e9', input_id: 'other-input' };
+    const reconciliationStorePath = writeReconciliationStore('quarantine-out-of-scope.jsonl', [
+      incident,
+      resolution,
+      outOfScope,
+    ]);
+
+    const { reconciliations, quarantined } = readGwsReconciliationRecords({ reconciliationStorePath, scopes });
+    expect(reconciliations).toHaveLength(1); // in-scope work proceeds
+    expect(quarantined).toHaveLength(1);
+    expect(quarantined[0]).toMatchObject({ inputId: 'other-input', reason: expect.stringContaining('malformed') });
+  });
+
+  it('quarantines an unknown-field record instead of halting all recovery host-wide', () => {
+    const { incident, resolution, scopes } = reconciliationFixture();
+    const outOfScope = { ...incident, audit_id: 'audit-2', input_id: 'other-input', tenant: 'x' };
+    const reconciliationStorePath = writeReconciliationStore('quarantine-unknown-field.jsonl', [
+      incident,
+      resolution,
+      outOfScope,
+    ]);
+
+    const { reconciliations, quarantined } = readGwsReconciliationRecords({ reconciliationStorePath, scopes });
+    expect(reconciliations).toHaveLength(1);
+    expect(quarantined[0].reason).toContain('unknown field');
+  });
+
+  // A12 fail-closed (validator-V7): identity corruption on an INCIDENT record
+  // must be FILE-level fatal \u2014 a quarantined-and-skipped record with unreadable
+  // input_id structurally cannot contribute to blockedInputIds, so recovery
+  // would re-run a GWS-uncertain input.
   it.each([
-    ['resolution before incident', [{ schema_version: 2, record_type: 'resolution', audit_id: 'a' }]],
     [
-      'wrong exact binding',
-      [
+      'non-ASCII byte in input_id',
+      (incident: Record<string, unknown>) => {
+        incident.input_id = 'input-\u00e91';
+      },
+    ],
+    [
+      'missing input_id',
+      (incident: Record<string, unknown>) => {
+        delete incident.input_id;
+      },
+    ],
+    [
+      'non-string input_id',
+      (incident: Record<string, unknown>) => {
+        incident.input_id = 42;
+      },
+    ],
+  ])('fails the whole store closed on an incident with unreadable identity: %s', (_name, mutate) => {
+    const { incident, scopes } = reconciliationFixture();
+    const record = { ...incident } as Record<string, unknown>;
+    mutate(record);
+    const reconciliationStorePath = writeReconciliationStore('unreadable-identity.jsonl', [record]);
+
+    expect(() => readGwsReconciliationRecords({ reconciliationStorePath, scopes })).toThrow(/identity|input_id/i);
+  });
+
+  it('fails the whole store closed on non-UTF8 bytes inside input_id', () => {
+    const { incident, scopes } = reconciliationFixture();
+    const line = Buffer.from(`${JSON.stringify(incident)}\n`, 'utf8');
+    const marker = Buffer.from(`"input_id":"${incident.input_id}`, 'utf8');
+    const at = line.indexOf(marker);
+    expect(at).toBeGreaterThanOrEqual(0);
+    line[at + marker.length - 1] = 0xff; // readFileSync(..., 'utf8') turns this into U+FFFD
+    const reconciliationStorePath = path.join(tmpRoot, 'non-utf8-identity.jsonl');
+    fs.writeFileSync(reconciliationStorePath, line);
+
+    expect(() => readGwsReconciliationRecords({ reconciliationStorePath, scopes })).toThrow(/identity|input_id/i);
+  });
+
+  it('fails the whole store closed on an unknown-record_type record with unreadable input_id', () => {
+    // It could be a corrupted INCIDENT; quarantining it would drop it from
+    // blockedInputIds, so identity must be readable before any quarantine.
+    const { incident, scopes } = reconciliationFixture();
+    const record = { ...incident, record_type: 'resoluti\u00f8n', audit_id: 'audit-2' } as Record<string, unknown>;
+    delete record.input_id;
+    const reconciliationStorePath = writeReconciliationStore('unknown-type-unreadable-id.jsonl', [record]);
+
+    expect(() => readGwsReconciliationRecords({ reconciliationStorePath, scopes })).toThrow(/identity|input_id/i);
+  });
+
+  it('keeps quarantine (not file-fatal) for corrupted record_type or mangled audit_id with INTACT input_id', () => {
+    const { incident, resolution, scopes } = reconciliationFixture();
+    const corruptedType = { ...incident, record_type: 'resoluti\u00f8n', audit_id: 'audit-2', input_id: 'other-input' };
+    const mangledAudit = { ...incident, audit_id: 'a-\u00e9', input_id: 'other-input' };
+    const reconciliationStorePath = writeReconciliationStore('quarantine-intact-identity.jsonl', [
+      incident,
+      resolution,
+      corruptedType,
+      mangledAudit,
+    ]);
+
+    const { reconciliations, quarantined } = readGwsReconciliationRecords({ reconciliationStorePath, scopes });
+    expect(reconciliations).toHaveLength(1); // in-scope work proceeds
+    expect(quarantined.length).toBeGreaterThanOrEqual(2);
+    expect(quarantined.every((q) => typeof q.inputId === 'string' || q.reason.includes('resolution'))).toBe(true);
+  });
+
+  it('quarantines a resolution-before-incident record instead of failing the whole store', () => {
+    // Record-level quarantine with an empty incidents map: the scope pass has
+    // nothing to throw about, so the reader RETURNS instead of throwing.
+    const reconciliationStore = path.join(tmpRoot, 'malformed-resolution.jsonl');
+    const entries = [{ schema_version: 2, record_type: 'resolution', audit_id: 'a' }];
+    fs.writeFileSync(reconciliationStore, `${entries.map((entry) => JSON.stringify(entry)).join('\n')}\n`);
+
+    const { reconciliations, quarantined } = readGwsReconciliationRecords({
+      reconciliationStorePath: reconciliationStore,
+      scopes: [
         {
-          schema_version: 2,
-          audit_id: 'a',
-          outcome: 'outcome_unknown',
-          account: 'dan@danshapiro.com',
-          input_id: 'in-strict',
-          route_key: 'opencode|discord|chan-strict|dm:mg-strict',
-          operation: 'drive files update',
-          resource_type: 'gws mutation',
-          started_at: '2026-05-29T12:00:01.000Z',
-          ended_at: '2026-05-29T12:00:04.000Z',
-          search_hints: ['inspect'],
-        },
-        {
-          schema_version: 2,
-          record_type: 'resolution',
-          audit_id: 'a',
-          input_id: 'other-input',
-          route_key: 'opencode|discord|chan-strict|dm:mg-strict',
-          disposition: 'completed',
-          operator: 'dan',
-          note: 'checked',
-          resolved_at: '2026-05-29T12:10:00.000Z',
+          inputId: 'in-strict',
+          routeKey: 'opencode|discord|chan-strict|dm:mg-strict',
+          notBefore: '2026-05-29T12:00:00.000Z',
+          notAfter: '2026-05-29T12:00:10.000Z',
         },
       ],
-    ],
-  ])('fails closed on malformed manual reconciliation: %s', (_label, entries) => {
-    const reconciliationStore = path.join(tmpRoot, 'malformed-resolution.jsonl');
+    });
+    expect(reconciliations).toEqual([]);
+    expect(quarantined).toHaveLength(1);
+    expect(quarantined[0].reason).toMatch(/resolution/i);
+  });
+
+  it('fails closed on malformed manual reconciliation: wrong exact binding', () => {
+    // The mis-bound resolution is quarantined at record level, but the VALID
+    // in-scope incident is accepted with no accepted resolution, so the KEPT
+    // scope pass throws its missing-resolution error.
+    const reconciliationStore = path.join(tmpRoot, 'malformed-binding.jsonl');
+    const entries = [
+      {
+        schema_version: 2,
+        audit_id: 'a',
+        outcome: 'outcome_unknown',
+        account: 'dan@danshapiro.com',
+        input_id: 'in-strict',
+        route_key: 'opencode|discord|chan-strict|dm:mg-strict',
+        operation: 'drive files update',
+        resource_type: 'gws mutation',
+        started_at: '2026-05-29T12:00:01.000Z',
+        ended_at: '2026-05-29T12:00:04.000Z',
+        search_hints: ['inspect'],
+      },
+      {
+        schema_version: 2,
+        record_type: 'resolution',
+        audit_id: 'a',
+        input_id: 'other-input',
+        route_key: 'opencode|discord|chan-strict|dm:mg-strict',
+        disposition: 'completed',
+        operator: 'dan',
+        note: 'checked',
+        resolved_at: '2026-05-29T12:10:00.000Z',
+      },
+    ];
     fs.writeFileSync(reconciliationStore, `${entries.map((entry) => JSON.stringify(entry)).join('\n')}\n`);
+
     expect(() =>
-      assertNoUnresolvedGwsReconciliationRecords({
+      readGwsReconciliationRecords({
         reconciliationStorePath: reconciliationStore,
         scopes: [
           {
@@ -1288,7 +1582,7 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
           },
         ],
       }),
-    ).toThrow(/reconciliation|resolution|incident|binding/i);
+    ).toThrow(/requires manual reconciliation/i);
   });
 
   it('writes recovery only after complete empty ledger, audit, and reconciliation evidence', () => {
@@ -1750,6 +2044,53 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
     outDb.close();
   });
 
+  it('blocks ONLY the session whose accepted input has a quarantined record (fail-closed per input_id)', () => {
+    const { sessionPath, inPath, outPath } = setupSession();
+    const auditStore = path.join(tmpRoot, 'blocked-input-audit.jsonl');
+    const reconciliationStore = path.join(tmpRoot, 'blocked-input-reconciliation.jsonl');
+    fs.writeFileSync(path.join(sessionPath, 'side-effects.jsonl'), '');
+    fs.writeFileSync(auditStore, '');
+    const inDb = new Database(inPath);
+    const outDb = new Database(outPath);
+    const accepted = addAcceptedClaim(inDb, outDb, { inputId: 'input-1' });
+    fs.writeFileSync(
+      reconciliationStore,
+      `${JSON.stringify({
+        schema_version: 2,
+        audit_id: 'audit-\u00e9', // non-ASCII: load-bearing failure, quarantined
+        outcome: 'outcome_unknown',
+        account: 'dan@danshapiro.com',
+        input_id: 'input-1',
+        route_key: accepted.routeKey,
+        operation: 'drive files update',
+        resource_type: 'gws mutation',
+        started_at: '2026-05-29T12:00:01.000Z',
+        ended_at: '2026-05-29T12:00:04.000Z',
+        search_hints: ['inspect'],
+      })}\n`,
+    );
+
+    const result = recoverGwsClaimPartitions({
+      sessionDir: sessionPath,
+      inDb,
+      outDb,
+      reason: 'claim-stuck',
+      containerStopped: true,
+      stoppedAt: '2026-05-29T12:00:10.000Z',
+      auditStorePath: auditStore,
+      reconciliationStorePath: reconciliationStore,
+    });
+    expect(result.recoveryIds).toEqual([]);
+    expect(result.blockedInputIds).toEqual(['input-1']);
+    expect(result.quarantinedReconciliation).toHaveLength(1);
+    // Claims untouched: still processing, ready for a fixed store on a later sweep.
+    const acks = outDb.prepare('SELECT status FROM processing_ack').all() as { status: string }[];
+    expect(acks).toHaveLength(1);
+    expect(acks.every((ack) => ack.status === 'processing')).toBe(true);
+    inDb.close();
+    outDb.close();
+  });
+
   it('returns a pre-acceptance-only crashed claim without requiring GWS evidence files', () => {
     const { sessionPath, inPath, outPath } = setupSession();
     const routeKey = 'opencode|discord|chan-preaccept|dm:mg-preaccept';
@@ -1794,7 +2135,12 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
         auditStorePath: undefined,
         reconciliationStorePath: undefined,
       }),
-    ).toEqual({ recoveryIds: [], returnedUnacceptedClaimIds: ['preaccept-only'] });
+    ).toEqual({
+      recoveryIds: [],
+      returnedUnacceptedClaimIds: ['preaccept-only'],
+      quarantinedReconciliation: [],
+      blockedInputIds: [],
+    });
     expect(getProcessingClaims(outDb)).toEqual([]);
     expect(inDb.prepare('SELECT status, tries FROM messages_in WHERE id = ?').get('preaccept-only')).toEqual({
       status: 'pending',
@@ -2162,7 +2508,7 @@ describe('recoverInterruptedTurnBounded (quarantine wiring for wedged side-effec
       verifyContainerStopped: async () => true,
       sealAndDrainAcceptedInputs: async () => {},
       importSideEffects: args.importSideEffects,
-      writeRecovery: () => {},
+      writeRecovery: async () => ({ blocked: false }),
       wakeContainer: async () => {},
       quarantineThreshold: args.threshold ?? 2,
     });
@@ -2373,5 +2719,90 @@ describe('recoverInterruptedTurnBounded (quarantine wiring for wedged side-effec
 
     inDb.close();
     outDb.close();
+  });
+});
+
+/**
+ * R9 fixture (deliberate test-island duplicate of the session-db.test.ts
+ * helper): materialize a REAL hot rollback journal. Copy the live journal
+ * aside mid-transaction (AFTER forcing a spill+sync so the header magic is
+ * written), commit, then restore the copy — a valid-header journal with no
+ * owning process is precisely SQLite's "hot" condition.
+ */
+function plantHotJournal(dbPath: string): void {
+  const db = new Database(dbPath);
+  db.pragma('journal_mode = DELETE');
+  // Tiny pager cache forces a mid-transaction journal spill+sync, which is
+  // what writes the journal header magic. Without this the journal FILE
+  // exists but its header is zeroed and SQLite ignores it (not hot).
+  db.pragma('cache_size = 10');
+  db.exec('CREATE TABLE IF NOT EXISTS filler (id INTEGER PRIMARY KEY, data BLOB)');
+  db.exec('BEGIN IMMEDIATE');
+  db.prepare('INSERT INTO filler (data) VALUES (?)').run(Buffer.alloc(1024 * 1024));
+  const journalPath = `${dbPath}-journal`;
+  if (!fs.existsSync(journalPath) || fs.statSync(journalPath).size === 0) {
+    throw new Error('test setup failed to materialize a rollback journal');
+  }
+  fs.copyFileSync(journalPath, `${journalPath}.saved`);
+  db.exec('COMMIT');
+  db.close();
+  fs.copyFileSync(`${journalPath}.saved`, journalPath);
+  fs.rmSync(`${journalPath}.saved`);
+}
+
+describe('sweepSession hot-journal heal gate (R9)', () => {
+  const R9_DATA_DIR = '/tmp/nanoclaw-test-host-sweep-r9';
+
+  function r9Session(): Session {
+    return {
+      id: 'sess-r9',
+      agent_group_id: 'ag-r9',
+      messaging_group_id: null,
+      thread_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: new Date().toISOString(),
+      created_at: new Date().toISOString(),
+    };
+  }
+
+  beforeEach(() => {
+    fs.rmSync(R9_DATA_DIR, { recursive: true, force: true });
+    fs.mkdirSync(R9_DATA_DIR, { recursive: true });
+    runMigrations(initTestDb());
+    createAgentGroup({
+      id: 'ag-r9',
+      name: 'R9 Agent',
+      folder: 'r9-agent',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    initSessionFolder('ag-r9', 'sess-r9');
+  });
+
+  afterEach(() => {
+    vi.mocked(isContainerRunning).mockReturnValue(false);
+    closeDb();
+    fs.rmSync(R9_DATA_DIR, { recursive: true, force: true });
+  });
+
+  it('heals a hot outbound journal only when the container is verified not running (R9 gate)', async () => {
+    const session = r9Session();
+    const journalPath = `${outboundDbPath('ag-r9', 'sess-r9')}-journal`;
+
+    // 1) Container running: no write-mode heal may happen. The hot journal
+    // surfaces as the incident failure mode (first outbound read throws) and
+    // the journal file MUST survive untouched.
+    plantHotJournal(outboundDbPath('ag-r9', 'sess-r9'));
+    vi.mocked(isContainerRunning).mockReturnValue(true);
+    await expect(sweepSessionForTest(session)).rejects.toThrow();
+    expect(fs.existsSync(journalPath)).toBe(true); // no RW heal while a writer may be live
+
+    // 2) Container verified not running: the gated heal runs at the outbound
+    // open — before any wake — and the sweep completes normally.
+    vi.mocked(isContainerRunning).mockReturnValue(false);
+    await expect(sweepSessionForTest(session)).resolves.toBeUndefined();
+    expect(fs.existsSync(journalPath)).toBe(false); // gated heal rolled the journal back
   });
 });

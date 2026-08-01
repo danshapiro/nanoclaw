@@ -42,7 +42,6 @@ import { getAgentGroup } from './db/agent-groups.js';
 import { RuntimeLockHeldError, withRuntimeLock } from './db/runtime-locks.js';
 import {
   assertHostGwsSideEffectsReconciledForScopes,
-  assertNoUnresolvedGwsReconciliationRecords,
   countDueMessages,
   countDueMessagesExcludingRecovery,
   deleteOrphanProcessingClaims,
@@ -53,11 +52,14 @@ import {
   getProcessingClaims,
   hasSchedulerTaskRows,
   importHostSideEffects,
+  isHotJournalError,
   markMessageFailed,
+  readGwsReconciliationRecords,
   retryWithBackoff,
   syncProcessingAcks,
   type ContainerState,
   type ProcessingClaim,
+  type QuarantinedGwsReconciliationRecord,
   type ImportSideEffectsResult,
   type GwsManualReconciliation,
 } from './db/session-db.js';
@@ -78,6 +80,7 @@ import {
 import {
   openInboundDb,
   openOutboundDb,
+  openOutboundDbHealing,
   openOutboundDbRw,
   inboundDbPath,
   heartbeatPath,
@@ -99,6 +102,7 @@ import {
   resolveProjectionContext,
   syncSessionSchedulerState,
 } from './modules/scheduling/sync.js';
+import { releaseOrEscalateExpiredRecoveryAcks } from './recovery-escalation.js';
 import type { Session } from './types.js';
 
 /**
@@ -139,6 +143,10 @@ export const IDLE_REAP_MS = Number(process.env.NANOCLAW_IDLE_REAP_MS) || 10 * 60
 // A container whose skill generation is stale is recycled only once it has been
 // quiet at least this long — confident it is between turns, not mid-flush.
 export const IDLE_RECYCLE_GRACE_MS = 60 * 1000;
+// R1: recovery-owned rows older than this count as due again in the wake gate.
+export const RECOVERY_WAKE_TTL_MS = Number(process.env.NANOCLAW_RECOVERY_WAKE_TTL_MS) || 30 * 60 * 1000;
+/** R2: failed resume attempts tolerated before a recovery ack escalates to terminal failure. */
+export const RECOVERY_MAX_WAKE_ATTEMPTS = Number(process.env.NANOCLAW_RECOVERY_MAX_WAKE_ATTEMPTS) || 3;
 const MAX_TRIES = 5;
 const BACKOFF_BASE_MS = 5000;
 
@@ -430,9 +438,29 @@ async function sweepSession(session: Session): Promise<void> {
   }
 
   try {
-    outDb = openOutboundDb(agentGroup.id, session.id);
-  } catch {
-    // outbound.db might not exist yet (container hasn't started)
+    // R9a: the write-mode healing open runs ONLY when the host knows no
+    // container writer can be live (cross-mount SQLite locking is unverified
+    // and must not be the guard). This site also covers the post-crash
+    // window: a nonzero exit schedules recoverSessionAfterUnexpectedExit ->
+    // sweepSession (container-runner.ts:545,593), and it always runs BEFORE
+    // the wake gate below.
+    outDb = !isContainerRunning(session.id)
+      ? openOutboundDbHealing(agentGroup.id, session.id)
+      : openOutboundDb(agentGroup.id, session.id);
+  } catch (err) {
+    // outbound.db might not exist yet (container hasn't started). Anything
+    // else deserves a log line: this bare swallow hid the hot-journal wedge.
+    outDb = null;
+    if (isHotJournalError(err)) {
+      // Hot journal while the container is (or may be) running: defer — a
+      // healthy container rolls its own journal back at startup, and the
+      // next sweep after it stops takes the gated heal path above.
+      log.warn('Hot outbound journal with container running; deferring heal to a gated sweep', {
+        sessionId: session.id,
+      });
+    } else if ((err as { code?: string }).code !== 'SQLITE_CANTOPEN') {
+      log.warn('Outbound DB unavailable during sweep', { sessionId: session.id, err });
+    }
   }
 
   try {
@@ -491,13 +519,46 @@ async function sweepSession(session: Session): Promise<void> {
       await recoverAfterKill(inDb, session, 'container not running');
     }
 
+    // 3.5 R1/R2: bounded lifecycle for recovery-owned rows. Requires the
+    // container-stopped guard (RW outbound open inside). Errors are contained
+    // per session: a failed pass must never block the wake below (the TTL-aware
+    // due count still fires, which only ADDS wakes).
+    if (outDb && !isContainerRunning(session.id)) {
+      try {
+        const outcome = await releaseOrEscalateExpiredRecoveryAcks({
+          session,
+          inDb,
+          outDb,
+          nowMs: Date.now(),
+          ttlMs: RECOVERY_WAKE_TTL_MS,
+          maxAttempts: RECOVERY_MAX_WAKE_ATTEMPTS,
+          // GWS-cleanliness release gate — same env source as recoverAfterKill.
+          reconciliationStorePath: process.env.NANOCLAW_GWS_RECONCILIATION_STORE,
+        });
+        if (outcome.released.length > 0 || outcome.escalated.length > 0) {
+          log.info('Recovery wake TTL pass acted', {
+            sessionId: session.id,
+            released: outcome.released,
+            escalated: outcome.escalated,
+          });
+        }
+      } catch (err) {
+        log.error('Recovery wake TTL pass failed', { sessionId: session.id, err });
+      }
+    }
+
     // 4. Wake a container if work is due and nothing is running.
     // Use the outbound-aware count when outDb is available so that
     // recovery-owned rows (processing_ack.status='recovery') are excluded and
     // do not trigger a redundant container wake. Fall back to the inbound-only
     // count when outDb does not exist yet (brand-new session: no outbound DB
     // means no recovery rows either, so the counts are equivalent).
-    const dueCount = outDb ? countDueMessagesExcludingRecovery(inDb, outDb) : countDueMessages(inDb);
+    const dueCount = outDb
+      ? countDueMessagesExcludingRecovery(inDb, outDb, {
+          nowMs: Date.now(),
+          recoveryWakeTtlMs: RECOVERY_WAKE_TTL_MS,
+        })
+      : countDueMessages(inDb);
     if (dueCount > 0 && !isContainerRunning(session.id)) {
       log.info('Waking container for due messages', { sessionId: session.id, count: dueCount });
       try {
@@ -746,8 +807,12 @@ export async function recoverInterruptedTurn(opts: {
   sealAndDrainAcceptedInputs: () => Promise<void>;
   /** Import staged side effects (must run before recovery is written). */
   importSideEffects: (args: { containerStopped: boolean }) => void;
-  /** Write route-scoped recovery / fallback for the active processing rows. */
-  writeRecovery: () => void;
+  /**
+   * Write route-scoped recovery / fallback for the active processing rows.
+   * Resolving `blocked: true` (R8 reconciliation quarantine for one of THIS
+   * session's accepted inputs) stops recovery before any reset or wake.
+   */
+  writeRecovery: () => Promise<{ blocked: boolean }>;
   /** Wake a replacement container (must run only after recovery is written). */
   wakeContainer: () => Promise<void>;
 }): Promise<void> {
@@ -770,7 +835,14 @@ export async function recoverInterruptedTurn(opts: {
   opts.importSideEffects({ containerStopped: true });
 
   // Recovery/fallback BEFORE we reset rows or wake anything.
-  opts.writeRecovery();
+  const recovery = await opts.writeRecovery();
+  if (recovery.blocked) {
+    // R8 fail-closed per input_id: a quarantined reconciliation record covers
+    // one of THIS session's accepted inputs. Claims stay processing, no reset,
+    // no wake -- waking would let container startup clear the processing acks
+    // and re-run a GWS-uncertain input.
+    return;
+  }
 
   // Clear stale tool state and reset the interrupted processing rows.
   const useDb = opts.writableOutDb ?? opts.outDb;
@@ -833,7 +905,7 @@ export async function recoverInterruptedTurnBounded(opts: {
   verifyContainerStopped: () => Promise<boolean>;
   sealAndDrainAcceptedInputs: () => Promise<void>;
   importSideEffects: (args: { containerStopped: boolean }) => void;
-  writeRecovery: () => void;
+  writeRecovery: () => Promise<{ blocked: boolean }>;
   wakeContainer: () => Promise<void>;
   /** Override for tests; production uses QUARANTINE_THRESHOLD. */
   quarantineThreshold?: number;
@@ -1281,7 +1353,12 @@ export function recoverGwsClaimPartitions(opts: {
   auditStorePath: string | undefined;
   reconciliationStorePath: string | undefined;
   gwsPublicKey?: string;
-}): { recoveryIds: string[]; returnedUnacceptedClaimIds: string[] } {
+}): {
+  recoveryIds: string[];
+  returnedUnacceptedClaimIds: string[];
+  quarantinedReconciliation: QuarantinedGwsReconciliationRecord[];
+  blockedInputIds: string[];
+} {
   const plan = strictAcceptedGwsRecoveryPlan(opts.inDb, opts.outDb, opts.stoppedAt ?? new Date().toISOString());
   if (plan.unacceptedClaimIds.length > 0) {
     const remove = opts.outDb.prepare("DELETE FROM processing_ack WHERE message_id = ? AND status = 'processing'");
@@ -1294,14 +1371,37 @@ export function recoverGwsClaimPartitions(opts: {
     })();
   }
   if (plan.partitions.length === 0) {
-    return { recoveryIds: [], returnedUnacceptedClaimIds: plan.unacceptedClaimIds };
+    return {
+      recoveryIds: [],
+      returnedUnacceptedClaimIds: plan.unacceptedClaimIds,
+      quarantinedReconciliation: [],
+      blockedInputIds: [],
+    };
   }
   const scopes = plan.partitions.map((partition) => partition.scope);
 
-  const manualReconciliations = assertNoUnresolvedGwsReconciliationRecords({
+  const { reconciliations: manualReconciliations, quarantined } = readGwsReconciliationRecords({
     reconciliationStorePath: opts.reconciliationStorePath,
     scopes,
   });
+  const quarantinedInputIds = new Set(
+    quarantined.map((q) => q.inputId).filter((v): v is string => typeof v === 'string'),
+  );
+  const blockedInputIds = plan.partitions
+    .map((partition) => partition.scope.inputId)
+    .filter((inputId) => quarantinedInputIds.has(inputId));
+  if (blockedInputIds.length > 0) {
+    // R8 fail-closed per input_id: THIS session's recovery stops (claims stay
+    // processing, no reset, no wake -- waking would let container startup
+    // clear the acks and re-run a GWS-uncertain input). Other sessions are
+    // unaffected. The caller records the loud incidents.
+    return {
+      recoveryIds: [],
+      returnedUnacceptedClaimIds: plan.unacceptedClaimIds,
+      quarantinedReconciliation: quarantined,
+      blockedInputIds,
+    };
+  }
 
   for (const partition of plan.partitions) {
     discoverGwsCrashWindowDraftsScoped({
@@ -1338,7 +1438,12 @@ export function recoverGwsClaimPartitions(opts: {
     }
     recoveryIds.push(recoveryId);
   }
-  return { recoveryIds, returnedUnacceptedClaimIds: plan.unacceptedClaimIds };
+  return {
+    recoveryIds,
+    returnedUnacceptedClaimIds: plan.unacceptedClaimIds,
+    quarantinedReconciliation: quarantined,
+    blockedInputIds: [],
+  };
 }
 
 /**
@@ -1393,7 +1498,7 @@ export async function recoverAfterKill(inDb: Database.Database, session: Session
           allowedArtifactRoots,
         });
       },
-      writeRecovery: () => {
+      writeRecovery: async () => {
         const recovered = recoverGwsClaimPartitions({
           sessionDir: dir,
           inDb,
@@ -1405,11 +1510,44 @@ export async function recoverAfterKill(inDb: Database.Database, session: Session
           reconciliationStorePath: process.env.NANOCLAW_GWS_RECONCILIATION_STORE,
           gwsPublicKey,
         });
+        if (recovered.quarantinedReconciliation.length > 0) {
+          const { reportSchedulerIncident } = await import('./yente/scheduler-alerts.js');
+          for (const q of recovered.quarantinedReconciliation) {
+            log.error('Quarantined GWS reconciliation record', { sessionId: session.id, ...q });
+            // Permanent dedupe means repeats on later sweeps are free.
+            await reportSchedulerIncident({
+              dedupeKey: `gws-reconciliation-quarantine:${q.auditId ?? `line-${q.lineNumber}`}`,
+              severity: 'error',
+              sessionId: session.id,
+              agentGroupId: session.agent_group_id,
+              message: `GWS reconciliation record quarantined (${q.reason}); ${
+                q.inputId
+                  ? `input ${q.inputId} is blocked from recovery`
+                  : 'resolution-side record -- its incident stays unresolved and remains blocked'
+              }. Fix the store record to unblock.`,
+              details: {
+                reason: 'gws-reconciliation-quarantine',
+                lineNumber: q.lineNumber,
+                auditId: q.auditId,
+                inputId: q.inputId,
+                quarantineReason: q.reason,
+              },
+            });
+          }
+        }
+        if (recovered.blockedInputIds.length > 0) {
+          log.error('GWS reconciliation quarantine blocks recovery for this session', {
+            sessionId: session.id,
+            blockedInputIds: recovered.blockedInputIds,
+          });
+          return { blocked: true }; // no reset, no wake
+        }
         log.info('Partitioned interrupted claims before reset', {
           sessionId: session.id,
           recoveryCount: recovered.recoveryIds.length,
           returnedUnacceptedCount: recovered.returnedUnacceptedClaimIds.length,
         });
+        return { blocked: false };
       },
       wakeContainer: async () => {
         shouldWake = true;

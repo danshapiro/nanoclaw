@@ -20,6 +20,13 @@
 import { Database } from 'bun:sqlite';
 import fs from 'fs';
 
+/**
+ * R9: must exceed legitimate host write-lock holds. The 07-31 holds were
+ * never measured (stderr destroyed); 30s is a defensible default, not a
+ * proven ceiling — hence configurable, and backed by the bounded retries.
+ */
+const BUSY_TIMEOUT_MS = Number(process.env.NANOCLAW_CONTAINER_SQLITE_BUSY_TIMEOUT_MS) || 30_000;
+
 const DEFAULT_INBOUND_PATH = '/workspace/inbound.db';
 const DEFAULT_OUTBOUND_PATH = '/workspace/outbound.db';
 const DEFAULT_HEARTBEAT_PATH = '/workspace/.heartbeat';
@@ -32,7 +39,7 @@ let _heartbeatPath: string = DEFAULT_HEARTBEAT_PATH;
 export function getInboundDb(): Database {
   if (!_inbound) {
     _inbound = new Database(DEFAULT_INBOUND_PATH, { readonly: true });
-    _inbound.exec('PRAGMA busy_timeout = 5000');
+    _inbound.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
   }
   return _inbound;
 }
@@ -42,7 +49,7 @@ export function getOutboundDb(): Database {
   if (!_outbound) {
     const db = new Database(DEFAULT_OUTBOUND_PATH);
     try {
-      db.exec('PRAGMA busy_timeout = 5000');
+      db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
       db.exec('PRAGMA journal_mode = DELETE');
       db.exec('PRAGMA foreign_keys = ON');
       ensureOutboundSchema(db);
