@@ -117,6 +117,14 @@ export async function releaseOrEscalateExpiredRecoveryAcks(opts: {
     noticeIds.set(messageId, noticeId);
   }
 
+  // Count the wake attempt BEFORE deleting the recovery ack (final-review
+  // deferred fix; validator-V6 A9): with delete-first, a crash between the two
+  // writes deleted the ack without bumping the counter -- one uncounted free
+  // release per crash. Increment-first makes that window fail toward EARLIER
+  // escalation (attempts bumped, ack still 'recovery', re-selected next
+  // sweep): louder, never a silent extra retry, and no message is dropped.
+  incrementRecoveryWakeAttempts(opts.inDb, toRelease);
+
   const outDbRw = openOutboundDbRw(opts.session.agent_group_id, opts.session.id);
   try {
     deleteRecoveryAcks(outDbRw, toRelease);
@@ -128,7 +136,6 @@ export async function releaseOrEscalateExpiredRecoveryAcks(opts: {
     outDbRw.close();
   }
 
-  incrementRecoveryWakeAttempts(opts.inDb, toRelease);
   for (const messageId of toEscalate) markMessageFailed(opts.inDb, messageId);
 
   for (const messageId of toRelease) {

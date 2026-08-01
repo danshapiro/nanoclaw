@@ -39,6 +39,7 @@ vi.mock('./yente/scheduler-alerts.js', () => ({
 }));
 
 import { releaseOrEscalateExpiredRecoveryAcks } from './recovery-escalation.js';
+import { openOutboundDbRw } from './session-manager.js';
 import {
   countDueMessagesExcludingRecovery,
   getRecoveryWakeAttempts,
@@ -164,6 +165,39 @@ describe('releaseOrEscalateExpiredRecoveryAcks', () => {
     // Error incident recorded with a stable dedupe key.
     expect(incidents).toHaveLength(1);
     expect(incidents[0]).toMatchObject({ severity: 'error', dedupeKey: 'recovery-escalation:sess-1:m-1' });
+  });
+
+  it('counts the wake attempt BEFORE deleting the recovery ack (a crash between the writes fails toward earlier escalation, never a free retry)', async () => {
+    const { inDb, outDb } = makeDbs();
+    inDb.prepare("INSERT INTO messages_in (id, channel_type, platform_id) VALUES ('m-1', 'discord', 'chan-1')").run();
+    reOwn(outDb, 'm-1');
+    // Simulate a crash in the window between the inbound increment and the
+    // outbound ack delete: the RW open (the first outbound-side write step)
+    // throws, so deleteRecoveryAcks never runs.
+    vi.mocked(openOutboundDbRw).mockImplementationOnce(() => {
+      throw new Error('injected crash before ack delete');
+    });
+    await expect(
+      releaseOrEscalateExpiredRecoveryAcks({ session, inDb, outDb, nowMs: NOW, ttlMs: TTL, maxAttempts: 3 }),
+    ).rejects.toThrow('injected crash before ack delete');
+    // The attempt was already durably counted (increment-first, V6 A9): the
+    // crash costs one attempt toward EARLIER escalation instead of granting an
+    // uncounted free release. The ack survives, so the row is re-selected.
+    expect(getRecoveryWakeAttempts(inDb, 'm-1')).toBe(1);
+    expect(outDb.prepare("SELECT status FROM processing_ack WHERE message_id = 'm-1'").get()).toMatchObject({
+      status: 'recovery',
+    });
+    // Next (healthy) sweep converges through the normal release path.
+    const outcome = await releaseOrEscalateExpiredRecoveryAcks({
+      session,
+      inDb,
+      outDb,
+      nowMs: NOW,
+      ttlMs: TTL,
+      maxAttempts: 3,
+    });
+    expect(outcome).toEqual({ released: ['m-1'], escalated: [] });
+    expect(getRecoveryWakeAttempts(inDb, 'm-1')).toBe(2);
   });
 
   it('supersedes the owning session_state recovery entries on escalation (no zombie context injection)', async () => {
