@@ -322,13 +322,42 @@ export function hasSchedulerTaskRows(db: Database.Database): boolean {
  * New behavior: the legacy countDueMessages never opened the outbound DB, so
  * this is a new outbound-aware due check, not a tweak to an existing filter.
  */
-export function countDueMessagesExcludingRecovery(inDb: Database.Database, outDb: Database.Database): number {
+/**
+ * Parse a session-DB timestamp to epoch ms. processing_ack.status_changed is
+ * written with SQLite datetime('now') ('YYYY-MM-DD HH:MM:SS', UTC, no zone
+ * marker); tests and some writers use ISO strings. Returns NaN if unparseable.
+ */
+export function parseSqliteUtcMs(s: string): number {
+  if (typeof s !== 'string' || s.length === 0) return NaN;
+  if (s.includes('T') || s.endsWith('Z')) return Date.parse(s);
+  return Date.parse(`${s.replace(' ', 'T')}Z`);
+}
+
+/** TTL options for the outbound-aware due count (R1). */
+export interface RecoveryWakeOptions {
+  nowMs: number;
+  recoveryWakeTtlMs: number;
+}
+
+export function countDueMessagesExcludingRecovery(
+  inDb: Database.Database,
+  outDb: Database.Database,
+  wake?: RecoveryWakeOptions,
+): number {
+  const recoveryRows = outDb
+    .prepare("SELECT message_id, status_changed FROM processing_ack WHERE status = 'recovery'")
+    .all() as Array<{ message_id: string; status_changed: string }>;
   const recoveryOwned = new Set(
-    (
-      outDb.prepare("SELECT message_id FROM processing_ack WHERE status = 'recovery'").all() as Array<{
-        message_id: string;
-      }>
-    ).map((r) => r.message_id),
+    recoveryRows
+      .filter((r) => {
+        if (!wake) return true; // legacy behavior: exclude every recovery row
+        const changedMs = parseSqliteUtcMs(r.status_changed);
+        // Unparseable timestamps count as expired: fail toward waking, never
+        // toward hiding work (R1 must only ADD wakes).
+        if (!Number.isFinite(changedMs)) return false;
+        return wake.nowMs - changedMs < wake.recoveryWakeTtlMs; // fresh -> keep excluded
+      })
+      .map((r) => r.message_id),
   );
 
   const due = inDb

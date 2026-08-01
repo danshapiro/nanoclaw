@@ -23,6 +23,7 @@ import {
   migrateMessagesInTable,
   migrateOutboundRouteColumns,
   openInboundDb,
+  parseSqliteUtcMs,
   syncProcessingAcks,
   upsertSessionRouting,
 } from './session-db.js';
@@ -384,6 +385,14 @@ describe('side_effect_ledger schema-v2 host migration', () => {
   });
 });
 
+describe('parseSqliteUtcMs', () => {
+  it('parses sqlite and ISO timestamps as UTC and returns NaN for garbage', () => {
+    expect(parseSqliteUtcMs('2026-04-20 11:00:00')).toBe(Date.parse('2026-04-20T11:00:00Z'));
+    expect(parseSqliteUtcMs('2026-04-20T11:00:00.000Z')).toBe(Date.parse('2026-04-20T11:00:00.000Z'));
+    expect(Number.isNaN(parseSqliteUtcMs('garbage'))).toBe(true);
+  });
+});
+
 // ── Task 1: host due-count excludes recovery-owned rows ──────────────────────
 
 describe('countDueMessagesExcludingRecovery', () => {
@@ -427,6 +436,88 @@ describe('countDueMessagesExcludingRecovery', () => {
     // Outbound-aware count excludes the recovery-owned row.
     expect(countDueMessagesExcludingRecovery(inDb, outDb)).toBe(1);
 
+    inDb.close();
+    outDb.close();
+  });
+
+  it('counts a recovery-owned row as due again once its ack is older than the wake TTL', () => {
+    freshDir();
+    const inDb = inboundDb();
+    const outDb = outboundDb();
+    insertMessage(inDb, {
+      id: 'm-old',
+      kind: 'chat',
+      timestamp: new Date().toISOString(),
+      platformId: null,
+      channelType: null,
+      threadId: null,
+      content: '{"text":"a"}',
+      processAfter: null,
+      recurrence: null,
+    });
+    // Recovery ack last transitioned 45 minutes ago.
+    outDb
+      .prepare(
+        `INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-old', 'recovery', datetime('now', '-45 minutes'))`,
+      )
+      .run();
+    const wake = { nowMs: Date.now(), recoveryWakeTtlMs: 30 * 60 * 1000 };
+    // Legacy call (no options): still excluded — R1 must not change callers that opt out.
+    expect(countDueMessagesExcludingRecovery(inDb, outDb)).toBe(0);
+    // TTL-aware call: expired recovery ownership no longer suppresses the wake.
+    expect(countDueMessagesExcludingRecovery(inDb, outDb, wake)).toBe(1);
+    inDb.close();
+    outDb.close();
+  });
+
+  it('keeps excluding a recovery-owned row younger than the wake TTL', () => {
+    freshDir();
+    const inDb = inboundDb();
+    const outDb = outboundDb();
+    insertMessage(inDb, {
+      id: 'm-fresh',
+      kind: 'chat',
+      timestamp: new Date().toISOString(),
+      platformId: null,
+      channelType: null,
+      threadId: null,
+      content: '{"text":"a"}',
+      processAfter: null,
+      recurrence: null,
+    });
+    outDb
+      .prepare(
+        `INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-fresh', 'recovery', datetime('now', '-5 minutes'))`,
+      )
+      .run();
+    const wake = { nowMs: Date.now(), recoveryWakeTtlMs: 30 * 60 * 1000 };
+    expect(countDueMessagesExcludingRecovery(inDb, outDb, wake)).toBe(0);
+    inDb.close();
+    outDb.close();
+  });
+
+  it('treats an unparseable status_changed as expired (fails toward waking)', () => {
+    freshDir();
+    const inDb = inboundDb();
+    const outDb = outboundDb();
+    insertMessage(inDb, {
+      id: 'm-bad',
+      kind: 'chat',
+      timestamp: new Date().toISOString(),
+      platformId: null,
+      channelType: null,
+      threadId: null,
+      content: '{"text":"a"}',
+      processAfter: null,
+      recurrence: null,
+    });
+    outDb
+      .prepare(
+        `INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-bad', 'recovery', 'garbage')`,
+      )
+      .run();
+    const wake = { nowMs: Date.now(), recoveryWakeTtlMs: 30 * 60 * 1000 };
+    expect(countDueMessagesExcludingRecovery(inDb, outDb, wake)).toBe(1);
     inDb.close();
     outDb.close();
   });

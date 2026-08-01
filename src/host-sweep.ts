@@ -139,6 +139,8 @@ export const IDLE_REAP_MS = Number(process.env.NANOCLAW_IDLE_REAP_MS) || 10 * 60
 // A container whose skill generation is stale is recycled only once it has been
 // quiet at least this long — confident it is between turns, not mid-flush.
 export const IDLE_RECYCLE_GRACE_MS = 60 * 1000;
+// R1: recovery-owned rows older than this count as due again in the wake gate.
+export const RECOVERY_WAKE_TTL_MS = Number(process.env.NANOCLAW_RECOVERY_WAKE_TTL_MS) || 30 * 60 * 1000;
 const MAX_TRIES = 5;
 const BACKOFF_BASE_MS = 5000;
 
@@ -497,7 +499,12 @@ async function sweepSession(session: Session): Promise<void> {
     // do not trigger a redundant container wake. Fall back to the inbound-only
     // count when outDb does not exist yet (brand-new session: no outbound DB
     // means no recovery rows either, so the counts are equivalent).
-    const dueCount = outDb ? countDueMessagesExcludingRecovery(inDb, outDb) : countDueMessages(inDb);
+    const dueCount = outDb
+      ? countDueMessagesExcludingRecovery(inDb, outDb, {
+          nowMs: Date.now(),
+          recoveryWakeTtlMs: RECOVERY_WAKE_TTL_MS,
+        })
+      : countDueMessages(inDb);
     if (dueCount > 0 && !isContainerRunning(session.id)) {
       log.info('Waking container for due messages', { sessionId: session.id, count: dueCount });
       try {

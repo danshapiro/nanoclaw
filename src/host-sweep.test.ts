@@ -809,6 +809,21 @@ describe('host sweep wake decision excludes recovery-owned rows', () => {
     outDb.close();
   });
 
+  it('counts a recovery-owned row as due once older than the wake TTL (R1)', () => {
+    const { inDb, outDb } = testDbs();
+    inDb.prepare("INSERT INTO messages_in (id, status, trigger) VALUES ('m-rec', 'pending', 1)").run();
+    outDb
+      .prepare(
+        "INSERT INTO processing_ack (message_id, status, status_changed) VALUES ('m-rec', 'recovery', '2026-04-20 10:00:00')",
+      )
+      .run();
+    // BASE is 2026-04-20T12:00:00Z — two hours after the ack transition.
+    expect(countDueMessagesExcludingRecovery(inDb, outDb, { nowMs: BASE, recoveryWakeTtlMs: 30 * 60 * 1000 })).toBe(1);
+    expect(countDueMessagesExcludingRecovery(inDb, outDb, { nowMs: BASE, recoveryWakeTtlMs: 3 * 60 * 60 * 1000 })).toBe(
+      0,
+    );
+  });
+
   it('counts a genuinely pending row (no recovery ack) as due (wake fires)', () => {
     const { inDb, outDb } = testDbs();
     // Pending row with no processing_ack at all — ordinary unprocessed message.
