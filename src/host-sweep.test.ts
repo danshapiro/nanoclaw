@@ -1684,6 +1684,50 @@ describe('discoverGwsCrashWindowDraftsScoped (production crash-window scoping)',
     outDb.close();
   });
 
+  it('recovers an interrupted adopted mixed-batch turn without throwing (multi-partition split expected)', async () => {
+    const { inPath, outPath } = setupSession();
+    const inDb = new Database(inPath);
+    const outDb = new Database(outPath);
+    // Post-fix row shapes: the adopted row keeps its immutable ORIGINAL triple
+    // (prior-life input + old acceptedAt) with a reopened (NULL-ended) interval;
+    // the trigger row is accepted under the current input. Both hold
+    // 'processing' claims from the interrupted turn.
+    const adopted = addAcceptedClaim(inDb, outDb, {
+      messageId: 'm-adopted-mix',
+      inputId: 'in-prior-life',
+      routeKey: 'opencode|discord|chan-mix|dm:mg-mix',
+      acceptedAt: '2026-07-25T10:00:00.000Z',
+    });
+    const fresh = addAcceptedClaim(inDb, outDb, {
+      messageId: 'm-trigger-mix',
+      inputId: 'in-current',
+      routeKey: adopted.routeKey,
+      acceptedAt: '2026-08-01T09:00:00.000Z',
+    });
+    // One turn => two partitions after adoption: default discovery collapses to
+    // the empty scope (fail-closed default — unchanged), and seal/drain must
+    // complete per partition instead of throwing the malformed-acceptance error.
+    expect(gwsDiscoveryScope(inDb, outDb)).toEqual({});
+    const sealed: Array<{ inputId: string; routeKey: string }> = [];
+    const receipts = await sealAndDrainAcceptedGwsClaims({
+      inDb,
+      outDb,
+      stoppedAt: '2026-08-01T09:30:00.000Z',
+      env: {
+        GWS_CONTROL_SOCKET: '/srv/gws-proxy/control/control.sock',
+        GWS_FINALIZE_TOKEN_FILE: '/run/credentials/nanoclaw.service/gws-finalize-token',
+      },
+      sealAndDrain: async (request) => {
+        sealed.push({ inputId: request.inputId, routeKey: request.routeKey });
+        return { inputId: request.inputId, routeKey: request.routeKey, sealed: true, drained: true };
+      },
+    });
+    expect(receipts).toHaveLength(2); // one per immutable original input triple
+    expect(sealed.map((entry) => entry.inputId).sort()).toEqual([fresh.inputId, adopted.inputId].sort());
+    inDb.close();
+    outDb.close();
+  });
+
   it('imports ONLY this turn’s route/window draft, excluding other-session/route entries from the shared global store', () => {
     const { sessionPath, inPath, outPath } = setupSession();
     const auditStore = path.join(tmpRoot, 'gws-audit.jsonl');
