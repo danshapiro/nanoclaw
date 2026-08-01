@@ -373,8 +373,18 @@ function startLeaseSocket(control: GwsCorrelationLaunchControl, state: GwsCorrel
         }
         state.mutationTail = state.mutationTail.then(async () => {
           try {
-            processGwsCorrelationRequest(control.agentGroupId, control.sessionId, value);
-            send({ schemaVersion: 1, ok: true, requestId: value?.requestId });
+            const acceptedAt = processGwsCorrelationRequest(control.agentGroupId, control.sessionId, value);
+            // A successful bind echoes the effective accepted time so the
+            // container can verify the published pointer even when the host
+            // derived a durable original acceptance older than the request's
+            // value. Release responses keep the original shape. Container-side
+            // response validation has no key whitelist, so the extra field is
+            // backward/forward compatible.
+            send(
+              acceptedAt !== undefined
+                ? { schemaVersion: 1, ok: true, requestId: value?.requestId, acceptedAt }
+                : { schemaVersion: 1, ok: true, requestId: value?.requestId },
+            );
           } catch (err) {
             const frame = value as { requestId?: unknown; inputId?: unknown; action?: unknown } | undefined;
             log.warn('GWS correlation request rejected', {
@@ -895,7 +905,7 @@ export function processAuthenticatedGwsCorrelationRequest(opts: {
   correlationPath: string;
   request: unknown;
   now?: string;
-}): void {
+}): string | undefined {
   const request = authenticatedRequest(opts.request);
   const state = launchLeases.get(launchLeaseKey(opts.agentGroupId, opts.mountedSessionId));
   if (
@@ -931,6 +941,7 @@ export function processAuthenticatedGwsCorrelationRequest(opts: {
   }
 
   const existing = state.acceptedInputs.get(request.inputId);
+  let boundAcceptedAt: string | undefined;
   if (request.action === 'bind') {
     let effectiveOriginalAcceptedAt = request.originalAcceptedAt;
     if (existing) {
@@ -981,6 +992,7 @@ export function processAuthenticatedGwsCorrelationRequest(opts: {
       lastClaimToken: request.claimToken,
       lastProviderAcceptance: request.providerAcceptance,
     });
+    boundAcceptedAt = effectiveOriginalAcceptedAt;
   } else {
     if (
       !existing ||
@@ -1006,15 +1018,20 @@ export function processAuthenticatedGwsCorrelationRequest(opts: {
     state.acceptedInputs.delete(request.inputId);
   }
   state.nextSequence++;
+  return boundAcceptedAt;
 }
 
-export function processGwsCorrelationRequest(agentGroupId: string, mountedSessionId: string, request: unknown): void {
+export function processGwsCorrelationRequest(
+  agentGroupId: string,
+  mountedSessionId: string,
+  request: unknown,
+): string | undefined {
   const group = getAgentGroup(agentGroupId);
   const session = getSession(mountedSessionId);
   if (!group || !session || session.agent_group_id !== group.id || session.status !== 'active') {
     throw new Error('GWS correlation request does not belong to its isolated active-session mount');
   }
-  processAuthenticatedGwsCorrelationRequest({
+  return processAuthenticatedGwsCorrelationRequest({
     agentGroupId: group.id,
     mountedSessionId: session.id,
     dbPath: inboundDbPath(group.id, session.id),

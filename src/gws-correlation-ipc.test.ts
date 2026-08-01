@@ -306,8 +306,8 @@ describe('authenticated GWS correlation acceptance lease', () => {
     return unsigned;
   }
 
-  function process(requestValue: AuthenticatedGwsCorrelationRequest): void {
-    processAuthenticatedGwsCorrelationRequest({
+  function process(requestValue: AuthenticatedGwsCorrelationRequest): string | undefined {
+    return processAuthenticatedGwsCorrelationRequest({
       agentGroupId: groupId,
       mountedSessionId: sessionId,
       dbPath,
@@ -415,7 +415,7 @@ describe('authenticated GWS correlation acceptance lease', () => {
       sequence: 2,
       releasedAt: '2026-05-29T00:00:01.050Z',
     });
-    process(release);
+    expect(process(release)).toBeUndefined();
 
     expect(fs.existsSync(correlationPath)).toBe(false);
     expect(JSON.parse(fs.readFileSync(path.join(path.dirname(correlationPath), 'last-request.json'), 'utf8'))).toEqual({
@@ -447,7 +447,8 @@ describe('authenticated GWS correlation acceptance lease', () => {
     db.close();
 
     // A fresh container has no durable source: it sends originalAcceptedAt = providerAcceptance.acceptedAt = now.
-    process(request());
+    // The bind returns the derived effective accepted time so the transport can echo it to the container.
+    expect(process(request())).toBe(priorAcceptedAt);
 
     const check = new Database(dbPath, { readonly: true });
     const row = check.prepare('SELECT * FROM messages_in WHERE id = ?').get('m-active') as Record<string, unknown>;
@@ -462,7 +463,7 @@ describe('authenticated GWS correlation acceptance lease', () => {
     expect(pointer.inputId).toBe('in-active');
 
     // A followup bind in the same lease must stay consistent (durable value memoized).
-    process(request({ requestId: '22222222-2222-4222-8222-222222222222', sequence: 2 }));
+    expect(process(request({ requestId: '22222222-2222-4222-8222-222222222222', sequence: 2 }))).toBe(priorAcceptedAt);
     const check2 = new Database(dbPath, { readonly: true });
     const row2 = check2.prepare('SELECT host_accepted_at FROM messages_in WHERE id = ?').get('m-active') as {
       host_accepted_at: string;
@@ -670,6 +671,8 @@ describe('bounded GWS correlation socket transport', () => {
       schemaVersion: 1,
       ok: true,
       requestId: request.requestId,
+      // A NEW input's effective accepted time is the value the request carried.
+      acceptedAt: request.originalAcceptedAt,
     });
     expect(JSON.parse(fs.readFileSync(hostCorrelationPath(groupId, sessionId), 'utf8'))).toMatchObject({
       inputId: request.inputId,
