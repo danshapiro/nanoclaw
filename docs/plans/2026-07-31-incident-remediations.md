@@ -311,12 +311,24 @@ In `src/db/session-db.test.ts` add a new describe (reuse `freshDir()`/`TEST_DIR`
 describe('recovery wake attempt tracking (R2)', () => {
   it('self-heals the recovery_wake_attempts column on an old inbound DB and increments it', () => {
     freshDir();
-    // Simulate an OLD inbound DB without the column.
+    // Simulate an OLD inbound DB without the column. CAUTION: openInboundDb's
+    // migrations ADD many columns but ASSUME others pre-exist — the
+    // platform_message_id backfill (session-db.ts ~:1457-1466) runs
+    // `UPDATE messages_in ... WHERE channel_type = 'discord'` and the
+    // migration never ADDs `channel_type`, so `id` and `channel_type` MUST be
+    // in the legacy fixture; migrateSessionRoutingTable unguardedly ALTERs
+    // `session_routing`, so that table must exist too. `content` is NOT NULL
+    // in the real schema, so the INSERT must supply it.
     const legacy = new Database(path.join(TEST_DIR, 'inbound.db'));
     legacy.exec(`CREATE TABLE messages_in (
-      id TEXT PRIMARY KEY, kind TEXT NOT NULL, timestamp TEXT NOT NULL,
-      status TEXT DEFAULT 'pending', trigger INTEGER NOT NULL DEFAULT 1)`);
-    legacy.prepare("INSERT INTO messages_in (id, kind, timestamp) VALUES ('m-1', 'chat', datetime('now'))").run();
+      id TEXT PRIMARY KEY, seq INTEGER UNIQUE, kind TEXT NOT NULL, timestamp TEXT NOT NULL,
+      status TEXT DEFAULT 'pending', process_after TEXT, recurrence TEXT,
+      tries INTEGER DEFAULT 0, platform_id TEXT, channel_type TEXT, thread_id TEXT,
+      content TEXT NOT NULL);
+      CREATE TABLE session_routing (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        channel_type TEXT, platform_id TEXT, thread_id TEXT);`);
+    legacy.prepare("INSERT INTO messages_in (id, kind, timestamp, content) VALUES ('m-1', 'chat', datetime('now'), 'hello')").run();
     legacy.close();
 
     const inDb = openInboundDb(path.join(TEST_DIR, 'inbound.db')); // runs migrateMessagesInTable
@@ -517,7 +529,7 @@ Design notes the implementer must not "simplify" away:
   - `export async function releaseOrEscalateExpiredRecoveryAcks(opts: { session: Session; inDb: Database.Database; outDb: Database.Database; nowMs: number; ttlMs: number; maxAttempts: number; reconciliationStorePath?: string; }): Promise<RecoveryReleaseOutcome>`
   - `export const RECOVERY_MAX_WAKE_ATTEMPTS: number` in `src/host-sweep.ts`.
   - `export function getHostAcceptedInputId(inDb: Database.Database, messageId: string): string | null` in `src/db/session-db.ts` — `SELECT host_accepted_input_id FROM messages_in WHERE id = ?` (column exists, `src/db/schema.ts:315`; self-healed at session-db.ts ~:1485).
-  - `export function listGwsUncertainInputIds(reconciliationStorePath: string | undefined): Set<string>` in `src/db/session-db.ts` — lightweight standalone scan (independent of Task 6's reader rework): undefined path OR missing file ⇒ empty set (GWS reconciliation not configured); otherwise parse the JSONL store and return the `input_id` of every incident record lacking a resolution record for its `audit_id`. Fail closed on unreadability: truncated tail, a line that fails `JSON.parse`, or an incident whose `input_id` is not a non-empty string ⇒ THROW (the caller defers the pass loudly).
+  - `export function listGwsUncertainInputIds(reconciliationStorePath: string | undefined): Set<string>` in `src/db/session-db.ts` — lightweight standalone scan (independent of Task 6's reader rework): undefined path ⇒ empty set (GWS reconciliation not configured). A DEFINED path fails closed on ANY unreadability: missing file, truncated tail, a line that fails `JSON.parse`, or an incident whose `input_id` is not a non-empty string ⇒ THROW (the caller defers the pass loudly — never toward release; this is what the Step 1 '/nonexistent-but-configured/store.jsonl' test asserts and what the Step 3 sketch implements). Otherwise parse the JSONL store and return the `input_id` of every incident record lacking a resolution record for its `audit_id`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -733,7 +745,7 @@ describe('releaseOrEscalateExpiredRecoveryAcks', () => {
 });
 ```
 
-(Add `syncProcessingAcks` and the fs/os/path imports to the test file's import lists. Note: `deferring` semantics apply only when `reconciliationStorePath` is DEFINED but unreadable; an undefined path — GWS reconciliation not configured — means an empty uncertain set. If the store path is defined but the file legitimately does not exist yet, decide the direction by content: mirror whatever `recoverGwsClaimPartitions` treats as "missing store" — fail toward deferral, never toward release.)
+(Add `syncProcessingAcks` and the fs/os/path imports to the test file's import lists. Note: `deferring` semantics apply only when `reconciliationStorePath` is DEFINED but unreadable; an undefined path — GWS reconciliation not configured — means an empty uncertain set. A DEFINED path whose file does not exist THROWS like any other unreadability — fail toward deferral, never toward release — which is exactly what the '/nonexistent-but-configured/store.jsonl' test above asserts and what the Interfaces spec and the Step 3 sketch require.)
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -1779,6 +1791,13 @@ it('fails the whole store closed on non-UTF8 bytes inside input_id', () => {
   expect(() => readGwsReconciliationRecords({ reconciliationStorePath, scopes })).toThrow(/identity|input_id/i);
 });
 
+it('fails the whole store closed on an unknown-record_type record with unreadable input_id', () => {
+  // Out-of-scope record with record_type 'resoluti\u00f8n' AND input_id deleted —
+  // it could be a corrupted INCIDENT; quarantining it would drop it from
+  // blockedInputIds, so identity must be readable before any quarantine.
+  expect(() => readGwsReconciliationRecords({ reconciliationStorePath, scopes })).toThrow(/identity|input_id/i);
+});
+
 it('keeps quarantine (not file-fatal) for corrupted record_type or mangled audit_id with INTACT input_id', () => {
   // Two out-of-scope records: one with record_type 'resoluti\u00f8n' + intact ids,
   // one incident with audit_id 'a-\u00e9' + intact input_id 'other-input'.
@@ -1886,7 +1905,7 @@ export interface GwsReconciliationReadResult {
 }
 ```
 
-Rename `assertNoUnresolvedGwsReconciliationRecords` → `readGwsReconciliationRecords`, return type `GwsReconciliationReadResult`, and rework the parse loop. Keep UNCHANGED: the missing-path throw, the truncated-tail throw, the per-line `JSON.parse` throw and non-object throw (file-level corruption), `canonicalAscii`, `canonicalTimestamp`, the allow-list sets. NEW file-level throw (A12): an INCIDENT record with unreadable identity (see the incident branch below) — same class as unparseable JSON. Restructure the rest of the loop (currently :972-1036) as follows — a line counter and quarantine helper first (the `inputId: string | null` tolerance in the helper exists for RESOLUTION records only; incidents with unreadable identity never reach `quarantine`):
+Rename `assertNoUnresolvedGwsReconciliationRecords` → `readGwsReconciliationRecords`, return type `GwsReconciliationReadResult`, and rework the parse loop. Keep UNCHANGED: the missing-path throw, the truncated-tail throw, the per-line `JSON.parse` throw and non-object throw (file-level corruption), `canonicalAscii`, `canonicalTimestamp`, the allow-list sets. NEW file-level throw (A12): any record that could be an incident — an incident-branch record OR an unknown-`record_type` record — with unreadable identity (`input_id` failing `canonicalAscii`) — same class as unparseable JSON. This identity check MUST run BEFORE every quarantine path that could swallow an incident (see both branches below). Restructure the rest of the loop (currently :972-1036) as follows — a line counter and quarantine helper first (the `inputId: string | null` tolerance in the helper exists for RESOLUTION records only; incidents with unreadable identity never reach `quarantine`):
 
 ```ts
   const quarantined: QuarantinedGwsReconciliationRecord[] = [];
@@ -1944,6 +1963,14 @@ Resolution branch (every former `throw` that is record-shaped becomes `quarantin
       continue;
     }
     if (entry.record_type !== undefined) {
+      // A12: an unknown record_type could be a corrupted INCIDENT. Quarantining
+      // it with unreadable identity would drop it from blockedInputIds — so
+      // identity must be readable BEFORE this quarantine is allowed.
+      if (!canonicalAscii((entry as Record<string, unknown>).input_id, 512)) {
+        throw new Error(
+          `GWS reconciliation store line ${lineNumber}: unknown record_type with missing or unreadable input_id — failing closed`,
+        );
+      }
       quarantine(lineNumber, entry as Record<string, unknown>, 'unknown record type');
       continue;
     }
@@ -1953,11 +1980,22 @@ Incident branch:
 
 ```ts
     const incident = entry as GwsReconciliationStoreEntry;
+    // IDENTITY validation FIRST — before ANY quarantine path in this branch —
+    // FILE-level fatal, NOT quarantine (A12, validator-V7): an incident whose
+    // input_id is unreadable structurally cannot contribute to
+    // blockedInputIds; quarantining it (e.g. as 'unknown field' when mojibake
+    // mangles field names and values together) would let recovery re-run a
+    // GWS-uncertain input. Same class as unparseable JSON.
+    if (!canonicalAscii(incident.input_id, 512)) {
+      throw new Error(
+        `GWS reconciliation store line ${lineNumber}: incident identity (input_id) is missing or unreadable — failing closed`,
+      );
+    }
     if (Object.keys(incident).some((key) => !incidentFields.has(key))) {
       quarantine(lineNumber, incident as Record<string, unknown>, 'incident contains an unknown field');
       continue;
     }
-    // ADVISORY sanitization FIRST: hint text must never fail validation.
+    // ADVISORY sanitization: hint text must never fail validation.
     if (typeof incident.outcome === 'string') incident.outcome = transliterateToAscii(incident.outcome, 256);
     if (typeof incident.resource_type === 'string') {
       incident.resource_type = transliterateToAscii(incident.resource_type, 512);
@@ -1967,15 +2005,6 @@ Incident branch:
           .filter((hint): hint is string => typeof hint === 'string')
           .map((hint) => transliterateToAscii(hint, 2048))
       : []; // hints are never consumed downstream; absence is tolerated
-    // IDENTITY validation FIRST — FILE-level fatal, NOT quarantine (A12,
-    // validator-V7): an incident whose input_id is unreadable structurally
-    // cannot contribute to blockedInputIds; quarantining it would let
-    // recovery re-run a GWS-uncertain input. Same class as unparseable JSON.
-    if (!canonicalAscii(incident.input_id, 512)) {
-      throw new Error(
-        `GWS reconciliation store line ${lineNumber}: incident identity (input_id) is missing or unreadable — failing closed`,
-      );
-    }
     // LOAD-BEARING validation: failure quarantines THIS record only (its
     // readable input_id still blocks the matching scope via the caller gate).
     if (
