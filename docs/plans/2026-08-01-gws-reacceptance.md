@@ -1589,7 +1589,12 @@ This is the e2e formerly specified as Task 4 Steps 5–6 — it passes only now 
         },
       },
     );
-    insertMessage('m-codex-bind-fail', 'chat', { text: 'hello' });
+    insertMessage('m-codex-bind-fail', { sender: 'Alice', text: 'hello' });
+    // NOTE insertMessage's local signature in this file: (id: string,
+    // content: object, opts?: { platformId?; channelType?; threadId? }) --
+    // kind is hard-coded 'chat' in its SQL; there is NO kind parameter.
+    // Defaults (chan-1/discord) match the destination seeded in beforeEach,
+    // same as the ~210 test.
     // Run the loop exactly as the '~210' test does, but with:
     //   provider,
     //   bindGwsCorrelation: async () => { bindAttempts += 1; throw new Error('host bind unavailable'); },
