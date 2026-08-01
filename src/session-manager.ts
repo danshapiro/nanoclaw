@@ -84,6 +84,11 @@ export function hostCorrelationPath(agentGroupId: string, sessionId: string): st
   return path.join(hostCorrelationDir(agentGroupId, sessionId), 'current.json');
 }
 
+/** R6: host-owned per-session container stderr tails — OUTSIDE the agent-writable session tree, never mounted. */
+export function containerLogsDir(agentGroupId: string, sessionId: string): string {
+  return path.join(DATA_DIR, 'v2-container-logs', agentGroupId, sessionId);
+}
+
 export function hostRouteKey(
   providerName: string,
   message: {
