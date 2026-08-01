@@ -953,6 +953,8 @@ export class OpenCodeProvider implements AgentProvider {
           event.type === 'message.updated',
       });
 
+      let bodyError: unknown;
+      let bodyErrorCaptured = false;
       try {
         while (!aborted) {
           while (pending.length === 0 && !ended && !aborted) {
@@ -1438,13 +1440,35 @@ export class OpenCodeProvider implements AgentProvider {
             resolvedInputIds: turnInputId ? [turnInputId] : [],
           };
         }
+      } catch (err) {
+        bodyError = err;
+        bodyErrorCaptured = true;
+        throw err;
       } finally {
         pump.dispose();
         // A closed event stream is a terminal query boundary. Retire the
         // controller even for unexpected generator failures so no OpenCode
         // process or SSE reader can outlive the query whose correlation the
         // poll loop is about to release.
-        await teardownRuntime('query_stream_finalized');
+        try {
+          await teardownRuntime('query_stream_finalized');
+        } catch (teardownErr) {
+          if (bodyErrorCaptured) {
+            // Same contract as codex.ts: the body error is the real failure;
+            // the always-throwing teardown must not replace it.
+            const quiescenceFailure = asProviderQuiescenceError(
+              teardownErr,
+              'OpenCode runtime teardown failed (query_stream_finalized)',
+            );
+            if (bodyError instanceof Error && bodyError.cause === undefined) {
+              (bodyError as Error & { cause?: unknown }).cause = quiescenceFailure;
+            } else if (bodyError instanceof Error) {
+              (bodyError as Error & { quiescenceFailure?: unknown }).quiescenceFailure = quiescenceFailure;
+            }
+            throw bodyError;
+          }
+          throw teardownErr;
+        }
       }
     }
 

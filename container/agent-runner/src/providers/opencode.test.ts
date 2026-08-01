@@ -714,6 +714,43 @@ describe('OpenCodeProvider runtime controller (event-driven)', () => {
     expect(controller.promptCalls).toBe(0);
   });
 
+  it('rethrows the acceptance-gate rejection type-preserved when teardown also throws a quiescence fault', async () => {
+    const stream = new FakeStream();
+    const { provider, controller } = makeProvider({ stream });
+    (controller as { destroy: (reason: string) => Promise<void> }).destroy = async () => {
+      throw new ProviderQuiescenceError(
+        'OpenCode runtime exited, but whole process tree quiescence is unproven until host container stop',
+      );
+    };
+    class FakeAcceptanceError extends Error {
+      constructor() {
+        super('trusted host input bind failed for in-oc-both-faults');
+        this.name = 'TrustedInputAcceptanceError';
+      }
+    }
+    const bodyError = new FakeAcceptanceError();
+    const query = provider.query({
+      inputId: 'in-oc-both-faults',
+      acceptInput: async () => {
+        throw bodyError;
+      },
+      prompt: 'do not submit',
+      cwd: '/workspace/agent',
+    });
+    let rejection: unknown;
+    try {
+      for await (const _event of query.events) {
+        // drain until rejection
+      }
+    } catch (err) {
+      rejection = err;
+    }
+    expect(rejection).toBe(bodyError);
+    const attached =
+      (rejection as { cause?: unknown }).cause ?? (rejection as { quiescenceFailure?: unknown }).quiescenceFailure;
+    expect(attached).toBeInstanceOf(ProviderQuiescenceError);
+  });
+
   it('does not submit when cancellation lands during the trusted bind', async () => {
     const stream = new FakeStream();
     const { provider, controller } = makeProvider({ stream });
