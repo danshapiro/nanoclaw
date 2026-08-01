@@ -28,6 +28,7 @@ import { fileURLToPath } from 'url';
 
 import { loadConfig } from './config.js';
 import { clearStaleContainerToolState } from './db/connection.js';
+import { withSqliteRetry } from './db/sqlite-retry.js';
 import { buildSystemPromptAddendum } from './destinations.js';
 import { createProvider, type ProviderName } from './providers/factory.js';
 import { connectGwsCorrelationControlSocket, consumeGwsCorrelationLaunchControlFromStdin } from './gws-correlation.js';
@@ -61,7 +62,7 @@ async function main(): Promise<void> {
 
   // Clear stale provider-owned tool state left by a prior crash (Task 3 Step 8)
   // so host-sweep does not honor a phantom long tool timeout from the old run.
-  clearStaleContainerToolState();
+  await withSqliteRetry(() => clearStaleContainerToolState(), { label: 'clearStaleContainerToolState' });
 
   // Runtime-generated system-prompt addendum: agent identity (name) plus
   // the live destinations map. Everything else (capabilities, per-module
@@ -69,7 +70,9 @@ async function main(): Promise<void> {
   // /workspace/agent/CLAUDE.md — the composed entry imports the shared
   // base (/app/CLAUDE.md) and each enabled module's fragment. Per-group
   // memory lives in /workspace/agent/CLAUDE.local.md (auto-loaded).
-  const instructions = buildSystemPromptAddendum(config.assistantName || undefined);
+  const instructions = await withSqliteRetry(() => buildSystemPromptAddendum(config.assistantName || undefined), {
+    label: 'buildSystemPromptAddendum',
+  });
 
   // Discover additional directories mounted at /workspace/extra/*
   const additionalDirectories: string[] = [];

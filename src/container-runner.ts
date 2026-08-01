@@ -1597,6 +1597,12 @@ async function buildContainerArgs(
   args.push('-e', `NANOCLAW_AGENT_GROUP_ID=${agentGroup.id}`);
   args.push('-e', `NANOCLAW_AGENT_GROUP_FOLDER=${agentGroup.folder}`);
 
+  // R9: container-side session-DB busy-timeout knob (runner defaults to 30s).
+  const containerSqliteBusyTimeoutMs = process.env.NANOCLAW_CONTAINER_SQLITE_BUSY_TIMEOUT_MS;
+  if (containerSqliteBusyTimeoutMs) {
+    args.push('-e', `NANOCLAW_CONTAINER_SQLITE_BUSY_TIMEOUT_MS=${containerSqliteBusyTimeoutMs}`);
+  }
+
   const yenteHostEnv = requireYenteHostEnv(process.env);
   for (const [key, value] of Object.entries(yenteHostEnv.containerEnv)) {
     args.push('-e', `${key}=${value}`);
