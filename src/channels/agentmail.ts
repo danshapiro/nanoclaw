@@ -37,6 +37,7 @@ import {
   reconcileAgentMailRoutes,
   recordAgentMailMessageRoute,
 } from './agentmail-state.js';
+import { ensureAgentMailOneCliEnv } from './agentmail-onecli.js';
 import { registerChannelAdapter } from './channel-registry.js';
 
 type AgentMailAdapterDeps = {
@@ -509,7 +510,45 @@ export function createAgentMailAdapter(deps: AgentMailAdapterDeps = {}): Channel
   };
 }
 
-registerChannelAdapter('agentmail', { factory: () => createAgentMailAdapter() });
+/**
+ * Registration factory: acquire the OneCLI proxy env if it's missing, then
+ * build the adapter. NODE_EXTRA_CA_CERTS and NODE_USE_ENV_PROXY are
+ * startup-only Node options — a process that booted without them cannot
+ * apply them at runtime (validated; an in-process undici/ws re-injection
+ * alternative was proven possible and deliberately rejected — see the
+ * Task 4 rationale in the plan) — so a successful LATE acquisition exits(1)
+ * deliberately: systemd (Restart=on-failure, RestartSec=5 — verified active
+ * on the live host) relaunches
+ * nanoclaw through start.sh, whose env eval now succeeds against the
+ * healthy network. This is the missing self-termination path from the
+ * 2026-08-02 incident. Preflight shape is unchanged: on acquisition
+ * failure, createAgentMailAdapter throws its usual errors and the
+ * channel-registry startup retry re-runs this whole factory.
+ */
+export async function agentMailChannelFactory(
+  deps: {
+    env?: NodeJS.ProcessEnv;
+    ensureEnv?: typeof ensureAgentMailOneCliEnv;
+    exit?: (code: number) => void;
+    createAdapter?: typeof createAgentMailAdapter;
+  } = {},
+): Promise<ChannelAdapter | null> {
+  const env = deps.env ?? process.env;
+  const ensureEnv = deps.ensureEnv ?? ensureAgentMailOneCliEnv;
+  const exit = deps.exit ?? ((code: number) => process.exit(code));
+  const createAdapter = deps.createAdapter ?? createAgentMailAdapter;
+
+  const result = await ensureEnv(env);
+  if (result === 'acquired' && env.AGENTMAIL_ONECLI_ENV_EXIT_ON_ACQUIRE !== '0') {
+    log.fatal(
+      'AgentMail OneCLI env acquired after boot; exiting so systemd restarts nanoclaw with NODE_EXTRA_CA_CERTS/NODE_USE_ENV_PROXY applied',
+    );
+    exit(1);
+  }
+  return createAdapter(deps.env ? { env } : {});
+}
+
+registerChannelAdapter('agentmail', { factory: () => agentMailChannelFactory() });
 
 function requireAgentMailOneCliProxyEnv(env: NodeJS.ProcessEnv): void {
   const proxy = env.HTTPS_PROXY?.trim() || env.https_proxy?.trim() || env.HTTP_PROXY?.trim() || env.http_proxy?.trim();

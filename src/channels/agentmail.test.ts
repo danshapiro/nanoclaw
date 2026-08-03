@@ -9,7 +9,7 @@ import { log } from '../log.js';
 import type { ChannelSetup, OutboundMessage } from './adapter.js';
 import { agentMailClientOptions } from './agentmail-api.js';
 import type { AgentMailApi, AgentMailSocketLike } from './agentmail-api.js';
-import { createAgentMailAdapter } from './agentmail.js';
+import { agentMailChannelFactory, createAgentMailAdapter } from './agentmail.js';
 
 class FakeSocket extends EventEmitter implements AgentMailSocketLike {
   subscriptions: unknown[] = [];
@@ -684,3 +684,41 @@ function setupCollector(inbound: Parameters<ChannelSetup['onInbound']>[] = []): 
     onAction: vi.fn(),
   };
 }
+
+describe('agentMailChannelFactory', () => {
+  it('propagates the unchanged preflight error when env acquisition fails (registry retries)', async () => {
+    await expect(
+      agentMailChannelFactory({
+        env: { ...BASE_AGENTMAIL_ENV },
+        ensureEnv: async () => 'failed' as const,
+      }),
+    ).rejects.toThrow('AgentMail requires OneCLI proxy env');
+  });
+
+  it('exits for a systemd restart when the env is acquired late (startup-only Node options)', async () => {
+    const exit = vi.fn((code: number) => {
+      throw new Error(`exit ${code}`);
+    });
+    await expect(
+      agentMailChannelFactory({
+        env: { ...BASE_AGENTMAIL_ENV },
+        ensureEnv: async () => 'acquired' as const,
+        exit,
+      }),
+    ).rejects.toThrow('exit 1');
+    expect(exit).toHaveBeenCalledWith(1);
+  });
+
+  it('continues in-process when exit-on-acquire is disabled', async () => {
+    const createAdapter = vi.fn(() => null);
+    const env = { ...BASE_AGENTMAIL_ENV, AGENTMAIL_ONECLI_ENV_EXIT_ON_ACQUIRE: '0' };
+    await expect(
+      agentMailChannelFactory({ env, ensureEnv: async () => 'acquired' as const, createAdapter }),
+    ).resolves.toBeNull();
+    expect(createAdapter).toHaveBeenCalledWith({ env });
+  });
+
+  it('returns null untouched when AgentMail is disabled', async () => {
+    await expect(agentMailChannelFactory({ env: {}, ensureEnv: async () => 'disabled' as const })).resolves.toBeNull();
+  });
+});
