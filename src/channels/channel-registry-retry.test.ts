@@ -413,4 +413,41 @@ describe('channel adapter startup retry', () => {
     expect(getActiveAdapters().map((a) => a.channelType)).toContain('hangs');
     expect(getChannelStartStates().get('hangs')).toEqual({ status: 'started', attempt: 1 });
   });
+
+  it('re-runs the full factory + setup on retry, so a late adapter arms catch-up exactly once', async () => {
+    const { registerChannelAdapter, initChannelAdapters, getActiveAdapters } = await freshRegistry();
+    const readyHookFiredOnAttempt: number[] = [];
+    let factoryCalls = 0;
+    registerChannelAdapter('late-discord', {
+      factory: () => {
+        factoryCalls += 1;
+        if (factoryCalls === 1) throw new TypeError('fetch failed'); // pre-connect REST death (incident shape)
+        const adapter = mockAdapter('late-discord');
+        const realSetup = adapter.setup.bind(adapter);
+        adapter.setup = async (config) => {
+          await realSetup(config);
+          // Stands in for onGatewayWebhookReady -> catchup.start(): the bridge
+          // fires it inside setup(), so a full re-run must re-arm catch-up.
+          readyHookFiredOnAttempt.push(factoryCalls);
+        };
+        return adapter;
+      },
+    });
+
+    await initChannelAdapters(
+      () => ({
+        conversations: [],
+        onInbound: () => {},
+        onInboundEvent: () => {},
+        onMetadata: () => {},
+        onAction: () => {},
+      }),
+      { retryConfig: TEST_RETRY, random: () => 0 },
+    );
+    expect(readyHookFiredOnAttempt).toHaveLength(0); // first attempt died before setup
+
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(readyHookFiredOnAttempt).toEqual([2]); // armed exactly once, on the successful late attempt
+    expect(getActiveAdapters().some((a) => a.channelType === 'late-discord')).toBe(true);
+  });
 });

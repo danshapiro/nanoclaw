@@ -198,6 +198,24 @@ describe('createDiscordCatchup runOnce', () => {
     expect(getDiscordChannelCursor('chan-1')).toBe('502');
   });
 
+  it("recovers the cursor gap on the 'startup' run (late adapter start, 2026-08-02 shape)", async () => {
+    // The adapter finally starts hours after messages 501/502 arrived; the
+    // durable cursor is behind the channel head. The immediate startup run
+    // must recover the gap — same guarantee as 'periodic', proven for the
+    // reason a late-starting adapter actually fires first.
+    advanceDiscordChannelCursor('chan-1', '500', '2026-07-30T00:00:00.000Z');
+    const { fetchImpl, webhookPosts } = fakeTransport({
+      'messages?after=': [json([restMessage('502'), restMessage('501')]), json([])],
+      '/channels/chan-1?': [json(CHANNEL_INFO)],
+      '/channels/chan-1': [json(CHANNEL_INFO)],
+    });
+    const engine = makeEngine(fetchImpl);
+    const summary = await engine.runOnce('startup');
+    expect(webhookPosts.map((p) => p.data.id)).toEqual(['501', '502']); // gap recovered, ascending
+    expect(summary?.routed).toBe(2);
+    expect(getDiscordChannelCursor('chan-1')).toBe('502'); // durable cursor advanced
+  });
+
   it('skips terminal messages but advances the cursor past them', async () => {
     advanceDiscordChannelCursor('chan-1', '500', '2026-07-30T00:00:00.000Z');
     claimDiscordMessage(
