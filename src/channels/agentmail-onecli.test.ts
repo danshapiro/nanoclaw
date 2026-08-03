@@ -76,4 +76,16 @@ describe('ensureAgentMailOneCliEnv', () => {
     await expect(ensureAgentMailOneCliEnv(env, { runScript, fileExists: () => true })).resolves.toBe('failed');
     warnSpy.mockRestore();
   });
+
+  it('returns failed when the script output is valid JSON but lacks the proxy env', async () => {
+    const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const env: NodeJS.ProcessEnv = { AGENTMAIL_ENABLED: '1', AGENTMAIL_ONECLI_ENV_SCRIPT: '/srv/x/env.mjs' };
+    const runScript = vi.fn(async () => JSON.stringify({ FOO: 'bar' }));
+    await expect(ensureAgentMailOneCliEnv(env, { runScript, fileExists: () => true })).resolves.toBe('failed');
+    expect(warnSpy).toHaveBeenCalledWith(
+      'AgentMail OneCLI env script output missing proxy env, adapter start will be retried',
+      expect.objectContaining({ scriptPath: '/srv/x/env.mjs', keys: ['FOO'] }),
+    );
+    warnSpy.mockRestore();
+  });
 });

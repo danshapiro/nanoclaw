@@ -66,6 +66,13 @@ export async function ensureAgentMailOneCliEnv(
     const stdout = await runScript(scriptPath, timeoutMs);
     const acquired = JSON.parse(stdout) as Record<string, string>;
     Object.assign(env, acquired);
+    if (!hasAgentMailOneCliProxyEnv(env)) {
+      log.warn('AgentMail OneCLI env script output missing proxy env, adapter start will be retried', {
+        scriptPath,
+        keys: Object.keys(acquired).sort(),
+      });
+      return 'failed';
+    }
     log.info('AgentMail OneCLI env acquired', { scriptPath, keys: Object.keys(acquired).sort() });
     return 'acquired';
   } catch (err) {
