@@ -1,3 +1,6 @@
+import { log } from '../log.js';
+import { startupRetryConfigFromEnv, startupRetryDelayMs, type StartupRetryConfig } from './startup-retry.js';
+
 const DISCORD_API_BASE = 'https://discord.com/api/v10';
 
 export interface YenteDiscordCommand {
@@ -213,11 +216,14 @@ export async function fetchDiscordApplicationConfig(args: {
   return { applicationId: body.id, publicKey: body.verify_key };
 }
 
-export async function resolveDiscordGuildIdsForChannels(args: {
-  botToken: string;
-  channelIds: readonly string[];
-  fetchImpl?: FetchLike;
-}): Promise<string[]> {
+export async function resolveDiscordGuildIdsForChannels(
+  args: {
+    botToken: string;
+    channelIds: readonly string[];
+    fetchImpl?: FetchLike;
+  },
+  failedChannelIds?: string[],
+): Promise<string[]> {
   const fetchImpl = args.fetchImpl ?? fetch;
   const guildIds = new Set<string>();
 
@@ -230,7 +236,10 @@ export async function resolveDiscordGuildIdsForChannels(args: {
         Authorization: `Bot ${args.botToken}`,
       },
     });
-    if (!response.ok) continue;
+    if (!response.ok) {
+      failedChannelIds?.push(channelId);
+      continue;
+    }
     const body = JSON.parse(await response.text()) as { guild_id?: unknown };
     if (typeof body.guild_id === 'string' && body.guild_id.length > 0) {
       guildIds.add(body.guild_id);
@@ -251,11 +260,15 @@ export async function syncYenteDiscordApplicationCommands(args: {
     args.applicationId && args.publicKey
       ? { applicationId: args.applicationId, publicKey: args.publicKey }
       : await fetchDiscordApplicationConfig({ botToken: args.botToken, fetchImpl: args.fetchImpl });
-  const guildIds = await resolveDiscordGuildIdsForChannels({
-    botToken: args.botToken,
-    channelIds: args.channelIds,
-    fetchImpl: args.fetchImpl,
-  });
+  const failedChannelIds: string[] = [];
+  const guildIds = await resolveDiscordGuildIdsForChannels(
+    {
+      botToken: args.botToken,
+      channelIds: args.channelIds,
+      fetchImpl: args.fetchImpl,
+    },
+    failedChannelIds,
+  );
 
   await clearYenteDiscordGlobalCommands({
     applicationId: discovered.applicationId,
@@ -268,6 +281,10 @@ export async function syncYenteDiscordApplicationCommands(args: {
     guildIds,
     fetchImpl: args.fetchImpl,
   });
+
+  if (failedChannelIds.length > 0) {
+    throw new Error(`Discord command sync incomplete: guild resolution failed for ${failedChannelIds.join(', ')}`);
+  }
 
   return { ...discovered, guildIds };
 }
@@ -306,4 +323,106 @@ function channelIdFromPlatformId(platformId: string): string | null {
   if (!platformId.startsWith('discord:')) return platformId;
   const parts = platformId.split(':');
   return parts[2] ?? null;
+}
+let commandSyncLoopActive = false;
+
+/**
+ * Background application-command sync with backoff — command sync must never
+ * be load-bearing for Discord adapter startup (2026-08-02: a pre-connect
+ * REST call died on cold network and killed the whole channel). Retries
+ * until it succeeds; returns false only when retries are disabled or
+ * maxAttempts is exhausted. Never throws. SINGLE-FLIGHT: one loop per
+ * process — a duplicate call while one is active logs a WARN and returns
+ * false (validated: without this, every factory retry attempt / re-init
+ * would spawn another immortal loop).
+ */
+export async function syncYenteDiscordApplicationCommandsWithRetry(args: {
+  botToken: string;
+  channelIds: readonly string[];
+  applicationId: string;
+  publicKey: string;
+  fetchImpl?: FetchLike;
+  retryConfig?: StartupRetryConfig;
+  sleep?: (ms: number) => Promise<void>;
+  random?: () => number;
+  maxAttempts?: number;
+}): Promise<boolean> {
+  if (commandSyncLoopActive) {
+    log.warn('Discord command sync already in flight, skipping duplicate');
+    return false;
+  }
+  commandSyncLoopActive = true;
+  const retryConfig = args.retryConfig ?? startupRetryConfigFromEnv(process.env, 'DISCORD_COMMAND_SYNC_RETRY');
+  const sleep =
+    args.sleep ??
+    ((ms: number) =>
+      new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, ms);
+        timer.unref?.();
+      }));
+  const random = args.random ?? Math.random;
+  const maxAttempts = args.maxAttempts ?? 0; // 0 = retry forever
+  try {
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        await syncYenteDiscordApplicationCommands({
+          botToken: args.botToken,
+          channelIds: args.channelIds,
+          applicationId: args.applicationId,
+          publicKey: args.publicKey,
+          fetchImpl: args.fetchImpl,
+        });
+        log.info('Discord command sync complete', { attempt });
+        return true;
+      } catch (err) {
+        if (retryConfig.disabled || (maxAttempts > 0 && attempt >= maxAttempts)) {
+          log.error('Discord command sync failed permanently', { attempt, err });
+          return false;
+        }
+        const retryInMs = startupRetryDelayMs(retryConfig, attempt, random);
+        log.warn('Discord command sync failed, will retry', { attempt, retryInMs, err });
+        await sleep(retryInMs);
+      }
+    }
+  } finally {
+    commandSyncLoopActive = false;
+  }
+}
+
+/**
+ * Resolve the application config needed to construct the Discord adapter,
+ * then kick off command sync in the background. Only config discovery (one
+ * REST GET, skipped entirely when applicationId+publicKey come from env)
+ * can throw — command sync failures never propagate to the caller.
+ */
+export async function resolveDiscordStartupConfig(args: {
+  botToken: string;
+  channelIds: readonly string[];
+  applicationId?: string | null;
+  publicKey?: string | null;
+  fetchImpl?: FetchLike;
+  retryConfig?: StartupRetryConfig;
+  sleep?: (ms: number) => Promise<void>;
+  random?: () => number;
+  scheduleCommandSync?: (run: () => Promise<void>) => void;
+}): Promise<DiscordApplicationConfig> {
+  const discovered =
+    args.applicationId && args.publicKey
+      ? { applicationId: args.applicationId, publicKey: args.publicKey }
+      : await fetchDiscordApplicationConfig({ botToken: args.botToken, fetchImpl: args.fetchImpl });
+  const runSync = async (): Promise<void> => {
+    await syncYenteDiscordApplicationCommandsWithRetry({
+      botToken: args.botToken,
+      channelIds: args.channelIds,
+      applicationId: discovered.applicationId,
+      publicKey: discovered.publicKey,
+      fetchImpl: args.fetchImpl,
+      retryConfig: args.retryConfig,
+      sleep: args.sleep,
+      random: args.random,
+    });
+  };
+  const schedule = args.scheduleCommandSync ?? ((run: () => Promise<void>) => void run());
+  schedule(runSync);
+  return discovered;
 }

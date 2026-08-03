@@ -9,7 +9,8 @@ import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
 import { createChatSdkBridge, type ReplyContext } from './chat-sdk-bridge.js';
 import { registerChannelAdapter } from './channel-registry.js';
-import { syncYenteDiscordApplicationCommands } from './discord-commands.js';
+import { resolveDiscordStartupConfig } from './discord-commands.js';
+import { startupRetryConfigFromEnv } from './startup-retry.js';
 import {
   advanceDiscordChannelCursor,
   claimDiscordMessage,
@@ -55,6 +56,10 @@ registerChannelAdapter('discord', {
       'DISCORD_CATCHUP_MAX_AGE_MS',
       'DISCORD_CATCHUP_ROUTE_LEASE_MS',
       'DISCORD_CATCHUP_MAX_THREADS',
+      'DISCORD_COMMAND_SYNC_RETRY_DISABLED',
+      'DISCORD_COMMAND_SYNC_RETRY_DELAYS_MS',
+      'DISCORD_COMMAND_SYNC_RETRY_CAP_MS',
+      'DISCORD_COMMAND_SYNC_RETRY_JITTER',
     ]);
     const botToken = process.env.DISCORD_BOT_TOKEN || env.DISCORD_BOT_TOKEN;
     if (!botToken) return null;
@@ -67,23 +72,28 @@ registerChannelAdapter('discord', {
     if (autoCreateThreadChannelIds.size > 0) {
       log.info('Discord auto-create thread channels configured', { count: autoCreateThreadChannelIds.size });
     }
-    const commandSync = await syncYenteDiscordApplicationCommands({
-      botToken,
-      applicationId: process.env.DISCORD_APPLICATION_ID || env.DISCORD_APPLICATION_ID,
-      publicKey: process.env.DISCORD_PUBLIC_KEY || env.DISCORD_PUBLIC_KEY,
-      channelIds: getRegisteredDiscordChannelIds(),
-    });
-    const discordAdapter = createDiscordAdapter({
-      botToken,
-      publicKey: process.env.DISCORD_PUBLIC_KEY || env.DISCORD_PUBLIC_KEY || commandSync.publicKey,
-      applicationId: process.env.DISCORD_APPLICATION_ID || env.DISCORD_APPLICATION_ID || commandSync.applicationId,
-    });
     // Catch-up wiring. For env-file keys, process.env wins (house precedence);
     // note: spread order makes process.env values override file values, but
     // only for keys present in process.env — matching the `process.env.X || env.X`
     // pattern used above for the other Discord keys.
     const catchupEnv: NodeJS.ProcessEnv = { ...env, ...process.env };
     const catchupConfig = discordCatchupConfigFromEnv(catchupEnv);
+    // Application-command sync is deliberately NOT load-bearing: only config
+    // discovery (skipped when env provides app id + public key) can throw —
+    // and the registry's startup retry covers that. The sync itself runs in
+    // the background with its own backoff (2026-08-02 outage class).
+    const commandSync = await resolveDiscordStartupConfig({
+      botToken,
+      applicationId: process.env.DISCORD_APPLICATION_ID || env.DISCORD_APPLICATION_ID,
+      publicKey: process.env.DISCORD_PUBLIC_KEY || env.DISCORD_PUBLIC_KEY,
+      channelIds: getRegisteredDiscordChannelIds(),
+      retryConfig: startupRetryConfigFromEnv(catchupEnv, 'DISCORD_COMMAND_SYNC_RETRY'),
+    });
+    const discordAdapter = createDiscordAdapter({
+      botToken,
+      publicKey: process.env.DISCORD_PUBLIC_KEY || env.DISCORD_PUBLIC_KEY || commandSync.publicKey,
+      applicationId: process.env.DISCORD_APPLICATION_ID || env.DISCORD_APPLICATION_ID || commandSync.applicationId,
+    });
     const channelIds = (): Set<string> => monitoredDiscordChannelIds(autoCreateThreadChannelIds);
     let catchup: DiscordCatchup | null = null;
     return createChatSdkBridge({

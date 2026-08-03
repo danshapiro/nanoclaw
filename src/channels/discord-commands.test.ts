@@ -1,11 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
 
+import { log } from '../log.js';
 import {
   buildYenteDiscordGuildCommandPayloads,
   fetchDiscordApplicationConfig,
   normalizeDiscordApplicationCommandInteraction,
   resolveDiscordGuildIdsForChannels,
+  resolveDiscordStartupConfig,
   syncYenteDiscordApplicationCommands,
+  syncYenteDiscordApplicationCommandsWithRetry,
   registerYenteDiscordGuildCommands,
   YENTE_DISCORD_COMMANDS,
 } from './discord-commands.js';
@@ -190,5 +193,181 @@ describe('Yente Discord application commands', () => {
       platformId: 'channel-1',
       threadId: 'discord:guild-1:channel-1:thread-1',
     });
+  });
+});
+describe('resolveDiscordStartupConfig', () => {
+  it('resolves env-provided config immediately without any REST call', async () => {
+    const fetchImpl = vi.fn(async () => new Response('down', { status: 500 }));
+    const scheduled: Array<() => Promise<void>> = [];
+    const config = await resolveDiscordStartupConfig({
+      botToken: 'bot-token',
+      channelIds: ['channel-1'],
+      applicationId: 'app-123',
+      publicKey: 'k'.repeat(64),
+      fetchImpl,
+      scheduleCommandSync: (run) => scheduled.push(run),
+    });
+    expect(config).toEqual({ applicationId: 'app-123', publicKey: 'k'.repeat(64) });
+    expect(fetchImpl).not.toHaveBeenCalled(); // no discovery needed, sync not yet run
+    expect(scheduled).toHaveLength(1);
+  });
+
+  it('command-sync failures retry in the background and never kill startup (incident shape)', async () => {
+    let clearAttempts = 0;
+    const fetchImpl = vi.fn(async (url: string, init?: { method?: string }) => {
+      if (url.endsWith('/channels/channel-1')) {
+        return new Response(JSON.stringify({ id: 'channel-1', guild_id: 'guild-1' }), { status: 200 });
+      }
+      if (url.endsWith('/applications/app-123/commands') && init?.method === 'PUT') {
+        clearAttempts += 1;
+        if (clearAttempts < 3) throw new TypeError('fetch failed'); // cold network at boot
+        return new Response('[]', { status: 200 });
+      }
+      if (url.endsWith('/applications/app-123/guilds/guild-1/commands') && init?.method === 'PUT') {
+        return new Response('[]', { status: 200 });
+      }
+      return new Response('unexpected', { status: 500 });
+    });
+    const sleeps: number[] = [];
+    let syncDone: Promise<void> = Promise.resolve();
+    const config = await resolveDiscordStartupConfig({
+      botToken: 'bot-token',
+      channelIds: ['channel-1'],
+      applicationId: 'app-123',
+      publicKey: 'k'.repeat(64),
+      fetchImpl,
+      retryConfig: { disabled: false, delaysMs: [5000, 15000], capMs: 30000, jitterRatio: 0 },
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+      random: () => 0,
+      scheduleCommandSync: (run) => {
+        syncDone = run(); // deterministic: awaiting the loop also releases the single-flight flag
+      },
+    });
+    expect(config.applicationId).toBe('app-123'); // startup config resolved despite sync failures
+    await syncDone;
+    expect(clearAttempts).toBe(3);
+    expect(sleeps).toEqual([5000, 15000]); // backoff ladder honored
+  });
+
+  it('still throws when config discovery itself fails (registry retries the factory)', async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new TypeError('fetch failed');
+    });
+    await expect(resolveDiscordStartupConfig({ botToken: 'bot-token', channelIds: [], fetchImpl })).rejects.toThrow(
+      'fetch failed',
+    );
+  });
+});
+
+describe('syncYenteDiscordApplicationCommandsWithRetry', () => {
+  it('gives up with an ERROR only when retries are disabled', async () => {
+    const errorSpy = vi.spyOn(log, 'error').mockImplementation(() => {});
+    const fetchImpl = vi.fn(async () => new Response('boom', { status: 500 }));
+    const ok = await syncYenteDiscordApplicationCommandsWithRetry({
+      botToken: 'bot-token',
+      channelIds: [],
+      applicationId: 'app-123',
+      publicKey: 'k'.repeat(64),
+      fetchImpl,
+      retryConfig: { disabled: true, delaysMs: [1], capMs: 1, jitterRatio: 0 },
+    });
+    expect(ok).toBe(false);
+    expect(errorSpy).toHaveBeenCalledWith(
+      'Discord command sync failed permanently',
+      expect.objectContaining({ attempt: 1 }),
+    );
+    errorSpy.mockRestore();
+  });
+
+  it('stops after maxAttempts when set', async () => {
+    const errorSpy = vi.spyOn(log, 'error').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const fetchImpl = vi.fn(async () => new Response('boom', { status: 500 }));
+    const sleeps: number[] = [];
+    const ok = await syncYenteDiscordApplicationCommandsWithRetry({
+      botToken: 'bot-token',
+      channelIds: [],
+      applicationId: 'app-123',
+      publicKey: 'k'.repeat(64),
+      fetchImpl,
+      retryConfig: { disabled: false, delaysMs: [100], capMs: 100, jitterRatio: 0 },
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+      maxAttempts: 3,
+    });
+    expect(ok).toBe(false);
+    expect(sleeps).toEqual([100, 100]); // slept between attempts 1->2 and 2->3
+    errorSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+
+  it('keeps retrying while guild resolution is incomplete (brownout partial-registration shape)', async () => {
+    const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    let channelLookups = 0;
+    const fetchImpl = vi.fn(async (url: string, init?: { method?: string }) => {
+      if (url.endsWith('/channels/channel-1')) {
+        channelLookups += 1;
+        if (channelLookups === 1) return new Response('upstream unavailable', { status: 502 }); // brownout
+        return new Response(JSON.stringify({ id: 'channel-1', guild_id: 'guild-1' }), { status: 200 });
+      }
+      if (init?.method === 'PUT') return new Response('[]', { status: 200 });
+      return new Response('unexpected', { status: 500 });
+    });
+    const sleeps: number[] = [];
+    const ok = await syncYenteDiscordApplicationCommandsWithRetry({
+      botToken: 'bot-token',
+      channelIds: ['channel-1'],
+      applicationId: 'app-123',
+      publicKey: 'k'.repeat(64),
+      fetchImpl,
+      retryConfig: { disabled: false, delaysMs: [5000], capMs: 5000, jitterRatio: 0 },
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+    });
+    expect(ok).toBe(true);
+    expect(channelLookups).toBe(2); // partial resolution = failed cycle, retried until complete
+    expect(sleeps).toEqual([5000]);
+    warnSpy.mockRestore();
+  });
+
+  it('single-flights the loop: a duplicate call while one is in flight returns false without syncing', async () => {
+    const errorSpy = vi.spyOn(log, 'error').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const fetchImpl = vi.fn(async () => new Response('boom', { status: 500 }));
+    let sleepCalls = 0;
+    let releaseSleep: () => void = () => {};
+    const first = syncYenteDiscordApplicationCommandsWithRetry({
+      botToken: 'bot-token',
+      channelIds: [],
+      applicationId: 'app-123',
+      publicKey: 'k'.repeat(64),
+      fetchImpl,
+      retryConfig: { disabled: false, delaysMs: [100], capMs: 100, jitterRatio: 0 },
+      sleep: () =>
+        new Promise((resolve) => {
+          sleepCalls += 1;
+          releaseSleep = resolve; // parks the loop between attempts
+        }),
+      maxAttempts: 2,
+    });
+    const second = await syncYenteDiscordApplicationCommandsWithRetry({
+      botToken: 'bot-token',
+      channelIds: [],
+      applicationId: 'app-123',
+      publicKey: 'k'.repeat(64),
+      fetchImpl,
+      retryConfig: { disabled: true, delaysMs: [1], capMs: 1, jitterRatio: 0 },
+    });
+    expect(second).toBe(false); // refused immediately: a loop is already active
+    expect(warnSpy).toHaveBeenCalledWith('Discord command sync already in flight, skipping duplicate');
+    await vi.waitFor(() => expect(sleepCalls).toBe(1));
+    releaseSleep();
+    await expect(first).resolves.toBe(false); // original loop exhausts maxAttempts as usual
+    errorSpy.mockRestore();
+    warnSpy.mockRestore();
   });
 });
