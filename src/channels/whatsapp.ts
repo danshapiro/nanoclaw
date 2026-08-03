@@ -160,6 +160,7 @@ registerChannelAdapter('whatsapp', {
     // State
     let sock: WASocket;
     let connected = false;
+    let tearingDown = false;
     let setupConfig: ChannelSetup;
 
     // LID → phone JID mapping (WhatsApp's new ID system)
@@ -388,6 +389,7 @@ registerChannelAdapter('whatsapp', {
     // --- Socket creation ---
 
     async function connectSocket(): Promise<void> {
+      tearingDown = false;
       const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
       const { version } = await fetchLatestWaWebVersion({}).catch((err) => {
@@ -447,7 +449,7 @@ registerChannelAdapter('whatsapp', {
         if (connection === 'close') {
           connected = false;
           const reason = (lastDisconnect?.error as { output?: { statusCode?: number } })?.output?.statusCode;
-          const shouldReconnect = reason !== DisconnectReason.loggedOut;
+          const shouldReconnect = !tearingDown && reason !== DisconnectReason.loggedOut;
 
           log.info('WhatsApp connection closed', { reason, shouldReconnect });
 
@@ -461,10 +463,10 @@ registerChannelAdapter('whatsapp', {
                 });
               }, RECONNECT_DELAY_MS);
             });
-          } else {
+          } else if (reason === DisconnectReason.loggedOut) {
             log.info('WhatsApp logged out');
             if (rejectFirstOpen) {
-              rejectFirstOpen(new Error('WhatsApp logged out'));
+              rejectFirstOpen(Object.assign(new Error('WhatsApp logged out'), { permanentStartupError: true }));
               rejectFirstOpen = undefined;
               resolveFirstOpen = undefined;
             }
@@ -735,6 +737,7 @@ registerChannelAdapter('whatsapp', {
 
       async teardown() {
         connected = false;
+        tearingDown = true;
         sock?.end(undefined);
         log.info('WhatsApp adapter shut down');
       },
