@@ -7,7 +7,7 @@
 
 **Goal:** A channel adapter is never permanently dead while the nanoclaw process lives — adapter startup failures retry with backoff+jitter forever, the Discord command sync stops being load-bearing, the AgentMail OneCLI env setup becomes retryable, and per-channel status is greppable from journalctl.
 
-**Architecture:** Three layers. (1) A generic startup-retry policy module (`startup-retry.ts`) feeds an outer retry loop in `channel-registry.ts` that re-runs the FULL channel start (factory + setup) on unref'd timers until it succeeds — this alone closes the 2026-08-02 outage class because catch-up is armed inside `setup()`, so a late start recovers the gap through the existing durable-cursor machinery. (2) Channel-specific fragility fixes: Discord's application-command sync moves to a fire-and-forget background loop (only the single config-discovery GET stays load-bearing, and only when env lacks `DISCORD_APPLICATION_ID`/`DISCORD_PUBLIC_KEY`); AgentMail's factory re-runs the ops-repo OneCLI env script on each retry and — because `NODE_EXTRA_CA_CERTS`/`NODE_USE_ENV_PROXY` are startup-only Node options — exits for a systemd restart when acquisition succeeds late. (3) A canonical `Channel adapter status` INFO log line at every state transition for host-side detectors.
+**Architecture:** Three layers. (1) A generic startup-retry policy module (`startup-retry.ts`) feeds an outer retry loop in `channel-registry.ts` that re-runs the FULL channel start (factory + setup) on unref'd timers until it succeeds — this alone closes the 2026-08-02 outage class because catch-up is armed inside `setup()`, so a late start recovers the gap through the existing durable-cursor machinery. Boot blocking is bounded (`CHANNEL_STARTUP_FIRST_ATTEMPT_WAIT_MS`; validated hang shapes exist: `ws` with no `handshakeTimeout` hangs ~133 s, a broken CONNECT proxy under `NODE_USE_ENV_PROXY=1` hangs fetch indefinitely, a pre-open WhatsApp close reconnects forever), and errors marked `permanentStartupError` (WhatsApp logged-out — Baileys documents blind re-login as the ban-risk anti-pattern) stop retrying with status `failed`. (2) Channel-specific fragility fixes: Discord's application-command sync moves to a single-flight fire-and-forget background loop that treats partial guild resolution as a failed cycle (only the single config-discovery GET stays load-bearing, and only when env lacks `DISCORD_APPLICATION_ID`/`DISCORD_PUBLIC_KEY`); WhatsApp teardown no longer triggers a Baileys reconnect (Task 2b); AgentMail's factory re-runs the ops-repo OneCLI env script on each retry and — because `NODE_EXTRA_CA_CERTS`/`NODE_USE_ENV_PROXY` are startup-only Node options (validated by experiment; a working in-process undici/ws re-injection alternative exists but is deliberately rejected for blast-radius reasons, see Task 4) — exits for a systemd restart when acquisition succeeds late (`Restart=on-failure` verified active on the live host). (3) A canonical `Channel adapter status` INFO log line at every state transition for host-side detectors (INFO verified visible in the live journal).
 
 **Tech Stack:** TypeScript 5.9 (ESM, NodeNext, `.js` import suffixes), Node 22, vitest 4 (host tests), bun test (container tests only — untouched here), better-sqlite3, hand-rolled `src/log.ts` logger. **No new dependencies.**
 
@@ -15,14 +15,14 @@
 
 - Worktree root (all paths relative to it): `/home/dan/code/nanoclaw-reboot-resilience/.worktrees/channel-adapter-startup-resilience`
 - SACRED: message durability and catch-up semantics unchanged — do not modify `src/channels/discord-catchup.ts`, `src/channels/discord-state.ts`, `src/channels/agentmail-state.ts`, or any claim/lease logic. A late-starting adapter must still run its startup catch-up.
-- SACRED: no double-processing — claim semantics hold. The only registry-side addition is best-effort `teardown()` of a partially-set-up adapter before a retry, so repeated attempts cannot leak webhook servers/timers.
+- SACRED: no double-processing — claim semantics hold; validation (2026-08-02) confirmed claims/leases are what actually carry this guarantee. The registry adds best-effort `teardown()` of a partially-set-up adapter before a retry, but do NOT claim leak-freedom: teardown is known-leaky today (validated) — the bridge's local webhook HTTP server is never closed (`chat-sdk-bridge.ts:786-819`; no `server.close()` exists) and the Discord catch-up engine's `catchup.stop()` has zero call sites. Both are pre-existing and out of scope; mitigating fact: a FAILED Discord `setup()` cannot leave an armed catch-up engine (the ready hook is try/caught and nothing after it throws, `chat-sdk-bridge.ts:553-557`). The one teardown hazard IN scope: WhatsApp `teardown()` currently triggers a Baileys reconnect (`sock.end(undefined)` ⇒ close handler computes `shouldReconnect=true`, `whatsapp.ts:447-463`) — Task 2b guards it.
 - SACRED: AgentMail preflight/secret handling unchanged in shape — `createAgentMailAdapter` and `requireAgentMailOneCliProxyEnv` keep their exact signatures, synchronous throws, and error strings. The existing pins at `src/channels/agentmail.test.ts:117-137` must keep passing unmodified.
 - All new behavior env-configurable with safe defaults (exact names/defaults in the env table below).
 - Do NOT deploy. Do NOT touch the live host. The systemd change is documented only (Task 6); `nanoclaw.service` lives in the shapiroserver2 repo, not here.
-- Baselines must stay green: ~1131 vitest tests (`pnpm test`) + 426 bun tests (`cd container/agent-runner && bun test`).
+- Baselines must stay green: 1131 vitest tests (`pnpm test`) + 428 bun tests (`cd container/agent-runner && bun test`) — both MEASURED green at HEAD on 2026-08-02; the bun suite requires `container/agent-runner` deps installed (Task 1, Step 0).
 - Conventions: Conventional Commits with scope (`feat(channels): ...`); prettier (singleQuote, 120 cols); eslint rule `preserve-caught-error` is an error — when wrapping a caught error in a new Error, attach `{ cause: err }`; log errors by passing the raw error under the key `err` (the logger special-cases it).
 - Tests: never mutate `process.env` — pass env objects; inject `sleep`/`random`/`fetchImpl`; use `vi.useFakeTimers()` + `await vi.advanceTimersByTimeAsync(ms)` for timer-driven code; spy on `log` levels as behavioral contracts.
-- `node_modules` is absent in the worktree: run `pnpm install` once before anything else (Task 1, Step 0).
+- `node_modules` may be absent in the worktree: run `pnpm install` once before anything else, AND `bun install --frozen-lockfile` in `container/agent-runner` (Task 1, Step 0) — the bun suite and the agent-runner typecheck both need it.
 
 ### New env tunables (all optional; defaults are the shipped behavior)
 
@@ -32,6 +32,7 @@
 | `CHANNEL_STARTUP_RETRY_DELAYS_MS` | `5000,15000,45000,120000,300000` | backoff ladder for channel start retries |
 | `CHANNEL_STARTUP_RETRY_CAP_MS` | `300000` | repeat delay after the ladder is exhausted (forever) |
 | `CHANNEL_STARTUP_RETRY_JITTER` | `0.2` | additive jitter ratio 0..1 (`delay = base + base*jitter*random()`) |
+| `CHANNEL_STARTUP_FIRST_ATTEMPT_WAIT_MS` | `30000` | max time boot blocks per channel's FIRST start attempt; a capped attempt keeps running in the background (never aborted). `0` = wait indefinitely (legacy) |
 | `DISCORD_COMMAND_SYNC_RETRY_DISABLED` / `_DELAYS_MS` / `_CAP_MS` / `_JITTER` | same defaults | same knobs for the background command sync |
 | `AGENTMAIL_ONECLI_ENV_SCRIPT` | `${NANOCLAW_ROOT}/agentmail-onecli-env.mjs` | OneCLI env script the runtime re-runs when proxy env is missing |
 | `AGENTMAIL_ONECLI_ENV_TIMEOUT_MS` | `30000` | timeout for that script |
@@ -44,10 +45,11 @@ One canonical INFO line per state transition, key=value structured (single line,
 ```
 Channel adapter status channel="discord" status="retrying" attempt=1 lastError="fetch failed" retryInMs=5000
 Channel adapter status channel="discord" status="started" attempt=2
-Channel adapter status channel="discord" status="failed" attempt=1 lastError="..."   (only when retries disabled)
+Channel adapter status channel="whatsapp" status="starting" attempt=1    (first attempt exceeded the boot-wait cap; still in flight)
+Channel adapter status channel="whatsapp" status="failed" attempt=1 lastError="..."   (retries disabled, teardown, or permanentStartupError)
 ```
 
-Host-side detectors distinguish "adapter retrying" from "adapter up" via `journalctl -u nanoclaw | grep 'Channel adapter status'`.
+Host-side detectors distinguish "adapter retrying" from "adapter up" via `journalctl -u nanoclaw | grep 'Channel adapter status'`. Semantics (validated): `started` means `setup()` RESOLVED — for discord it does NOT imply the gateway is connected or the token valid (login is fire-and-forget; `isConnected()` is hard-coded true), and for agentmail it does NOT imply the socket opened. It is a startup-progress signal, not a connectivity probe.
 
 ### Spec coverage map
 
@@ -57,6 +59,8 @@ Host-side detectors distinguish "adapter retrying" from "adapter up" via `journa
 | 2a. Discord command sync not load-bearing; background retry | 3 |
 | 2b. AgentMail OneCLI env setup retryable | 4 (+2 for the retry loop) |
 | 3. Structured per-channel health signal | 2 |
+| Permanent startup failures stop retrying (WhatsApp logged-out — Baileys ban-risk anti-pattern) | 2, 2b |
+| Bounded boot blocking (hang-proof first attempts) | 2 |
 | 4. systemd `network-online.target` documented for shapiroserver2 | 6 |
 | Test: adapter-start failure then success on retry (both channels) | 2 (discord-shape + agentmail-shape), 4 |
 | Test: command-sync failure not killing the gateway | 3 |
@@ -72,9 +76,10 @@ Host-side detectors distinguish "adapter retrying" from "adapter up" via `journa
 | `src/channels/startup-retry.test.ts` | new | unit tests for parsing + delay math |
 | `src/channels/channel-registry.ts` | modify | outer per-channel start retry loop, per-channel state map, status log lines, teardown cancellation |
 | `src/channels/channel-registry-retry.test.ts` | new | behavior tests for the retry loop (fake timers, module-reset per test) |
-| `src/channels/discord-commands.ts` | modify | add `syncYenteDiscordApplicationCommandsWithRetry` + `resolveDiscordStartupConfig`; existing exports untouched |
+| `src/channels/discord-commands.ts` | modify | add `syncYenteDiscordApplicationCommandsWithRetry` + `resolveDiscordStartupConfig`; existing exports extended backward-compatibly (optional failed-channel collector on the guild-resolution helper) — partial resolution fails the sync cycle (Task 3) |
 | `src/channels/discord-commands.test.ts` | modify | tests for the two new functions |
 | `src/channels/discord.ts` | modify | factory calls `resolveDiscordStartupConfig` instead of awaiting the full command sync |
+| `src/channels/whatsapp.ts` | modify | Task 2b: logged-out startup rejection marked `permanentStartupError`; teardown guarded so `sock.end()` cannot trigger a reconnect |
 | `src/channels/agentmail-onecli.ts` | new | runtime acquisition of the OneCLI proxy env (never throws) |
 | `src/channels/agentmail-onecli.test.ts` | new | unit tests for acquisition |
 | `src/channels/agentmail.ts` | modify | new exported `agentMailChannelFactory` composing acquisition + unchanged `createAgentMailAdapter`; registration uses it |
@@ -105,9 +110,10 @@ Not modified: `src/index.ts` (the `initChannelAdapters(setupFn)` call at `src/in
 ```bash
 cd /home/dan/code/nanoclaw-reboot-resilience/.worktrees/channel-adapter-startup-resilience
 pnpm install
+cd container/agent-runner && bun install --frozen-lockfile && cd ../..
 ```
 
-Expected: install completes (lockfile already present; supply-chain `minimumReleaseAge` applies automatically). Do not commit any lockfile change; if `pnpm install` dirties `pnpm-lock.yaml`, run `git checkout -- pnpm-lock.yaml` after install and use `pnpm install --frozen-lockfile` instead.
+Expected: install completes (lockfile already present; supply-chain `minimumReleaseAge` applies automatically). Do not commit any lockfile change; if `pnpm install` dirties `pnpm-lock.yaml`, run `git checkout -- pnpm-lock.yaml` after install and use `pnpm install --frozen-lockfile` instead. The bun install is required for Task 7's bun suite and the agent-runner typecheck (validated 2026-08-02: 106 packages; `bun test` then measures 428 pass / 0 fail).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -276,7 +282,7 @@ export function startupRetryDelayMs(
 pnpm exec vitest run src/channels/startup-retry.test.ts
 ```
 
-Expected: PASS (7 tests).
+Expected: PASS (5 tests).
 
 - [ ] **Step 5: Commit**
 
@@ -298,12 +304,13 @@ This is the core outage-class fix. Today `src/channels/channel-registry.ts:53-94
 **Interfaces:**
 - Consumes (Task 1): `startupRetryConfigFromEnv`, `startupRetryDelayMs`, `StartupRetryConfig` from `./startup-retry.js`; `readEnvFile(keys: string[]): Record<string, string>` from `../env.js`.
 - Produces:
-  - `initChannelAdapters(setupFn: (adapter: ChannelAdapter) => ChannelSetup, options?: InitChannelAdaptersOptions): Promise<void>` — signature extended with an OPTIONAL second parameter; all 8 existing call sites (`src/index.ts:96`, 5 tests, 1 script) compile unchanged.
-  - `interface InitChannelAdaptersOptions { env?: NodeJS.ProcessEnv; retryConfig?: StartupRetryConfig; random?: () => number }`
-  - `type ChannelStartStatus = 'started' | 'retrying' | 'failed'`
+  - `initChannelAdapters(setupFn: (adapter: ChannelAdapter) => ChannelSetup, options?: InitChannelAdaptersOptions): Promise<void>` — signature extended with an OPTIONAL second parameter; all 7 existing call sites (`src/index.ts:96`, 5 tests, 1 script) compile unchanged.
+  - `interface InitChannelAdaptersOptions { env?: NodeJS.ProcessEnv; retryConfig?: StartupRetryConfig; random?: () => number; firstAttemptWaitMs?: number }` — `firstAttemptWaitMs` bounds how long boot blocks per channel's first attempt (default 30000, env `CHANNEL_STARTUP_FIRST_ATTEMPT_WAIT_MS`; 0 = wait forever). A capped attempt keeps running in the background — it is never aborted, so there is no double-attempt risk.
+  - `type ChannelStartStatus = 'starting' | 'started' | 'retrying' | 'failed'` — `starting` = first attempt exceeded the boot-wait cap and is still in flight.
   - `interface ChannelStartState { status: ChannelStartStatus; attempt: number; lastError?: string }`
   - `getChannelStartStates(): Map<string, ChannelStartState>` (snapshot copy)
-  - Log contract: see "Health-signal log contract" in Global Constraints. On failure with retry pending: WARN `'Failed to start channel adapter, will retry'` + INFO `'Channel adapter status'` (`status: 'retrying'`). ERROR `'Failed to start channel adapter'` fires ONLY when retries are disabled or teardown has begun.
+  - `isPermanentStartupError(err: unknown): boolean` — true when an error carries `permanentStartupError: true` (adapter-side marker contract; wired for WhatsApp in Task 2b). Permanent failures report `status: 'failed'` and are NOT retried (validated: Baileys documents halting on logged-out; blind re-login is the ban-risk anti-pattern).
+  - Log contract: see "Health-signal log contract" in Global Constraints. On failure with retry pending: WARN `'Failed to start channel adapter, will retry'` + INFO `'Channel adapter status'` (`status: 'retrying'`). ERROR `'Failed to start channel adapter'` fires ONLY when retries are disabled, teardown has begun, or the error is marked permanent (`isPermanentStartupError`). A first attempt that outlives the boot-wait cap logs WARN `'Channel adapter start attempt still pending, continuing boot'` + INFO status (`status: 'starting'`).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -322,7 +329,6 @@ Create `src/channels/channel-registry-retry.test.ts`:
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { log } from '../log.js';
 import type { ChannelAdapter } from './adapter.js';
 import type { StartupRetryConfig } from './startup-retry.js';
 
@@ -348,8 +354,14 @@ function mockAdapter(channelType: string): ChannelAdapter {
 }
 
 async function freshRegistry() {
+  // vi.resetModules() gives a fresh registry singleton per test — which also
+  // re-instantiates ../log.js. Spy on the POST-reset log instance returned
+  // here, never a file-level log import (repo gotcha: import log AFTER
+  // resetModules — see container-runner.test.ts:2647-2649).
   vi.resetModules();
-  return import('./channel-registry.js');
+  const registry = await import('./channel-registry.js');
+  const { log } = await import('../log.js');
+  return { ...registry, log };
 }
 
 describe('channel adapter startup retry', () => {
@@ -363,7 +375,7 @@ describe('channel adapter startup retry', () => {
   });
 
   it('retries a throwing factory with backoff until it succeeds (incident shape: fetch failed)', async () => {
-    const { registerChannelAdapter, initChannelAdapters, getActiveAdapters, getChannelStartStates } =
+    const { registerChannelAdapter, initChannelAdapters, getActiveAdapters, getChannelStartStates, log } =
       await freshRegistry();
     const infoSpy = vi.spyOn(log, 'info');
     const errorSpy = vi.spyOn(log, 'error');
@@ -476,7 +488,7 @@ describe('channel adapter startup retry', () => {
   });
 
   it('emits a single greppable status line at each transition', async () => {
-    const { registerChannelAdapter, initChannelAdapters } = await freshRegistry();
+    const { registerChannelAdapter, initChannelAdapters, log } = await freshRegistry();
     const infoSpy = vi.spyOn(log, 'info');
     const warnSpy = vi.spyOn(log, 'warn');
     let attempts = 0;
@@ -578,7 +590,7 @@ describe('channel adapter startup retry', () => {
   });
 
   it('CHANNEL_STARTUP_RETRY_DISABLED restores the legacy single-attempt ERROR behavior', async () => {
-    const { registerChannelAdapter, initChannelAdapters, getChannelStartStates } = await freshRegistry();
+    const { registerChannelAdapter, initChannelAdapters, getChannelStartStates, log } = await freshRegistry();
     const errorSpy = vi.spyOn(log, 'error');
     let attempts = 0;
     registerChannelAdapter('legacy', {
@@ -642,6 +654,80 @@ describe('channel adapter startup retry', () => {
     await vi.advanceTimersByTimeAsync(2000); // cap after 1-entry ladder
     expect(attempts).toBe(3);
   });
+
+  it('stops retrying and reports failed when the error is marked permanent (WhatsApp logged-out shape)', async () => {
+    const { registerChannelAdapter, initChannelAdapters, getChannelStartStates, log } = await freshRegistry();
+    const errorSpy = vi.spyOn(log, 'error');
+    let attempts = 0;
+    registerChannelAdapter('logged-out', {
+      factory: () => {
+        attempts += 1;
+        throw Object.assign(new Error('WhatsApp session logged out, re-pair required'), {
+          permanentStartupError: true,
+        });
+      },
+    });
+
+    await initChannelAdapters(
+      () => ({
+        conversations: [],
+        onInbound: () => {},
+        onInboundEvent: () => {},
+        onMetadata: () => {},
+        onAction: () => {},
+      }),
+      { retryConfig: TEST_RETRY, random: () => 0 },
+    );
+
+    expect(attempts).toBe(1);
+    expect(getChannelStartStates().get('logged-out')?.status).toBe('failed');
+    expect(errorSpy).toHaveBeenCalledWith(
+      'Failed to start channel adapter',
+      expect.objectContaining({ channel: 'logged-out', permanent: true }),
+    );
+    await vi.advanceTimersByTimeAsync(600000);
+    expect(attempts).toBe(1); // permanent = never retried
+  });
+
+  it('bounds boot blocking when a first attempt hangs, then lets it finish in the background', async () => {
+    const { registerChannelAdapter, initChannelAdapters, getChannelStartStates, getActiveAdapters, log } =
+      await freshRegistry();
+    const warnSpy = vi.spyOn(log, 'warn');
+    let release: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const adapter = mockAdapter('hangs');
+    registerChannelAdapter('hangs', {
+      factory: async () => {
+        await gate; // validated hang shapes: ws with no handshakeTimeout; broken CONNECT proxy; pre-open WhatsApp close
+        return adapter;
+      },
+    });
+
+    const initPromise = initChannelAdapters(
+      () => ({
+        conversations: [],
+        onInbound: () => {},
+        onInboundEvent: () => {},
+        onMetadata: () => {},
+        onAction: () => {},
+      }),
+      { retryConfig: TEST_RETRY, random: () => 0, firstAttemptWaitMs: 30000 },
+    );
+    await vi.advanceTimersByTimeAsync(30000); // boot-wait cap elapses
+    await initPromise; // boot proceeds although the attempt is still in flight
+    expect(getChannelStartStates().get('hangs')).toEqual({ status: 'starting', attempt: 1 });
+    expect(warnSpy).toHaveBeenCalledWith(
+      'Channel adapter start attempt still pending, continuing boot',
+      expect.objectContaining({ channel: 'hangs', waitedMs: 30000 }),
+    );
+
+    release();
+    await vi.advanceTimersByTimeAsync(0); // let the in-flight attempt settle
+    expect(getActiveAdapters().map((a) => a.channelType)).toContain('hangs');
+    expect(getChannelStartStates().get('hangs')).toEqual({ status: 'started', attempt: 1 });
+  });
 });
 ```
 
@@ -651,7 +737,7 @@ describe('channel adapter startup retry', () => {
 pnpm exec vitest run src/channels/channel-registry-retry.test.ts
 ```
 
-Expected: FAIL — `getChannelStartStates` is not exported / retries never happen (`attempts` stays 1).
+Expected: FAIL — `getChannelStartStates`/`isPermanentStartupError` are not exported / retries never happen (`attempts` stays 1); the boot-wait test fails by TEST TIMEOUT (the current `initChannelAdapters` awaits the hanging factory with no cap).
 
 - [ ] **Step 3: Implement the registry changes**
 
@@ -669,7 +755,7 @@ import { startupRetryConfigFromEnv, startupRetryDelayMs, type StartupRetryConfig
 3b. Add state + types near the existing `registry`/`activeAdapters` maps (after line 22):
 
 ```ts
-export type ChannelStartStatus = 'started' | 'retrying' | 'failed';
+export type ChannelStartStatus = 'starting' | 'started' | 'retrying' | 'failed';
 
 export interface ChannelStartState {
   status: ChannelStartStatus;
@@ -682,6 +768,8 @@ export interface InitChannelAdaptersOptions {
   env?: NodeJS.ProcessEnv;
   retryConfig?: StartupRetryConfig;
   random?: () => number;
+  /** Max ms boot blocks per channel's first attempt (0 = wait forever). */
+  firstAttemptWaitMs?: number;
 }
 
 const CHANNEL_STARTUP_RETRY_ENV_KEYS = [
@@ -689,7 +777,10 @@ const CHANNEL_STARTUP_RETRY_ENV_KEYS = [
   'CHANNEL_STARTUP_RETRY_DELAYS_MS',
   'CHANNEL_STARTUP_RETRY_CAP_MS',
   'CHANNEL_STARTUP_RETRY_JITTER',
+  'CHANNEL_STARTUP_FIRST_ATTEMPT_WAIT_MS',
 ];
+
+const DEFAULT_FIRST_ATTEMPT_WAIT_MS = 30_000;
 
 const startStates = new Map<string, ChannelStartState>();
 const retryTimers = new Map<string, NodeJS.Timeout>();
@@ -698,6 +789,36 @@ let retriesHalted = false;
 /** Snapshot of per-channel startup state (tests + future health probes). */
 export function getChannelStartStates(): Map<string, ChannelStartState> {
   return new Map(startStates);
+}
+
+/**
+ * Adapters mark startup errors that must NOT be retried by attaching
+ * `permanentStartupError: true` (e.g. WhatsApp logged-out: Baileys documents
+ * blind re-login on stale creds as the ban-risk anti-pattern — see Task 2b).
+ * Permanent failures report status "failed" and stop the retry loop.
+ */
+export function isPermanentStartupError(err: unknown): boolean {
+  return (
+    typeof err === 'object' &&
+    err !== null &&
+    (err as { permanentStartupError?: unknown }).permanentStartupError === true
+  );
+}
+
+function firstAttemptWaitMsFromEnv(env: NodeJS.ProcessEnv): number {
+  const raw = env.CHANNEL_STARTUP_FIRST_ATTEMPT_WAIT_MS?.trim();
+  if (!raw) return DEFAULT_FIRST_ATTEMPT_WAIT_MS;
+  const parsed = Number(raw);
+  if (Number.isInteger(parsed) && parsed >= 0) return parsed;
+  log.warn('Ignoring malformed CHANNEL_STARTUP_FIRST_ATTEMPT_WAIT_MS', { value: raw });
+  return DEFAULT_FIRST_ATTEMPT_WAIT_MS;
+}
+
+function bootWaitSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref?.();
+  });
 }
 ```
 
@@ -708,10 +829,20 @@ export function getChannelStartStates(): Map<string, ChannelStartState> {
  * Instantiate and set up all registered channel adapters.
  * Skips adapters that return null (missing credentials).
  *
- * The first attempt per channel runs inline (boot blocks only on first
- * attempts, as before). Failures schedule background re-attempts with
- * backoff + jitter that repeat indefinitely — a channel is never
+ * The first attempt per channel runs inline but blocks boot for at most
+ * firstAttemptWaitMs (validated hang shapes: `ws` with no handshakeTimeout
+ * hangs ~133 s; a broken CONNECT proxy under NODE_USE_ENV_PROXY=1 hangs
+ * fetch indefinitely; a pre-open WhatsApp close reconnects forever). A
+ * capped attempt keeps running in the background — it is never aborted, so
+ * there is no double-attempt risk. Failures schedule background re-attempts
+ * with backoff + jitter that repeat indefinitely — a channel is never
  * permanently dead while the process lives (2026-08-02 outage class).
+ *
+ * Liveness invariant (validated): every timer here is unref'd; the process
+ * is kept alive by the delivery/host-sweep poll chains armed in
+ * src/index.ts:189-194 AFTER this function resolves. Do not unref those
+ * polls, and do not let this function block indefinitely — either would
+ * reintroduce silent clean-exit death when all channels are down.
  */
 export async function initChannelAdapters(
   setupFn: (adapter: ChannelAdapter) => ChannelSetup,
@@ -724,15 +855,36 @@ export async function initChannelAdapters(
   const env = options.env ?? { ...readEnvFile(CHANNEL_STARTUP_RETRY_ENV_KEYS), ...process.env };
   const retryConfig = options.retryConfig ?? startupRetryConfigFromEnv(env, 'CHANNEL_STARTUP_RETRY');
   const random = options.random ?? Math.random;
+  const firstAttemptWaitMs = options.firstAttemptWaitMs ?? firstAttemptWaitMsFromEnv(env);
   for (const [name, registration] of registry) {
-    await attemptChannelStart(name, registration, setupFn, retryConfig, random, 1);
+    const attempt = attemptChannelStart(name, registration, setupFn, retryConfig, random, 1);
+    if (firstAttemptWaitMs <= 0) {
+      await attempt;
+      continue;
+    }
+    const timedOut = await Promise.race([
+      attempt.then(() => false),
+      bootWaitSleep(firstAttemptWaitMs).then(() => true),
+    ]);
+    if (timedOut && !startStates.has(name)) {
+      // has(name) guards the same-tick race where the attempt settled right
+      // after the cap fired — never clobber a real started/retrying state.
+      startStates.set(name, { status: 'starting', attempt: 1 });
+      log.warn('Channel adapter start attempt still pending, continuing boot', {
+        channel: name,
+        waitedMs: firstAttemptWaitMs,
+      });
+      log.info('Channel adapter status', { channel: name, status: 'starting', attempt: 1 });
+    }
   }
 }
 
 /**
  * One full start attempt (factory + setup). On failure, schedules the next
- * attempt on an unref'd timer. Retries stop only at teardown or when
- * CHANNEL_STARTUP_RETRY_DISABLED=1 (legacy single-attempt behavior).
+ * attempt on an unref'd timer. Retries stop only at teardown, when
+ * CHANNEL_STARTUP_RETRY_DISABLED=1 (legacy single-attempt behavior), or when
+ * the error is marked permanent (isPermanentStartupError — e.g. WhatsApp
+ * logged-out, Task 2b).
  */
 async function attemptChannelStart(
   name: string,
@@ -792,16 +944,20 @@ async function attemptChannelStart(
     log.info('Channel adapter status', { channel: name, status: 'started', attempt });
   } catch (err) {
     if (adapter) {
-      // Best-effort cleanup of a partially set-up adapter so retries can't
-      // leak webhook servers or timers from the failed attempt.
+      // Best-effort cleanup of a partially set-up adapter before the retry.
+      // NOTE (validated): teardown is NOT leak-free today — the bridge's
+      // webhook server and catch-up engine are never reclaimed (pre-existing,
+      // out of scope; see plan SACRED #2). Claims/leases are what prevent
+      // double-processing.
       await adapter.teardown().catch((teardownErr) => {
         log.warn('Cleanup of failed adapter start attempt failed', { channel: name, err: teardownErr });
       });
     }
     const lastError = err instanceof Error ? err.message : String(err);
-    if (retriesHalted || retryConfig.disabled) {
+    const permanent = isPermanentStartupError(err);
+    if (retriesHalted || retryConfig.disabled || permanent) {
       startStates.set(name, { status: 'failed', attempt, lastError });
-      log.error('Failed to start channel adapter', { channel: name, err });
+      log.error('Failed to start channel adapter', { channel: name, permanent, err });
       log.info('Channel adapter status', { channel: name, status: 'failed', attempt, lastError });
       return;
     }
@@ -855,13 +1011,61 @@ git commit -m "feat(channels): retry adapter startup with backoff until it succe
 
 ---
 
+### Task 2b: WhatsApp startup-failure safety (no ban-risk retry, no teardown reconnect)
+
+Validated findings this task closes: (1) Baileys documents halting on `DisconnectReason.loggedOut` — blind re-login on stale creds is the community-documented ban-risk anti-pattern (WhiskeySockets/Baileys issues #2075/#1869/#225/#2707) — so the registry must NOT retry a logged-out WhatsApp startup. (2) The current `teardown()` triggers a reconnect: `sock?.end(undefined)` makes Baileys emit a `connection.update` close with `lastDisconnect.error = undefined` BEFORE listeners are removed, so the adapter's close handler computes `shouldReconnect = true` and dials a NEW socket (verified against the vendored Baileys `lib/Socket/socket.js:243-269`; re-verify on any Baileys upgrade). Without this task, the registry's cleanup-before-retry would itself spawn reconnect loops.
+
+**Files:**
+- Modify: `src/channels/whatsapp.ts` — the `connection.update` close handler (around `:447-463`), the logged-out `setup()` rejection (around `:465-469` — the `rejectFirstOpen(new Error(...))` call for `DisconnectReason.loggedOut`), and `teardown()` (around `:736-738`). Line anchors verified against the repo on 2026-08-02; re-locate by content if drifted.
+- Test: `src/channels/channel-registry-retry.test.ts` already covers the registry side (Task 2's permanent-marker test). `src/channels/whatsapp.test.ts` EXISTS but covers attachment contracts only (no Baileys socket harness) — do NOT build one for this task; direct coverage is Step 3's verification greps plus the full suite staying green.
+
+**Interfaces:**
+- Consumes (Task 2): the `permanentStartupError: true` marker contract read by `isPermanentStartupError` in `channel-registry.ts`.
+- Produces: behavior only — no signature changes.
+
+- [ ] **Step 1: Guard teardown against reconnect**
+
+Add an adapter-scoped flag (e.g. `let tearingDown = false;` alongside the socket state). In `teardown()`, set `tearingDown = true` BEFORE `sock?.end(...)`. In the `connection.update` close handler, include the flag in the reconnect decision — `const shouldReconnect = !tearingDown && reason !== DisconnectReason.loggedOut;` (adapt to the file's actual variable names) — so teardown can never dial a new socket. Reset `tearingDown = false` at the start of the connect path so a later registry retry can still connect.
+
+- [ ] **Step 2: Mark logged-out startup failures permanent**
+
+At the logged-out `setup()` rejection (≈`:465-469`, where the close handler calls `rejectFirstOpen(new Error(...))` for `DisconnectReason.loggedOut`), attach the marker to the error it already constructs (keep the message and type; adapt to the file's actual variable names — the marker is the contract, not the exact expression):
+
+```ts
+rejectFirstOpen(Object.assign(new Error(/* existing message unchanged */), { permanentStartupError: true }));
+```
+
+The registry (Task 2) then reports `status="failed"` and never retries — re-pairing is a human operation; blind re-login is the documented ban-risk anti-pattern.
+
+- [ ] **Step 3: Verify**
+
+```bash
+grep -n "permanentStartupError" src/channels/whatsapp.ts
+grep -n "tearingDown" src/channels/whatsapp.ts
+pnpm exec vitest run src/channels
+pnpm exec tsc --noEmit
+```
+
+Expected: the first grep hits the logged-out rejection; the second hits both the teardown set-site and the close-handler guard; all channel suites PASS (including Task 2's permanent-marker test and every pre-existing whatsapp test); typecheck clean.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add src/channels/whatsapp.ts
+git commit -m "fix(whatsapp): no teardown-triggered reconnect; logged-out startup failures are permanent (no ban-risk retry)"
+```
+
+(no new test files are expected for this task.)
+
+---
+
 ### Task 3: Discord — application-command sync is no longer load-bearing
 
 Incident mechanism (a): the factory `await`s `syncYenteDiscordApplicationCommands` (`src/channels/discord.ts:70`) before the adapter is even constructed; its first REST call (`fetchDiscordApplicationConfig`, GET `/oauth2/applications/@me`) died with `fetch failed` on cold network and killed the whole channel. After this task, only that single config-discovery GET remains load-bearing (and only when env does not supply `DISCORD_APPLICATION_ID` + `DISCORD_PUBLIC_KEY` — Task 2's registry retry covers it); the guild resolution + command clear/register calls move to a background retry loop that can never fail the factory.
 
 **Files:**
 - Modify: `src/channels/discord-commands.ts` (append two functions + add the file's first imports)
-- Modify: `src/channels/discord.ts` (imports at `:16`; the factory block at `:59-84` — env-read list, command-sync call, `catchupEnv` construction order)
+- Modify: `src/channels/discord.ts` (imports at `:12`; the factory block at `:59-84` — env-read list, command-sync call, `catchupEnv` construction order)
 - Test: `src/channels/discord-commands.test.ts` (append two describes)
 
 **Interfaces:**
@@ -869,6 +1073,8 @@ Incident mechanism (a): the factory `await`s `syncYenteDiscordApplicationCommand
 - Produces:
   - `syncYenteDiscordApplicationCommandsWithRetry(args: { botToken: string; channelIds: readonly string[]; applicationId: string; publicKey: string; fetchImpl?: FetchLike; retryConfig?: StartupRetryConfig; sleep?: (ms: number) => Promise<void>; random?: () => number; maxAttempts?: number }): Promise<boolean>`
   - `resolveDiscordStartupConfig(args: { botToken: string; channelIds: readonly string[]; applicationId?: string | null; publicKey?: string | null; fetchImpl?: FetchLike; retryConfig?: StartupRetryConfig; sleep?: (ms: number) => Promise<void>; random?: () => number; scheduleCommandSync?: (run: () => Promise<void>) => void }): Promise<DiscordApplicationConfig>` — returns `{ applicationId, publicKey }`; command sync failures NEVER propagate; discovery failures DO throw (registry retries the factory).
+  - Behavior change (validated falsifier): `syncYenteDiscordApplicationCommands` now fails a cycle instead of silently under-registering — when any configured channel's guild lookup fails (the non-OK branch that is currently a bare `continue`, `discord-commands.ts:233`), it throws `Discord command sync incomplete: ...` AFTER applying what it could; empty `channelIds` (or zero failures) is still success. The retry wrapper therefore keeps retrying through brownouts instead of declaring victory on partial registration (Step 3b'').
+  - Single-flight (validated falsifier): `syncYenteDiscordApplicationCommandsWithRetry` refuses to run concurrently — a module-level in-flight flag makes a duplicate call log a WARN and return `false` — so factory retry attempts / re-inits cannot each spawn an immortal loop.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -909,6 +1115,7 @@ describe('resolveDiscordStartupConfig', () => {
       return new Response('unexpected', { status: 500 });
     });
     const sleeps: number[] = [];
+    let syncDone: Promise<void> = Promise.resolve();
     const config = await resolveDiscordStartupConfig({
       botToken: 'bot-token',
       channelIds: ['channel-1'],
@@ -920,9 +1127,13 @@ describe('resolveDiscordStartupConfig', () => {
         sleeps.push(ms);
       },
       random: () => 0,
+      scheduleCommandSync: (run) => {
+        syncDone = run(); // deterministic: awaiting the loop also releases the single-flight flag
+      },
     });
     expect(config.applicationId).toBe('app-123'); // startup config resolved despite sync failures
-    await vi.waitFor(() => expect(clearAttempts).toBe(3));
+    await syncDone;
+    expect(clearAttempts).toBe(3);
     expect(sleeps).toEqual([5000, 15000]); // backoff ladder honored
   });
 
@@ -978,6 +1189,73 @@ describe('syncYenteDiscordApplicationCommandsWithRetry', () => {
     errorSpy.mockRestore();
     warnSpy.mockRestore();
   });
+
+  it('keeps retrying while guild resolution is incomplete (brownout partial-registration shape)', async () => {
+    const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    let channelLookups = 0;
+    const fetchImpl = vi.fn(async (url: string, init?: { method?: string }) => {
+      if (url.endsWith('/channels/channel-1')) {
+        channelLookups += 1;
+        if (channelLookups === 1) return new Response('upstream unavailable', { status: 502 }); // brownout
+        return new Response(JSON.stringify({ id: 'channel-1', guild_id: 'guild-1' }), { status: 200 });
+      }
+      if (init?.method === 'PUT') return new Response('[]', { status: 200 });
+      return new Response('unexpected', { status: 500 });
+    });
+    const sleeps: number[] = [];
+    const ok = await syncYenteDiscordApplicationCommandsWithRetry({
+      botToken: 'bot-token',
+      channelIds: ['channel-1'],
+      applicationId: 'app-123',
+      publicKey: 'k'.repeat(64),
+      fetchImpl,
+      retryConfig: { disabled: false, delaysMs: [5000], capMs: 5000, jitterRatio: 0 },
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+    });
+    expect(ok).toBe(true);
+    expect(channelLookups).toBe(2); // partial resolution = failed cycle, retried until complete
+    expect(sleeps).toEqual([5000]);
+    warnSpy.mockRestore();
+  });
+
+  it('single-flights the loop: a duplicate call while one is in flight returns false without syncing', async () => {
+    const errorSpy = vi.spyOn(log, 'error').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const fetchImpl = vi.fn(async () => new Response('boom', { status: 500 }));
+    let sleepCalls = 0;
+    let releaseSleep: () => void = () => {};
+    const first = syncYenteDiscordApplicationCommandsWithRetry({
+      botToken: 'bot-token',
+      channelIds: [],
+      applicationId: 'app-123',
+      publicKey: 'k'.repeat(64),
+      fetchImpl,
+      retryConfig: { disabled: false, delaysMs: [100], capMs: 100, jitterRatio: 0 },
+      sleep: () =>
+        new Promise((resolve) => {
+          sleepCalls += 1;
+          releaseSleep = resolve; // parks the loop between attempts
+        }),
+      maxAttempts: 2,
+    });
+    const second = await syncYenteDiscordApplicationCommandsWithRetry({
+      botToken: 'bot-token',
+      channelIds: [],
+      applicationId: 'app-123',
+      publicKey: 'k'.repeat(64),
+      fetchImpl,
+      retryConfig: { disabled: true, delaysMs: [1], capMs: 1, jitterRatio: 0 },
+    });
+    expect(second).toBe(false); // refused immediately: a loop is already active
+    expect(warnSpy).toHaveBeenCalledWith('Discord command sync already in flight, skipping duplicate');
+    await vi.waitFor(() => expect(sleepCalls).toBe(1));
+    releaseSleep();
+    await expect(first).resolves.toBe(false); // original loop exhausts maxAttempts as usual
+    errorSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
 });
 ```
 
@@ -1003,12 +1281,17 @@ import { startupRetryConfigFromEnv, startupRetryDelayMs, type StartupRetryConfig
 3b. Append at the end of the file:
 
 ```ts
+let commandSyncLoopActive = false;
+
 /**
  * Background application-command sync with backoff — command sync must never
  * be load-bearing for Discord adapter startup (2026-08-02: a pre-connect
  * REST call died on cold network and killed the whole channel). Retries
  * until it succeeds; returns false only when retries are disabled or
- * maxAttempts is exhausted. Never throws.
+ * maxAttempts is exhausted. Never throws. SINGLE-FLIGHT: one loop per
+ * process — a duplicate call while one is active logs a WARN and returns
+ * false (validated: without this, every factory retry attempt / re-init
+ * would spawn another immortal loop).
  */
 export async function syncYenteDiscordApplicationCommandsWithRetry(args: {
   botToken: string;
@@ -1021,6 +1304,11 @@ export async function syncYenteDiscordApplicationCommandsWithRetry(args: {
   random?: () => number;
   maxAttempts?: number;
 }): Promise<boolean> {
+  if (commandSyncLoopActive) {
+    log.warn('Discord command sync already in flight, skipping duplicate');
+    return false;
+  }
+  commandSyncLoopActive = true;
   const retryConfig = args.retryConfig ?? startupRetryConfigFromEnv(process.env, 'DISCORD_COMMAND_SYNC_RETRY');
   const sleep =
     args.sleep ??
@@ -1031,26 +1319,30 @@ export async function syncYenteDiscordApplicationCommandsWithRetry(args: {
       }));
   const random = args.random ?? Math.random;
   const maxAttempts = args.maxAttempts ?? 0; // 0 = retry forever
-  for (let attempt = 1; ; attempt += 1) {
-    try {
-      await syncYenteDiscordApplicationCommands({
-        botToken: args.botToken,
-        channelIds: args.channelIds,
-        applicationId: args.applicationId,
-        publicKey: args.publicKey,
-        fetchImpl: args.fetchImpl,
-      });
-      log.info('Discord command sync complete', { attempt });
-      return true;
-    } catch (err) {
-      if (retryConfig.disabled || (maxAttempts > 0 && attempt >= maxAttempts)) {
-        log.error('Discord command sync failed permanently', { attempt, err });
-        return false;
+  try {
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        await syncYenteDiscordApplicationCommands({
+          botToken: args.botToken,
+          channelIds: args.channelIds,
+          applicationId: args.applicationId,
+          publicKey: args.publicKey,
+          fetchImpl: args.fetchImpl,
+        });
+        log.info('Discord command sync complete', { attempt });
+        return true;
+      } catch (err) {
+        if (retryConfig.disabled || (maxAttempts > 0 && attempt >= maxAttempts)) {
+          log.error('Discord command sync failed permanently', { attempt, err });
+          return false;
+        }
+        const retryInMs = startupRetryDelayMs(retryConfig, attempt, random);
+        log.warn('Discord command sync failed, will retry', { attempt, retryInMs, err });
+        await sleep(retryInMs);
       }
-      const retryInMs = startupRetryDelayMs(retryConfig, attempt, random);
-      log.warn('Discord command sync failed, will retry', { attempt, retryInMs, err });
-      await sleep(retryInMs);
     }
+  } finally {
+    commandSyncLoopActive = false;
   }
 }
 
@@ -1093,9 +1385,31 @@ export async function resolveDiscordStartupConfig(args: {
 }
 ```
 
+3b''. Harden guild resolution for the retry era (validated falsifier: a "resolved" sync could silently under-register). The per-channel non-OK branch in `resolveDiscordGuildIdsForChannels` is currently a bare `continue` (verified at `discord-commands.ts:233`). Extend the helper BACKWARD-COMPATIBLY with an optional collector parameter — its return type and existing pins (e.g. the `['guild-1']` assertion) stay intact:
+
+```ts
+// resolveDiscordGuildIdsForChannels(...existing params..., failedChannelIds?: string[])
+// in the non-OK / thrown-fetch branch (currently a bare `continue`):
+failedChannelIds?.push(channelId);
+continue;
+```
+
+Then in `syncYenteDiscordApplicationCommands` (adapt names to the actual parameter list):
+
+```ts
+const failedChannelIds: string[] = [];
+const guildIds = await resolveDiscordGuildIdsForChannels(/* existing args */, failedChannelIds);
+// ... perform the clear/register PUTs it can, as today ...
+if (failedChannelIds.length > 0) {
+  throw new Error(`Discord command sync incomplete: guild resolution failed for ${failedChannelIds.join(', ')}`);
+}
+```
+
+so the retry wrapper treats the cycle as failed and retries. Keep empty `channelIds` (and zero-resolved-with-zero-failures) as success. Rate-limit note (validated against Discord docs): the 200-creates/day/guild limit counts only NEW commands — an idempotent re-PUT of an unchanged set consumes nothing, so retry-until-complete is safe. Check existing `discord-commands.test.ts` pins: any test asserting the old silent-partial-success must be updated deliberately (that swallow is the falsified behavior this step removes).
+
 3c. Wire the factory in `src/channels/discord.ts`:
 
-- Change the import at line 16 from `import { syncYenteDiscordApplicationCommands } from './discord-commands.js';` to:
+- Change the import at line 12 from `import { syncYenteDiscordApplicationCommands } from './discord-commands.js';` to:
 
 ```ts
 import { resolveDiscordStartupConfig } from './discord-commands.js';
@@ -1157,7 +1471,7 @@ git commit -m "feat(discord): decouple application-command sync from adapter sta
 
 ### Task 4: AgentMail — OneCLI env setup becomes retryable
 
-Incident mechanism (b): `start.sh` produces the OneCLI proxy env exactly once at boot via `eval "$(node $NANOCLAW_ROOT/agentmail-onecli-env.mjs --shell)"`; when that fetch chain failed on cold network, nanoclaw booted proxy-less and `requireAgentMailOneCliProxyEnv` (`src/channels/agentmail.ts:514-525`) hard-failed the factory forever. Fix: the factory re-runs the SAME ops script (JSON mode) on each registry retry. Because `NODE_EXTRA_CA_CERTS` and `NODE_USE_ENV_PROXY` are startup-only Node options (they cannot be applied to a running process), a successful LATE acquisition exits(1) deliberately so systemd (`Restart=on-failure`, `RestartSec=5`) relaunches nanoclaw through `start.sh`, whose eval now succeeds — the missing self-termination path called out in the incident. Preflight shape is untouched: `createAgentMailAdapter` keeps its synchronous throws and the pinned tests at `agentmail.test.ts:117-137` pass unmodified.
+Incident mechanism (b): `start.sh` produces the OneCLI proxy env exactly once at boot via `eval "$(node $NANOCLAW_ROOT/agentmail-onecli-env.mjs --shell)"`; when that fetch chain failed on cold network, nanoclaw booted proxy-less and `requireAgentMailOneCliProxyEnv` (`src/channels/agentmail.ts:514-525`) hard-failed the factory forever. Fix: the factory re-runs the SAME ops script (JSON mode) on each registry retry. `NODE_EXTRA_CA_CERTS` and `NODE_USE_ENV_PROXY` are startup-only Node options — VALIDATED by experiment (late-set CA is ignored; the env-proxy config is read once at first use; a late-set flag is a no-op) — so a successful LATE acquisition exits(1) deliberately and systemd relaunches nanoclaw through `start.sh`, whose eval now succeeds. `Restart=on-failure` / `RestartSec=5` is VERIFIED ACTIVE on the live host (2026-08-02 `systemctl show`; the only drop-in is an additive `OnFailure=` pager). Design note (validated): an in-process alternative DOES exist — runtime `setGlobalDispatcher(ProxyAgent{requestTls.ca})` plus `ws` `{agent, ca}` injection was proven to work — but it is deliberately REJECTED: it swaps the dispatcher under every fetch in the process, `EnvHttpProxyAgent` snapshots env at construction, npm↔bundled undici compatibility is fragile across upgrades, and the ws plumbing would modify `agentmail-api.ts`, which this plan keeps untouched. Exit-for-restart is the smaller-blast-radius choice, not a necessity. Preflight shape is untouched: `createAgentMailAdapter` keeps its synchronous throws and the pinned tests at `agentmail.test.ts:117-137` pass unmodified.
 
 **Files:**
 - Create: `src/channels/agentmail-onecli.ts`
@@ -1404,8 +1718,11 @@ import { ensureAgentMailOneCliEnv } from './agentmail-onecli.js';
  * Registration factory: acquire the OneCLI proxy env if it's missing, then
  * build the adapter. NODE_EXTRA_CA_CERTS and NODE_USE_ENV_PROXY are
  * startup-only Node options — a process that booted without them cannot
- * apply them at runtime — so a successful LATE acquisition exits(1)
- * deliberately: systemd (Restart=on-failure, RestartSec=5) relaunches
+ * apply them at runtime (validated; an in-process undici/ws re-injection
+ * alternative was proven possible and deliberately rejected — see the
+ * Task 4 rationale in the plan) — so a successful LATE acquisition exits(1)
+ * deliberately: systemd (Restart=on-failure, RestartSec=5 — verified active
+ * on the live host) relaunches
  * nanoclaw through start.sh, whose env eval now succeeds against the
  * healthy network. This is the missing self-termination path from the
  * 2026-08-02 incident. Preflight shape is unchanged: on acquisition
@@ -1552,9 +1869,9 @@ git commit -m "test(channels): prove late-start catch-up fires after startup ret
 
 ---
 
-### Task 6: Deploy notes — systemd ordering + tunables (shapiroserver2 changes documented, NOT applied)
+### Task 6: Deploy notes — verified systemd reality + tunables (shapiroserver2 changes documented, NOT applied)
 
-`nanoclaw.service` lives in the shapiroserver2 repo (`/home/dan/code/shapiroserver2/srv/nanoclaw/nanoclaw.service`), not in this repo. Per the spec, this task documents the exact change so the deploy step applies it. Do NOT touch that repo or the live host from this worktree.
+`nanoclaw.service` lives in the shapiroserver2 repo (`/home/dan/code/shapiroserver2/srv/nanoclaw/nanoclaw.service`), not in this repo. Validation (2026-08-02, read-only ssh to the live host) FALSIFIED the original premise of this task — the ordering directives are already present and vacuous on this host — so the notes now document the verified host-side state, the corrected residual-risk model, and the new tunables. No unit change ships. Do NOT touch that repo or the live host from this worktree.
 
 **Files:**
 - Create: `docs/plans/2026-08-02-channel-adapter-startup-resilience-deploy-notes.md`
@@ -1571,40 +1888,53 @@ Create `docs/plans/2026-08-02-channel-adapter-startup-resilience-deploy-notes.md
 # Deploy notes — channel adapter startup resilience (2026-08-02 outage class)
 
 Runtime changes ship in danshapiro/nanoclaw (branch overlay/shapiroserver2).
-The following host-side items live in the **shapiroserver2 repo** and must be
-applied by the deploy step. They are defense-in-depth: the in-runtime startup
-retry is the real fix; ordering only shrinks the cold-network window.
+The notes below record the VERIFIED host-side state (2026-08-02, read-only
+ssh) and what the deploy step must (and must not) do. The in-runtime startup
+retry is the real fix; no systemd unit change is required.
 
-## 1. systemd unit ordering (shapiroserver2 repo — REQUIRED)
+## 1. systemd unit — verified state; NO ordering change required
 
 File: `srv/nanoclaw/nanoclaw.service` (deployed at `/etc/systemd/system/nanoclaw.service`)
 
-Add to the `[Unit]` section:
+The original plan called for adding `After/Wants=network-online.target`.
+Validation (2026-08-02, read-only ssh to the live host) falsified that
+premise on both halves:
 
-```ini
-After=network-online.target
-Wants=network-online.target
-```
+- the live unit (and the repo unit since commit `29c5472`, 2026-03-26)
+  ALREADY carries both directives — they were present through the incident;
+- they are VACUOUS on this host: `systemd-networkd-wait-online.service` is
+  skipped ("start condition unmet" — observed at the 2026-08-02 09:55:25
+  incident reboot itself), so `network-online.target` was reached at 2.019 s,
+  4 ms after `network.target`.
 
-Why: on 2026-08-02 the host rebooted at 09:55 PDT and nanoclaw started before
-the network was ready; the Discord and AgentMail adapters each failed their
-single startup attempt and stayed down 10.5 h. Ordering after
-network-online.target avoids that window in the common case; the runtime
-retry guarantees recovery even when ordering does not help (late DNS, OneCLI
-outage, mid-run network loss at restart).
+So: no unit change. The runtime startup retry (Tasks 1–2) is the actual fix
+for the cold-network window. OPTIONAL host-side hardening, only if desired
+later: make a wait-online service actually run — that is generator/netplan
+level work (satisfying the service's start condition), NOT a unit `Wants=`
+edit; investigate on the host before relying on it.
 
-Keep `Restart=on-failure` / `RestartSec=5` unchanged — the AgentMail
-late-acquisition path DEPENDS on it: when the runtime acquires the OneCLI env
-after boot, it logs
+Keep `Restart=on-failure` / `RestartSec=5` unchanged — VERIFIED ACTIVE live
+(`systemctl show`: `Restart=on-failure`, `RestartUSec=5s`; sole drop-in
+`10-discord-onfailure.conf` is an additive `OnFailure=` pager only). The
+AgentMail late-acquisition path DEPENDS on it: when the runtime acquires the
+OneCLI env after boot, it logs
 `AgentMail OneCLI env acquired after boot; exiting so systemd restarts nanoclaw ...`
-and exits(1) so start.sh's env eval re-runs against the healthy network.
-(Residual risk, accepted: if start.sh's eval persistently fails while the
-in-process script succeeds — implies a start.sh bug — the unit will restart
-repeatedly until systemd's start-limit backoff engages. Set
-`AGENTMAIL_ONECLI_ENV_EXIT_ON_ACQUIRE=0` to break such a loop.)
+and exits(1) so start.sh's env eval re-runs against the healthy network. The
+deploy step should re-assert unit parity (repo unit == `systemctl cat
+nanoclaw`) whenever it ships this feature.
 
-Apply with: `systemctl daemon-reload && systemctl restart nanoclaw` (deploy
-step's normal flow).
+Residual risk — CORRECTED by validation (the previous "until systemd's
+start-limit backoff engages" wording was FALSE): if start.sh's eval
+persistently fails while the in-process script succeeds — which requires a
+start.sh bug, since both run the same code path — the exit(1)/restart loop is
+NOT bounded. With the live values (`StartLimitBurst=5`,
+`StartLimitIntervalSec=10`, `RestartSec=5`, systemd 255) the start limit is
+mathematically unreachable (≤3 starts fit in any 10 s window), so the unit
+never enters `failed` state, NO backoff engages, the loop churns silently
+forever — and the host's `OnFailure=discord-notify@%N` pager never fires for
+this class. Detector: repeated `AgentMail OneCLI env acquired after boot`
+fatal lines across restarts in `journalctl -u nanoclaw`. Break the loop with
+`AGENTMAIL_ONECLI_ENV_EXIT_ON_ACQUIRE=0`.
 
 ## 2. New runtime env tunables (all optional; defaults ship correct behavior)
 
@@ -1614,6 +1944,7 @@ step's normal flow).
 | `CHANNEL_STARTUP_RETRY_DELAYS_MS` | `5000,15000,45000,120000,300000` | backoff ladder |
 | `CHANNEL_STARTUP_RETRY_CAP_MS` | `300000` | repeat delay after ladder, forever |
 | `CHANNEL_STARTUP_RETRY_JITTER` | `0.2` | additive jitter ratio 0..1 |
+| `CHANNEL_STARTUP_FIRST_ATTEMPT_WAIT_MS` | `30000` | max ms boot blocks per channel's first start attempt (`0` = wait forever); capped attempts keep running in the background |
 | `DISCORD_COMMAND_SYNC_RETRY_{DISABLED,DELAYS_MS,CAP_MS,JITTER}` | same | background command-sync knobs |
 | `AGENTMAIL_ONECLI_ENV_SCRIPT` | `${NANOCLAW_ROOT}/agentmail-onecli-env.mjs` | env script the runtime re-runs |
 | `AGENTMAIL_ONECLI_ENV_TIMEOUT_MS` | `30000` | script timeout |
@@ -1621,19 +1952,35 @@ step's normal flow).
 
 ## 3. Health signal for host-side detectors
 
-Every channel state transition emits one INFO line:
+Every channel state transition emits one INFO line (INFO verified visible in
+the live journal — the running service already logs INFO-level lines):
 
 ```
 Channel adapter status channel="discord" status="retrying" attempt=3 lastError="fetch failed" retryInMs=45000
 Channel adapter status channel="discord" status="started" attempt=4
+Channel adapter status channel="whatsapp" status="starting" attempt=1
+Channel adapter status channel="whatsapp" status="failed" attempt=1 lastError="..."
 ```
 
 Detector recipe: `journalctl -u nanoclaw | grep 'Channel adapter status'` —
-`status="retrying"` means degraded-but-self-healing; `status="started"` means
-up; `status="failed"` appears only with retries disabled. The legacy ERROR
-`Failed to start channel adapter` now indicates a PERMANENT failure only
-(retries disabled or shutdown); during retries the same words appear as WARN
+`status="retrying"` means degraded-but-self-healing; `status="starting"`
+means a first attempt exceeded the boot-wait cap and is still in flight;
+`status="failed"` is permanent (retries disabled, shutdown, or an error
+marked permanent — e.g. WhatsApp logged out, where human re-pairing is
+required). IMPORTANT semantics (validated): `status="started"` means
+`setup()` RESOLVED — for discord it does NOT prove the gateway connected or
+the token is valid (login is fire-and-forget), and for agentmail it does NOT
+prove the socket opened. It is a startup-progress signal, not a connectivity
+probe. The legacy ERROR `Failed to start channel adapter` now indicates a
+PERMANENT failure only (retries disabled, shutdown, or permanent-marked
+error); during retries the same words appear as WARN
 `Failed to start channel adapter, will retry`.
+
+Known pre-existing limitation (out of scope, documented for operators):
+outbound deliveries drained while a channel is down are dropped and marked
+delivered (`src/index.ts:175-178` → `delivery.ts:349-350`); this plan
+SHRINKS that window (channels come back on their own) but does not remove
+the path.
 ````
 
 - [ ] **Step 2: Commit**
@@ -1671,7 +2018,7 @@ pnpm test
 cd container/agent-runner && bun test; cd ../..
 ```
 
-Expected: vitest ≥ 1131 baseline tests + the ~25 new ones, 0 failures; bun 426 tests, 0 failures. If a pre-existing test fails, STOP and investigate whether Tasks 2-4 changed observable behavior it pinned (most likely candidates: anything asserting the old `Failed to start channel adapter` ERROR) — fix the production code's compatibility, not the unrelated test, unless the pinned behavior is exactly what this plan intentionally changed (the ERROR→WARN-when-retrying transition is intentional).
+Expected: vitest ≥ 1131 baseline tests (measured green at HEAD 2026-08-02) + the new ones, 0 failures; bun 428 tests (measured; requires Task 1 Step 0's bun install), 0 failures. Lint baseline: 0 errors / 179 pre-existing `no-catch-all` warnings (non-blocking). If a pre-existing test fails, STOP and investigate whether Tasks 2–4 (incl. 2b) changed observable behavior it pinned (most likely candidates: anything asserting the old `Failed to start channel adapter` ERROR, the discord-commands guild-resolution swallow, or WhatsApp teardown/reconnect behavior) — fix the production code's compatibility, not the unrelated test, unless the pinned behavior is exactly what this plan intentionally changed (the ERROR→WARN-when-retrying transition, the partial-guild-resolution failure, and the teardown-reconnect guard are intentional).
 
 - [ ] **Step 3: Commit any verification fixes**
 
