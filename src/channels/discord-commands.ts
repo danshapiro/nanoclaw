@@ -216,20 +216,40 @@ export async function fetchDiscordApplicationConfig(args: {
   return { applicationId: body.id, publicKey: body.verify_key };
 }
 
+/**
+ * Retryable guild-lookup failures: rate limiting and server/transport
+ * trouble. Every other non-OK status (404 deleted channel, 403 kicked
+ * guild, ...) is permanent — retrying it every cycle forever only
+ * produces WARN noise and PUT churn.
+ */
+function isRetryableDiscordStatus(status: number): boolean {
+  return status === 429 || status >= 500;
+}
+
+/**
+ * Channels whose guild lookup failed permanently (non-retryable 4xx).
+ * Process-lifetime memory so a deleted/kicked channel is warned about
+ * exactly once, not every sync cycle; a process restart re-evaluates.
+ */
+const permanentlySkippedDiscordChannelIds = new Set<string>();
+
 export async function resolveDiscordGuildIdsForChannels(
   args: {
     botToken: string;
     channelIds: readonly string[];
     fetchImpl?: FetchLike;
+    skippedChannelIds?: Set<string>;
   },
   failedChannelIds?: string[],
 ): Promise<string[]> {
   const fetchImpl = args.fetchImpl ?? fetch;
+  const skippedChannelIds = args.skippedChannelIds ?? permanentlySkippedDiscordChannelIds;
   const guildIds = new Set<string>();
 
   for (const channelId of args.channelIds) {
     const normalized = channelIdFromPlatformId(channelId);
     if (!normalized) continue;
+    if (skippedChannelIds.has(normalized)) continue;
     const response = await fetchImpl(`${DISCORD_API_BASE}/channels/${encodeURIComponent(normalized)}`, {
       method: 'GET',
       headers: {
@@ -237,7 +257,15 @@ export async function resolveDiscordGuildIdsForChannels(
       },
     });
     if (!response.ok) {
-      failedChannelIds?.push(channelId);
+      if (isRetryableDiscordStatus(response.status)) {
+        failedChannelIds?.push(channelId);
+      } else {
+        skippedChannelIds.add(normalized);
+        log.warn('Discord command sync: permanent guild-lookup failure, skipping channel until process restart', {
+          channelId,
+          status: response.status,
+        });
+      }
       continue;
     }
     const body = JSON.parse(await response.text()) as { guild_id?: unknown };
@@ -255,6 +283,7 @@ export async function syncYenteDiscordApplicationCommands(args: {
   applicationId?: string | null;
   publicKey?: string | null;
   fetchImpl?: FetchLike;
+  skippedChannelIds?: Set<string>;
 }): Promise<DiscordApplicationConfig & { guildIds: string[] }> {
   const discovered =
     args.applicationId && args.publicKey
@@ -266,6 +295,7 @@ export async function syncYenteDiscordApplicationCommands(args: {
       botToken: args.botToken,
       channelIds: args.channelIds,
       fetchImpl: args.fetchImpl,
+      skippedChannelIds: args.skippedChannelIds,
     },
     failedChannelIds,
   );
@@ -346,6 +376,7 @@ export async function syncYenteDiscordApplicationCommandsWithRetry(args: {
   sleep?: (ms: number) => Promise<void>;
   random?: () => number;
   maxAttempts?: number;
+  skippedChannelIds?: Set<string>;
 }): Promise<boolean> {
   if (commandSyncLoopActive) {
     log.warn('Discord command sync already in flight, skipping duplicate');
@@ -371,6 +402,7 @@ export async function syncYenteDiscordApplicationCommandsWithRetry(args: {
           applicationId: args.applicationId,
           publicKey: args.publicKey,
           fetchImpl: args.fetchImpl,
+          skippedChannelIds: args.skippedChannelIds,
         });
         log.info('Discord command sync complete', { attempt });
         return true;

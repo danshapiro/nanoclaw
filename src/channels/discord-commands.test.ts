@@ -338,6 +338,151 @@ describe('syncYenteDiscordApplicationCommandsWithRetry', () => {
     warnSpy.mockRestore();
   });
 
+  it('treats 404 guild lookup as permanent: one WARN, cycle succeeds, other channels still applied', async () => {
+    const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const infoSpy = vi.spyOn(log, 'info').mockImplementation(() => {});
+    const fetchImpl = vi.fn(async (url: string, init?: { method?: string }) => {
+      if (url.endsWith('/channels/deleted-channel')) return new Response('missing', { status: 404 });
+      if (url.endsWith('/channels/healthy-channel')) {
+        return new Response(JSON.stringify({ id: 'healthy-channel', guild_id: 'guild-1' }), { status: 200 });
+      }
+      if (init?.method === 'PUT') return new Response('[]', { status: 200 });
+      return new Response('unexpected', { status: 500 });
+    });
+    const sleeps: number[] = [];
+    const ok = await syncYenteDiscordApplicationCommandsWithRetry({
+      botToken: 'bot-token',
+      channelIds: ['deleted-channel', 'healthy-channel'],
+      applicationId: 'app-123',
+      publicKey: 'k'.repeat(64),
+      fetchImpl,
+      skippedChannelIds: new Set<string>(),
+      retryConfig: { disabled: false, delaysMs: [5000], capMs: 5000, jitterRatio: 0 },
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+      maxAttempts: 3,
+    });
+    expect(ok).toBe(true); // permanent failure does not fail the cycle
+    expect(sleeps).toEqual([]); // no retry churn
+    const permanentWarns = warnSpy.mock.calls.filter(([msg]) => String(msg).includes('permanent'));
+    expect(permanentWarns).toHaveLength(1);
+    expect(permanentWarns[0]?.[1]).toMatchObject({ channelId: 'deleted-channel', status: 404 });
+    // the healthy channel's guild still got its commands registered
+    expect(
+      fetchImpl.mock.calls.some(
+        ([url, init]) => String(url).endsWith('/guilds/guild-1/commands') && init?.method === 'PUT',
+      ),
+    ).toBe(true);
+    warnSpy.mockRestore();
+    infoSpy.mockRestore();
+  });
+
+  it('treats 429 guild lookup as retryable: cycle fails and the loop retries', async () => {
+    const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const infoSpy = vi.spyOn(log, 'info').mockImplementation(() => {});
+    let channelLookups = 0;
+    const fetchImpl = vi.fn(async (url: string, init?: { method?: string }) => {
+      if (url.endsWith('/channels/rate-limited-channel')) {
+        channelLookups += 1;
+        if (channelLookups === 1) return new Response('slow down', { status: 429 });
+        return new Response(JSON.stringify({ id: 'rate-limited-channel', guild_id: 'guild-1' }), { status: 200 });
+      }
+      if (init?.method === 'PUT') return new Response('[]', { status: 200 });
+      return new Response('unexpected', { status: 500 });
+    });
+    const sleeps: number[] = [];
+    const ok = await syncYenteDiscordApplicationCommandsWithRetry({
+      botToken: 'bot-token',
+      channelIds: ['rate-limited-channel'],
+      applicationId: 'app-123',
+      publicKey: 'k'.repeat(64),
+      fetchImpl,
+      skippedChannelIds: new Set<string>(),
+      retryConfig: { disabled: false, delaysMs: [5000], capMs: 5000, jitterRatio: 0 },
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+      maxAttempts: 3,
+    });
+    expect(ok).toBe(true);
+    expect(channelLookups).toBe(2); // 429 failed the cycle, loop retried
+    expect(sleeps).toEqual([5000]);
+    warnSpy.mockRestore();
+    infoSpy.mockRestore();
+  });
+
+  it('treats network errors during guild lookup as retryable: cycle fails and the loop retries', async () => {
+    const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const infoSpy = vi.spyOn(log, 'info').mockImplementation(() => {});
+    let channelLookups = 0;
+    const fetchImpl = vi.fn(async (url: string, init?: { method?: string }) => {
+      if (url.endsWith('/channels/flaky-channel')) {
+        channelLookups += 1;
+        if (channelLookups === 1) throw new TypeError('fetch failed'); // transport error
+        return new Response(JSON.stringify({ id: 'flaky-channel', guild_id: 'guild-1' }), { status: 200 });
+      }
+      if (init?.method === 'PUT') return new Response('[]', { status: 200 });
+      return new Response('unexpected', { status: 500 });
+    });
+    const sleeps: number[] = [];
+    const ok = await syncYenteDiscordApplicationCommandsWithRetry({
+      botToken: 'bot-token',
+      channelIds: ['flaky-channel'],
+      applicationId: 'app-123',
+      publicKey: 'k'.repeat(64),
+      fetchImpl,
+      skippedChannelIds: new Set<string>(),
+      retryConfig: { disabled: false, delaysMs: [5000], capMs: 5000, jitterRatio: 0 },
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+      maxAttempts: 3,
+    });
+    expect(ok).toBe(true);
+    expect(channelLookups).toBe(2);
+    expect(sleeps).toEqual([5000]);
+    warnSpy.mockRestore();
+    infoSpy.mockRestore();
+  });
+
+  it('remembers permanent skips across cycles: no re-WARN, no repeated lookup churn', async () => {
+    const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const skippedChannelIds = new Set<string>();
+    const fetchImpl = vi.fn(async (url: string, init?: { method?: string }) => {
+      if (url.endsWith('/channels/dead-channel')) return new Response('missing', { status: 404 });
+      if (init?.method === 'PUT') return new Response('[]', { status: 200 });
+      return new Response('unexpected', { status: 500 });
+    });
+    const countDeadLookups = () =>
+      fetchImpl.mock.calls.filter(([url]) => String(url).endsWith('/channels/dead-channel')).length;
+
+    // first cycle: warns once, succeeds
+    await syncYenteDiscordApplicationCommands({
+      botToken: 'bot-token',
+      channelIds: ['dead-channel'],
+      fetchImpl,
+      skippedChannelIds,
+      applicationId: 'app-123',
+      publicKey: 'k'.repeat(64),
+    });
+    expect(countDeadLookups()).toBe(1);
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+
+    // second cycle in the same process: no new WARN, no re-lookup of the dead channel
+    await syncYenteDiscordApplicationCommands({
+      botToken: 'bot-token',
+      channelIds: ['dead-channel'],
+      fetchImpl,
+      skippedChannelIds,
+      applicationId: 'app-123',
+      publicKey: 'k'.repeat(64),
+    });
+    expect(countDeadLookups()).toBe(1); // still just the first lookup
+    expect(warnSpy).toHaveBeenCalledTimes(1); // no re-log
+    warnSpy.mockRestore();
+  });
+
   it('single-flights the loop: a duplicate call while one is in flight returns false without syncing', async () => {
     const errorSpy = vi.spyOn(log, 'error').mockImplementation(() => {});
     const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {});
