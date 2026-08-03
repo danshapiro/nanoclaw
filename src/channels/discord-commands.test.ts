@@ -213,6 +213,8 @@ describe('resolveDiscordStartupConfig', () => {
   });
 
   it('command-sync failures retry in the background and never kill startup (incident shape)', async () => {
+    const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {});
+    const infoSpy = vi.spyOn(log, 'info').mockImplementation(() => {});
     let clearAttempts = 0;
     const fetchImpl = vi.fn(async (url: string, init?: { method?: string }) => {
       if (url.endsWith('/channels/channel-1')) {
@@ -249,6 +251,8 @@ describe('resolveDiscordStartupConfig', () => {
     await syncDone;
     expect(clearAttempts).toBe(3);
     expect(sleeps).toEqual([5000, 15000]); // backoff ladder honored
+    warnSpy.mockRestore();
+    infoSpy.mockRestore();
   });
 
   it('still throws when config discovery itself fails (registry retries the factory)', async () => {
