@@ -11,6 +11,7 @@ import {
   createManagedSkillTempRoot,
   currentManagedSkillGeneration,
   managedSkillRootsFromEnv,
+  readSkillRuntimeRequirements,
   resolveManagedSkillRoot,
   syncManagedSkillSymlinks,
 } from './managed-skills.js';
@@ -227,10 +228,7 @@ describe('resolveManagedSkillRoot', () => {
     const writableRoot = makeTempDir();
     makeSkill(path.join(projectRoot, 'container', 'skills'), 'bundled-one');
     const local = makeSkill(path.join(writableRoot, 'skills'), 'local-tool');
-    fs.writeFileSync(
-      path.join(local, 'SKILL.md'),
-      `---\nname: local-tool\nmetadata:\n  openclaw:\n    requires:\n      bins: ["local-tool"]\n---\n# Local Tool\n`,
-    );
+    fs.writeFileSync(path.join(local, 'SKILL.md'), `---\nname: local-tool\nbins: ["local-tool"]\n---\n# Local Tool\n`);
 
     expect(() =>
       resolveManagedSkillRoot({
@@ -249,13 +247,38 @@ describe('resolveManagedSkillRoot', () => {
     expect(fs.lstatSync(path.join(result.root, '.bin', 'local-tool')).isSymbolicLink()).toBe(true);
   });
 
+  it('spawns cleanly when bins appear only nested under informational metadata (last30days regression)', () => {
+    const projectRoot = makeTempDir();
+    const dataDir = makeTempDir();
+    const skillDir = makeSkill(path.join(projectRoot, 'container', 'skills'), 'last30days');
+    // Modeled on upstream mvanhorn/last30days-skill frontmatter: the nested
+    // metadata.openclaw.requires.bins list is informational for OpenClaw.
+    // There is deliberately NO scripts/node or scripts/python3 — before the
+    // fix, resolveManagedSkillRoot threw 'Skill "last30days" declares helper
+    // "node" but executable script is missing' and every spawn failed
+    // (shapiroserver2 kata 23ma, 2026-08-07 fleet outage).
+    fs.writeFileSync(
+      path.join(skillDir, 'SKILL.md'),
+      `---\nname: last30days\ndescription: Research the last 30 days of a topic.\nmetadata:\n  openclaw:\n    requires:\n      bins:\n        - node\n        - python3\n---\n# last30days\n`,
+    );
+
+    const result = resolveManagedSkillRoot({ projectRoot, dataDir });
+
+    expect(result.skills.find((entry) => entry.name === 'last30days')?.requirements).toEqual({
+      skillLocalBins: [],
+      runtimeBins: [],
+      baseCommands: [],
+    });
+    expect(fs.existsSync(path.join(result.root, '.bin'))).toBe(false);
+  });
+
   it('treats gws as a runtime shim and base commands outside .bin', () => {
     const projectRoot = makeTempDir();
     const dataDir = makeTempDir();
     const local = makeSkill(path.join(projectRoot, 'container', 'skills'), 'gws-like');
     fs.writeFileSync(
       path.join(local, 'SKILL.md'),
-      `---\nname: gws-like\nmetadata:\n  openclaw:\n    requires:\n      bins:\n        - gws\n      baseCommands: ["bash", "node"]\n---\n# GWS Like\n`,
+      `---\nname: gws-like\nbins:\n  - gws\nbaseCommands: ["bash", "node"]\n---\n# GWS Like\n`,
     );
 
     const result = resolveManagedSkillRoot({ projectRoot, dataDir });
@@ -272,19 +295,13 @@ describe('resolveManagedSkillRoot', () => {
     const projectRoot = makeTempDir();
     const dataDir = makeTempDir();
     const skill = makeSkill(path.join(projectRoot, 'container', 'skills'), 'bad-runtime');
-    fs.writeFileSync(
-      path.join(skill, 'SKILL.md'),
-      `---\nname: bad-runtime\nmetadata:\n  openclaw:\n    requires:\n      runtimeBins: ["not-a-shim"]\n---\n# Bad\n`,
-    );
+    fs.writeFileSync(path.join(skill, 'SKILL.md'), `---\nname: bad-runtime\nruntimeBins: ["not-a-shim"]\n---\n# Bad\n`);
 
     expect(() => resolveManagedSkillRoot({ projectRoot, dataDir })).toThrow(
       'Skill "bad-runtime" declares unknown runtime shim "not-a-shim"',
     );
 
-    fs.writeFileSync(
-      path.join(skill, 'SKILL.md'),
-      `---\nname: bad-runtime\nmetadata:\n  openclaw:\n    requires:\n      baseCommands: ["gcc"]\n---\n# Bad\n`,
-    );
+    fs.writeFileSync(path.join(skill, 'SKILL.md'), `---\nname: bad-runtime\nbaseCommands: ["gcc"]\n---\n# Bad\n`);
     expect(() => resolveManagedSkillRoot({ projectRoot, dataDir })).toThrow(
       'Skill "bad-runtime" declares unknown base runtime command "gcc"',
     );
@@ -546,5 +563,106 @@ describe('managed skill generation (content digest)', () => {
     // Generation covers ONLY the env managed roots, not the bundled source.
     expect(result.generation).toBe(computeManagedSkillGeneration([managedRoot]));
     expect(result.generation).not.toBe('');
+  });
+});
+describe('readSkillRuntimeRequirements', () => {
+  function writeSkillMd(contents: string): string {
+    const dir = makeTempDir();
+    fs.writeFileSync(path.join(dir, 'SKILL.md'), contents);
+    return dir;
+  }
+
+  it('ignores bin keys nested under informational metadata at any depth', () => {
+    // Real-world shape from upstream mvanhorn/last30days-skill (kata 23ma).
+    const dir = writeSkillMd(
+      `---\nname: last30days\ndescription: Research the last 30 days of a topic.\nmetadata:\n  openclaw:\n    requires:\n      bins:\n        - node\n        - python3\n---\n# last30days\n`,
+    );
+
+    expect(readSkillRuntimeRequirements(dir)).toEqual({
+      skillLocalBins: [],
+      runtimeBins: [],
+      baseCommands: [],
+    });
+  });
+
+  it('parses top-level bins in block and inline forms', () => {
+    const block = writeSkillMd(`---\nname: t\nbins:\n  - helper-a\n  - gws\n---\n# t\n`);
+    expect(readSkillRuntimeRequirements(block)).toEqual({
+      skillLocalBins: ['helper-a'],
+      runtimeBins: ['gws'],
+      baseCommands: [],
+    });
+
+    const inline = writeSkillMd(`---\nname: t\nbins: ["helper-a", "gws"]\n---\n# t\n`);
+    expect(readSkillRuntimeRequirements(inline)).toEqual({
+      skillLocalBins: ['helper-a'],
+      runtimeBins: ['gws'],
+      baseCommands: [],
+    });
+  });
+
+  it('parses top-level skillLocalBins and skill_local_bins in block and inline forms', () => {
+    const block = writeSkillMd(
+      `---\nname: t\nskillLocalBins:\n  - helper-a\nskill_local_bins:\n  - helper-b\n---\n# t\n`,
+    );
+    expect(readSkillRuntimeRequirements(block)).toEqual({
+      skillLocalBins: ['helper-a', 'helper-b'],
+      runtimeBins: [],
+      baseCommands: [],
+    });
+
+    const inline = writeSkillMd(
+      `---\nname: t\nskillLocalBins: ["helper-a"]\nskill_local_bins: ["helper-b"]\n---\n# t\n`,
+    );
+    expect(readSkillRuntimeRequirements(inline)).toEqual({
+      skillLocalBins: ['helper-a', 'helper-b'],
+      runtimeBins: [],
+      baseCommands: [],
+    });
+  });
+
+  it('parses top-level runtimeBins and baseCommands (and snake_case aliases) in block and inline forms', () => {
+    const block = writeSkillMd(`---\nname: t\nruntimeBins:\n  - gws\nbaseCommands:\n  - bash\n  - node\n---\n# t\n`);
+    expect(readSkillRuntimeRequirements(block)).toEqual({
+      skillLocalBins: [],
+      runtimeBins: ['gws'],
+      baseCommands: ['bash', 'node'],
+    });
+
+    const inline = writeSkillMd(`---\nname: t\nruntime_bins: ["gws"]\nbase_commands: ["bash", "node"]\n---\n# t\n`);
+    expect(readSkillRuntimeRequirements(inline)).toEqual({
+      skillLocalBins: [],
+      runtimeBins: ['gws'],
+      baseCommands: ['bash', 'node'],
+    });
+  });
+
+  it('does not double-count a nested key shadowing a top-level key of the same name', () => {
+    const dir = writeSkillMd(
+      `---\nname: t\nbins: ["jq-helper"]\nmetadata:\n  openclaw:\n    requires:\n      bins:\n        - node\n        - python3\n---\n# t\n`,
+    );
+
+    expect(readSkillRuntimeRequirements(dir)).toEqual({
+      skillLocalBins: ['jq-helper'],
+      runtimeBins: [],
+      baseCommands: [],
+    });
+  });
+
+  it('ignores a nested gws runtime-shim declaration (fleet gws-* skills parse to empty)', () => {
+    // Real-world shape shared by the 25 deployed gws-* skills
+    // (gws-shared/SKILL.md): nested metadata.openclaw.requires.bins ["gws"]
+    // at indent 6. Before the fix this parsed to runtimeBins ['gws']; that
+    // entry was validation-only and the gws shim is image-provided at
+    // /usr/local/bin/gws, so the correct post-fix result is empty.
+    const dir = writeSkillMd(
+      `---\nname: gws-mail\ndescription: GWS mail helper.\nmetadata:\n  openclaw:\n    requires:\n      bins: ["gws"]\n---\n# gws-mail\n`,
+    );
+
+    expect(readSkillRuntimeRequirements(dir)).toEqual({
+      skillLocalBins: [],
+      runtimeBins: [],
+      baseCommands: [],
+    });
   });
 });

@@ -380,7 +380,12 @@ function extractFrontmatter(body: string): string | null {
 function readYamlStringList(frontmatter: string, key: string): string[] {
   const lines = frontmatter.split(/\r?\n/);
   const values: string[] = [];
-  const keyPattern = new RegExp(`^\\s*${escapeRegExp(key)}\\s*:\\s*(.*)$`);
+  // Only TOP-LEVEL frontmatter keys (column 0) count as bin/helper
+  // declarations. Nested occurrences at any depth — e.g. the informational
+  // metadata.openclaw.requires.bins block that upstream skills carry — must
+  // be ignored: an indentation-agnostic match here turned into deterministic
+  // fleet-wide spawn failures on 2026-08-07 (shapiroserver2 kata 23ma).
+  const keyPattern = new RegExp(`^${escapeRegExp(key)}\\s*:\\s*(.*)$`);
   for (let i = 0; i < lines.length; i += 1) {
     const match = lines[i].match(keyPattern);
     if (!match) continue;
