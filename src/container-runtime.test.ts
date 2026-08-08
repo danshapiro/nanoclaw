@@ -81,10 +81,17 @@ describe('agent container Dockerfile', () => {
 
     // Pinned uv provides a managed CPython 3.12 for skills needing PEP 701
     // (shapiroserver2 kata 68q9); the distro 3.11 stack must stay untouched.
-    expect(dockerfile).toMatch(/^ARG UV_VERSION=\d+\.\d+\.\d+$/m);
+    // The uv helper stage is pinned by digest (tag is human context only).
+    expect(dockerfile).toMatch(/^FROM ghcr\.io\/astral-sh\/uv:\d+\.\d+\.\d+@sha256:[a-f0-9]{64} AS uv-dist$/m);
     expect(dockerfile).toContain('uv python install 3.12');
-    expect(dockerfile).toContain('ln -s "$(uv python find 3.12)" /usr/local/bin/python3.12');
+    expect(dockerfile).toContain(
+      'ln -s "$(UV_PYTHON_INSTALL_DIR=/opt/uv/python uv python find 3.12)" /usr/local/bin/python3.12',
+    );
+    // UV_PYTHON_INSTALL_DIR must be scoped to the build RUN, never a global
+    // ENV: agent-user runtime `uv python install` self-provisioning would
+    // otherwise fail against the read-only baked /opt/uv/python tree.
     expect(dockerfile).toContain('UV_PYTHON_INSTALL_DIR=/opt/uv/python');
+    expect(dockerfile).not.toMatch(/^ENV UV_PYTHON_INSTALL_DIR/m);
     expect(dockerfile).toContain('python-is-python3');
     expect(dockerfile).toContain('python3-jsonschema');
   });

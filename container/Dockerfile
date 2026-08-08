@@ -12,9 +12,10 @@
 
 # ---- uv (pinned) ---------------------------------------------------------
 # Distroless helper stage providing the static `uv` binary used below to
-# install a managed CPython 3.12. Pinned like every other tool in this image.
-ARG UV_VERSION=0.12.3
-FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv-dist
+# install a managed CPython 3.12 and retained at runtime so skills can
+# self-provision other pinned Python versions. Pinned by digest (the tag is
+# human-readable context only; the digest is authoritative). uv 0.12.3.
+FROM ghcr.io/astral-sh/uv:0.12.3@sha256:2d890623d310b57771ce840f0da5eed5fc6d657da05ffaa45d82797b53fa3abc AS uv-dist
 
 FROM node:22-slim
 
@@ -185,12 +186,25 @@ RUN curl -fsSL --retry 3 \
 # run as an arbitrary host uid with no /etc/passwd entry (999:987 in
 # production), so the interpreter lives outside any home directory and is
 # world-readable/executable.
-# Bump UV_VERSION on a regular cadence: it transitively pins the CPython
+# Bump the uv digest on a regular cadence: it transitively pins the CPython
 # 3.12.x patch level (3.12 receives security fixes until 2028-10).
-ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
+#
+# Python contract for this image (operator-adopted, 2026-08-08):
+# - distro python3 (3.11, apt) serves OS tooling only (python3-jsonschema
+#   and friends); never repoint or upgrade it in place.
+# - python3.12 on PATH is the baked, pinned default interpreter for skills;
+#   it lives in the root-owned, read-only /opt/uv/python tree.
+# - `uv` on PATH lets skills self-provision OTHER pinned Python versions at
+#   runtime (several third-party skills carry `uv python install X`
+#   preflight fallbacks). UV_PYTHON_INSTALL_DIR is deliberately NOT a
+#   container ENV: runtime installs default to the agent user's writable
+#   HOME (/home/node, world-writable, container-ephemeral) instead of
+#   failing against the read-only baked tree. New versions ride container
+#   recycles; anything durable belongs in the image via a digest bump.
 COPY --from=uv-dist /uv /usr/local/bin/uv
-RUN UV_CACHE_DIR=/tmp/uv-cache uv python install 3.12 && \
-    ln -s "$(uv python find 3.12)" /usr/local/bin/python3.12 && \
+RUN UV_CACHE_DIR=/tmp/uv-cache UV_PYTHON_INSTALL_DIR=/opt/uv/python \
+      uv python install 3.12 && \
+    ln -s "$(UV_PYTHON_INSTALL_DIR=/opt/uv/python uv python find 3.12)" /usr/local/bin/python3.12 && \
     chmod -R a+rX /opt/uv && \
     rm -rf /tmp/uv-cache && \
     python3.12 --version && \
