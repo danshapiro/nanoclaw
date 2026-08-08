@@ -23,6 +23,8 @@
 - **Never commit** the untracked `package-lock.json` at the worktree root (the repo is pnpm-canonical; `pnpm-lock.yaml` is the only tracked lockfile). Always `git add` explicit file paths; never `git add -A` / `git add .`.
 - **No new package dependencies** (npm or pnpm) — no YAML library.
 - The pre-commit hook (`.husky/pre-commit`) runs `pnpm run format:fix`. If `pnpm` is not on PATH, run `corepack enable` first (Node 22 ships corepack). Do not bypass the hook with `--no-verify` for code commits.
+- **Toolchain/tree remediation (load-bearing validation finding, 2026-08-07):** the worktree starts DIRTY — 22 modified tracked files under `src/`, byte-for-byte prettier churn from the npm-installed prettier 3.9.6 (pnpm canon: 3.8.2), left behind by the plan commit's hook run. Task 1 Step 0 remediates BEFORE any other work. Explicit-path `git add` (already policy) keeps these files out of commits regardless.
+- **Docker credentials (load-bearing validation finding, 2026-08-07):** this machine's `~/.docker/config.json` carries a stale `credsStore: desktop.exe` that breaks EVERY registry pull (even `docker pull hello-world`). Any docker command that contacts a registry (builds, pulls, `docker manifest inspect`) must run with a clean config: `export DOCKER_CONFIG="$(mktemp -d)"` first. Never edit `~/.docker/config.json` itself.
 - `AGENTS.md` (repo root) rule: subagents report to their caller, not directly to the user. `README.md` is not touched.
 - Report the final `overlay/shapiroserver2` SHA prominently at the end (the follow-up deploy task pins it).
 
@@ -33,7 +35,7 @@
 | File | Action | Responsibility |
 |---|---|---|
 | `src/yente/managed-skills.ts` | Modify (1 regex + comment, in `readYamlStringList`, ~line 383) | Frontmatter key scan becomes top-level-only |
-| `src/yente/managed-skills.test.ts` | Modify (add 1 import, 1 new `describe` with 5 tests, 1 new e2e test, rewrite 4 nested fixture strings in 3 existing tests) | Regression coverage for kata 23ma + both parse forms |
+| `src/yente/managed-skills.test.ts` | Modify (add 1 import, 1 new `describe` with 6 tests, 1 new e2e test, rewrite 4 nested fixture strings in 3 existing tests) | Regression coverage for kata 23ma + both parse forms |
 | `container/Dockerfile` | Modify (add `ARG UV_VERSION` + uv stage before `FROM node:22-slim`; add Python 3.12 block after the yt-dlp block) | Bake uv-managed CPython 3.12 alongside distro 3.11 |
 | `container/build.sh` | Modify (add a second in-image verification run) | Durable non-root python3.12 + unchanged python3 smoke on every build (deploy runs this script) |
 | `src/container-runtime.test.ts` | Modify (add 1 guard test to the existing `describe('agent container Dockerfile')` block) | Pin the new Dockerfile lines so they can't silently regress |
@@ -59,6 +61,22 @@ Scope check: the two fixes touch independent subsystems (TS runtime scan; contai
 Background you need (verified against the current source): `readYamlStringList(frontmatter, key)` builds `` new RegExp(`^\\s*${escapeRegExp(key)}\\s*:\\s*(.*)$`) `` — the leading `\\s*` makes it match the key at ANY indentation, so the nested informational block that upstream skills carry (`metadata:` → `openclaw:` → `requires:` → `bins:`) is misread as a declaration. `readSkillRuntimeRequirements` routes `bins` entries through `RUNTIME_SHIM_BINS = new Set(['gws'])`: `gws` → `runtimeBins`, anything else → `skillLocalBins`. `synthesizeSkillBinLinks` (called from `resolveManagedSkillRoot`) then throws `Skill "<name>" declares helper "<bin>" but executable script is missing: <path>/scripts/<bin>` for any `skillLocalBins` entry without an executable `scripts/<bin>` — that throw is what killed every container spawn fleet-wide.
 
 **Important:** three existing tests in `managed-skills.test.ts` declare requirements in the NESTED form (`metadata.openclaw.requires.*`) — they pin the buggy behavior and MUST be rewritten to the top-level form (Step 4). A repo-wide audit confirmed these are the only nested fixtures in any test file, and the only bundled skill declaring bins (`container/skills/local-skills/SKILL.md`) already uses the top-level form `bins: ["publish-local-skill"]`, so it keeps working unchanged.
+
+- [ ] **Step 0: Restore toolchain canon and clean the pre-existing formatter churn (validated blocker)**
+
+Load-bearing validation (2026-08-07) proved the worktree starts dirty: 22 tracked files under `src/` carry formatting-only churn (33 leading-union-pipe removals, zero semantic edits) — byte-for-byte the output of the npm-installed prettier 3.9.6 over the 3.8.2-canonical HEAD, produced by the plan commit's pre-commit hook. The tracked `pnpm-lock.yaml` pins prettier 3.8.2 / vitest 4.1.4 / js-yaml 4.1.1; the npm flat install drifted to 3.9.6 / 4.1.10 / 4.3.1 (typescript 5.9.3 matches). Remediate before touching anything else:
+
+```bash
+cd /home/dan/code/nanoclaw-frontmatter-py312/.worktrees/frontmatter-py312
+git status --porcelain        # expect: 22 ' M src/...' lines + '?? package-lock.json'
+git diff --stat               # expect ~33 insertions(+), 74 deletions(-) of formatting-only union-pipe rewraps
+corepack enable               # Node 22 ships corepack; provides pnpm
+pnpm install --frozen-lockfile   # realign node_modules to pnpm-lock.yaml; needs network; changes no lockfile
+git restore src/
+git status --short            # expect ONLY '?? package-lock.json'
+```
+
+If `git diff` shows ANYTHING beyond formatting-only rewraps (added/removed identifiers or logic), STOP — do not restore; investigate first. If `pnpm install --frozen-lockfile` fails (network/policy), fall back to leaving the 22 files unrestored and untouched — explicit-path `git add` keeps them out of every commit, and the Task-1 target files are provably formatted identically under both prettier versions — but record the deviation: Task 3 Step 2's clean-tree expectation will then show exactly those 22 files. Leave the untracked `package-lock.json` in place either way (never commit it).
 
 - [ ] **Step 1: Write the failing regression tests**
 
@@ -199,6 +217,23 @@ describe('readSkillRuntimeRequirements', () => {
       baseCommands: [],
     });
   });
+
+  it('ignores a nested gws runtime-shim declaration (fleet gws-* skills parse to empty)', () => {
+    // Real-world shape shared by the 25 deployed gws-* skills
+    // (gws-shared/SKILL.md): nested metadata.openclaw.requires.bins ["gws"]
+    // at indent 6. Before the fix this parsed to runtimeBins ['gws']; that
+    // entry was validation-only and the gws shim is image-provided at
+    // /usr/local/bin/gws, so the correct post-fix result is empty.
+    const dir = writeSkillMd(
+      `---\nname: gws-mail\ndescription: GWS mail helper.\nmetadata:\n  openclaw:\n    requires:\n      bins: ["gws"]\n---\n# gws-mail\n`,
+    );
+
+    expect(readSkillRuntimeRequirements(dir)).toEqual({
+      skillLocalBins: [],
+      runtimeBins: [],
+      baseCommands: [],
+    });
+  });
 });
 ```
 
@@ -211,10 +246,11 @@ Run (from the worktree root):
 cd /home/dan/code/nanoclaw-frontmatter-py312/.worktrees/frontmatter-py312
 npx vitest run src/yente/managed-skills.test.ts
 ```
-Expected: exactly **3 failures**, all demonstrating the bug — record this output as the red evidence:
+Expected: exactly **4 failures**, all demonstrating the bug — record this output as the red evidence:
 - `spawns cleanly when bins appear only nested under informational metadata (last30days regression)` — FAILS with thrown `Skill "last30days" declares helper "node" but executable script is missing: ...`
 - `ignores bin keys nested under informational metadata at any depth` — FAILS: received `skillLocalBins: ['node', 'python3']`, expected `[]`
 - `does not double-count a nested key shadowing a top-level key of the same name` — FAILS: received `skillLocalBins: ['jq-helper', 'node', 'python3']`, expected `['jq-helper']`
+- `ignores a nested gws runtime-shim declaration (fleet gws-* skills parse to empty)` — FAILS: received `runtimeBins: ['gws']`, expected `[]`
 
 The three "parses top-level ..." tests PASS against unfixed code (they pin behavior that must be preserved). All pre-existing tests still pass. If the failures differ from the above, stop and reconcile before proceeding.
 
@@ -288,12 +324,12 @@ Expected: the only matches are in the fixtures added in Step 1 (the two `last30d
 - [ ] **Step 5: Run the test file to verify green**
 
 Run: `npx vitest run src/yente/managed-skills.test.ts`
-Expected: PASS — all tests in the file (previous count plus the 6 new tests), 0 failures.
+Expected: PASS — all tests in the file (previous count plus the 7 new tests), 0 failures.
 
 - [ ] **Step 6: Run the full suite**
 
 Run: `npm test` (allow up to 10 minutes)
-Expected: PASS — 96+ files, 1177+ tests, 0 failures. Any failure elsewhere means an unaccounted consumer of the nested form — stop and investigate before committing.
+Expected: PASS — 96+ files, 1178+ tests, 0 failures. Any failure elsewhere means an unaccounted consumer of the nested form — stop and investigate before committing.
 
 - [ ] **Step 7: Commit (scan fix + tests together — spec-mandated scoping)**
 
@@ -315,7 +351,8 @@ Keys now only count at column 0 of the frontmatter block; block-list and
 inline forms keep working for every top-level key alias. Existing test
 fixtures that declared requirements under metadata.openclaw.requires move
 to the top-level form; new regression tests pin the last30days shape, both
-parse forms for every key alias, and nested/top-level shadowing.
+parse forms for every key alias, nested/top-level shadowing, and the
+fleet's nested gws runtime-shim shape.
 
 🤖 Generated with [Amplifier](https://github.com/microsoft/amplifier)
 
@@ -376,12 +413,12 @@ Expected: FAIL — `expected ... to match /^ARG UV_VERSION=...$/m` (the Dockerfi
 # ---- uv (pinned) ---------------------------------------------------------
 # Distroless helper stage providing the static `uv` binary used below to
 # install a managed CPython 3.12. Pinned like every other tool in this image.
-ARG UV_VERSION=0.5.11
+ARG UV_VERSION=0.12.3
 FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv-dist
 
 ```
 
-(The `ARG` must sit before the first `FROM` to be usable in the `FROM` line. If pulling `ghcr.io/astral-sh/uv:0.5.11` fails at build time, verify tag availability with `docker manifest inspect ghcr.io/astral-sh/uv:0.5.11`; if the registry has retired it, bump `UV_VERSION` to the newest tag listed at https://github.com/astral-sh/uv/releases — any uv >= 0.5.11 works for `uv python install 3.12`.)
+(The `ARG` must sit before the first `FROM` to be usable in the `FROM` line. `0.12.3` is the latest stable uv as of 2026-08-07 and was validated end-to-end in the load-bearing probe: the tag is anonymously pullable (amd64+arm64 manifest) and `uv python install 3.12` resolves CPython 3.12.13, the current 3.12 security patch. Do NOT regress the pin toward the 2024-era 0.5.11: it installs CPython 3.12.8, which misses the 3.12.11–3.12.13 security-only fixes (tarfile extraction-filter CVE-2024-12718 / CVE-2025-4138 / 4330 / 4435 / 4517, libexpat CVE-2025-59375, email header injection CVE-2024-6923). If pulling the tag fails at build time, first re-check the clean-`DOCKER_CONFIG` rule (Global Constraints), then verify availability with `docker manifest inspect ghcr.io/astral-sh/uv:0.12.3`; if the registry has genuinely retired it, bump `UV_VERSION` to the newest tag listed at https://github.com/astral-sh/uv/releases — any uv >= 0.5.11 supports `uv python install 3.12`.)
 
 3b. AFTER the yt-dlp block (it ends with `test "$(yt-dlp --version)" = "$YT_DLP_VERSION"`) and BEFORE the `# ---- GWS policy proxy shim` comment, insert:
 
@@ -395,6 +432,8 @@ FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv-dist
 # run as an arbitrary host uid with no /etc/passwd entry (999:987 in
 # production), so the interpreter lives outside any home directory and is
 # world-readable/executable.
+# Bump UV_VERSION on a regular cadence: it transitively pins the CPython
+# 3.12.x patch level (3.12 receives security fixes until 2028-10).
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
 COPY --from=uv-dist /uv /usr/local/bin/uv
 RUN UV_CACHE_DIR=/tmp/uv-cache uv python install 3.12 && \
@@ -441,6 +480,7 @@ Expected: PASS — the new test and ALL pre-existing Dockerfile guard tests (apt
 Run (long: first local build downloads chromium, bun, pinned CLIs — allow 30+ minutes; requires network):
 ```bash
 cd /home/dan/code/nanoclaw-frontmatter-py312/.worktrees/frontmatter-py312
+export DOCKER_CONFIG="$(mktemp -d)"   # validated: the default ~/.docker/config.json credsStore breaks all pulls; never edit the user's config
 bash container/build.sh py312-local
 ```
 This is the same script the production deploy invokes (deploy runs it with the release SHA as the tag; `py312-local` is a representative local tag). Expected: build succeeds; the in-Dockerfile self-check prints `Python 3.12.x` then a `Python 3.11.2` grep match; the yt-dlp verification passes; the NEW python verification block prints `Python 3.12.x` and the full `sys.version` string and exits cleanly; final output `Build complete!` with `Image: nanoclaw-agent-v2-<slug>:py312-local`. Record the printed image name for Step 7.
@@ -449,6 +489,7 @@ This is the same script the production deploy invokes (deploy runs it with the r
 
 ```bash
 cd /home/dan/code/nanoclaw-frontmatter-py312/.worktrees/frontmatter-py312
+export DOCKER_CONFIG="$(mktemp -d)"   # same credsStore workaround as Step 6 (harmless for local-image runs; required if anything pulls)
 IMAGE_BASE="$(source setup/lib/install-slug.sh && container_image_base)"
 docker run --rm --network none --user 999:987 -e HOME=/home/node \
   --entrypoint sh "${IMAGE_BASE}:py312-local" -c 'set -eu
@@ -467,7 +508,7 @@ Expected output (record it as validation evidence):
 - `3.12.<x> (...)` from `sys.version`
 - `Python 3.11.2` for `python3` AND `python` (distro stack untouched, `python-is-python3` intact)
 - `command -v python3.12` → `/usr/local/bin/python3.12`
-- `/opt/uv` around 100–200M and `uv` around 30–50M — reasonable growth. If `/opt/uv` exceeds ~300M, investigate before committing (likely a leftover cache — the `rm -rf /tmp/uv-cache` must be in the same RUN layer).
+- `/opt/uv` around 100–200M (probe-validated: 104M with uv 0.12.3) and the `uv` binary a few tens of MB — reasonable growth. If `/opt/uv` exceeds ~300M, investigate before committing (likely a leftover cache — the `rm -rf /tmp/uv-cache` must be in the same RUN layer).
 
 If any of these fail, fix the Dockerfile (permissions → check `chmod -R a+rX /opt/uv`; PATH → the symlink must be exactly `/usr/local/bin/python3.12`) and repeat Steps 6–7. Compiling CPython from source is the fallback ONLY if the uv route proves unworkable.
 
@@ -522,7 +563,7 @@ npm run typecheck
 npm run build
 npm test
 ```
-Expected: all three exit 0; `npm test` reports 0 failures across 96+ files / 1177+ tests (baseline 1171 + Task 1's 6 new tests + Task 2's 1 guard test). Any failure: stop, fix on the branch, re-run all three.
+Expected: all three exit 0; `npm test` reports 0 failures across 96+ files / 1179+ tests (baseline 1171 + Task 1's 7 new tests + Task 2's 1 guard test). Any failure: stop, fix on the branch, re-run all three.
 
 - [ ] **Step 2: Confirm working tree and branch state**
 
@@ -530,7 +571,7 @@ Expected: all three exit 0; `npm test` reports 0 failures across 96+ files / 117
 git -C /home/dan/code/nanoclaw-frontmatter-py312/.worktrees/frontmatter-py312 status --short
 git -C /home/dan/code/nanoclaw-frontmatter-py312/.worktrees/frontmatter-py312 log --oneline overlay/shapiroserver2..fix/frontmatter-py312
 ```
-Expected: status shows ONLY the untracked `package-lock.json` (leave it: untracked, never committed); the log shows exactly three commits — the plan commit (`docs: add implementation plan for frontmatter-py312`), the Fix 1 commit (`fix(yente): ...`), and the Fix 2 commit (`feat(container): ...`).
+Expected: status shows ONLY the untracked `package-lock.json` (leave it: untracked, never committed). Task 1 Step 0 already restored the pre-existing formatter churn, so any OTHER modification appearing here is unexpected — stop and investigate (exception: if Step 0's documented pnpm-failure fallback was taken, exactly the 22 known churn files may appear; verify they are exactly those and that no commit includes them). The log shows exactly four commits — the plan commit (`docs: add implementation plan for frontmatter-py312`), the plan-hardening commit (`docs: harden frontmatter-py312 plan with load-bearing validation findings`), the Fix 1 commit (`fix(yente): ...`), and the Fix 2 commit (`feat(container): ...`).
 
 - [ ] **Step 3: Fast-forward merge into overlay/shapiroserver2**
 
@@ -586,4 +627,5 @@ Also restate for the follow-up deploy task: (a) do NOT touch the shapiroserver2 
 1. **Spec coverage:** Fix 1 required behavior (top-level-only; both forms preserved; last30days fixture; double-count case; extend existing test file) → Task 1 Steps 1–5. Red-before-green → Task 1 Step 2. Fix 2 (add 3.12 without disturbing 3.11 stack; pinned uv; non-root world-readable; size; empirical docker build via the deploy-representative `container/build.sh`; `python3.12 --version`, `sys.version`, `python3` still 3.11) → Task 2 Steps 3–7. Quality bar (`npm run typecheck` / `npm run build` / `npm test`) → Task 3 Step 1. Two separately-revertible commits → Task 1 Step 7 / Task 2 Step 8. Merge + push to fork only, never upstream; SHA reported prominently → Task 3 Steps 3–5. Commit conventions + Amplifier co-author → the two heredoc messages. No deploy-config changes → Global Constraints + Task 3 Step 5 note. No gaps found.
 2. **No silent deferrals:** the only excluded work (production deploy + live validation) is the spec's explicit boundary for the follow-up task, not a scope reduction. Fix 1's user-facing outcome (spawns no longer hard-fail) is proven by a real end-to-end test through `resolveManagedSkillRoot` with no stubs/mocks (the suite uses real temp dirs and the real parser). Fix 2's outcome is proven empirically against the actually-built image as a passwd-less non-root uid — no mocks anywhere in this plan.
 3. **Placeholder scan:** every code step contains complete code; every command has expected output; no TBD/TODO/"similar to" references.
-4. **Type consistency:** all assertions use the `SkillRuntimeRequirements` shape `{ skillLocalBins, runtimeBins, baseCommands }` matching `readSkillRuntimeRequirements(skillDir: string)`; helper names (`makeTempDir`, `makeSkill`, `writeSkillMd`) are used consistently; Dockerfile strings asserted by the guard test exactly match the strings inserted in Task 2 Step 3 (`ARG UV_VERSION=0.5.11`, `uv python install 3.12`, `ln -s "$(uv python find 3.12)" /usr/local/bin/python3.12`, `UV_PYTHON_INSTALL_DIR=/opt/uv/python`).
+4. **Type consistency:** all assertions use the `SkillRuntimeRequirements` shape `{ skillLocalBins, runtimeBins, baseCommands }` matching `readSkillRuntimeRequirements(skillDir: string)`; helper names (`makeTempDir`, `makeSkill`, `writeSkillMd`) are used consistently; Dockerfile strings asserted by the guard test exactly match the strings inserted in Task 2 Step 3 (`ARG UV_VERSION=0.12.3`, `uv python install 3.12`, `ln -s "$(uv python find 3.12)" /usr/local/bin/python3.12`, `UV_PYTHON_INSTALL_DIR=/opt/uv/python`).
+5. **Load-bearing validation addendum (2026-08-07, workflow Stage 2):** ten assumptions were verified/falsified/accepted (ledger: `.worktrees/.the-usual-logs/frontmatter-py312/load-bearing-ledger.md`); the resulting edits were re-reviewed against this checklist. (a) `UV_VERSION` bumped 0.5.11 → 0.12.3 (probe-validated: anonymously pullable amd64+arm64; installs CPython 3.12.13; verified as passwd-less uid 999:987 under `--cap-drop=ALL`/`no-new-privileges`) — the guard-test regex `/^ARG UV_VERSION=\d+\.\d+\.\d+$/m` and every literal string asserted in Task 2 Step 1 still exactly match the Step 3 insertions. (b) New Task 1 Step 0 remediation (corepack + `pnpm install --frozen-lockfile` + verified `git restore src/`) with complete commands, expected outputs, and a workable no-network fallback — driven by the falsified clean-tree/toolchain-parity assumption. (c) New gws-shim nested-declaration unit test with red expectation added to Step 2 (now 4 failures) and counts propagated everywhere (7 new Task 1 tests; 1178+ after Task 1; 1179+ at Task 3; four commits at Task 3 Step 2). (d) Clean-`DOCKER_CONFIG` rule (Global Constraints + Task 2 Steps 6–7) for the falsified docker-credential assumption. No placeholders introduced; every new command carries expected output; user-facing outcomes remain proven by real end-to-end tests and the empirical image build (no mocks).
