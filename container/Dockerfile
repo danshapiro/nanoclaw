@@ -10,6 +10,12 @@
 # bind mount at runtime (see src/container-runner.ts). Source-only changes
 # never require an image rebuild.
 
+# ---- uv (pinned) ---------------------------------------------------------
+# Distroless helper stage providing the static `uv` binary used below to
+# install a managed CPython 3.12. Pinned like every other tool in this image.
+ARG UV_VERSION=0.12.3
+FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv-dist
+
 FROM node:22-slim
 
 # ---- Build-time arguments ----------------------------------------------------
@@ -169,6 +175,26 @@ RUN curl -fsSL --retry 3 \
     chmod 0755 /usr/local/bin/yt-dlp && \
     printf '%s\n' '--js-runtimes node' > /etc/yt-dlp.conf && \
     test "$(yt-dlp --version)" = "$YT_DLP_VERSION"
+
+# ---- Python 3.12 (uv-managed) --------------------------------------------
+# Debian bookworm ships python3 = 3.11 only (no python3.12 apt package), but
+# the last30days research skill's engine needs Python 3.12+ (PEP 701
+# f-string grammar) - shapiroserver2 kata 68q9. Bake a uv-managed CPython
+# 3.12 ALONGSIDE the distro stack: python3 / python-is-python3 /
+# python3-jsonschema / python3-pip stay untouched at 3.11. Agent processes
+# run as an arbitrary host uid with no /etc/passwd entry (999:987 in
+# production), so the interpreter lives outside any home directory and is
+# world-readable/executable.
+# Bump UV_VERSION on a regular cadence: it transitively pins the CPython
+# 3.12.x patch level (3.12 receives security fixes until 2028-10).
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
+COPY --from=uv-dist /uv /usr/local/bin/uv
+RUN UV_CACHE_DIR=/tmp/uv-cache uv python install 3.12 && \
+    ln -s "$(uv python find 3.12)" /usr/local/bin/python3.12 && \
+    chmod -R a+rX /opt/uv && \
+    rm -rf /tmp/uv-cache && \
+    python3.12 --version && \
+    python3 --version 2>&1 | grep -F 'Python 3.11'
 
 # ---- GWS policy proxy shim ---------------------------------------------------
 # Agent containers must not include the real Google Workspace CLI or OAuth

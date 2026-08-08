@@ -55,6 +55,22 @@ grep -Eq "JS runtimes: node(-[0-9.]+)?" /tmp/yt-dlp-smoke.out
 grep -Eq "exe versions:.*ffmpeg .*ffprobe " /tmp/yt-dlp-smoke.out
 grep -q "ERROR: Unsupported URL:" /tmp/yt-dlp-smoke.out'
 
+echo "Verifying python3.12 (uv-managed) alongside distro python3 as a non-root uid..."
+# Mirror production agent spawns: an arbitrary host uid with no /etc/passwd
+# entry (src/container-runner.ts pushes --user <uid>:<gid> + HOME=/home/node).
+# shellcheck disable=SC2016 # The quoted script expands inside the container.
+${CONTAINER_RUNTIME} run --rm \
+    --network none \
+    --user 12345:12345 \
+    -e HOME=/home/node \
+    --entrypoint sh \
+    "${IMAGE_NAME}:${TAG}" \
+    -c 'set -eu
+python3.12 --version
+python3.12 -c "import sys; print(sys.version)"
+case "$(python3.12 --version 2>&1)" in "Python 3.12."*) ;; *) echo "unexpected python3.12 version" >&2; exit 1 ;; esac
+case "$(python3 --version 2>&1)" in "Python 3.11."*) ;; *) echo "distro python3 is no longer 3.11" >&2; exit 1 ;; esac'
+
 echo ""
 echo "Build complete!"
 echo "Image: ${IMAGE_NAME}:${TAG}"
