@@ -671,7 +671,9 @@ describe('discord ingress chain: bridge dispatch → acceptance hook → ledger'
         captured = chat as never;
       },
       channelIdFromThreadId: (threadId: string) => threadId,
-      startGatewayListener: async () => new Response('ok'),
+      // No startGatewayListener: this test drives handleForwardedMessage →
+      // handleIncomingMessage directly, so setup takes the SDK-owned webhook
+      // path and no per-test local server starts (delta review round 8).
       // The wrapper binds the outbound methods at wrap time; stub them like fakeAdapter().
       postMessage: vi.fn(async () => 'mid'),
       editMessage: vi.fn(async () => undefined),

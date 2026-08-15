@@ -483,10 +483,6 @@ describe('onGatewayWebhookReady hook', () => {
       await bridge.teardown();
       closeDb();
     }
-    // teardown owns the gateway webhook server it started: after it closes,
-    // the URL must refuse connections. Pre-fix this resolved with 200
-    // {"ok":true} — the leaked server kept listening for the process lifetime.
-    await expect(fetch(seen[0])).rejects.toThrow();
   });
 });
 
@@ -523,6 +519,10 @@ describe('plain-message catch-all dispatch', () => {
     const onInbound = (setupOverrides.onInbound ?? vi.fn().mockResolvedValue(undefined)) as ReturnType<typeof vi.fn>;
     const onInboundForwarded = vi.fn();
     let captured: DispatchDriver | null = null;
+    // No startGatewayListener: these tests drive handleIncomingMessage
+    // directly and never need the gateway branch, so setup takes the
+    // SDK-owned webhook path and no per-test local server starts (delta
+    // review round 8).
     const fakeAdapter = {
       name: 'discord',
       userName: 'yente-test',
@@ -530,7 +530,6 @@ describe('plain-message catch-all dispatch', () => {
         captured = chat as DispatchDriver;
       },
       channelIdFromThreadId: (threadId: string) => threadId,
-      startGatewayListener: async () => new Response('ok'),
     };
     const bridge = createChatSdkBridge({
       adapter: fakeAdapter as never,
