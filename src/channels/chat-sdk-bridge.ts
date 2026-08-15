@@ -494,7 +494,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
 
       // Plain messages in unsubscribed threads.
       //
-      // Chat SDK dispatch (handling-events.mdx §"Handler dispatch order") is
+      // Chat SDK dispatch (handling-events.mdx §"How routing works") is
       // exclusive: subscribed → onSubscribedMessage; unsubscribed+mention →
       // onNewMention; unsubscribed+pattern-match → onNewMessage. Registering
       // with `/[\s\S]*/` — which intentionally also matches the empty string —
