@@ -429,12 +429,17 @@ export async function forwardChatSdkInboundMessage<
       isMention,
       isGroup,
       source,
-      onInbound: setupConfig.onInbound,
+      // Prefer the strict variant so router failures propagate and the
+      // acceptance hook stays silent — the message remains catch-up eligible
+      // instead of being falsely marked routed (delta-review round-1 fix).
+      onInbound: setupConfig.onInboundStrict ?? setupConfig.onInbound,
       toInbound: messageToInbound,
       onForwarded: config.onInboundForwarded,
     });
   }
 ```
+
+(The strict-preferred pass-through was added by delta-review remediation; two acceptance-contract tests — strict path preferred, hook silent when strict rejects — live in the same describe block. The harness gained an optional `setupOverrides` bag to support them; see commit 0da9782f.)
 
 4. Plumb the dedupe override into the Chat construction in `setup()` (the SDK is fine with an explicit `undefined` — it consumes the value via `?? DEDUPE_TTL_MS`):
 
