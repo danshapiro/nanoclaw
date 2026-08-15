@@ -481,12 +481,13 @@ git commit -m "feat(channels): add onInboundForwarded hook and configurable dedu
 - Consumes: `ChatSdkBridgeConfig.onInboundForwarded` and `ChatSdkBridgeConfig.dedupeTtlMs` from Task 2; `DiscordAdapter.botUserId` (public readonly, set at adapter construction — verified in vendored `@chat-adapter/discord` dist).
 - Produces:
   - `YenteDiscordWrapOptions.wasMessageHandled: (messageId: string) => boolean` — **required** consume-on-read acceptance probe: returns `true` exactly once per message id that was actually forwarded inbound by a dispatch handler.
+  - `dedupeTtlForRouteLease(routeLeaseMs: number): number` — exported pure derivation (`Math.max(1, Math.floor(routeLeaseMs / 4))`) used by the factory and unit-tested.
 
 Current bug this fixes: after `originalHandleForwardedMessage` resolves, the wrapper calls `markDiscordMessageRouted` unconditionally (src/channels/discord.ts:552). The vendored adapter resolves even when no dispatch handler matched (e.g. the Task 1 drop), so the ledger recorded a never-handled message as terminal `routed` and catch-up could never retry it.
 
-Design: the Discord channel factory holds a shared `Set<string>`. The bridge's `onInboundForwarded` hook adds ids; the wrapper's step-3 outcome consults via `Set.delete` (consume-on-read: one forward → one consult). Own-bot messages stay terminal `routed` by an explicit carve-out, because the SDK filters them before dispatch and the bridge same-bot guard drops any that slip through — no handler ever fires for them, and that drop is intentional.
+Design: the Discord channel factory holds a shared `Set<string>`. The bridge's `onInboundForwarded` hook adds ids; the wrapper's step-3 outcome consults via `Set.delete` (consume-on-read: one forward → one consult). The bot's OWN messages are bypassed BEFORE the claim and forward entirely (they are intentionally never dispatched — the SDK filters them pre-dispatch via isMe and the bridge same-bot guard drops any remainder), so they never enter the ledger: that keeps the invariant "`routed` is recorded only when a dispatch handler actually accepted the message" true by construction, with no falsely-terminal rows and no catch-up churn (plan-review finding 3).
 
-Retry-honesty alignment (from load-bearing validation V3, confirmed): the Chat SDK dedupes incoming message ids for a per-instance TTL defaulting to 300s, planted before dispatch with no compensation delete. The discord route lease is 120s and attempts increment only on claim (cap 3), so without an override a message marked `failed` for "no handler matched" can be abandoned after as few as two in-window catch-up sweeps — each re-claim burns an attempt while the dedupe entry short-circuits the re-presentation BEFORE dispatch, no handler ever runs, and the row goes terminal with zero real retries. Aligning `dedupeTtlMs: 30_000` (well under the 120s lease) in the factory guarantees every catch-up re-presentation reaches dispatch and burns an attempt only when a handler actually did not accept the message again. Value-of-record caveat now handled by construction; no residual to record.
+Retry-honesty alignment (from load-bearing validation V3, confirmed): the Chat SDK dedupes incoming message ids for a per-instance TTL defaulting to 300s, planted before dispatch with no compensation delete. The discord route lease (default 120s, env-configurable down to milliseconds) is the minimum catch-up re-presentation cadence, and attempts increment only on claim (cap 3), so without an override a message marked `failed` for "no handler matched" can be abandoned after as few as two in-window sweeps — each re-claim burns an attempt while the dedupe entry short-circuits the re-presentation BEFORE dispatch, no handler ever runs, and the row goes terminal with zero real retries. The factory therefore sets `dedupeTtlMs: dedupeTtlForRouteLease(catchupConfig.routeLeaseMs)` — one quarter of the configured lease, clamped to ≥1ms (the SDK treats 0 as permanent dedupe) — so every catch-up re-presentation reaches dispatch and burns an attempt only when a handler actually did not accept the message again. A fixed 30s constant was rejected at plan review (finding 2) because it is only safe against the default lease; the derivation tracks whatever lease is configured.
 
 - [ ] **Step 1: Write the failing behavioral tests**
 
@@ -537,28 +538,152 @@ Retry-honesty alignment (from load-bearing validation V3, confirmed): the Chat S
     );
   });
 
-  it("keeps the bot's own messages terminal even though no dispatch handler fires for them", async () => {
+  it("bypasses the ledger and the SDK entirely for the bot's own messages", async () => {
     const fake = { ...fakeAdapter(), botUserId: 'bot-1' };
+    const forwardSpy = fake.handleForwardedMessage;
     const wrapped = wrap(fake, [], ['chan-1'], () => false);
+    const cursorBefore = getDiscordChannelCursor('chan-1');
     const ownMessage = { ...message('m-own'), author: { id: 'bot-1', bot: true } };
 
-    await wrapped.handleForwardedMessage(ownMessage, {});
+    const result = await wrapped.handleForwardedMessage(ownMessage, {});
 
-    expect(getDiscordMessageRouteStatus('chan-1', 'm-own')).toBe('routed');
-    expect(isDiscordMessageTerminal('chan-1', 'm-own')).toBe(true);
+    expect(result).toBeUndefined();
+    // The SDK filters isMe messages pre-dispatch, so forwarding them is
+    // pointless — and no ledger row may exist for a message no dispatch
+    // handler could ever accept (the requested invariant).
+    expect(forwardSpy).not.toHaveBeenCalled();
+    expect(getDiscordMessageRouteStatus('chan-1', 'm-own')).toBeNull();
+    expect(getDiscordChannelCursor('chan-1')).toBe(cursorBefore);
   });
 ```
 
-3. Update the three remaining direct `wrapYenteDiscordChannelIds` call sites to pass `wasMessageHandled: () => true` with the same "fake always handles" comment, since the option becomes required:
+3. Add a `dedupeTtlForRouteLease` unit-test describe. Use a dynamic import so the missing-export red fails only THIS test (a static import of a not-yet-exported symbol would fail the whole file at module load):
+
+```ts
+describe('dedupeTtlForRouteLease', () => {
+  it('derives a dedupe TTL strictly below any configured route lease, never zero', async () => {
+    const mod = (await import('./discord.js')) as unknown as {
+      dedupeTtlForRouteLease?: (routeLeaseMs: number) => number;
+    };
+    if (!mod.dedupeTtlForRouteLease) throw new Error('dedupeTtlForRouteLease not exported');
+    const derive = mod.dedupeTtlForRouteLease;
+    expect(derive(120_000)).toBe(30_000); // default lease
+    expect(derive(100)).toBe(25);
+    expect(derive(3)).toBe(1); // clamped: 0 would mean permanent dedupe in the SDK
+    expect(derive(1)).toBe(1);
+  });
+});
+```
+
+4. Add ONE chain integration test (plan-review finding 4: unit tests inject the probe manually, so miswiring the production chain must be caught). New top-level describe in `src/channels/discord.test.ts` — it needs `Message` and `parseMarkdown` from `'chat'` and `createChatSdkBridge` from `./chat-sdk-bridge.js` added to imports:
+
+```ts
+describe('discord ingress chain: bridge dispatch → acceptance hook → ledger', () => {
+  it('marks routed only when the real dispatch chain accepted the message', async () => {
+    const db = initTestDb();
+    runMigrations(db);
+    const onInbound = vi.fn().mockResolvedValue(undefined);
+    // The set + closures mirror the production factory wiring exactly:
+    // the bridge hook writes; the wrapper consults via consume-on-read delete.
+    const handledMessageIds = new Set<string>();
+    let captured:
+      | { handleIncomingMessage(adapter: unknown, threadId: string, message: Message): Promise<void> }
+      | null = null;
+    const fake = {
+      name: 'discord',
+      userName: 'yente-test',
+      initialize: async (chat: unknown) => {
+        captured = chat as never;
+      },
+      channelIdFromThreadId: (threadId: string) => threadId,
+      startGatewayListener: async () => new Response('ok'),
+      // Mirrors the vendored adapter: its forward awaits chat.handleIncomingMessage.
+      handleForwardedMessage: vi.fn(
+        async (data: { id: string; channel_id: string; author: { id: string }; content: string }) => {
+          const driver = captured; // closure assignment defeats narrowing; re-check
+          if (!driver) throw new Error('Chat SDK did not initialize the adapter');
+          await driver.handleIncomingMessage(
+            fake,
+            data.channel_id,
+            new Message({
+              id: data.id,
+              threadId: data.channel_id,
+              text: data.content,
+              formatted: parseMarkdown(data.content),
+              raw: data,
+              author: { userId: data.author.id, userName: data.author.id, fullName: data.author.id, isBot: false, isMe: false },
+              metadata: { dateSent: new Date(), edited: false },
+              attachments: [],
+            }),
+          );
+          return 'handled';
+        },
+      ),
+    };
+    const wrapped = wrapYenteDiscordChannelIds(fake as never, 'test-token', new Set(), {
+      monitoredChannelIds: () => new Set(['chan-1']),
+      routeLeaseMs: 120000,
+      wasMessageHandled: (messageId) => handledMessageIds.delete(messageId),
+    });
+    const bridge = createChatSdkBridge({
+      adapter: wrapped as never,
+      supportsThreads: true,
+      botToken: 'test-token',
+      onInboundForwarded: (messageId) => handledMessageIds.add(messageId),
+    });
+    try {
+      await bridge.setup({
+        onInbound,
+        onInboundEvent: async () => {},
+        onMetadata: async () => {},
+        onAction: async () => {},
+      } as never);
+      if (!captured) throw new Error('Chat SDK did not initialize the adapter');
+
+      await wrapped.handleForwardedMessage(
+        {
+          id: 'm-chain',
+          channel_id: 'chan-1',
+          guild_id: 'guild-1',
+          author: { id: 'user-1', bot: false },
+          content: 'hello',
+          mentions: [],
+          attachments: [],
+        },
+        {},
+      );
+
+      // A real dispatch handler accepted the message.
+      expect(onInbound).toHaveBeenCalledTimes(1);
+      // The wrapper consumed the acceptance signal (regression pin: pre-fix
+      // the wrapper ignores the probe and the id would still sit in the set).
+      expect(handledMessageIds.size).toBe(0);
+      // ...so the ledger says routed and the monitored cursor advanced.
+      expect(getDiscordMessageRouteStatus('chan-1', 'm-chain')).toBe('routed');
+      expect(isDiscordMessageTerminal('chan-1', 'm-chain')).toBe(true);
+      expect(getDiscordChannelCursor('chan-1')).toBe('m-chain');
+    } finally {
+      await bridge.teardown();
+      closeDb();
+    }
+  });
+});
+```
+
+5. Update the three remaining direct `wrapYenteDiscordChannelIds` call sites to pass `wasMessageHandled: () => true` with the same "fake always handles" comment, since the option becomes required:
    - `src/channels/discord-catchup.integration.test.ts:77`;
    - `src/channels/discord.test.ts` ~line 466 (`'marks the route failed (keeping the lease) and rethrows; immediate retries drop, post-lease retries route'` — its final assertion expects the post-lease re-claim to be marked `routed`, which the always-handles probe preserves);
    - `src/channels/discord.test.ts` ~line 520 (`'taps gateway event types before forwarding'` — never calls `handleForwardedMessage`, but the type is required).
 
-- [ ] **Step 2: Run the tests and verify the intended failure**
+- [ ] **Step 2: Run the tests and verify the intended failures**
 
-Run: `pnpm test src/channels/discord.test.ts -t "failed, not routed"`
+Run: `pnpm test src/channels/discord.test.ts`
 
-Expected: FAIL because the wrapper still marks every message `routed` unconditionally — the new test observes status `routed` instead of `failed`. (The own-bot test also fails pre-fix for the same reason: status `routed` is expected there, so it passes only after the carve-out — pre-fix it fails because... no: pre-fix the wrapper marks routed unconditionally, so the own-bot test PASSES pre-fix. That is intentional: the own-bot test is a characterization guard against the new acceptance logic stranding self-messages, not a red regression test. The red test for this task is the "failed, not routed" one.)
+Expected: four intended reds (pre-existing tests stay green):
+- `'marks a message failed, not routed, when no dispatch handler accepted it'` FAILS because the wrapper still marks every message `routed` unconditionally — it observes status `routed` instead of `failed`.
+- `'bypasses the ledger and the SDK entirely for the bot's own messages'` FAILS because there is no pre-claim bypass yet — the wrapper claims and forwards, so `forwardSpy` HAS been called and a `routed` row exists.
+- `'dedupeTtlForRouteLease ... never zero'` FAILS because `dedupeTtlForRouteLease` is not exported yet (the dynamic import exposes `undefined` and the test throws).
+- the chain test FAILS on `expect(handledMessageIds.size).toBe(0)` because the pre-fix wrapper never consults the acceptance signal — even though the Task 2 hook correctly wrote `m-chain` into the set (so `onInbound` and `routed` assertions already hold). The consumed-set assertion is the chain's fail-first pin; the rest is characterization.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -584,13 +709,36 @@ export type YenteDiscordWrapOptions = {
 };
 ```
 
-2. `wrapYenteDiscordChannelIds` — destructure alongside `monitoredChannelIds`:
+2. `wrapYenteDiscordChannelIds` — remove the now-illegal `= {}` default (plan-review finding 1: with `wasMessageHandled` required, `{}` is not assignable; every call site passes options — census verified) and destructure alongside `monitoredChannelIds`:
+
+```ts
+export function wrapYenteDiscordChannelIds(
+  adapter: DiscordAdapterInstance,
+  botToken: string,
+  autoCreateThreadChannelIds: Set<string> = new Set(),
+  options: YenteDiscordWrapOptions,
+): DiscordAdapterInstance {
+```
 
 ```ts
   const wasMessageHandled = options.wasMessageHandled;
 ```
 
-3. Wrapper step-3 outcome block — replace the unconditional bookkeeping with:
+3. Pre-claim own-bot bypass (plan-review finding 3) — insert immediately BEFORE the `// 1. Idempotency gate` claim section:
+
+```ts
+    // The bot's own messages are intentionally never dispatched (the SDK
+    // filters isMe messages before dispatch), so no dispatch handler can ever
+    // accept one. Bypass the ledger and the forward entirely: a route row
+    // could only ever be a lie against the invariant "'routed' means a
+    // dispatch handler accepted the message".
+    const authorId = (data?.author as { id?: string } | undefined)?.id;
+    if (authorId !== undefined && authorId === rawAdapter.botUserId) {
+      return undefined;
+    }
+```
+
+4. Wrapper step-3 outcome block — replace the unconditional bookkeeping with:
 
 ```ts
     // 3. Forward, then record the outcome (fail-open on state errors). The
@@ -601,13 +749,7 @@ export type YenteDiscordWrapOptions = {
       const result = await originalHandleForwardedMessage(dataArg, opts, ...rest);
       try {
         const routedAt = nowIso();
-        // The SDK filters the bot's own messages before dispatch (isMe), and
-        // the bridge same-bot guard drops any that slip through — neither
-        // fires the acceptance hook. That drop is intentional, so own-bot
-        // messages stay terminal 'routed' instead of churning catch-up.
-        const authorId = (data?.author as { id?: string } | undefined)?.id;
-        const isOwnBot = authorId !== undefined && authorId === rawAdapter.botUserId;
-        if (wasMessageHandled(messageId) || isOwnBot) {
+        if (wasMessageHandled(messageId)) {
           markDiscordMessageRouted(channelId, messageId, routedAt);
           const monitored = monitoredChannelIds();
           const parentId = (dataArg as Record<string, any>)?.thread?.parent_id as string | undefined;
@@ -633,22 +775,15 @@ export type YenteDiscordWrapOptions = {
 
 (the trailing `catch` block is unchanged).
 
-4. Channel factory — add the shared tracker just before `return createChatSdkBridge({`:
+5. Channel factory — add the shared tracker just before `return createChatSdkBridge({` (no cap — plan-review finding 5: a FIFO cap can evict a still-pending acknowledgment under wide concurrency, and no leak path exists: entries are added only by a successful inbound forward and always consumed by the consult that the same forward reaches; reject paths throw before the hook fires):
 
 ```ts
     // Acceptance tracker shared by the bridge hook (writer) and the wrapped
-    // adapter below (consume-on-read reader). Consume-on-read keeps the set
-    // near zero; the cap only guards a leak if bookkeeping throws between the
-    // hook firing and the consult (e.g. a state error after a forward).
+    // adapter below (consume-on-read reader via Set.delete). Entries are added
+    // only by a successful inbound forward and always consumed by the consult
+    // in the wrapper's outcome block, so the set stays near zero by
+    // construction.
     const handledMessageIds = new Set<string>();
-    const MAX_HANDLED_MESSAGE_IDS = 1000;
-    const noteMessageHandled = (messageId: string): void => {
-      if (handledMessageIds.size >= MAX_HANDLED_MESSAGE_IDS) {
-        const oldest = handledMessageIds.values().next().value;
-        if (oldest !== undefined) handledMessageIds.delete(oldest); // FIFO eviction
-      }
-      handledMessageIds.add(messageId);
-    };
 ```
 
 then extend the wrap options:
@@ -662,16 +797,30 @@ then extend the wrap options:
       }),
 ```
 
-then add the acceptance hook and the dedupe alignment to the `createChatSdkBridge({...})` config object:
+then add the acceptance hook and the lease-derived dedupe alignment to the `createChatSdkBridge({...})` config object:
 
 ```ts
-      onInboundForwarded: noteMessageHandled,
-      // Well under the 120s route lease: the SDK's 300s dedupe default would
-      // let catch-up re-presentations short-circuit before dispatch and burn
-      // the 3-attempt cap with zero real retries (load-bearing V3). The
-      // route-claim layer already dedupes across time and processes; this TTL
-      // only absorbs same-process duplicate bursts.
-      dedupeTtlMs: 30_000,
+      onInboundForwarded: (messageId) => handledMessageIds.add(messageId),
+      // Derived from the configured route lease (never 0 — the SDK treats 0
+      // as permanent dedupe): the SDK's 300s default would let catch-up
+      // re-presentations short-circuit before dispatch and burn the 3-attempt
+      // cap with zero real retries (load-bearing V3).
+      dedupeTtlMs: dedupeTtlForRouteLease(catchupConfig.routeLeaseMs),
+```
+
+6. Add the exported pure derivation (module scope, near `wrapYenteDiscordChannelIds`):
+
+```ts
+/**
+ * SDK incoming-message dedupe TTL derived from the configured route lease:
+ * the lease is the minimum catch-up re-presentation cadence, so a TTL of one
+ * quarter guarantees every re-presentation lands after the SDK dedupe entry
+ * expired and genuinely re-dispatches. Clamped to >= 1ms because the SDK's
+ * sqlite dedupe treats 0 as no-expiry (permanent dedupe).
+ */
+export function dedupeTtlForRouteLease(routeLeaseMs: number): number {
+  return Math.max(1, Math.floor(routeLeaseMs / 4));
+}
 ```
 
 - [ ] **Step 4: Run the focused test**
@@ -682,7 +831,7 @@ Expected: PASS (whole file — the extended helper must keep all pre-existing te
 
 - [ ] **Step 5: Refactor while green**
 
-No refactor needed: the tracker is a six-line closure at its only call site; extracting a helper would add a name without a second consumer (YAGNI).
+No refactor needed: the tracker is a one-line `Set` at its only call site; the closures are inline at the wiring; extracting anything would add names without second consumers (YAGNI).
 
 - [ ] **Step 6: Run impacted-test verification**
 
@@ -696,7 +845,7 @@ Expected: PASS (exit 0 for each command).
 
 ```bash
 git add src/channels/discord.ts src/channels/discord.test.ts src/channels/discord-catchup.integration.test.ts
-git commit -m "fix(channels): record discord routes as failed, not routed, when no handler accepted"
+git commit -m "fix(channels): truthful discord route bookkeeping — acceptance signal, own-bot bypass, lease-aligned dedupe"
 ```
 
 ---
