@@ -729,12 +729,16 @@ describe('replay idempotency', () => {
 
     // First attempt: the session write lands durably, then the wake throws —
     // the strict inbound path propagates so catch-up re-presents the message.
+    // The replay is the IDENTICAL event object: production catch-up
+    // re-presents the original message, whose timestamp (the platform's
+    // message-creation time) is stable across re-presentations.
+    const replayed = event('ping', 'msg-replay');
     wakeMock.mockRejectedValueOnce(new Error('container spawn failed'));
-    await expect(routeInbound(event('ping', 'msg-replay'))).rejects.toThrow('container spawn failed');
+    await expect(routeInbound(replayed)).rejects.toThrow('container spawn failed');
 
     // Catch-up replay of the SAME message: the durable row must not collide.
     wakeMock.mockResolvedValue(undefined);
-    await routeInbound(event('ping', 'msg-replay'));
+    await routeInbound(replayed);
 
     const session = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
     expect(session).toBeDefined();
@@ -778,12 +782,16 @@ describe('replay idempotency', () => {
 
     // First pass: fan-out is sequential in agent order; the first wake
     // succeeds, the second agent's wake fails after BOTH rows are durable.
+    // The replay is the IDENTICAL event object: production catch-up
+    // re-presents the original message, whose timestamp (the platform's
+    // message-creation time) is stable across re-presentations.
+    const replayed = event('ping', 'msg-multi');
     wakeMock.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error('second agent spawn failed'));
-    await expect(routeInbound(event('ping', 'msg-multi'))).rejects.toThrow('second agent spawn failed');
+    await expect(routeInbound(replayed)).rejects.toThrow('second agent spawn failed');
 
     // Catch-up replay: neither deterministic id may collide; both wakes retry.
     wakeMock.mockResolvedValue(undefined);
-    await routeInbound(event('ping', 'msg-multi'));
+    await routeInbound(replayed);
 
     for (const agentGroupId of ['ag-yente', 'ag-second']) {
       const session = getSessionsByAgentGroup(agentGroupId)[0];
@@ -797,6 +805,24 @@ describe('replay idempotency', () => {
       expect(rows[0].id).toBe(`msg-multi:${agentGroupId}`);
     }
     expect(wakeMock).toHaveBeenCalledTimes(4); // 2 attempts on first pass, 2 retries on replay
+  });
+
+  it('throws loudly when a distinct message reuses a provider-local id instead of silently skipping', async () => {
+    const { routeInbound } = await import('./router.js');
+    await routeInbound(event(JSON.stringify({ text: 'first' }), 'msg-x'));
+    // Distinct message, same provider-local id (different timestamp/content):
+    // the guard must refuse, not silently swallow.
+    const distinct = event(JSON.stringify({ text: 'second' }), 'msg-x');
+    distinct.message = { ...distinct.message, timestamp: '2026-08-15T05:00:00.000Z' };
+    await expect(routeInbound(distinct)).rejects.toThrow(/Refusing to skip distinct message/);
+    const session = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
+    const db = new Database(inboundDbPath('ag-yente', session.id));
+    const rows = db.prepare("SELECT content FROM messages_in WHERE id = 'msg-x:ag-yente'").all() as Array<{
+      content: string;
+    }>;
+    db.close();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].content).toContain('first');
   });
 });
 

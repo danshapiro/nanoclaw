@@ -37,7 +37,12 @@ import {
 import { deliverSessionMessages, getDeliveryAdapter, suppressSessionOutbound } from './delivery.js';
 import { startTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
-import { resolveSession, sessionMessageExists, writeSessionMessage, writeOutboundDirect } from './session-manager.js';
+import {
+  getSessionMessageRouteIdentity,
+  resolveSession,
+  writeSessionMessage,
+  writeOutboundDirect,
+} from './session-manager.js';
 import { wakeContainer } from './container-runner.js';
 import type { AgentGroup, MessagingGroup, MessagingGroupAgent, Session } from './types.js';
 import type { InboundEvent } from './channels/adapter.js';
@@ -604,7 +609,23 @@ async function deliverToAgent(
   }
 
   const routedMessageId = messageIdForAgent(agentEvent.message.id, agent.agent_group_id);
-  if (sessionMessageExists(session.agent_group_id, session.id, routedMessageId)) {
+  const storedRoute = getSessionMessageRouteIdentity(session.agent_group_id, session.id, routedMessageId);
+  if (storedRoute) {
+    const sameDelivery =
+      storedRoute.platformMessageId === (agentEvent.message.id || null) &&
+      storedRoute.platformId === deliveryAddr.platformId &&
+      storedRoute.channelType === deliveryAddr.channelType &&
+      storedRoute.threadId === deliveryAddr.threadId &&
+      storedRoute.messagingGroupId === mg.id &&
+      storedRoute.timestamp === agentEvent.message.timestamp;
+    if (!sameDelivery) {
+      // A distinct message reusing this id: do NOT silently skip (delta
+      // review round 8). Throwing keeps the collision loud — on the strict
+      // inbound path the route stays failed and retriable.
+      throw new Error(
+        `Refusing to skip distinct message with colliding route id ${routedMessageId}: stored identity does not match inbound event`,
+      );
+    }
     // Catch-up replay after a partial delivery: the row from the first
     // attempt is already durable; re-writing would hit the PK and abort the
     // retry. Skip the write; the wake below is what actually needs retrying.

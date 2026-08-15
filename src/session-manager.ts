@@ -506,18 +506,38 @@ export function writeSessionMessage(
   updateSession(sessionId, { last_active: new Date().toISOString() });
 }
 
+/** Route identity of a stored session inbound row, as stamped at write time. */
+export interface SessionMessageRouteIdentity {
+  platformId: string | null;
+  platformMessageId: string | null;
+  channelType: string | null;
+  threadId: string | null;
+  messagingGroupId: string | null;
+  timestamp: string;
+}
+
 /**
- * Read-only existence check for a session inbound row by message id.
- * Host-only. Used by the router to make catch-up replays idempotent: the
- * route ledger can re-present a message after a partial delivery failure,
- * and the deterministic messageIdForAgent id must not collide with the row
- * the first attempt already wrote (delta review round 6). messages_in is
- * host-written from this process, so the check-then-insert pair is safe.
+ * Read-only lookup of a session inbound row's route identity by message id.
+ * Host-only. Used by the router's replay guard: the route ledger can
+ * re-present a message after a partial delivery failure, and replay must be
+ * detected by ROUTE IDENTITY, not by id alone — the deterministic
+ * messageIdForAgent id carries no channel/platform/thread scope, so a
+ * distinct message reusing a provider-local id must stay loud (throw at the
+ * caller) rather than be silently skipped (delta review round 8).
  */
-export function sessionMessageExists(agentGroupId: string, sessionId: string, messageId: string): boolean {
+export function getSessionMessageRouteIdentity(
+  agentGroupId: string,
+  sessionId: string,
+  messageId: string,
+): SessionMessageRouteIdentity | null {
   const db = openInboundDb(agentGroupId, sessionId);
   try {
-    return db.prepare('SELECT 1 FROM messages_in WHERE id = ?').get(messageId) !== undefined;
+    const row = db
+      .prepare(
+        'SELECT platform_id AS platformId, platform_message_id AS platformMessageId, channel_type AS channelType, thread_id AS threadId, messaging_group_id AS messagingGroupId, timestamp AS timestamp FROM messages_in WHERE id = ?',
+      )
+      .get(messageId) as SessionMessageRouteIdentity | undefined;
+    return row ?? null;
   } finally {
     db.close();
   }
