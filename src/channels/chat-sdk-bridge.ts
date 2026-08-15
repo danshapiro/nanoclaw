@@ -146,6 +146,27 @@ export interface ChatSdkBridgeConfig {
    * exactly once per setup().
    */
   onGatewayWebhookReady?: (webhookUrl: string) => void;
+  /**
+   * Called with the platform message id immediately after a message is
+   * actually forwarded inbound — i.e. a registered Chat SDK handler accepted
+   * it and the host `onInbound` completed. Chat SDK dispatch resolves void
+   * whether or not any handler matched, and the vendored adapters' forwards
+   * resolve either way, so channels that keep route bookkeeping (Discord) use
+   * this to distinguish "dispatched to a handler" from "no handler matched".
+   * REQUIRED (not optional) so that wiring it is compile-gated: an optional
+   * hook could be silently dropped by a channel factory, leaving every routed
+   * message recorded as failed (plan-review round-2 finding 2).
+   */
+  onInboundForwarded: (messageId: string) => void;
+  /**
+   * Override for the Chat SDK's incoming-message dedupe TTL (default 300s).
+   * Channels with their own idempotent claim/replay layer (Discord's
+   * message-route claim + catch-up) set this BELOW their re-presentation
+   * cadence so a re-presented message id dispatches again; the SDK layer
+   * then only absorbs same-process duplicate bursts. Never set 0: the SDK's
+   * sqlite dedupe treats 0 as no-expiry (permanent dedupe).
+   */
+  dedupeTtlMs?: number;
 }
 
 type SerializableAttachment = Record<string, unknown>;
@@ -323,8 +344,10 @@ export async function forwardChatSdkInboundMessage<
   source: ChatSdkForwardSource;
   onInbound: ChannelSetup['onInbound'];
   toInbound: (message: TMessage, isMention: boolean, isGroup: boolean) => Promise<InboundMessage>;
+  onForwarded?: (messageId: string) => void;
 }): Promise<'dropped' | 'forwarded'> {
-  const { adapterName, channelId, threadId, message, isMention, isGroup, source, onInbound, toInbound } = opts;
+  const { adapterName, channelId, threadId, message, isMention, isGroup, source, onInbound, toInbound, onForwarded } =
+    opts;
   if (isOwnChatSdkMessageForTest(message)) {
     const author = message.author;
     log.warn('chat_sdk_same_bot_message_dropped', {
@@ -340,6 +363,7 @@ export async function forwardChatSdkInboundMessage<
   }
 
   await onInbound(channelId, threadId, await toInbound(message, isMention, isGroup));
+  onForwarded?.(message.id);
   return 'forwarded';
 }
 
@@ -435,6 +459,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       source,
       onInbound: setupConfig.onInbound,
       toInbound: messageToInbound,
+      onForwarded: config.onInboundForwarded,
     });
   }
 
@@ -454,6 +479,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         concurrency: config.concurrency ?? 'concurrent',
         state,
         logger: 'silent',
+        dedupeTtlMs: config.dedupeTtlMs,
       });
 
       // Four SDK dispatch paths — bridge just forwards. All per-wiring

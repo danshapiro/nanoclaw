@@ -96,11 +96,13 @@ registerChannelAdapter('discord', {
     });
     const channelIds = (): Set<string> => monitoredDiscordChannelIds(autoCreateThreadChannelIds);
     let catchup: DiscordCatchup | null = null;
+    const handledTracker = createDiscordHandledTracker();
     return createChatSdkBridge({
       adapter: wrapYenteDiscordChannelIds(discordAdapter, botToken, autoCreateThreadChannelIds, {
         monitoredChannelIds: channelIds,
         routeLeaseMs: catchupConfig.routeLeaseMs,
         onGatewayEvent: (type) => catchup?.onGatewayEvent(type),
+        wasMessageHandled: handledTracker.wasHandled,
       }),
       concurrency: 'concurrent',
       botToken,
@@ -108,6 +110,7 @@ registerChannelAdapter('discord', {
       supportsThreads: true,
       maxTextLength: DISCORD_MESSAGE_TEXT_LIMIT,
       transformOutboundText: normalizeDiscordOutboundMarkdown,
+      onInboundForwarded: handledTracker.noteHandled,
       onGatewayWebhookReady: (webhookUrl) => {
         if (catchup) return; // idempotency guard: channel-registry retries the WHOLE setup() body on NetworkError (channel-registry.ts:68-87) — a re-fired hook must not build a second engine + duplicate unref()'d timers
         catchup = createDiscordCatchup({
@@ -421,7 +424,35 @@ export type YenteDiscordWrapOptions = {
   routeLeaseMs?: number;
   onGatewayEvent?: (type: string) => void;
   now?: () => string;
+  /**
+   * Consume-on-read acceptance probe wired from the bridge's onInboundForwarded
+   * hook: returns true exactly once per message id a dispatch handler actually
+   * forwarded. Optional in this task; the wrapper begins consulting it (and
+   * the option becomes required) in the follow-up bookkeeping change.
+   */
+  wasMessageHandled?: (messageId: string) => boolean;
 };
+
+/**
+ * Acceptance tracker shared by the chat-sdk bridge's onInboundForwarded hook
+ * (writer) and the wrapped adapter's outcome block (consume-on-read reader
+ * via Set.delete). Entries are added only by a successful inbound forward and
+ * always consumed by the consult that the same forward reaches, so the set
+ * stays near zero by construction. Exported so production and tests build the
+ * tracker from the SAME constructor.
+ */
+export function createDiscordHandledTracker(): {
+  noteHandled: (id: string) => void;
+  wasHandled: (id: string) => boolean;
+} {
+  const handled = new Set<string>();
+  return {
+    noteHandled: (id) => {
+      handled.add(id);
+    },
+    wasHandled: (id) => handled.delete(id),
+  };
+}
 
 export function wrapYenteDiscordChannelIds(
   adapter: DiscordAdapterInstance,

@@ -128,6 +128,66 @@ describe('Chat SDK bridge same-bot ingress guard', () => {
   });
 });
 
+describe('forward acknowledgment hook', () => {
+  const userAuthor = { userId: 'user-1', userName: 'user-1', fullName: 'User One', isBot: false, isMe: false };
+  const botSelfAuthor = { userId: 'bot-1', userName: 'bot-1', fullName: 'bot-1', isBot: true, isMe: true };
+
+  function ackHarness() {
+    return {
+      onInbound: vi.fn().mockResolvedValue(undefined),
+      toInbound: vi.fn().mockResolvedValue({
+        id: 'm1',
+        kind: 'chat-sdk',
+        content: {},
+        timestamp: new Date().toISOString(),
+        isMention: false,
+        isGroup: true,
+      }),
+      onForwarded: vi.fn(),
+    };
+  }
+
+  it('fires onForwarded with the message id after a successful inbound forward', async () => {
+    const { onInbound, toInbound, onForwarded } = ackHarness();
+    await expect(
+      forwardChatSdkInboundMessage({
+        adapterName: 'discord',
+        channelId: 'channel-1',
+        threadId: 'thread-1',
+        message: { id: 'm1', author: userAuthor },
+        isMention: false,
+        isGroup: true,
+        source: 'plain',
+        onInbound,
+        toInbound,
+        onForwarded,
+      }),
+    ).resolves.toBe('forwarded');
+    expect(onForwarded).toHaveBeenCalledTimes(1);
+    expect(onForwarded).toHaveBeenCalledWith('m1');
+  });
+
+  it('does not fire onForwarded when the same-bot guard drops the message', async () => {
+    const { onInbound, toInbound, onForwarded } = ackHarness();
+    await expect(
+      forwardChatSdkInboundMessage({
+        adapterName: 'discord',
+        channelId: 'channel-1',
+        threadId: 'thread-1',
+        message: { id: 'm-self', author: botSelfAuthor },
+        isMention: false,
+        isGroup: true,
+        source: 'plain',
+        onInbound,
+        toInbound,
+        onForwarded,
+      }),
+    ).resolves.toBe('dropped');
+    expect(onForwarded).not.toHaveBeenCalled();
+    expect(onInbound).not.toHaveBeenCalled();
+  });
+});
+
 describe('Chat SDK bridge outbound splitting', () => {
   it('posts oversized text as multiple messages when an adapter limit is configured', async () => {
     const postMessage = vi
@@ -142,6 +202,7 @@ describe('Chat SDK bridge outbound splitting', () => {
       } as unknown as Adapter,
       supportsThreads: true,
       maxTextLength: 10,
+      onInboundForwarded: vi.fn(),
     });
 
     const result = await bridge.deliver('discord:guild:channel', null, {
@@ -282,7 +343,7 @@ describe('Chat SDK bridge deliver — reactions', () => {
       addReaction,
       editMessage,
     } as unknown as Adapter;
-    const bridge = createChatSdkBridge({ adapter, supportsThreads: true });
+    const bridge = createChatSdkBridge({ adapter, supportsThreads: true, onInboundForwarded: vi.fn() });
     return { bridge, addReaction, editMessage };
   }
 
@@ -407,6 +468,7 @@ describe('onGatewayWebhookReady hook', () => {
       supportsThreads: true,
       botToken: 'test-token',
       onGatewayWebhookReady: (webhookUrl) => seen.push(webhookUrl),
+      onInboundForwarded: vi.fn(),
     });
     try {
       await bridge.setup({
@@ -461,6 +523,7 @@ describe('plain-message catch-all dispatch', () => {
       adapter: fakeAdapter as never,
       supportsThreads: true,
       botToken: 'test-token',
+      onInboundForwarded: vi.fn(),
       ...bridgeConfig,
     });
     await bridge.setup({
@@ -531,6 +594,29 @@ describe('plain-message catch-all dispatch', () => {
         makeMessage({ id: 'm-sub', text: 'hi there', formatted: parseMarkdown('hi there') }),
       );
       expect(onInbound).toHaveBeenCalledTimes(1);
+    } finally {
+      await bridge.teardown();
+      closeDb();
+    }
+  });
+
+  it('re-dispatches a re-presented message id once the configured dedupeTtlMs has elapsed', async () => {
+    const { bridge, driver, fakeAdapter, onInbound } = await makeDispatchHarness({ dedupeTtlMs: 1 });
+    try {
+      const msg = makeMessage({
+        id: 'm-redeliver',
+        threadId: 'thread-9',
+        text: 'ping',
+        formatted: parseMarkdown('ping'),
+      });
+      await driver.handleIncomingMessage(fakeAdapter, 'thread-9', msg);
+      expect(onInbound).toHaveBeenCalledTimes(1);
+      // Configured dedupe TTL is 1ms; the awaited dispatch above plus this
+      // sleep guarantee expiry. This models catch-up re-presentation (minutes
+      // later in production); the SDK's 300s default would swallow it.
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      await driver.handleIncomingMessage(fakeAdapter, 'thread-9', msg);
+      expect(onInbound).toHaveBeenCalledTimes(2);
     } finally {
       await bridge.teardown();
       closeDb();
