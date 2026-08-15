@@ -96,12 +96,14 @@ export type DiscordCatchupRunSummary = {
   fetched: number;
   routed: number;
   skippedTerminal: number;
+  skippedOwnBot: number;
   failed: number;
   durationMs: number;
 };
 
 export type DiscordCatchupDeps = {
   botToken: string;
+  botUserId: string;
   webhookUrl: string;
   monitoredChannelIds: () => Set<string>;
   env?: NodeJS.ProcessEnv;
@@ -222,6 +224,16 @@ export function createDiscordCatchup(deps: DiscordCatchupDeps): DiscordCatchup {
           cursor = message.id;
         };
         if (!ROUTABLE_MESSAGE_TYPES.has(message.type)) {
+          advance();
+          continue;
+        }
+        if ((message.author as { id?: string } | undefined)?.id === deps.botUserId) {
+          // The wrapper bypasses the bot's own messages entirely (never
+          // dispatched, no ledger row). The walk must skip them too: without
+          // this, a presented-by-catch-up own-bot message stays row-less, is
+          // neither 'routed' nor attempts-exhausted, and the walk stops at it
+          // — wedging every missed user message behind it.
+          summary.skippedOwnBot += 1;
           advance();
           continue;
         }
@@ -375,6 +387,7 @@ export function createDiscordCatchup(deps: DiscordCatchupDeps): DiscordCatchup {
       fetched: 0,
       routed: 0,
       skippedTerminal: 0,
+      skippedOwnBot: 0,
       failed: 0,
       durationMs: 0,
     };

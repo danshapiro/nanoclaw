@@ -2,11 +2,14 @@ import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { Message, parseMarkdown } from 'chat';
 
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../db/index.js';
 import { inboundDbPath, resolveSession, writeSessionMessage } from '../session-manager.js';
 import { log } from '../log.js';
+import { createChatSdkBridge } from './chat-sdk-bridge.js';
 import {
+  createDiscordHandledTracker,
   forwardDiscordGatewayEventWithRetry,
   monitoredDiscordChannelIds,
   normalizeDiscordOutboundMarkdown,
@@ -14,7 +17,13 @@ import {
   wrapYenteDiscordChannelIds,
   yenteDiscordPlatformIdFromThreadId,
 } from './discord.js';
-import { getDiscordChannelCursor, getDiscordMessageRouteAttempts, isDiscordMessageTerminal } from './discord-state.js';
+import {
+  getDiscordChannelCursor,
+  getDiscordMessageRouteAttempts,
+  getDiscordMessageRouteStatus,
+  isDiscordMessageTerminal,
+  listRetriableDiscordMessageRoutes,
+} from './discord-state.js';
 
 vi.mock('../config.js', async () => {
   const actual = await vi.importActual('../config.js');
@@ -389,12 +398,18 @@ describe('wrapYenteDiscordChannelIds ingress claim', () => {
     };
   }
 
-  function wrap(fake: ReturnType<typeof fakeAdapter>, autoThread: string[] = [], monitored: string[] = ['chan-1']) {
+  function wrap(
+    fake: ReturnType<typeof fakeAdapter>,
+    autoThread: string[] = [],
+    monitored: string[] = ['chan-1'],
+    // Default matches this fake adapter's semantics: its handleForwardedMessage always "handles" the message.
+    wasMessageHandled: (messageId: string) => boolean = () => true,
+  ) {
     return wrapYenteDiscordChannelIds(
       fake as unknown as Parameters<typeof wrapYenteDiscordChannelIds>[0],
       'test-token',
       new Set(autoThread),
-      { monitoredChannelIds: () => new Set(monitored), routeLeaseMs: 120000 },
+      { monitoredChannelIds: () => new Set(monitored), routeLeaseMs: 120000, wasMessageHandled },
     ) as unknown as {
       handleForwardedMessage: (data: unknown, options: unknown) => Promise<unknown>;
       forwardGatewayEvent: (webhookUrl: string, event: { type: string }) => Promise<void>;
@@ -471,6 +486,8 @@ describe('wrapYenteDiscordChannelIds ingress claim', () => {
         monitoredChannelIds: () => new Set(['chan-1']),
         routeLeaseMs: 120000,
         now: () => new Date(nowMs).toISOString(),
+        // Matches this fake adapter's semantics: its handleForwardedMessage always "handles" the message.
+        wasMessageHandled: () => true,
       },
     ) as unknown as { handleForwardedMessage: (data: unknown, options: unknown) => Promise<unknown> };
     await expect(wrapped.handleForwardedMessage(message('m3'), {})).rejects.toThrow('dispatch exploded');
@@ -521,7 +538,11 @@ describe('wrapYenteDiscordChannelIds ingress claim', () => {
         fake as unknown as Parameters<typeof wrapYenteDiscordChannelIds>[0],
         'test-token',
         new Set(),
-        { onGatewayEvent: (type) => seen.push(type) },
+        {
+          onGatewayEvent: (type) => seen.push(type),
+          // Matches this fake adapter's semantics: its handleForwardedMessage always "handles" the message.
+          wasMessageHandled: () => true,
+        },
       );
       const forward = (fake as unknown as { forwardGatewayEvent: (url: string, e: { type: string }) => Promise<void> })
         .forwardGatewayEvent;
@@ -533,6 +554,45 @@ describe('wrapYenteDiscordChannelIds ingress claim', () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+
+  it('marks a message failed, not routed, when no dispatch handler accepted it', async () => {
+    const fake = fakeAdapter();
+    const forwardSpy = fake.handleForwardedMessage;
+    const wrapped = wrap(fake, [], ['chan-1'], () => false);
+    const cursorBefore = getDiscordChannelCursor('chan-1');
+
+    await wrapped.handleForwardedMessage(message('m-unhandled'), {});
+
+    expect(forwardSpy).toHaveBeenCalledTimes(1); // message is still forwarded to the SDK
+    expect(getDiscordMessageRouteStatus('chan-1', 'm-unhandled')).toBe('failed');
+    expect(isDiscordMessageTerminal('chan-1', 'm-unhandled')).toBe(false);
+    expect(getDiscordChannelCursor('chan-1')).toBe(cursorBefore); // cursor not advanced
+
+    // Catch-up eligibility: failed + attempts < max + lease expired (lease is 120s).
+    const horizon = '2020-01-01T00:00:00.000Z';
+    const afterLease = new Date(Date.now() + 121_000).toISOString();
+    expect(listRetriableDiscordMessageRoutes(afterLease, horizon, 50).map((r) => r.message_id)).toContain(
+      'm-unhandled',
+    );
+  });
+
+  it("bypasses the ledger and the SDK entirely for the bot's own messages", async () => {
+    const fake = { ...fakeAdapter(), botUserId: 'bot-1' };
+    const forwardSpy = fake.handleForwardedMessage;
+    const wrapped = wrap(fake, [], ['chan-1'], () => false);
+    const cursorBefore = getDiscordChannelCursor('chan-1');
+    const ownMessage = { ...message('m-own'), author: { id: 'bot-1', bot: true } };
+
+    const result = await wrapped.handleForwardedMessage(ownMessage, {});
+
+    expect(result).toBeUndefined();
+    // The SDK filters isMe messages pre-dispatch, so forwarding them is
+    // pointless — and no ledger row may exist for a message no dispatch
+    // handler could ever accept (the requested invariant).
+    expect(forwardSpy).not.toHaveBeenCalled();
+    expect(getDiscordMessageRouteStatus('chan-1', 'm-own')).toBeNull();
+    expect(getDiscordChannelCursor('chan-1')).toBe(cursorBefore);
   });
 });
 
@@ -573,5 +633,129 @@ describe('monitoredDiscordChannelIds', () => {
       created_at: '2026-07-30T00:00:00.000Z',
     });
     expect(monitoredDiscordChannelIds(new Set(['chan-d']))).toEqual(new Set(['chan-a', 'chan-b', 'chan-d']));
+  });
+});
+
+describe('dedupeTtlForRouteLease', () => {
+  it('derives a dedupe TTL strictly below any configured route lease, never zero', async () => {
+    const mod = (await import('./discord.js')) as unknown as {
+      dedupeTtlForRouteLease?: (routeLeaseMs: number) => number;
+    };
+    if (!mod.dedupeTtlForRouteLease) throw new Error('dedupeTtlForRouteLease not exported');
+    const derive = mod.dedupeTtlForRouteLease;
+    expect(derive(120_000)).toBe(30_000); // default lease
+    expect(derive(100)).toBe(25);
+    expect(derive(3)).toBe(1); // clamped: 0 would mean permanent dedupe in the SDK
+    expect(derive(1)).toBe(1);
+  });
+});
+
+describe('discord ingress chain: bridge dispatch → acceptance hook → ledger', () => {
+  it('marks routed only when the real dispatch chain accepted the message', async () => {
+    const db = initTestDb();
+    runMigrations(db);
+    const onInbound = vi.fn().mockResolvedValue(undefined);
+    // Same tracker constructor as the production factory; bridge hook writes,
+    // wrapper consults via consume-on-read delete.
+    const tracker = createDiscordHandledTracker();
+    let captured: {
+      handleIncomingMessage(adapter: unknown, threadId: string, message: Message): Promise<void>;
+    } | null = null;
+    const fake = {
+      name: 'discord',
+      userName: 'yente-test',
+      initialize: async (chat: unknown) => {
+        captured = chat as never;
+      },
+      channelIdFromThreadId: (threadId: string) => threadId,
+      startGatewayListener: async () => new Response('ok'),
+      // The wrapper binds the outbound methods at wrap time; stub them like fakeAdapter().
+      postMessage: vi.fn(async () => 'mid'),
+      editMessage: vi.fn(async () => undefined),
+      deleteMessage: vi.fn(async () => undefined),
+      addReaction: vi.fn(async () => undefined),
+      removeReaction: vi.fn(async () => undefined),
+      startTyping: vi.fn(async () => undefined),
+      // Mirrors the vendored adapter: its forward awaits chat.handleIncomingMessage.
+      handleForwardedMessage: vi.fn(
+        async (data: { id: string; channel_id: string; author: { id: string }; content: string }) => {
+          const driver = captured; // closure assignment defeats narrowing; re-check
+          if (!driver) throw new Error('Chat SDK did not initialize the adapter');
+          await driver.handleIncomingMessage(
+            fake,
+            data.channel_id,
+            new Message({
+              id: data.id,
+              threadId: data.channel_id,
+              text: data.content,
+              formatted: parseMarkdown(data.content),
+              raw: data,
+              author: {
+                userId: data.author.id,
+                userName: data.author.id,
+                fullName: data.author.id,
+                isBot: false,
+                isMe: false,
+              },
+              metadata: { dateSent: new Date(), edited: false },
+              attachments: [],
+            }),
+          );
+          return 'handled';
+        },
+      ),
+    };
+    const wrappedAdapter = wrapYenteDiscordChannelIds(fake as never, 'test-token', new Set(), {
+      monitoredChannelIds: () => new Set(['chan-1']),
+      routeLeaseMs: 120000,
+      wasMessageHandled: tracker.wasHandled,
+    });
+    // Same structural cast as the wrap() helper: handleForwardedMessage is
+    // private on the vendored adapter's class type.
+    const wrapped = wrappedAdapter as unknown as {
+      handleForwardedMessage: (data: unknown, options: unknown) => Promise<unknown>;
+    };
+    const bridge = createChatSdkBridge({
+      adapter: wrappedAdapter as never,
+      supportsThreads: true,
+      botToken: 'test-token',
+      onInboundForwarded: tracker.noteHandled,
+    });
+    try {
+      await bridge.setup({
+        onInbound,
+        onInboundEvent: async () => {},
+        onMetadata: async () => {},
+        onAction: async () => {},
+      } as never);
+      if (!captured) throw new Error('Chat SDK did not initialize the adapter');
+
+      await wrapped.handleForwardedMessage(
+        {
+          id: 'm-chain',
+          channel_id: 'chan-1',
+          guild_id: 'guild-1',
+          author: { id: 'user-1', bot: false },
+          content: 'hello',
+          mentions: [],
+          attachments: [],
+        },
+        {},
+      );
+
+      // A real dispatch handler accepted the message.
+      expect(onInbound).toHaveBeenCalledTimes(1);
+      // The wrapper consumed the acceptance signal (regression pin: pre-fix
+      // the wrapper never consults the probe, so the entry is still pending
+      // and this second consult observes it).
+      expect(tracker.wasHandled('m-chain')).toBe(false);
+      // ...so the ledger says routed and the monitored cursor advanced.
+      expect(getDiscordMessageRouteStatus('chan-1', 'm-chain')).toBe('routed');
+      expect(isDiscordMessageTerminal('chan-1', 'm-chain')).toBe(true);
+      expect(getDiscordChannelCursor('chan-1')).toBe('m-chain');
+    } finally {
+      await bridge.teardown();
+      closeDb();
+    }
   });
 });
