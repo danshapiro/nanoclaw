@@ -1180,7 +1180,7 @@ function buildMounts(
     const claudeDir = path.join(DATA_DIR, 'v2-sessions', agentGroup.id, '.claude-shared');
     syncManagedSkillSymlinks({
       claudeDir,
-      skillNames: managedSkills.skills.map((skill) => skill.name),
+      skills: managedSkills.skills,
     });
 
     // Compose CLAUDE.md fresh every spawn from the shared base, enabled skill

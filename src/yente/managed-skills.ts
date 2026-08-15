@@ -179,13 +179,17 @@ export function resolveEffectiveSkillInventory(
   return desiredNames.map((name) => availableByName.get(name)!);
 }
 
-export function syncManagedSkillSymlinks(args: { claudeDir: string; skillNames: readonly string[] }): void {
+export const LOCAL_SKILLS_CONTAINER_ROOT = '/workspace/local-skills/skills';
+
+export type SyncableSkill = Pick<ManagedSkill, 'name' | 'sourceKind'>;
+
+export function syncManagedSkillSymlinks(args: { claudeDir: string; skills: readonly SyncableSkill[] }): void {
   const skillsDir = path.join(args.claudeDir, 'skills');
   fs.mkdirSync(skillsDir, { recursive: true });
 
-  const desired = [...args.skillNames];
+  const desired = [...args.skills];
 
-  const desiredSet = new Set(desired);
+  const desiredSet = new Set(desired.map((skill) => skill.name));
   for (const entry of fs.readdirSync(skillsDir)) {
     const entryPath = path.join(skillsDir, entry);
     const stat = fs.lstatSync(entryPath);
@@ -198,8 +202,14 @@ export function syncManagedSkillSymlinks(args: { claudeDir: string; skillNames: 
   }
 
   for (const skill of desired) {
-    const linkPath = path.join(skillsDir, skill);
-    const target = `/app/skills/${skill}`;
+    const linkPath = path.join(skillsDir, skill.name);
+    // Local skills live outside the per-spawn merged root: the frozen
+    // /app/skills copy only exists for skills present at spawn, so linking a
+    // local skill at /app/skills dangles for any local skill added after the
+    // session started. Point these at the live RW local mount instead (that
+    // mount is how agents edit local skills commit-first).
+    const target =
+      skill.sourceKind === 'local' ? `${LOCAL_SKILLS_CONTAINER_ROOT}/${skill.name}` : `/app/skills/${skill.name}`;
     if (fs.existsSync(linkPath) || pathExistsNoFollow(linkPath)) {
       const stat = fs.lstatSync(linkPath);
       if (!stat.isSymbolicLink()) {

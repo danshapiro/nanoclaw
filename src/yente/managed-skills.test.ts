@@ -459,11 +459,47 @@ describe('syncManagedSkillSymlinks', () => {
     makeSkill(skillRoot, 'alpha');
     makeSkill(skillRoot, 'beta');
 
-    syncManagedSkillSymlinks({ claudeDir, skillNames: ['alpha', 'beta'] });
+    syncManagedSkillSymlinks({
+      claudeDir,
+      skills: [
+        { name: 'alpha', sourceKind: 'managed' },
+        { name: 'beta', sourceKind: 'bundled' },
+      ],
+    });
 
     expect(fs.lstatSync(path.join(claudeDir, 'skills', 'alpha')).isSymbolicLink()).toBe(true);
     expect(fs.readlinkSync(path.join(claudeDir, 'skills', 'alpha'))).toBe('/app/skills/alpha');
     expect(fs.readlinkSync(path.join(claudeDir, 'skills', 'beta'))).toBe('/app/skills/beta');
+  });
+
+  it('links local skills to the live local mount, not the frozen spawn root', () => {
+    // Regression: local skills added after a long-lived session started had NO
+    // copy in the per-spawn merged root, so a symlink at /app/skills/<name>
+    // dangled (production incident 2026-08-15: dropping-balls unreachable via
+    // its symlink in a 4-day-old yente-threaded container).
+    const claudeDir = makeTempDir();
+
+    syncManagedSkillSymlinks({
+      claudeDir,
+      skills: [{ name: 'dropping-balls', sourceKind: 'local' }],
+    });
+
+    expect(fs.readlinkSync(path.join(claudeDir, 'skills', 'dropping-balls'))).toBe(
+      '/workspace/local-skills/skills/dropping-balls',
+    );
+  });
+
+  it('retargets a stale symlink whose kind changed between spawns', () => {
+    const claudeDir = makeTempDir();
+    syncManagedSkillSymlinks({
+      claudeDir,
+      skills: [{ name: 'alpha', sourceKind: 'managed' }],
+    });
+    syncManagedSkillSymlinks({
+      claudeDir,
+      skills: [{ name: 'alpha', sourceKind: 'local' }],
+    });
+    expect(fs.readlinkSync(path.join(claudeDir, 'skills', 'alpha'))).toBe('/workspace/local-skills/skills/alpha');
   });
 });
 
