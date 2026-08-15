@@ -47,6 +47,17 @@ describe('Discord message route claims', () => {
     expect(isDiscordMessageTerminal('c1', 'm1')).toBe(true);
   });
 
+  it('never regresses a routed row to failed (monotonic terminality under overlapping attempts)', () => {
+    // Attempt A completes routing; an overlapping attempt B — re-claimed after
+    // the lease expired while A's dispatch was still in flight, its tracker
+    // entry consumed by A — attempts to mark the row failed. It must no-op.
+    claimDiscordMessage('c1', 'm1', META, T0, T0_LEASE);
+    markDiscordMessageRouted('c1', 'm1', '2026-07-30T00:00:30.000Z');
+    markDiscordMessageFailed('c1', 'm1', '2026-07-30T00:00:31.000Z', 'no dispatch handler accepted the message');
+    expect(getDiscordMessageRouteStatus('c1', 'm1')).toBe('routed');
+    expect(isDiscordMessageTerminal('c1', 'm1')).toBe(true);
+  });
+
   it('an expired lease reclaims with attempts+1', () => {
     claimDiscordMessage('c1', 'm1', META, T0, T0_LEASE);
     expect(claimDiscordMessage('c1', 'm1', META, AFTER_LEASE, AFTER_LEASE_LEASE)).toEqual({

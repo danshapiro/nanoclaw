@@ -899,6 +899,8 @@ export function wrapYenteDiscordChannelIds(
 
 (the trailing `catch` block is unchanged).
 
+(post-remediation, delta review round 4: markDiscordMessageFailed carries a `status != 'routed'` guard — routed rows are monotonic and never regress)
+
 5. The tracker constructor, factory wiring of BOTH acceptance ends, and the wrap options were landed live-but-inert in Task 2 — nothing further to add here. This task's only remaining factory edit is the lease-derived dedupe alignment on the `createChatSdkBridge({...})` config object:
 
 ```ts
