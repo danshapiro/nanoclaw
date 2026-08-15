@@ -55,7 +55,6 @@ Append this describe block to `src/channels/chat-sdk-bridge.test.ts` (the file a
 describe('plain-message catch-all dispatch', () => {
   type DispatchDriver = {
     handleIncomingMessage: (adapter: unknown, threadId: string, message: Message) => Promise<void>;
-    subscribe: (threadId: string) => Promise<void>;
   };
 
   function makeMessage(overrides: Record<string, unknown> = {}): Message {
@@ -72,7 +71,7 @@ describe('plain-message catch-all dispatch', () => {
     });
   }
 
-  async function makeDispatchHarness() {
+  async function makeDispatchHarness(bridgeConfig: { dedupeTtlMs?: number } = {}) {
     const db = initTestDb();
     runMigrations(db);
     const onInbound = vi.fn().mockResolvedValue(undefined);
@@ -90,6 +89,7 @@ describe('plain-message catch-all dispatch', () => {
       adapter: fakeAdapter as never,
       supportsThreads: true,
       botToken: 'test-token',
+      ...bridgeConfig,
     });
     await bridge.setup({
       onInbound,
@@ -147,7 +147,12 @@ describe('plain-message catch-all dispatch', () => {
   it('delivers exactly once for a subscribed thread (widening must not double-fire)', async () => {
     const { bridge, driver, fakeAdapter, onInbound } = await makeDispatchHarness();
     try {
-      await driver.subscribe('thread-1');
+      // bridge.subscribe(_platformId, threadId) blind-upserts into
+      // chat_sdk_subscriptions (no thread-existence prerequisite); the SDK's
+      // subscribed dispatch branch early-returns before the pattern loop, so
+      // a subscribed thread takes the subscribed path exactly once even with
+      // the widened catch-all.
+      await bridge.subscribe('ignored', 'thread-1');
       await driver.handleIncomingMessage(
         fakeAdapter,
         'thread-1',
@@ -231,16 +236,46 @@ git commit -m "fix(channels): dispatch empty-text plain messages instead of drop
 - Test: `src/channels/chat-sdk-bridge.test.ts`
 
 **Interfaces:**
-- Consumes: existing exported `forwardChatSdkInboundMessage` and its `opts` bag; internal `forwardInboundMessage` closure inside `createChatSdkBridge`.
+- Consumes: existing exported `forwardChatSdkInboundMessage` and its `opts` bag; internal `forwardInboundMessage` closure inside `createChatSdkBridge`; the Task 1 `makeDispatchHarness` (same test file) which already spreads an optional `{ dedupeTtlMs }` arg into `createChatSdkBridge`.
 - Produces:
   - `ChatSdkBridgeConfig.onInboundForwarded?: (messageId: string) => void` — config-level hook, fired by the bridge after every successful inbound forward.
   - `forwardChatSdkInboundMessage` opts field `onForwarded?: (messageId: string) => void` — per-call hook fired with the message id after `onInbound` completes, only on the `'forwarded'` path (not on the same-bot `'dropped'` path).
+  - `ChatSdkBridgeConfig.dedupeTtlMs?: number` — plumbed straight into `new Chat({...})` (`dedupeTtlMs: config.dedupeTtlMs`; the SDK defaults to 300000 via `??` when undefined). Task 3 sets it under the discord route lease so catch-up re-presentations of a message id actually re-dispatch (SDK default 300s vs 120s lease would otherwise swallow them pre-dispatch: validated V3). Never use `0` — the SDK's sqlite dedupe treats 0 as permanent (`expires_at = null`), the opposite of disabling.
 
 This is the plumbing Task 3 wires to truthful route bookkeeping. The Chat SDK's dispatch resolves `void` whether or not any handler matched, and the vendored discord adapter's forward resolves either way, so without this hook the wrapper cannot distinguish "handler accepted the message" from "no handler matched".
 
 - [ ] **Step 1: Write the failing behavioral test**
 
-Add this describe block to `src/channels/chat-sdk-bridge.test.ts`, next to the existing `'Chat SDK bridge same-bot ingress guard'` describe (which already imports and unit-tests `forwardChatSdkInboundMessage`):
+Add two things to `src/channels/chat-sdk-bridge.test.ts`:
+
+(a) A re-dispatch test appended INSIDE the Task 1 `'plain-message catch-all dispatch'` describe (it reuses `makeDispatchHarness` and `makeMessage` from Task 1 — the harness already accepts the optional `{ dedupeTtlMs?: number }` bag that Task 1 added for exactly this purpose, and the spread into `createChatSdkBridge({...})` keeps the pre-fix run free of excess-property type errors; textually it lives there, but it is implemented in this task because the plumbing it proves is this task's production change):
+
+```ts
+  it('re-dispatches a re-presented message id once the configured dedupeTtlMs has elapsed', async () => {
+    const { bridge, driver, fakeAdapter, onInbound } = await makeDispatchHarness({ dedupeTtlMs: 1 });
+    try {
+      const msg = makeMessage({
+        id: 'm-redeliver',
+        threadId: 'thread-9',
+        text: 'ping',
+        formatted: parseMarkdown('ping'),
+      });
+      await driver.handleIncomingMessage(fakeAdapter, 'thread-9', msg);
+      expect(onInbound).toHaveBeenCalledTimes(1);
+      // Configured dedupe TTL is 1ms; the awaited dispatch above plus this
+      // sleep guarantee expiry. This models catch-up re-presentation (minutes
+      // later in production); the SDK's 300s default would swallow it.
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      await driver.handleIncomingMessage(fakeAdapter, 'thread-9', msg);
+      expect(onInbound).toHaveBeenCalledTimes(2);
+    } finally {
+      await bridge.teardown();
+      closeDb();
+    }
+  });
+```
+
+(b) This describe block, next to the existing `'Chat SDK bridge same-bot ingress guard'` describe (which already imports and unit-tests `forwardChatSdkInboundMessage`):
 
 ```ts
 describe('forward acknowledgment hook', () => {
@@ -304,15 +339,15 @@ describe('forward acknowledgment hook', () => {
 });
 ```
 
-- [ ] **Step 2: Run the test and verify the intended failure**
+- [ ] **Step 2: Run the tests and verify the intended failures**
 
-Run: `pnpm test src/channels/chat-sdk-bridge.test.ts -t "acknowledgment"`
+Run: `pnpm test src/channels/chat-sdk-bridge.test.ts -t "re-dispatches"` and `pnpm test src/channels/chat-sdk-bridge.test.ts -t "acknowledgment"`
 
-Expected: FAIL because `forwardChatSdkInboundMessage` does not accept or invoke `onForwarded` yet (the hook never fires; additionally strict typecheck rejects the unknown option until the implementation lands).
+Expected: the re-dispatch test FAILS because the bridge does not plumb `dedupeTtlMs` yet — the SDK default of 300s swallows the second dispatch of the same message id, so `onInbound` is called only once. (Runtime ignores unknown config fields, so there is no typecheck noise here: spreading an options object into `createChatSdkBridge({...})` does not trigger excess-property checks.) The acknowledgment tests FAIL because `forwardChatSdkInboundMessage` does not accept or invoke `onForwarded` yet — the first test observes `onForwarded` called zero times; additionally strict typecheck rejects the unknown option until the implementation lands.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-Three edits in `src/channels/chat-sdk-bridge.ts`:
+Four edits in `src/channels/chat-sdk-bridge.ts`:
 
 1. In `ChatSdkBridgeConfig`, after the `onGatewayWebhookReady` field (end of the interface), add:
 
@@ -326,6 +361,15 @@ Three edits in `src/channels/chat-sdk-bridge.ts`:
    * this to distinguish "dispatched to a handler" from "no handler matched".
    */
   onInboundForwarded?: (messageId: string) => void;
+  /**
+   * Override for the Chat SDK's incoming-message dedupe TTL (default 300s).
+   * Channels with their own idempotent claim/replay layer (Discord's
+   * message-route claim + catch-up) set this BELOW their re-presentation
+   * cadence so a re-presented message id dispatches again; the SDK layer
+   * then only absorbs same-process duplicate bursts. Never set 0: the SDK's
+   * sqlite dedupe treats 0 as no-expiry (permanent dedupe).
+   */
+  dedupeTtlMs?: number;
 ```
 
 2. In `forwardChatSdkInboundMessage`, extend the `opts` type with `onForwarded?: (messageId: string) => void;`, add it to the destructure, and invoke it after the forward:
@@ -386,15 +430,28 @@ export async function forwardChatSdkInboundMessage<
   }
 ```
 
-- [ ] **Step 4: Run the focused test**
+4. Plumb the dedupe override into the Chat construction in `setup()` (the SDK consumes it via `?? DEDUPE_TTL_MS`, so an explicit `undefined` keeps the 300s default):
 
-Run: `pnpm test src/channels/chat-sdk-bridge.test.ts -t "acknowledgment"`
+```ts
+      chat = new Chat({
+        adapters: { [adapter.name]: adapter },
+        userName: adapter.userName || 'NanoClaw',
+        concurrency: config.concurrency ?? 'concurrent',
+        dedupeTtlMs: config.dedupeTtlMs,
+        state,
+        logger: 'silent',
+      });
+```
 
-Expected: PASS
+- [ ] **Step 4: Run the focused tests**
+
+Run: `pnpm test src/channels/chat-sdk-bridge.test.ts -t "re-dispatches"` and `pnpm test src/channels/chat-sdk-bridge.test.ts -t "acknowledgment"`
+
+Expected: PASS (both)
 
 - [ ] **Step 5: Refactor while green**
 
-No refactor needed: a single optional hook added along one existing options-bag path, mirroring the file's existing conventions.
+No refactor needed: two optional config fields and one pass-through hook added along existing options-bag paths, mirroring the file's conventions.
 
 - [ ] **Step 6: Run impacted-test verification**
 
@@ -408,7 +465,7 @@ Expected: PASS (exit 0 for each command).
 
 ```bash
 git add src/channels/chat-sdk-bridge.ts src/channels/chat-sdk-bridge.test.ts
-git commit -m "feat(channels): add onInboundForwarded acceptance hook to chat-sdk bridge"
+git commit -m "feat(channels): add onInboundForwarded hook and configurable dedupe TTL to chat-sdk bridge"
 ```
 
 ---
@@ -417,17 +474,19 @@ git commit -m "feat(channels): add onInboundForwarded acceptance hook to chat-sd
 
 **Files:**
 - Modify: `src/channels/discord.ts` (`YenteDiscordWrapOptions` type ~lines 419-425, `wrapYenteDiscordChannelIds` option destructuring ~line 432, wrapper step-3 outcome block ~lines 547-576, channel factory wiring ~lines 97-105)
-- Modify (call-site update only): `src/channels/discord-catchup.integration.test.ts` (add the new required option to its `wrapYenteDiscordChannelIds` call)
-- Test: `src/channels/discord.test.ts` (extend the `wrap()` helper; add a describe block)
+- Modify (call-site updates only, all in `src/channels/`): `discord-catchup.integration.test.ts:77` and the two direct calls in `discord.test.ts` at ~lines 466 and 520 (adding the required option preserves their current behavior; all four call sites together with the production factory at discord.ts:100 are the COMPLETE inventory of `wrapYenteDiscordChannelIds` calls — verified by grep)
+- Test: `src/channels/discord.test.ts` (extend the `wrap()` helper at ~line 393; add tests to its describe block)
 
 **Interfaces:**
-- Consumes: `ChatSdkBridgeConfig.onInboundForwarded` from Task 2; `DiscordAdapter.botUserId` (public readonly, set at adapter construction — verified in vendored `@chat-adapter/discord` dist).
+- Consumes: `ChatSdkBridgeConfig.onInboundForwarded` and `ChatSdkBridgeConfig.dedupeTtlMs` from Task 2; `DiscordAdapter.botUserId` (public readonly, set at adapter construction — verified in vendored `@chat-adapter/discord` dist).
 - Produces:
   - `YenteDiscordWrapOptions.wasMessageHandled: (messageId: string) => boolean` — **required** consume-on-read acceptance probe: returns `true` exactly once per message id that was actually forwarded inbound by a dispatch handler.
 
 Current bug this fixes: after `originalHandleForwardedMessage` resolves, the wrapper calls `markDiscordMessageRouted` unconditionally (src/channels/discord.ts:552). The vendored adapter resolves even when no dispatch handler matched (e.g. the Task 1 drop), so the ledger recorded a never-handled message as terminal `routed` and catch-up could never retry it.
 
 Design: the Discord channel factory holds a shared `Set<string>`. The bridge's `onInboundForwarded` hook adds ids; the wrapper's step-3 outcome consults via `Set.delete` (consume-on-read: one forward → one consult). Own-bot messages stay terminal `routed` by an explicit carve-out, because the SDK filters them before dispatch and the bridge same-bot guard drops any that slip through — no handler ever fires for them, and that drop is intentional.
+
+Retry-honesty alignment (from load-bearing validation V3, confirmed): the Chat SDK dedupes incoming message ids for a per-instance TTL defaulting to 300s, planted before dispatch with no compensation delete. The discord route lease is 120s and attempts increment only on claim (cap 3), so without an override a message marked `failed` for "no handler matched" can be abandoned after as few as two in-window catch-up sweeps — each re-claim burns an attempt while the dedupe entry short-circuits the re-presentation BEFORE dispatch, no handler ever runs, and the row goes terminal with zero real retries. Aligning `dedupeTtlMs: 30_000` (well under the 120s lease) in the factory guarantees every catch-up re-presentation reaches dispatch and burns an attempt only when a handler actually did not accept the message again. Value-of-record caveat now handled by construction; no residual to record.
 
 - [ ] **Step 1: Write the failing behavioral tests**
 
@@ -490,7 +549,10 @@ Design: the Discord channel factory holds a shared `Set<string>`. The bridge's `
   });
 ```
 
-3. Update the direct `wrapYenteDiscordChannelIds` call in `src/channels/discord-catchup.integration.test.ts` to pass `wasMessageHandled: () => true` with the same "fake always handles" comment, since the option becomes required. (Check the test's intent: if it asserts catch-up behavior for a message that the fake forwards, `() => true` preserves current behavior exactly.)
+3. Update the three remaining direct `wrapYenteDiscordChannelIds` call sites to pass `wasMessageHandled: () => true` with the same "fake always handles" comment, since the option becomes required:
+   - `src/channels/discord-catchup.integration.test.ts:77`;
+   - `src/channels/discord.test.ts` ~line 466 (`'marks the route failed (keeping the lease) and rethrows; immediate retries drop, post-lease retries route'` — its final assertion expects the post-lease re-claim to be marked `routed`, which the always-handles probe preserves);
+   - `src/channels/discord.test.ts` ~line 520 (`'taps gateway event types before forwarding'` — never calls `handleForwardedMessage`, but the type is required).
 
 - [ ] **Step 2: Run the tests and verify the intended failure**
 
@@ -589,7 +651,7 @@ export type YenteDiscordWrapOptions = {
     };
 ```
 
-then extend the wrap options and the bridge config:
+then extend the wrap options:
 
 ```ts
       adapter: wrapYenteDiscordChannelIds(discordAdapter, botToken, autoCreateThreadChannelIds, {
@@ -600,8 +662,16 @@ then extend the wrap options and the bridge config:
       }),
 ```
 
+then add the acceptance hook and the dedupe alignment to the `createChatSdkBridge({...})` config object:
+
 ```ts
       onInboundForwarded: noteMessageHandled,
+      // Well under the 120s route lease: the SDK's 300s dedupe default would
+      // let catch-up re-presentations short-circuit before dispatch and burn
+      // the 3-attempt cap with zero real retries (load-bearing V3). The
+      // route-claim layer already dedupes across time and processes; this TTL
+      // only absorbs same-process duplicate bursts.
+      dedupeTtlMs: 30_000,
 ```
 
 - [ ] **Step 4: Run the focused test**
