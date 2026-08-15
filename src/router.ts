@@ -32,6 +32,7 @@ import {
   findActiveSessionThreadIdEndingWithForAgent,
   findLatestArchivedSessionForAgent,
   findSessionForAgent,
+  findSessionsForAgentRouteKey,
   getSession,
 } from './db/sessions.js';
 import { deliverSessionMessages, getDeliveryAdapter, suppressSessionOutbound } from './delivery.js';
@@ -635,6 +636,41 @@ async function deliverToAgent(
       messageId: routedMessageId,
     });
   } else {
+    // Rollover guard (delta review round 9): if an earlier delivery attempt
+    // recorded this message into a sibling session that has since been
+    // archived (/new, /clear), re-writing it into the freshly resolved
+    // session would duplicate the event and contaminate the user's
+    // deliberately fresh session. A row can only have been written by an
+    // earlier attempt into a session created at/before the platform
+    // timestamp of this message — bound the sweep by that.
+    for (const sibling of findSessionsForAgentRouteKey(agent.agent_group_id, mg.id, agentEvent.threadId)) {
+      if (sibling.id === session.id) continue;
+      if (sibling.created_at > agentEvent.message.timestamp) continue;
+      const priorRoute = getSessionMessageRouteIdentity(agent.agent_group_id, sibling.id, routedMessageId);
+      if (!priorRoute) continue;
+      const sameDelivery =
+        priorRoute.platformMessageId === (agentEvent.message.id || null) &&
+        priorRoute.platformId === deliveryAddr.platformId &&
+        priorRoute.channelType === deliveryAddr.channelType &&
+        priorRoute.threadId === deliveryAddr.threadId &&
+        priorRoute.messagingGroupId === mg.id &&
+        priorRoute.timestamp === agentEvent.message.timestamp;
+      if (!sameDelivery) {
+        throw new Error(
+          `Refusing to skip distinct message with colliding route id ${routedMessageId}: stored identity does not match inbound event`,
+        );
+      }
+      log.info(
+        'Replay already recorded in a since-archived sibling session — not writing into the post-reset session',
+        {
+          sessionId: session.id,
+          siblingSessionId: sibling.id,
+          agentGroup: agent.agent_group_id,
+          messageId: routedMessageId,
+        },
+      );
+      return;
+    }
     writeSessionMessage(session.agent_group_id, session.id, {
       id: routedMessageId,
       kind: agentEvent.message.kind,

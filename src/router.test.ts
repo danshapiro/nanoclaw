@@ -824,6 +824,63 @@ describe('replay idempotency', () => {
     expect(rows).toHaveLength(1);
     expect(rows[0].content).toContain('first');
   });
+
+  it('does not write a catch-up replay into the fresh session after /new rolled the original session', async () => {
+    const { routeInbound } = await import('./router.js');
+    const { wakeContainer } = await import('./container-runner.js');
+    const wakeMock = vi.mocked(wakeContainer);
+    wakeMock.mockClear();
+
+    // Session S1 exists before the replayed message arrives. (The rollover
+    // guard sweeps siblings created at/before the platform message
+    // timestamp; routing a prior message keeps that ordering deterministic
+    // even when everything lands in the same millisecond.)
+    await routeInbound(event('hello first', 'msg-first-before-rollover'));
+    const original = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
+
+    // Attempt 1: the durable session write lands in S1, then the wake throws
+    // — the strict inbound path stays catch-up eligible. Capture the event
+    // object ONCE: the helper stamps a fresh timestamp per call, while
+    // production catch-up re-presents the original platform message whose
+    // dateSent timestamp is stable.
+    const replay = event('ping', 'msg-roll');
+    wakeMock.mockRejectedValueOnce(new Error('container spawn failed'));
+    await expect(routeInbound(replay)).rejects.toThrow('container spawn failed');
+
+    // Before catch-up replays, /new archives S1 and creates a deliberately
+    // fresh S2 for the same route key.
+    wakeMock.mockResolvedValue(undefined);
+    await routeInbound(event('/new', 'msg-reset'));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const fresh = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
+    expect(fresh.id).not.toBe(original.id);
+
+    const wakesBeforeReplay = wakeMock.mock.calls.length;
+    await routeInbound(replay);
+
+    // The pre-reset row must NOT be duplicated into the post-reset session.
+    const freshDb = new Database(inboundDbPath('ag-yente', fresh.id));
+    const freshRows = freshDb.prepare("SELECT id FROM messages_in WHERE id LIKE 'msg-roll%'").all();
+    freshDb.close();
+    expect(freshRows).toHaveLength(0);
+
+    // Exactly one row across every session of the agent — it stays in the
+    // archived original session's inbound DB.
+    let total = 0;
+    for (const s of getSessionsByAgentGroup('ag-yente')) {
+      const db = new Database(inboundDbPath('ag-yente', s.id));
+      const rows = db.prepare("SELECT id FROM messages_in WHERE id = 'msg-roll:ag-yente'").all() as Array<{
+        id: string;
+      }>;
+      db.close();
+      total += rows.length;
+    }
+    expect(total).toBe(1);
+
+    // The delivery was already recorded by attempt 1: the replay is a
+    // skip-without-wake, not a fresh route.
+    expect(wakeMock.mock.calls.length).toBe(wakesBeforeReplay);
+  });
 });
 
 function deferred(): { promise: Promise<void>; resolve: () => void } {
