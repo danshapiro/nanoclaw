@@ -497,12 +497,15 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // Chat SDK dispatch (handling-events.mdx §"Handler dispatch order") is
       // exclusive: subscribed → onSubscribedMessage; unsubscribed+mention →
       // onNewMention; unsubscribed+pattern-match → onNewMessage. Registering
-      // with `/./` lets the router see every plain message on every
-      // unsubscribed thread the bot can see. The router short-circuits via
+      // with `/[\s\S]*/` — which intentionally also matches the empty string —
+      // lets the router see every plain message on every unsubscribed thread
+      // the bot can see, including attachment-only posts: Discord sends those
+      // with empty content, and the previous `/./` silently dropped them
+      // (2026-08-15 incident). The router short-circuits via
       // getMessagingGroupWithAgentCount (~1 DB read) for unwired channels,
       // so forwarding every one is cheap enough to not need a bridge-side
       // flood gate.
-      chat.onNewMessage(/./, async (thread, message) => {
+      chat.onNewMessage(/[\s\S]*/, async (thread, message) => {
         const channelId = adapter.channelIdFromThreadId(thread.id);
         await forwardInboundMessage(channelId, thread.id, message, false, true, 'plain');
       });

@@ -1,7 +1,7 @@
 import http from 'http';
 
 import { describe, expect, it, vi } from 'vitest';
-import type { Adapter } from 'chat';
+import { Message, parseMarkdown, type Adapter } from 'chat';
 
 import type { ChannelSetup } from './adapter.js';
 import { closeDb, initTestDb } from '../db/connection.js';
@@ -417,6 +417,120 @@ describe('onGatewayWebhookReady hook', () => {
       } as never);
       expect(seen).toHaveLength(1);
       expect(seen[0]).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/webhook$/);
+    } finally {
+      await bridge.teardown();
+      closeDb();
+    }
+  });
+});
+
+describe('plain-message catch-all dispatch', () => {
+  type DispatchDriver = {
+    handleIncomingMessage: (adapter: unknown, threadId: string, message: Message) => Promise<void>;
+  };
+
+  function makeMessage(overrides: Record<string, unknown> = {}): Message {
+    return new Message({
+      id: 'm-1',
+      threadId: 'thread-1',
+      text: '',
+      formatted: parseMarkdown(''),
+      raw: {},
+      author: { userId: 'user-1', userName: 'user-1', fullName: 'User One', isBot: false, isMe: false },
+      metadata: { dateSent: new Date('2026-08-15T04:09:31.975Z'), edited: false },
+      attachments: [],
+      ...overrides,
+    });
+  }
+
+  async function makeDispatchHarness(bridgeConfig: { dedupeTtlMs?: number } = {}) {
+    const db = initTestDb();
+    runMigrations(db);
+    const onInbound = vi.fn().mockResolvedValue(undefined);
+    let captured: DispatchDriver | null = null;
+    const fakeAdapter = {
+      name: 'discord',
+      userName: 'yente-test',
+      initialize: async (chat: unknown) => {
+        captured = chat as DispatchDriver;
+      },
+      channelIdFromThreadId: (threadId: string) => threadId,
+      startGatewayListener: async () => new Response('ok'),
+    };
+    const bridge = createChatSdkBridge({
+      adapter: fakeAdapter as never,
+      supportsThreads: true,
+      botToken: 'test-token',
+      ...bridgeConfig,
+    });
+    await bridge.setup({
+      onInbound,
+      onInboundEvent: async () => {},
+      onMetadata: async () => {},
+      onAction: async () => {},
+    } as never);
+    if (!captured) throw new Error('Chat SDK did not initialize the adapter');
+    const driver: DispatchDriver = captured;
+    return { bridge, driver, fakeAdapter, onInbound };
+  }
+
+  it('forwards an attachment-only message (empty text) to the router', async () => {
+    const { bridge, driver, fakeAdapter, onInbound } = await makeDispatchHarness();
+    try {
+      await driver.handleIncomingMessage(
+        fakeAdapter,
+        'thread-1',
+        makeMessage({
+          id: 'm-empty-attach',
+          attachments: [{ type: 'file', name: 'report.pdf', size: 3 }],
+        }),
+      );
+      expect(onInbound).toHaveBeenCalledTimes(1);
+      const [channelId, threadId, inbound] = onInbound.mock.calls[0] as [
+        string,
+        string,
+        { content: { text?: unknown; attachments?: Array<Record<string, unknown>> } },
+      ];
+      expect(channelId).toBe('thread-1');
+      expect(threadId).toBe('thread-1');
+      expect(inbound.content.text).toBe('');
+      expect(inbound.content.attachments?.[0]?.name).toBe('report.pdf');
+    } finally {
+      await bridge.teardown();
+      closeDb();
+    }
+  });
+
+  it('still forwards ordinary text messages (control)', async () => {
+    const { bridge, driver, fakeAdapter, onInbound } = await makeDispatchHarness();
+    try {
+      await driver.handleIncomingMessage(
+        fakeAdapter,
+        'thread-1',
+        makeMessage({ id: 'm-text', text: 'hello', formatted: parseMarkdown('hello') }),
+      );
+      expect(onInbound).toHaveBeenCalledTimes(1);
+    } finally {
+      await bridge.teardown();
+      closeDb();
+    }
+  });
+
+  it('delivers exactly once for a subscribed thread (widening must not double-fire)', async () => {
+    const { bridge, driver, fakeAdapter, onInbound } = await makeDispatchHarness();
+    try {
+      // bridge.subscribe(_platformId, threadId) blind-upserts into
+      // chat_sdk_subscriptions (no thread-existence prerequisite); the SDK's
+      // subscribed dispatch branch early-returns before the pattern loop, so
+      // a subscribed thread takes the subscribed path exactly once even with
+      // the widened catch-all.
+      await bridge.subscribe!('ignored', 'thread-1');
+      await driver.handleIncomingMessage(
+        fakeAdapter,
+        'thread-1',
+        makeMessage({ id: 'm-sub', text: 'hi there', formatted: parseMarkdown('hi there') }),
+      );
+      expect(onInbound).toHaveBeenCalledTimes(1);
     } finally {
       await bridge.teardown();
       closeDb();
