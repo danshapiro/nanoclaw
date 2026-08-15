@@ -32,7 +32,7 @@ vi.mock('./container-runner.js', () => ({
 
 vi.mock('./config.js', async () => {
   const actual = await vi.importActual('./config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-router' };
+  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-router', GROUPS_DIR: '/tmp/nanoclaw-test-router/groups' };
 });
 
 function now(): string {
@@ -177,6 +177,69 @@ function deliveredRows(sessionId: string): Array<{
 }
 
 describe('Yente host command routing', () => {
+  it('routes an attachment-only message (empty text) to the session and wakes the container', async () => {
+    const { routeInbound } = await import('./router.js');
+    const { wakeContainer } = await import('./container-runner.js');
+    vi.mocked(wakeContainer).mockClear();
+
+    const raw = 'todo list contents';
+    await routeInbound({
+      channelType: 'discord',
+      platformId: DISCORD_PLATFORM_ID,
+      threadId: DISCORD_THREAD_ID,
+      message: {
+        id: 'msg-attach-only',
+        kind: 'chat-sdk',
+        content: JSON.stringify({
+          sender: 'discord:admin',
+          senderId: 'discord:admin',
+          senderName: 'Admin',
+          text: '',
+          attachments: [
+            {
+              id: 'att-1',
+              name: 'message.txt',
+              mimeType: 'text/plain; charset=utf-8',
+              size: Buffer.from(raw).length,
+              data: Buffer.from(raw).toString('base64'),
+            },
+          ],
+        }),
+        timestamp: now(),
+        isMention: false,
+        isGroup: true,
+      },
+    });
+
+    const session = getSessionsByAgentGroup('ag-yente')[0];
+    expect(session).toBeDefined();
+    const db = new Database(inboundDbPath('ag-yente', session.id));
+    const rows = db
+      .prepare("SELECT content, trigger FROM messages_in WHERE id LIKE 'msg-attach-only%'")
+      .all() as Array<{ content: string; trigger: number }>;
+    db.close();
+    expect(rows).toHaveLength(1);
+
+    const parsed = JSON.parse(rows[0].content) as {
+      text: string;
+      attachments: Array<{ workspacePath: string }>;
+    };
+    expect(rows[0].trigger).toBe(1); // engage '.' fired — this message wakes the session
+    expect(parsed.text).toContain('message.txt');
+    expect(parsed.text).toContain('/workspace/agent/attachments/discord/');
+    expect(parsed.attachments[0].workspacePath).toMatch(/^\/workspace\/agent\/attachments\/discord\//);
+
+    // Derive the host path from the workspace path exactly as the container
+    // mount maps it, instead of hardcoding the sanitized message folder name.
+    const hostPath = parsed.attachments[0].workspacePath.replace(
+      '/workspace/agent',
+      '/tmp/nanoclaw-test-router/groups/yente',
+    );
+    expect(fs.readFileSync(hostPath, 'utf8')).toBe(raw);
+
+    expect(wakeContainer).toHaveBeenCalled();
+  });
+
   it('writes /help and bare help as host-authored responses without waking a container', async () => {
     const { routeInbound } = await import('./router.js');
     const { wakeContainer } = await import('./container-runner.js');
