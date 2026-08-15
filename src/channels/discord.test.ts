@@ -637,7 +637,7 @@ describe('monitoredDiscordChannelIds', () => {
 });
 
 describe('dedupeTtlForRouteLease', () => {
-  it('derives a dedupe TTL strictly below any configured route lease, never zero', async () => {
+  it('derives a dedupe TTL never zero, strictly below for every lease >= 2 ms', async () => {
     const mod = (await import('./discord.js')) as unknown as {
       dedupeTtlForRouteLease?: (routeLeaseMs: number) => number;
     };
@@ -647,6 +647,9 @@ describe('dedupeTtlForRouteLease', () => {
     expect(derive(100)).toBe(25);
     expect(derive(3)).toBe(1); // clamped: 0 would mean permanent dedupe in the SDK
     expect(derive(1)).toBe(1);
+    for (const lease of [2, 3, 4, 5, 8, 100, 120_000]) {
+      expect(derive(lease)).toBeLessThan(lease);
+    }
   });
 });
 

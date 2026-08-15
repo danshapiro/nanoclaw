@@ -720,6 +720,86 @@ describe('Yente host command routing', () => {
   });
 });
 
+describe('replay idempotency', () => {
+  it('recovers a write-succeeded/wake-failed route when catch-up replays the same message', async () => {
+    const { routeInbound } = await import('./router.js');
+    const { wakeContainer } = await import('./container-runner.js');
+    const wakeMock = vi.mocked(wakeContainer);
+    wakeMock.mockClear();
+
+    // First attempt: the session write lands durably, then the wake throws —
+    // the strict inbound path propagates so catch-up re-presents the message.
+    wakeMock.mockRejectedValueOnce(new Error('container spawn failed'));
+    await expect(routeInbound(event('ping', 'msg-replay'))).rejects.toThrow('container spawn failed');
+
+    // Catch-up replay of the SAME message: the durable row must not collide.
+    wakeMock.mockResolvedValue(undefined);
+    await routeInbound(event('ping', 'msg-replay'));
+
+    const session = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
+    expect(session).toBeDefined();
+    const db = new Database(inboundDbPath('ag-yente', session.id));
+    const rows = db.prepare("SELECT id FROM messages_in WHERE id LIKE 'msg-replay%'").all() as Array<{ id: string }>;
+    db.close();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].id).toBe('msg-replay:ag-yente');
+
+    const wakesForAgent = wakeMock.mock.calls.filter((call) => call[0].agent_group_id === 'ag-yente');
+    expect(wakesForAgent).toHaveLength(2); // failed attempt + successful retry
+  });
+
+  it('replays a multi-agent fan-out without colliding on the earlier row and retries the later agent', async () => {
+    const { routeInbound } = await import('./router.js');
+    const { wakeContainer } = await import('./container-runner.js');
+    const wakeMock = vi.mocked(wakeContainer);
+    wakeMock.mockClear();
+
+    createAgentGroup({
+      id: 'ag-second',
+      name: 'Second',
+      folder: 'second',
+      agent_provider: null,
+      created_at: now(),
+    });
+    createMessagingGroupAgent({
+      id: 'mga-second',
+      messaging_group_id: 'mg-discord',
+      agent_group_id: 'ag-second',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'per-thread',
+      // Fan-out orders by priority DESC; pin below mga-yente (0) so the wake
+      // sequence below maps deterministically to ag-yente then ag-second.
+      priority: -1,
+      created_at: now(),
+    });
+
+    // First pass: fan-out is sequential in agent order; the first wake
+    // succeeds, the second agent's wake fails after BOTH rows are durable.
+    wakeMock.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error('second agent spawn failed'));
+    await expect(routeInbound(event('ping', 'msg-multi'))).rejects.toThrow('second agent spawn failed');
+
+    // Catch-up replay: neither deterministic id may collide; both wakes retry.
+    wakeMock.mockResolvedValue(undefined);
+    await routeInbound(event('ping', 'msg-multi'));
+
+    for (const agentGroupId of ['ag-yente', 'ag-second']) {
+      const session = getSessionsByAgentGroup(agentGroupId)[0];
+      expect(session).toBeDefined();
+      const db = new Database(inboundDbPath(agentGroupId, session.id));
+      const rows = db.prepare("SELECT id FROM messages_in WHERE id LIKE 'msg-multi%'").all() as Array<{
+        id: string;
+      }>;
+      db.close();
+      expect(rows).toHaveLength(1);
+      expect(rows[0].id).toBe(`msg-multi:${agentGroupId}`);
+    }
+    expect(wakeMock).toHaveBeenCalledTimes(4); // 2 attempts on first pass, 2 retries on replay
+  });
+});
+
 function deferred(): { promise: Promise<void>; resolve: () => void } {
   let resolve!: () => void;
   const promise = new Promise<void>((r) => {

@@ -37,7 +37,7 @@ import {
 import { deliverSessionMessages, getDeliveryAdapter, suppressSessionOutbound } from './delivery.js';
 import { startTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
-import { resolveSession, writeSessionMessage, writeOutboundDirect } from './session-manager.js';
+import { resolveSession, sessionMessageExists, writeSessionMessage, writeOutboundDirect } from './session-manager.js';
 import { wakeContainer } from './container-runner.js';
 import type { AgentGroup, MessagingGroup, MessagingGroupAgent, Session } from './types.js';
 import type { InboundEvent } from './channels/adapter.js';
@@ -603,22 +603,34 @@ async function deliverToAgent(
     }
   }
 
-  writeSessionMessage(session.agent_group_id, session.id, {
-    id: messageIdForAgent(agentEvent.message.id, agent.agent_group_id),
-    kind: agentEvent.message.kind,
-    timestamp: agentEvent.message.timestamp,
-    platformId: deliveryAddr.platformId,
-    platformMessageId: agentEvent.message.id || null,
-    channelType: deliveryAddr.channelType,
-    threadId: deliveryAddr.threadId,
-    content: agentEvent.message.content,
-    trigger: wake ? 1 : 0,
-    // Host-stamped route identity from the resolved messaging group. Lets the
-    // container normalizer collapse DM aliases safely and isolate distinct
-    // group threads, without inferring from nullable thread ids.
-    messagingGroupId: mg.id,
-    isGroup: mg.is_group === 1 ? 1 : 0,
-  });
+  const routedMessageId = messageIdForAgent(agentEvent.message.id, agent.agent_group_id);
+  if (sessionMessageExists(session.agent_group_id, session.id, routedMessageId)) {
+    // Catch-up replay after a partial delivery: the row from the first
+    // attempt is already durable; re-writing would hit the PK and abort the
+    // retry. Skip the write; the wake below is what actually needs retrying.
+    log.info('Replay of already-recorded routed message — skipping session write', {
+      sessionId: session.id,
+      agentGroup: agent.agent_group_id,
+      messageId: routedMessageId,
+    });
+  } else {
+    writeSessionMessage(session.agent_group_id, session.id, {
+      id: routedMessageId,
+      kind: agentEvent.message.kind,
+      timestamp: agentEvent.message.timestamp,
+      platformId: deliveryAddr.platformId,
+      platformMessageId: agentEvent.message.id || null,
+      channelType: deliveryAddr.channelType,
+      threadId: deliveryAddr.threadId,
+      content: agentEvent.message.content,
+      trigger: wake ? 1 : 0,
+      // Host-stamped route identity from the resolved messaging group. Lets the
+      // container normalizer collapse DM aliases safely and isolate distinct
+      // group threads, without inferring from nullable thread ids.
+      messagingGroupId: mg.id,
+      isGroup: mg.is_group === 1 ? 1 : 0,
+    });
+  }
 
   log.info('Message routed', {
     sessionId: session.id,

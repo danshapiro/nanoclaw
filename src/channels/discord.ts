@@ -467,6 +467,12 @@ export function createDiscordHandledTracker(): {
  * quarter guarantees every re-presentation lands after the SDK dedupe entry
  * expired and genuinely re-dispatches. Clamped to >= 1ms because the dedupe
  * TTL path treats 0 as no-expiry (permanent dedupe).
+ * Strictly smaller than the lease for every lease >= 2 ms by construction;
+ * the floor clamp keeps a 1 ms lease non-zero (0 would mean permanent dedupe
+ * in the SDK). Degenerate sub-2 ms leases are outside the supported
+ * configuration range (production: 120 s). The quarter-of-lease derivation
+ * also bounds how late the SDK dedupe stamp may land after the route claim
+ * before a retried claim is swallowed. Accepted residual, delta review round 6.
  */
 export function dedupeTtlForRouteLease(routeLeaseMs: number): number {
   return Math.max(1, Math.floor(routeLeaseMs / 4));

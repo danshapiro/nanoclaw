@@ -901,6 +901,8 @@ export function wrapYenteDiscordChannelIds(
 
 (post-remediation, delta review round 4: markDiscordMessageFailed carries a `status != 'routed'` guard — routed rows are monotonic and never regress)
 
+(post-remediation, delta review round 6: catch-up replay is idempotent at the router's deterministic session-write seam, so a partially delivered route can be re-presented without PK collisions; the quarter-of-lease dedupe guarantee is documented as strict for leases ≥ 2 ms, with degenerate sub-2 ms leases an accepted residual)
+
 5. The tracker constructor, factory wiring of BOTH acceptance ends, and the wrap options were landed live-but-inert in Task 2 — nothing further to add here. This task's only remaining factory edit is the lease-derived dedupe alignment on the `createChatSdkBridge({...})` config object:
 
 ```ts

@@ -507,6 +507,23 @@ export function writeSessionMessage(
 }
 
 /**
+ * Read-only existence check for a session inbound row by message id.
+ * Host-only. Used by the router to make catch-up replays idempotent: the
+ * route ledger can re-present a message after a partial delivery failure,
+ * and the deterministic messageIdForAgent id must not collide with the row
+ * the first attempt already wrote (delta review round 6). messages_in is
+ * host-written from this process, so the check-then-insert pair is safe.
+ */
+export function sessionMessageExists(agentGroupId: string, sessionId: string, messageId: string): boolean {
+  const db = openInboundDb(agentGroupId, sessionId);
+  try {
+    return db.prepare('SELECT 1 FROM messages_in WHERE id = ?').get(messageId) !== undefined;
+  } finally {
+    db.close();
+  }
+}
+
+/**
  * If message content has attachments with base64 `data`, save them to
  * the agent group's mounted workspace and add prompt metadata.
  */
