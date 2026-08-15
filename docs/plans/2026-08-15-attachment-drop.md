@@ -1088,7 +1088,7 @@ Expected: PASS even before any production change (deliberate guard coverage — 
 
 - [ ] **Step 3: Production implementation**
 
-None — coverage only (config-mock override + test). Explicitly nothing to change in `src/router.ts` or `src/session-manager.ts`: investigation showed the empty-text + attachments path is already clean end to end (engage `'.'` short-circuit at src/router.ts:~407-408; attachment metadata appended to `parsed.text` by `extractAttachmentFiles`; no `!text` guards on the inbound path).
+None — coverage only (config-mock override + test). Explicitly nothing to change in `src/router.ts` or `src/session-manager.ts`: investigation showed the empty-text + attachments path is already clean end to end (engage `'.'` short-circuit at src/router.ts:~407-408; attachment metadata appended to `parsed.text` by `extractAttachmentFiles`; no `!text` guards on the inbound path). (with one exception landed post-execution by delta-review remediation round 6: the replay-idempotency guard at the router's deterministic session-write seam — see 'Post-execution delta-review remediations')
 
 - [ ] **Step 4: Re-confirm after Tasks 1-3**
 
@@ -1114,3 +1114,11 @@ Expected: PASS (exit 0 for each command).
 git add src/router.test.ts
 git commit -m "test(router): cover attachment-only messages reaching the session and waking the container"
 ```
+
+## Post-execution delta-review remediations
+
+- Round 1 (0da9782): acceptance hook follows `setupConfig.onInboundStrict ?? setupConfig.onInbound` so router failures propagate and stay catch-up eligible; two contract tests in chat-sdk-bridge.test.ts.
+- Round 2 (115c0da): plan-doc alignment for the strict-inbound pass-through (documentation only).
+- Round 4 (3a9ce95): `markDiscordMessageFailed` gained `AND status != 'routed'` (monotonic terminality against overlapping re-claims); red-first unit regression in discord-state.test.ts.
+- Round 6 (327862e): `sessionMessageExists` in session-manager.ts + skip-before-insert guard in router.ts `deliverToAgent` making catch-up replay idempotent (no PK collision after partial delivery); two replay-idempotency tests in router.test.ts; `dedupeTtlForRouteLease` strict-below-lease guarantee documented for leases ≥ 2 ms with degenerate sub-2 ms leases an accepted residual, plus a property assertion in discord.test.ts.
+- Round 7 (this commit): bridge retains and closes the gateway webhook server in `teardown()`; fetch-rejection assertion in the webhook-ready test; this appendix.

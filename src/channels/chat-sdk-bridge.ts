@@ -375,6 +375,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
   let state: SqliteStateAdapter;
   let setupConfig: ChannelSetup;
   let gatewayAbort: AbortController | null = null;
+  let webhookServerHandle: http.Server | null = null;
 
   async function messageToInbound(
     message: ChatMessage,
@@ -581,7 +582,12 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         gatewayAbort = new AbortController();
 
         // Start local HTTP server to receive forwarded Gateway events (including interactions)
-        const webhookUrl = await startLocalWebhookServer(gatewayAdapter, setupConfig, config.botToken);
+        const { url: webhookUrl, server: webhookServer } = await startLocalWebhookServer(
+          gatewayAdapter,
+          setupConfig,
+          config.botToken,
+        );
+        webhookServerHandle = webhookServer;
 
         if (config.onGatewayWebhookReady) {
           try {
@@ -758,6 +764,14 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
 
     async teardown() {
       gatewayAbort?.abort();
+      if (webhookServerHandle) {
+        // Close the local webhook server started with the gateway listener —
+        // teardown owns every resource setup opened (delta review round 7:
+        // otherwise each setup leaks a listening socket for the process
+        // lifetime, which the dispatch-terminated tests trigger per test).
+        await new Promise<void>((resolve) => webhookServerHandle!.close(() => resolve()));
+        webhookServerHandle = null;
+      }
       await chat.shutdown();
       log.info('Chat SDK bridge shut down', { adapter: adapter.name });
     },
@@ -815,13 +829,15 @@ export function disableWebhookServerKeepAlive(server: http.Server): void {
  * Start a local HTTP server to receive forwarded Gateway events.
  * This is needed because the Gateway listener in webhook-forwarding mode
  * sends ALL raw events (including INTERACTION_CREATE for button clicks)
- * to the webhookUrl, which we handle here.
+ * to the webhookUrl, which we handle here. Returns the URL alongside the
+ * server itself so the bridge can close it in teardown() — without the
+ * handle each setup leaks a listening socket for the process lifetime.
  */
 function startLocalWebhookServer(
   adapter: GatewayAdapter,
   setupConfig: ChannelSetup,
   botToken?: string,
-): Promise<string> {
+): Promise<{ url: string; server: http.Server }> {
   return new Promise((resolve) => {
     const server = http.createServer((req, res) => {
       const chunks: Buffer[] = [];
@@ -847,7 +863,7 @@ function startLocalWebhookServer(
       const addr = server.address() as { port: number };
       const url = `http://127.0.0.1:${addr.port}/webhook`;
       log.info('Local webhook server started', { port: addr.port });
-      resolve(url);
+      resolve({ url, server });
     });
   });
 }

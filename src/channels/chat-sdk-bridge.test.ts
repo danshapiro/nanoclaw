@@ -483,6 +483,10 @@ describe('onGatewayWebhookReady hook', () => {
       await bridge.teardown();
       closeDb();
     }
+    // teardown owns the gateway webhook server it started: after it closes,
+    // the URL must refuse connections. Pre-fix this resolved with 200
+    // {"ok":true} — the leaked server kept listening for the process lifetime.
+    await expect(fetch(seen[0])).rejects.toThrow();
   });
 });
 
