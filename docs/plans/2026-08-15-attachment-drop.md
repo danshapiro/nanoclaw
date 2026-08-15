@@ -152,7 +152,7 @@ describe('plain-message catch-all dispatch', () => {
       // subscribed dispatch branch early-returns before the pattern loop, so
       // a subscribed thread takes the subscribed path exactly once even with
       // the widened catch-all.
-      await bridge.subscribe('ignored', 'thread-1');
+      await bridge.subscribe!('ignored', 'thread-1'); // (non-null assertion: ChannelAdapter.subscribe is optional; strict tsc requires it here)
       await driver.handleIncomingMessage(
         fakeAdapter,
         'thread-1',
@@ -652,9 +652,9 @@ describe('discord ingress chain: bridge dispatch → acceptance hook → ledger'
     // Same tracker constructor as the production factory; bridge hook writes,
     // wrapper consults via consume-on-read delete.
     const tracker = createDiscordHandledTracker();
-    let captured:
-      | { handleIncomingMessage(adapter: unknown, threadId: string, message: Message): Promise<void> }
-      | null = null;
+    let captured: {
+      handleIncomingMessage(adapter: unknown, threadId: string, message: Message): Promise<void>;
+    } | null = null;
     const fake = {
       name: 'discord',
       userName: 'yente-test',
@@ -663,6 +663,13 @@ describe('discord ingress chain: bridge dispatch → acceptance hook → ledger'
       },
       channelIdFromThreadId: (threadId: string) => threadId,
       startGatewayListener: async () => new Response('ok'),
+      // The wrapper binds the outbound methods at wrap time; stub them like fakeAdapter().
+      postMessage: vi.fn(async () => 'mid'),
+      editMessage: vi.fn(async () => undefined),
+      deleteMessage: vi.fn(async () => undefined),
+      addReaction: vi.fn(async () => undefined),
+      removeReaction: vi.fn(async () => undefined),
+      startTyping: vi.fn(async () => undefined),
       // Mirrors the vendored adapter: its forward awaits chat.handleIncomingMessage.
       handleForwardedMessage: vi.fn(
         async (data: { id: string; channel_id: string; author: { id: string }; content: string }) => {
@@ -677,7 +684,13 @@ describe('discord ingress chain: bridge dispatch → acceptance hook → ledger'
               text: data.content,
               formatted: parseMarkdown(data.content),
               raw: data,
-              author: { userId: data.author.id, userName: data.author.id, fullName: data.author.id, isBot: false, isMe: false },
+              author: {
+                userId: data.author.id,
+                userName: data.author.id,
+                fullName: data.author.id,
+                isBot: false,
+                isMe: false,
+              },
               metadata: { dateSent: new Date(), edited: false },
               attachments: [],
             }),
@@ -686,13 +699,18 @@ describe('discord ingress chain: bridge dispatch → acceptance hook → ledger'
         },
       ),
     };
-    const wrapped = wrapYenteDiscordChannelIds(fake as never, 'test-token', new Set(), {
+    const wrappedAdapter = wrapYenteDiscordChannelIds(fake as never, 'test-token', new Set(), {
       monitoredChannelIds: () => new Set(['chan-1']),
       routeLeaseMs: 120000,
       wasMessageHandled: tracker.wasHandled,
     });
+    // Same structural cast as the wrap() helper: handleForwardedMessage is
+    // private on the vendored adapter's class type.
+    const wrapped = wrappedAdapter as unknown as {
+      handleForwardedMessage: (data: unknown, options: unknown) => Promise<unknown>;
+    };
     const bridge = createChatSdkBridge({
-      adapter: wrapped as never,
+      adapter: wrappedAdapter as never,
       supportsThreads: true,
       botToken: 'test-token',
       onInboundForwarded: tracker.noteHandled,

@@ -458,7 +458,11 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       isMention,
       isGroup,
       source,
-      onInbound: setupConfig.onInbound,
+      // Prefer the strict inbound variant when the host provides it: it
+      // propagates router failures instead of swallowing them, so the
+      // acceptance hook stays silent on failure and the message remains
+      // catch-up eligible instead of being falsely marked routed.
+      onInbound: setupConfig.onInboundStrict ?? setupConfig.onInbound,
       toInbound: messageToInbound,
       onForwarded: config.onInboundForwarded,
     });

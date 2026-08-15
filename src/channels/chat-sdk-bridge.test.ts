@@ -505,10 +505,19 @@ describe('plain-message catch-all dispatch', () => {
     });
   }
 
-  async function makeDispatchHarness(bridgeConfig: { dedupeTtlMs?: number } = {}) {
+  async function makeDispatchHarness(
+    bridgeConfig: { dedupeTtlMs?: number } = {},
+    setupOverrides: {
+      onInbound?: ChannelSetup['onInbound'];
+      onInboundStrict?: ChannelSetup['onInboundStrict'];
+    } = {},
+  ) {
     const db = initTestDb();
     runMigrations(db);
-    const onInbound = vi.fn().mockResolvedValue(undefined);
+    // Loose mock type so callers can always assert `.mock` — with an
+    // override provided the spy lives in the test that constructed it.
+    const onInbound = (setupOverrides.onInbound ?? vi.fn().mockResolvedValue(undefined)) as ReturnType<typeof vi.fn>;
+    const onInboundForwarded = vi.fn();
     let captured: DispatchDriver | null = null;
     const fakeAdapter = {
       name: 'discord',
@@ -523,7 +532,7 @@ describe('plain-message catch-all dispatch', () => {
       adapter: fakeAdapter as never,
       supportsThreads: true,
       botToken: 'test-token',
-      onInboundForwarded: vi.fn(),
+      onInboundForwarded,
       ...bridgeConfig,
     });
     await bridge.setup({
@@ -531,10 +540,11 @@ describe('plain-message catch-all dispatch', () => {
       onInboundEvent: async () => {},
       onMetadata: async () => {},
       onAction: async () => {},
+      ...(setupOverrides.onInboundStrict ? { onInboundStrict: setupOverrides.onInboundStrict } : {}),
     } as never);
     if (!captured) throw new Error('Chat SDK did not initialize the adapter');
     const driver: DispatchDriver = captured;
-    return { bridge, driver, fakeAdapter, onInbound };
+    return { bridge, driver, fakeAdapter, onInbound, onInboundForwarded };
   }
 
   it('forwards an attachment-only message (empty text) to the router', async () => {
@@ -617,6 +627,53 @@ describe('plain-message catch-all dispatch', () => {
       await new Promise((resolve) => setTimeout(resolve, 10));
       await driver.handleIncomingMessage(fakeAdapter, 'thread-9', msg);
       expect(onInbound).toHaveBeenCalledTimes(2);
+    } finally {
+      await bridge.teardown();
+      closeDb();
+    }
+  });
+
+  it('fires the acceptance hook through onInboundStrict when the host provides it', async () => {
+    const onInbound = vi.fn().mockResolvedValue(undefined);
+    const onInboundStrict = vi.fn().mockResolvedValue(undefined);
+    const { bridge, driver, fakeAdapter, onInboundForwarded } = await makeDispatchHarness(
+      {},
+      { onInbound, onInboundStrict },
+    );
+    try {
+      await driver.handleIncomingMessage(
+        fakeAdapter,
+        'thread-1',
+        makeMessage({ id: 'm-strict-ok', text: 'up', formatted: parseMarkdown('up') }),
+      );
+      expect(onInboundStrict).toHaveBeenCalledTimes(1);
+      expect(onInbound).not.toHaveBeenCalled();
+      expect(onInboundForwarded).toHaveBeenCalledWith('m-strict-ok');
+    } finally {
+      await bridge.teardown();
+      closeDb();
+    }
+  });
+
+  it('suppresses the acceptance hook when onInboundStrict rejects (router failure stays catch-up eligible)', async () => {
+    const onInbound = vi.fn().mockResolvedValue(undefined);
+    const onInboundStrict = vi.fn().mockRejectedValue(new Error('router blew up'));
+    const { bridge, driver, fakeAdapter, onInboundForwarded } = await makeDispatchHarness(
+      {},
+      { onInbound, onInboundStrict },
+    );
+    try {
+      // Whether the SDK surfaces or swallows a handler failure, the acceptance
+      // contract is observable either way: the hook must not fire.
+      await driver
+        .handleIncomingMessage(
+          fakeAdapter,
+          'thread-1',
+          makeMessage({ id: 'm-strict-fail', text: 'up', formatted: parseMarkdown('up') }),
+        )
+        .catch(() => {});
+      expect(onInboundForwarded).not.toHaveBeenCalled();
+      expect(onInbound).not.toHaveBeenCalled();
     } finally {
       await bridge.teardown();
       closeDb();
