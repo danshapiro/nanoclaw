@@ -163,8 +163,9 @@ export interface ChatSdkBridgeConfig {
    * Channels with their own idempotent claim/replay layer (Discord's
    * message-route claim + catch-up) set this BELOW their re-presentation
    * cadence so a re-presented message id dispatches again; the SDK layer
-   * then only absorbs same-process duplicate bursts. Never set 0: the SDK's
-   * sqlite dedupe treats 0 as no-expiry (permanent dedupe).
+   * then only absorbs same-process duplicate bursts. Never set 0: the dedupe
+   * TTL path (chat core + the sqlite state adapter's setIfNotExists) treats 0
+   * as no-expiry (permanent dedupe).
    */
   dedupeTtlMs?: number;
 }
