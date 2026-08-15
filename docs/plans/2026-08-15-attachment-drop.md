@@ -83,7 +83,6 @@ describe('plain-message catch-all dispatch', () => {
         captured = chat as DispatchDriver;
       },
       channelIdFromThreadId: (threadId: string) => threadId,
-      startGatewayListener: async () => new Response('ok'),
     };
     const bridge = createChatSdkBridge({
       adapter: fakeAdapter as never,
@@ -169,7 +168,7 @@ describe('plain-message catch-all dispatch', () => {
 
 Notes for the implementer:
 
-- The fake adapter mirrors the existing `onGatewayWebhookReady hook` test's harness in this file (`initialize`, `channelIdFromThreadId`, `startGatewayListener`). The Chat SDK calls `adapter.initialize(chat)`-style construction during `new Chat({...})`; capturing through `initialize` is how the test obtains the dispatch driver. `handleIncomingMessage` is a public (deprecated-for-adapters) method on the SDK Chat instance: `handleIncomingMessage(adapter, threadId, message)` — the vendored discord adapter calls it the same way at runtime.
+- The fake adapter mirrors the existing `onGatewayWebhookReady hook` test's harness in this file minus `startGatewayListener` (`initialize`, `channelIdFromThreadId` only): these dispatch tests drive `handleIncomingMessage` directly and never need the gateway branch, so no per-test local server starts (delta review rounds 7-8). The Chat SDK calls `adapter.initialize(chat)`-style construction during `new Chat({...})`; capturing through `initialize` is how the test obtains the dispatch driver. `handleIncomingMessage` is a public (deprecated-for-adapters) method on the SDK Chat instance: `handleIncomingMessage(adapter, threadId, message)` — the vendored discord adapter calls it the same way at runtime.
 - The attachment fixture has neither `url` nor `fetchData`, so serialization performs no network access.
 - `makeDispatchHarness` asserts capture non-null via an explicit throw and a re-assignment to satisfy `strict` narrowing (the closure-assigned variable pattern defeats TS control-flow narrowing without it).
 
@@ -667,7 +666,6 @@ describe('discord ingress chain: bridge dispatch → acceptance hook → ledger'
         captured = chat as never;
       },
       channelIdFromThreadId: (threadId: string) => threadId,
-      startGatewayListener: async () => new Response('ok'),
       // The wrapper binds the outbound methods at wrap time; stub them like fakeAdapter().
       postMessage: vi.fn(async () => 'mid'),
       editMessage: vi.fn(async () => undefined),
@@ -1120,6 +1118,7 @@ git commit -m "test(router): cover attachment-only messages reaching the session
 - Round 1 (0da9782): acceptance hook follows `setupConfig.onInboundStrict ?? setupConfig.onInbound` so router failures propagate and stay catch-up eligible; two contract tests in chat-sdk-bridge.test.ts.
 - Round 2 (115c0da): plan-doc alignment for the strict-inbound pass-through (documentation only).
 - Round 4 (3a9ce95): `markDiscordMessageFailed` gained `AND status != 'routed'` (monotonic terminality against overlapping re-claims); red-first unit regression in discord-state.test.ts.
-- Round 6 (327862e): `sessionMessageExists` in session-manager.ts + skip-before-insert guard in router.ts `deliverToAgent` making catch-up replay idempotent (no PK collision after partial delivery); two replay-idempotency tests in router.test.ts; `dedupeTtlForRouteLease` strict-below-lease guarantee documented for leases ≥ 2 ms with degenerate sub-2 ms leases an accepted residual, plus a property assertion in discord.test.ts.
-- Round 7 (4071ffa, production half reverted by delta review round 8): bridge webhook-server teardown change was reverted as an out-of-scope lifecycle repair; the leak remediation was scoped to the test harnesses — dispatch fakes no longer advertise `startGatewayListener`, so no per-test server starts.
-- Round 8 (this commit): the replay guard validates the stored route identity (platform, channel, thread, messaging group, platform message id, timestamp) before skipping — a distinct message colliding on a provider-local id throws loudly instead of being swallowed; harness gateway advertisement removed per the reverted round-7 production change.
+- Round 6 (327862e, superseded implementation recorded for history): catch-up replay idempotency landed as `sessionMessageExists` in session-manager.ts + skip-before-insert guard in router.ts `deliverToAgent` (no PK collision after partial delivery); two replay-idempotency tests in router.test.ts; `dedupeTtlForRouteLease` strict-below-lease guarantee documented for leases ≥ 2 ms with degenerate sub-2 ms leases an accepted residual, plus a property assertion in discord.test.ts.
+- Round 7 (c2987d2): the interim webhook-server teardown change (4071ffa) was reverted as out-of-scope; remediation rescoped to tests — dispatch harnesses no longer advertise `startGatewayListener`, so no per-test local server starts.
+- Round 8 (458aadb): `sessionMessageExists` replaced by `getSessionMessageRouteIdentity(platformId, platformMessageId, channelType, threadId, messagingGroupId, timestamp)`; skip only on full route-identity match, throw `Refusing to skip distinct message…` on collision; new collision test; the two round-6 replay tests re-present the identical event object (test helper stamps a fresh timestamp per call; production catch-up re-presents the original platform message whose dateSent timestamp is stable).
+- Round 9 (this commit): sibling-session sweep handles catch-up replay after a `/new` or `/clear` rollover. When the resolved session holds no row, router.ts `deliverToAgent` sweeps every sibling on the route key via `findSessionsForAgentRouteKey(agentGroupId: string, messagingGroupId: string, threadId: string | null): Session[]` (src/db/sessions.ts), bounded by `sibling.created_at <= message.timestamp` (only a session created at/before the platform timestamp can hold the first attempt's row), and consults the round-8 identity lookup `getSessionMessageRouteIdentity(agentGroupId: string, sessionId: string, messageId: string): SessionMessageRouteIdentity | null` (session-manager.ts) on each candidate sibling. Full route-identity match → skip the write AND the wake and return (the pre-reset message is not re-written into the deliberately fresh session); identity mismatch on the colliding id → throw `Refusing to skip distinct message…` exactly as the current-session branch. Rollover regression test in router.test.ts (`replay idempotency` describe) proves the replay writes nothing into the fresh session, leaves exactly one row across all of the agent's session DBs (in the archived original), and does not re-wake.
