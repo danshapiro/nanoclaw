@@ -233,6 +233,7 @@ git commit -m "fix(channels): dispatch empty-text plain messages instead of drop
 
 **Files:**
 - Modify: `src/channels/chat-sdk-bridge.ts` (config interface ~line 148 after `onGatewayWebhookReady`, `forwardChatSdkInboundMessage` ~lines 311-344, `forwardInboundMessage` ~lines 420-440)
+- Modify: `src/channels/discord.ts` (YenteDiscordWrapOptions type, new exported tracker constructor, factory wiring) — the sole production `createChatSdkBridge` caller MUST migrate in this same commit: with `onInboundForwarded` required, deferring the factory to Task 3 would fail this task's whole-repo typecheck gate (plan-review round-3 finding 1). The wrapper does not yet CONSUME the new option (Task 3 owns the consult), so Task 2 wires it live but behavior-inert.
 - Test: `src/channels/chat-sdk-bridge.test.ts`
 
 **Interfaces:**
@@ -241,6 +242,8 @@ git commit -m "fix(channels): dispatch empty-text plain messages instead of drop
   - `ChatSdkBridgeConfig.onInboundForwarded: (messageId: string) => void` — **required** config-level hook (compile-gated against factory omission), fired by the bridge after every successful inbound forward.
   - `forwardChatSdkInboundMessage` opts field `onForwarded?: (messageId: string) => void` — per-call hook fired with the message id after `onInbound` completes, only on the `'forwarded'` path (not on the same-bot `'dropped'` path).
   - `ChatSdkBridgeConfig.dedupeTtlMs?: number` — plumbed straight into `new Chat({...})` (`dedupeTtlMs: config.dedupeTtlMs`; the SDK defaults to 300000 via `??` when undefined). Task 3 sets it under the discord route lease so catch-up re-presentations of a message id actually re-dispatch (SDK default 300s vs 120s lease would otherwise swallow them pre-dispatch: validated V3). Never use `0` — the SDK's sqlite dedupe treats 0 as permanent (`expires_at = null`), the opposite of disabling.
+  - `YenteDiscordWrapOptions.wasMessageHandled?: (messageId: string) => boolean` — added OPTIONAL in this task (the wrapper ignores it until Task 3 flips it required and adds the consult); needed now only so the factory wiring below is type-correct.
+  - `createDiscordHandledTracker(): { noteHandled: (id: string) => void; wasHandled: (id: string) => boolean }` — exported from `src/channels/discord.ts`; the factory builds it in this task and Task 3's chain test uses the same constructor.
 
 This is the plumbing Task 3 wires to truthful route bookkeeping. The Chat SDK's dispatch resolves `void` whether or not any handler matched, and the vendored discord adapter's forward resolves either way, so without this hook the wrapper cannot distinguish "handler accepted the message" from "no handler matched".
 
@@ -450,7 +453,59 @@ export async function forwardChatSdkInboundMessage<
    - `src/channels/chat-sdk-bridge.test.ts:138` and `:285` (outbound-splitting tests): add `onInboundForwarded: vi.fn()`;
    - `src/channels/chat-sdk-bridge.test.ts:405` (onGatewayWebhookReady test): add `onInboundForwarded: vi.fn()`;
    - Task 1's `makeDispatchHarness` (same file, its `createChatSdkBridge` call): add `onInboundForwarded: vi.fn()`.
-   The only production caller is the discord factory, updated in Task 3 — that sequencing is safe because tasks execute in order on one branch.
+
+6. In `src/channels/discord.ts`, add the OPTIONAL wrapper option (the consult arrives in Task 3; this exists now so the factory wiring is type-correct):
+
+```ts
+  /**
+   * Consume-on-read acceptance probe wired from the bridge's onInboundForwarded
+   * hook: returns true exactly once per message id a dispatch handler actually
+   * forwarded. Optional in this task; the wrapper begins consulting it (and
+   * the option becomes required) in the follow-up bookkeeping change.
+   */
+  wasMessageHandled?: (messageId: string) => boolean;
+```
+
+7. In `src/channels/discord.ts`, add the exported tracker constructor (module scope, near `wrapYenteDiscordChannelIds`; no cap — plan-review round-1 finding 5: a FIFO cap can evict a still-pending acknowledgment under wide concurrency, and no leak path exists: entries are added only by a successful inbound forward and always consumed by the consult that the same forward reaches; reject paths throw before the hook fires):
+
+```ts
+/**
+ * Acceptance tracker shared by the chat-sdk bridge's onInboundForwarded hook
+ * (writer) and the wrapped adapter's outcome block (consume-on-read reader
+ * via Set.delete). Entries are added only by a successful inbound forward and
+ * always consumed by the consult that the same forward reaches, so the set
+ * stays near zero by construction. Exported so production and tests build the
+ * tracker from the SAME constructor.
+ */
+export function createDiscordHandledTracker(): { noteHandled: (id: string) => void; wasHandled: (id: string) => boolean } {
+  const handled = new Set<string>();
+  return {
+    noteHandled: (id) => {
+      handled.add(id);
+    },
+    wasHandled: (id) => handled.delete(id),
+  };
+}
+```
+
+8. In the discord channel factory, just before `return createChatSdkBridge({`, build the tracker and wire BOTH ends (the bridge hook — required from this task — and the wrapper option — inert until Task 3):
+
+```ts
+    const handledTracker = createDiscordHandledTracker();
+```
+
+```ts
+      adapter: wrapYenteDiscordChannelIds(discordAdapter, botToken, autoCreateThreadChannelIds, {
+        monitoredChannelIds: channelIds,
+        routeLeaseMs: catchupConfig.routeLeaseMs,
+        onGatewayEvent: (type) => catchup?.onGatewayEvent(type),
+        wasMessageHandled: handledTracker.wasHandled,
+      }),
+```
+
+```ts
+      onInboundForwarded: handledTracker.noteHandled,
+```
 
 - [ ] **Step 4: Run the focused tests**
 
@@ -464,17 +519,17 @@ No refactor needed: two optional config fields and one pass-through hook added a
 
 - [ ] **Step 6: Run impacted-test verification**
 
-Only the bridge module and its direct consumers change; `forwardChatSdkInboundMessage`'s only production caller is `forwardInboundMessage` in the same file, and the config interface addition is optional, so no other channel is affected.
+The bridge module, its direct consumers, and the discord factory change. `forwardChatSdkInboundMessage`'s only production caller is `forwardInboundMessage` in the same file; the factory wiring is behavior-inert until Task 3, but discord tests run to prove the factory edit and optional wrapper field break nothing.
 
-Run: `pnpm test src/channels/chat-sdk-bridge.test.ts && pnpm run typecheck && pnpm exec eslint src/channels/chat-sdk-bridge.ts src/channels/chat-sdk-bridge.test.ts`
+Run: `pnpm test src/channels/chat-sdk-bridge.test.ts src/channels/discord.test.ts && pnpm run typecheck && pnpm exec eslint src/channels/chat-sdk-bridge.ts src/channels/chat-sdk-bridge.test.ts src/channels/discord.ts`
 
 Expected: PASS (exit 0 for each command).
 
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add src/channels/chat-sdk-bridge.ts src/channels/chat-sdk-bridge.test.ts
-git commit -m "feat(channels): add onInboundForwarded hook and configurable dedupe TTL to chat-sdk bridge"
+git add src/channels/chat-sdk-bridge.ts src/channels/chat-sdk-bridge.test.ts src/channels/discord.ts
+git commit -m "feat(channels): acceptance-forwarded hook, dedupe TTL, and live-but-inert discord acceptance wiring"
 ```
 
 ---
@@ -488,10 +543,9 @@ git commit -m "feat(channels): add onInboundForwarded hook and configurable dedu
 - Test: `src/channels/discord.test.ts` (extend the `wrap()` helper; add tests), `src/channels/discord-catchup.test.ts` (add the walk-skip test)
 
 **Interfaces:**
-- Consumes: `ChatSdkBridgeConfig.onInboundForwarded` (required) and `ChatSdkBridgeConfig.dedupeTtlMs` from Task 2; `DiscordAdapter.botUserId` (public readonly, set at adapter construction — verified in vendored `@chat-adapter/discord` dist); the applicationId string the factory already resolves for the adapter constructor.
+- Consumes: `ChatSdkBridgeConfig.onInboundForwarded` (required) and `ChatSdkBridgeConfig.dedupeTtlMs` from Task 2; the optional `YenteDiscordWrapOptions.wasMessageHandled`, the exported `createDiscordHandledTracker`, and the live-but-inert factory wiring (tracker + both ends) all landed in Task 2; `DiscordAdapter.botUserId` (public readonly, set at adapter construction — verified in vendored `@chat-adapter/discord` dist); the applicationId string the factory already resolves for the adapter constructor.
 - Produces:
-  - `YenteDiscordWrapOptions.wasMessageHandled: (messageId: string) => boolean` — **required** consume-on-read acceptance probe: returns `true` exactly once per message id that was actually forwarded inbound by a dispatch handler.
-  - `createDiscordHandledTracker(): { noteHandled(id: string): void; wasHandled(id: string): boolean }` — the single tracker constructor used by BOTH the production factory and the chain test (plan-review round-2 finding 2: hand-mirrored wiring in tests proves nothing about production).
+  - `YenteDiscordWrapOptions.wasMessageHandled: (messageId: string) => boolean` — flipped from optional to **required** here; the wrapper outcome block now consults it (consume-on-read acceptance probe wired by Task 2's `createDiscordHandledTracker`, which the chain test also uses — round-2 finding 2: hand-mirrored wiring in tests proves nothing about production).
   - `dedupeTtlForRouteLease(routeLeaseMs: number): number` — exported pure derivation (`Math.max(1, Math.floor(routeLeaseMs / 4))`) used by the factory and unit-tested.
   - `DiscordCatchupDeps.botUserId: string` — **required**; the catch-up walk skips own-bot messages (advance cursor, continue) or the wrapper's bypass would wedge the walk at a row-less message (plan-review round-2 finding 1).
 
@@ -587,7 +641,7 @@ describe('dedupeTtlForRouteLease', () => {
 });
 ```
 
-4. Add ONE chain integration test (plan-review findings: round-1 finding 4 — unit tests inject the probe manually; round-2 finding 2 — hand-mirrored factory wiring proves nothing). New top-level describe in `src/channels/discord.test.ts` — it uses `createDiscordHandledTracker` (the SAME constructor the production factory uses, added in step 3 below), and needs `Message` and `parseMarkdown` from `'chat'` and `createChatSdkBridge` from `./chat-sdk-bridge.js` added to imports:
+4. Add ONE chain integration test (plan-review findings: round-1 finding 4 — unit tests inject the probe manually; round-2 finding 2 — hand-mirrored factory wiring proves nothing; round-3 finding 2 — resolved by sequencing, since Task 2 already exports the constructor). New top-level describe in `src/channels/discord.test.ts` — it uses `createDiscordHandledTracker` (the SAME constructor the production factory uses, exported statically in Task 2; add it to the existing `./discord.js` import alongside `wrapYenteDiscordChannelIds`), and needs `Message` and `parseMarkdown` from `'chat'` and `createChatSdkBridge` from `./chat-sdk-bridge.js` added to imports:
 
 ```ts
 describe('discord ingress chain: bridge dispatch → acceptance hook → ledger', () => {
@@ -688,46 +742,34 @@ describe('discord ingress chain: bridge dispatch → acceptance hook → ledger'
    - `src/channels/discord.test.ts` ~line 466 (`'marks the route failed (keeping the lease) and rethrows; immediate retries drop, post-lease retries route'` — its final assertion expects the post-lease re-claim to be marked `routed`, which the always-handles probe preserves);
    - `src/channels/discord.test.ts` ~line 520 (`'taps gateway event types before forwarding'` — never calls `handleForwardedMessage`, but the type is required).
 
-6. Add the catch-up walk own-bot skip test to `src/channels/discord-catchup.test.ts` (plan-review round-2 finding 1: without a walk-side skip, the bypassed own-bot message wedges the walk). Follow the file's existing harness conventions (`fakeTransport` for REST pages + the claim-simulating webhook fetch, `makeEngine`, channel `chan-1`):
+6. Add the catch-up walk own-bot skip test to `src/channels/discord-catchup.test.ts` (plan-review round-2 finding 1: without a walk-side skip, the bypassed own-bot message wedges the walk; round-3 finding 4's fixture corrections are incorporated: needle `'/channels/chan-1'` — the channel-info URL carries no query, so a `'...chan-1?'` needle never matches; `restMessage(id, overrides)` builds page messages; the cursor is pre-seeded with `advanceDiscordChannelCursor`, no init run; `webhookPosts` entries expose `.data.id`; `getDiscordChannelCursor` is already imported in this file):
 
 ```ts
-  it('skips the bot\'s own messages in the walk (advance cursor, continue) instead of stalling on them', async () => {
-    // First sweep: initializes the cursor at the channel head (existing
-    // first-deploy behavior; routes nothing).
-    const initTransport = fakeTransport({ '/channels/chan-1?': [json(CHANNEL_INFO)] });
-    await makeEngine(initTransport.fetchImpl).runOnce('startup');
-    expect(getDiscordChannelCursor('chan-1')).toBe('500');
-
-    // Second sweep: the page contains an own-bot message BEFORE a missed user
-    // message. Without the skip, the own-bot message POSTs, stays row-less
-    // (the wrapper bypass never writes a row), and the walk stops there
-    // forever — the user message behind it is never presented.
+  it("skips the bot's own messages in the walk (advance cursor, no POST, no stall)", async () => {
+    advanceDiscordChannelCursor('chan-1', '500', '2026-07-30T00:00:00.000Z');
     const page = [
-      { id: '600', type: 0, author: { id: 'bot-1' }, content: 'yente reply' },
-      { id: '601', type: 0, author: { id: 'user-1' }, content: 'missed question' },
+      restMessage('601', { author: { id: 'bot-1', bot: true }, content: 'yente reply' }),
+      restMessage('602', { content: 'missed question' }),
     ];
-    const walkTransport = fakeTransport({
-      '/channels/chan-1/messages': [json(page, 200), json([], 200)],
+    const { fetchImpl, webhookPosts } = fakeTransport({
+      // Insertion order matters: the page URL also contains '/channels/chan-1'.
+      'messages?after=': [json(page), json([])],
+      '/channels/chan-1': [json(CHANNEL_INFO)],
     });
-    const summary = await makeEngine(walkTransport.fetchImpl).runOnce('periodic');
+    const engine = makeEngine(fetchImpl);
+    const summary = await engine.runOnce('periodic');
 
-    // Only the user message was presented; the own-bot message was skipped and
-    // counted, and the cursor advanced past BOTH (own-bot advance happens
-    // in-walk; user advance on routed).
-    expect(walkTransport.webhookPosts.map((p) => p.event.data.id)).toEqual(['601']);
+    // Without the skip, the own-bot message 601 POSTs too, stays row-less
+    // (the wrapper bypass never writes a row), and the walk stops at it
+    // forever — the user message 602 behind it is never presented.
+    expect(webhookPosts.map((p) => p.data.id)).toEqual(['602']);
     expect(summary?.skippedOwnBot).toBe(1);
     expect(summary?.routed).toBe(1);
-    expect(getDiscordChannelCursor('chan-1')).toBe('601');
-
-    // A third sweep POSTs nothing: the skipped own-bot message does not cause
-    // unbounded re-presentation (cursor is past it).
-    const thirdTransport = fakeTransport({ '/channels/chan-1/messages': [json([], 200)] });
-    await makeEngine(thirdTransport.fetchImpl).runOnce('periodic');
-    expect(thirdTransport.webhookPosts).toHaveLength(0);
+    // The skip advanced the cursor past the own-bot message (no stall, no
+    // unbounded re-presentation; the user's message advanced it to its own id).
+    expect(getDiscordChannelCursor('chan-1')).toBe('602');
   });
 ```
-
-Adjust the capture-field names (`p.event.data.id` above) to `fakeTransport`'s actual webhook-capture shape and import `getDiscordChannelCursor` from `./discord-state.js` if the file does not already — inspect both while implementing. The load-bearing assertions are: exactly one POST whose message id is 601; `skippedOwnBot === 1`; cursor at 601; and a subsequent sweep POSTs nothing.
 
 7. Add `botUserId` to every existing `createDiscordCatchup` construction (the deps field becomes required; complete census, verified by grep):
    - `src/channels/discord-catchup.test.ts` — the `makeEngine` helper (~line 154): add `botUserId: 'bot-1'`; the two direct constructions (~lines 379 and 523): add `botUserId: 'bot-1'` (their existing pages never carry `author.id: 'bot-1'`, so behavior is unchanged);
@@ -742,13 +784,13 @@ Expected: five intended reds (pre-existing tests stay green):
 - `'bypasses the ledger and the SDK entirely for the bot's own messages'` FAILS because there is no pre-claim bypass yet — the wrapper claims and forwards, so `forwardSpy` HAS been called and a `routed` row exists.
 - `'dedupeTtlForRouteLease ... never zero'` FAILS because `dedupeTtlForRouteLease` is not exported yet (the dynamic import exposes `undefined` and the test throws).
 - the chain test FAILS on `expect(tracker.wasHandled('m-chain')).toBe(false)` because the pre-fix wrapper never consults the acceptance signal — even though the Task 2 hook correctly wrote `m-chain` (so `onInbound` and `routed` assertions already hold). The consumed-entry assertion is the chain's fail-first pin; the rest is characterization.
-- the walk skip test FAILS pre-fix on two counts: `webhookPosts` contains the own-bot message `600` too (no skip), and `summary?.skippedOwnBot` is undefined (field does not exist yet).
+- the walk skip test FAILS pre-fix on two counts: `webhookPosts` contains BOTH `601` and `602` (no skip), and `summary?.skippedOwnBot` is undefined (field does not exist yet).
 
 - [ ] **Step 3: Add the minimal production implementation**
 
 All edits in `src/channels/discord.ts`:
 
-1. `YenteDiscordWrapOptions` — add the required probe:
+1. `YenteDiscordWrapOptions` — flip the Task-2 optional probe to required (update its doc comment to drop the "Optional in this task" sentence):
 
 ```ts
 export type YenteDiscordWrapOptions = {
@@ -834,49 +876,9 @@ export function wrapYenteDiscordChannelIds(
 
 (the trailing `catch` block is unchanged).
 
-5. Add the exported tracker constructor (module scope, near `wrapYenteDiscordChannelIds`; no cap — plan-review round-1 finding 5: a FIFO cap can evict a still-pending acknowledgment under wide concurrency, and no leak path exists: entries are added only by a successful inbound forward and always consumed by the consult that the same forward reaches; reject paths throw before the hook fires):
+5. The tracker constructor, factory wiring of BOTH acceptance ends, and the wrap options were landed live-but-inert in Task 2 — nothing further to add here. This task's only remaining factory edit is the lease-derived dedupe alignment on the `createChatSdkBridge({...})` config object:
 
 ```ts
-/**
- * Acceptance tracker shared by the chat-sdk bridge's onInboundForwarded hook
- * (writer) and the wrapped adapter's outcome block (consume-on-read reader
- * via Set.delete). Entries are added only by a successful inbound forward and
- * always consumed by the consult that the same forward reaches, so the set
- * stays near zero by construction. Exported so production and tests build the
- * tracker from the SAME constructor.
- */
-export function createDiscordHandledTracker(): { noteHandled: (id: string) => void; wasHandled: (id: string) => boolean } {
-  const handled = new Set<string>();
-  return {
-    noteHandled: (id) => {
-      handled.add(id);
-    },
-    wasHandled: (id) => handled.delete(id),
-  };
-}
-```
-
-and in the channel factory, just before `return createChatSdkBridge({`, build it:
-
-```ts
-    const handledTracker = createDiscordHandledTracker();
-```
-
-then extend the wrap options:
-
-```ts
-      adapter: wrapYenteDiscordChannelIds(discordAdapter, botToken, autoCreateThreadChannelIds, {
-        monitoredChannelIds: channelIds,
-        routeLeaseMs: catchupConfig.routeLeaseMs,
-        onGatewayEvent: (type) => catchup?.onGatewayEvent(type),
-        wasMessageHandled: handledTracker.wasHandled,
-      }),
-```
-
-then add the acceptance hook and the lease-derived dedupe alignment to the `createChatSdkBridge({...})` config object:
-
-```ts
-      onInboundForwarded: handledTracker.noteHandled,
       // Derived from the configured route lease (never 0 — the SDK treats 0
       // as permanent dedupe): the SDK's 300s default would let catch-up
       // re-presentations short-circuit before dispatch and burn the 3-attempt
