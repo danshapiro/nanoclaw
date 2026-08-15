@@ -627,7 +627,7 @@ export function wrapYenteDiscordChannelIds(
             channelId,
             messageId,
           });
-          markDiscordMessageFailed(channelId, messageId, routedAt, 'no dispatch handler matched');
+          markDiscordMessageFailed(channelId, messageId, routedAt, 'no dispatch handler accepted the message');
         }
       } catch (error) {
         log.error('Discord route bookkeeping failed', { channelId, messageId, error: String(error) });
