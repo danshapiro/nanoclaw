@@ -7,6 +7,8 @@ export const YENTE_LOCAL_PROXY_HOSTS = {
 } as const;
 export const YENTE_LOCAL_PROXY_HOSTNAMES = Object.values(YENTE_LOCAL_PROXY_HOSTS);
 export const YENTE_BROWSER_HANDOFF_PRODUCTION_URL = `http://${YENTE_LOCAL_PROXY_HOSTS.browserHandoff}:6081`;
+export const YENTE_PLAYWRITER_PRODUCTION_HOST = 'http://172.17.0.1:19988';
+export const YENTE_PLAYWRITER_AUTO_ENABLE = 'false';
 
 export const REQUIRED_YENTE_PROXY_URLS = [
   { service: 'gws', urlEnv: 'GWS_PROXY_URL', apiUrlEnv: undefined, compatibilityKeyEnv: undefined },
@@ -55,7 +57,18 @@ export function requireYenteHostEnv(env: NodeJS.ProcessEnv): {
   const onecliUrl = requireEnvValue(env, 'ONECLI_URL');
   const onecliApiKey = requireEnvValue(env, 'ONECLI_API_KEY');
   requireEnvValue(env, 'ONECLI_GATEWAY_URL');
-  const containerEnv: Record<string, string> = {};
+  const playwriterHost = env.PLAYWRITER_HOST?.trim() || YENTE_PLAYWRITER_PRODUCTION_HOST;
+  if (playwriterHost !== YENTE_PLAYWRITER_PRODUCTION_HOST) {
+    throw new Error(`PLAYWRITER_HOST must be exactly ${YENTE_PLAYWRITER_PRODUCTION_HOST}.`);
+  }
+  const playwriterAutoEnable = env.PLAYWRITER_AUTO_ENABLE?.trim() || YENTE_PLAYWRITER_AUTO_ENABLE;
+  if (playwriterAutoEnable !== YENTE_PLAYWRITER_AUTO_ENABLE) {
+    throw new Error(`PLAYWRITER_AUTO_ENABLE must be exactly ${YENTE_PLAYWRITER_AUTO_ENABLE}.`);
+  }
+  const containerEnv: Record<string, string> = {
+    PLAYWRITER_HOST: playwriterHost,
+    PLAYWRITER_AUTO_ENABLE: playwriterAutoEnable,
+  };
 
   for (const entry of REQUIRED_YENTE_PROXY_URLS) {
     const url = requireEnvValue(env, entry.urlEnv);
@@ -85,6 +98,10 @@ export function buildNoProxy(env: NodeJS.ProcessEnv): string {
     // host.docker.internal:8086). The auth-gate proxy cannot reach host
     // services, so requests must go direct over the bridge.
     'host.docker.internal',
+    // Playwriter's fixed host proxy injects the relay bearer itself; requests
+    // must reach it directly rather than traverse the OneCLI gateway.
+    '172.17.0.1',
+    '172.17.0.1:19988',
   ]);
   const mediatedHosts = new Set<string>();
   for (const entry of REQUIRED_YENTE_PROXY_URLS) {

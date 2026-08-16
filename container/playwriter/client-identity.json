@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "artifact": {
+    "kind": "client_npm_pack",
+    "filename": "playwriter-client-0303f56f07c838bb4686870cc03c9374ccff46f8.tgz",
+    "bytes": 1066577,
+    "sha256": "15bdc6b333ef539de575b8b14fd41fd622b57d9af69fbc4c678d339788d823ea"
+  },
+  "source": {
+    "repository": "https://github.com/remorses/playwriter.git",
+    "selection": "exact_git_commit",
+    "commit": "0303f56f07c838bb4686870cc03c9374ccff46f8",
+    "tree": "879cb66e86da0ae81c95d5c00218ec686ce1eeef",
+    "lockfile_sha256": "eb88e54978fbdce46545e1e457d9ac534a31816ab828d0ff5b254338fcf088ed",
+    "playwright_commit": "1c634ae0c0a463a8ee86f12ce8ee732f40521088"
+  },
+  "preparation_receipt": {
+    "filename": "playwriter-0303f56f07c838bb4686870cc03c9374ccff46f8.json",
+    "sha256": "72e943cb6a6ba4fd49e52d0abca8af7834894fc3c61b626580ae2d50fce2749a"
+  },
+  "package": {
+    "name": "playwriter",
+    "version": "0.4.0"
+  },
+  "optional_dependencies_omitted": [
+    "@playwriter/patchright-core",
+    "sharp"
+  ]
+}

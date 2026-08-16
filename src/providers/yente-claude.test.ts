@@ -20,12 +20,16 @@ describe('Yente Claude provider container config', () => {
         FAMILIAR_PROXY_URL: 'http://yente-familiar-proxy.local:8081',
         NYNE_PROXY_URL: 'http://yente-nyne-proxy.local:8082',
         YENTE_BROWSER_HANDOFF_URL: 'http://yente-browser-handoff.local:6081',
+        PLAYWRITER_HOST: 'http://172.17.0.1:19988',
+        PLAYWRITER_AUTO_ENABLE: 'false',
         YENTE_BROWSER_HANDOFF_BROKER_SECRET: 'raw-broker-secret',
         YENTE_BROWSER_HANDOFF_VNC_PASSWORD: 'raw-vnc-password',
       },
     });
 
     expect(contribution.env?.YENTE_BROWSER_HANDOFF_URL).toBe('http://yente-browser-handoff.local:6081');
+    expect(contribution.env?.PLAYWRITER_HOST).toBe('http://172.17.0.1:19988');
+    expect(contribution.env?.PLAYWRITER_AUTO_ENABLE).toBe('false');
     expect(contribution.env).not.toHaveProperty('YENTE_BROWSER_HANDOFF_BROKER_SECRET');
     expect(contribution.env).not.toHaveProperty('YENTE_BROWSER_HANDOFF_VNC_PASSWORD');
     expect(contribution.extraHosts).toEqual(

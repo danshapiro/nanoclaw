@@ -71,6 +71,31 @@ python3.12 -c "import sys; print(sys.version)"
 case "$(python3.12 --version 2>&1)" in "Python 3.12."*) ;; *) echo "unexpected python3.12 version" >&2; exit 1 ;; esac
 case "$(python3 --version 2>&1)" in "Python 3.11."*) ;; *) echo "distro python3 is no longer 3.11" >&2; exit 1 ;; esac'
 
+echo "Verifying the exact stock Playwriter client as a non-root uid..."
+# Identity and help/version checks are intentionally offline: the relay is not
+# contacted until the shared skill performs its explicit browser/status preflight.
+# shellcheck disable=SC2016 # The quoted script expands inside the container.
+${CONTAINER_RUNTIME} run --rm \
+    --network none \
+    --user 12345:12345 \
+    -e HOME=/home/node \
+    --entrypoint sh \
+    "${IMAGE_NAME}:${TAG}" \
+    -lc 'set -eu
+archive=/usr/local/share/nanoclaw/playwriter/playwriter-client-0303f56f07c838bb4686870cc03c9374ccff46f8.tgz
+identity=/usr/local/share/nanoclaw/playwriter/client-identity.json
+test -x "$(command -v playwriter)"
+playwriter_version="$(playwriter --version 2>&1)"
+printf "%s\n" "$playwriter_version" | grep -Eq "^playwriter/0[.]4[.]0([[:space:]]|$)"
+test "$(wc -c <"$archive")" = "1066577"
+printf "%s  %s\n" "15bdc6b333ef539de575b8b14fd41fd622b57d9af69fbc4c678d339788d823ea" "$archive" | sha256sum --check --strict
+jq -e ".artifact.filename == \"playwriter-client-0303f56f07c838bb4686870cc03c9374ccff46f8.tgz\" and .artifact.sha256 == \"15bdc6b333ef539de575b8b14fd41fd622b57d9af69fbc4c678d339788d823ea\" and .preparation_receipt.sha256 == \"72e943cb6a6ba4fd49e52d0abca8af7834894fc3c61b626580ae2d50fce2749a\"" "$identity" >/dev/null
+playwriter_bin="$(readlink -f "$(command -v playwriter)")"
+playwriter_deps="$(dirname "$(dirname "$playwriter_bin")")"
+for optional in @playwriter/patchright-core sharp; do
+    test ! -e "$playwriter_deps/$optional"
+done'
+
 echo ""
 echo "Build complete!"
 echo "Image: ${IMAGE_NAME}:${TAG}"
