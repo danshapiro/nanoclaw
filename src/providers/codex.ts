@@ -33,6 +33,7 @@ import path from 'path';
 
 import { GROUPS_DIR } from '../config.js';
 import { log } from '../log.js';
+import { YENTE_PLAYWRITER_PRODUCTION_HOST } from '../yente/service-env.js';
 import {
   registerProviderContainerConfig,
   registerProviderPrepare,
@@ -662,12 +663,20 @@ export const codexHostContainerFactory = (ctx: ProviderContainerContext) => {
   // env so the Rust codex binary trusts the MITM gateway. No model-provider key
   // is injected; Codex carries its own brokered bearer to chatgpt.com, which
   // matches no gateway secret and passes through untouched.
-  const codexNoProxyDefaults = ['127.0.0.1', 'localhost', 'registry.npmjs.org', 'host.docker.internal'].join(',');
+  const playwriterProxy = new URL(YENTE_PLAYWRITER_PRODUCTION_HOST);
+  const codexNoProxyDefaults = [
+    '127.0.0.1',
+    'localhost',
+    'registry.npmjs.org',
+    'host.docker.internal',
+    playwriterProxy.hostname,
+    `${playwriterProxy.hostname}:${playwriterProxy.port}`,
+  ].join(',');
   Object.assign(env, nativeConfig.env, buildCodexAuthGatedProxyEnv(nativeConfig, ctx.hostEnv), {
-    // Local MCP servers, app-server IPC, and package registries must bypass the
-    // Codex auth-gate egress proxy. Yente service proxies are intentionally not
-    // listed here; their shims use YENTE_ONECLI_GATEWAY_PROXY_URL so OneCLI can
-    // inject the service-specific authorization.
+    // Local MCP servers, app-server IPC, package registries, and Playwriter's
+    // fixed credential-injecting host proxy must bypass the Codex auth gate.
+    // OneCLI-mediated Yente service proxy hosts remain excluded; their shims use
+    // YENTE_ONECLI_GATEWAY_PROXY_URL for service-specific authorization.
     NO_PROXY: mergeNoProxy(ctx.hostEnv.NO_PROXY, codexNoProxyDefaults),
     no_proxy: mergeNoProxy(ctx.hostEnv.no_proxy, codexNoProxyDefaults),
     YENTE_CODEX_ONECLI_NATIVE: '1',

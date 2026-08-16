@@ -525,11 +525,20 @@ describe('codex host provider container config', () => {
           'localhost',
           'registry.npmjs.org',
           'host.docker.internal',
+          '172.17.0.1',
+          '172.17.0.1:19988',
           'internal.example',
         ]),
       );
       expect(contribution.env?.no_proxy?.split(',')).toEqual(
-        expect.arrayContaining(['127.0.0.1', 'localhost', 'registry.npmjs.org', 'host.docker.internal']),
+        expect.arrayContaining([
+          '127.0.0.1',
+          'localhost',
+          'registry.npmjs.org',
+          'host.docker.internal',
+          '172.17.0.1',
+          '172.17.0.1:19988',
+        ]),
       );
       expect(contribution.env?.NO_PROXY?.split(',')).not.toEqual(
         expect.arrayContaining([
