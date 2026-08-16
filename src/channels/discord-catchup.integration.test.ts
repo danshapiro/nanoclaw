@@ -78,7 +78,12 @@ describe('discord catch-up integration: gap message routed exactly once', () => 
       inner as unknown as Parameters<typeof wrapYenteDiscordChannelIds>[0],
       'test-token',
       new Set([CHANNEL]),
-      { monitoredChannelIds: () => new Set([CHANNEL]), routeLeaseMs: 120000 },
+      {
+        monitoredChannelIds: () => new Set([CHANNEL]),
+        routeLeaseMs: 120000,
+        // Matches this fake adapter's semantics: its handleForwardedMessage always "handles" the message.
+        wasMessageHandled: () => true,
+      },
     ) as unknown as { handleForwardedMessage: (data: unknown, options: unknown) => Promise<unknown> };
 
     // --- a REAL local webhook server, dispatching like the bridge + vendored adapter ---
@@ -124,6 +129,7 @@ describe('discord catch-up integration: gap message routed exactly once', () => 
 
     const engine = createDiscordCatchup({
       botToken: 'test-token',
+      botUserId: 'bot-1',
       webhookUrl,
       monitoredChannelIds: () => new Set([CHANNEL]),
       env: {},

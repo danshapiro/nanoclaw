@@ -89,18 +89,22 @@ registerChannelAdapter('discord', {
       channelIds: getRegisteredDiscordChannelIds(),
       retryConfig: startupRetryConfigFromEnv(catchupEnv, 'DISCORD_COMMAND_SYNC_RETRY'),
     });
+    const discordApplicationId =
+      process.env.DISCORD_APPLICATION_ID || env.DISCORD_APPLICATION_ID || commandSync.applicationId;
     const discordAdapter = createDiscordAdapter({
       botToken,
       publicKey: process.env.DISCORD_PUBLIC_KEY || env.DISCORD_PUBLIC_KEY || commandSync.publicKey,
-      applicationId: process.env.DISCORD_APPLICATION_ID || env.DISCORD_APPLICATION_ID || commandSync.applicationId,
+      applicationId: discordApplicationId,
     });
     const channelIds = (): Set<string> => monitoredDiscordChannelIds(autoCreateThreadChannelIds);
     let catchup: DiscordCatchup | null = null;
+    const handledTracker = createDiscordHandledTracker();
     return createChatSdkBridge({
       adapter: wrapYenteDiscordChannelIds(discordAdapter, botToken, autoCreateThreadChannelIds, {
         monitoredChannelIds: channelIds,
         routeLeaseMs: catchupConfig.routeLeaseMs,
         onGatewayEvent: (type) => catchup?.onGatewayEvent(type),
+        wasMessageHandled: handledTracker.wasHandled,
       }),
       concurrency: 'concurrent',
       botToken,
@@ -108,10 +112,17 @@ registerChannelAdapter('discord', {
       supportsThreads: true,
       maxTextLength: DISCORD_MESSAGE_TEXT_LIMIT,
       transformOutboundText: normalizeDiscordOutboundMarkdown,
+      onInboundForwarded: handledTracker.noteHandled,
+      // Derived from the configured route lease (never 0 — the dedupe TTL path
+      // treats 0 as permanent): the SDK's 300s default would let catch-up
+      // re-presentations short-circuit before dispatch and burn the 3-attempt
+      // cap with zero real retries (load-bearing V3).
+      dedupeTtlMs: dedupeTtlForRouteLease(catchupConfig.routeLeaseMs),
       onGatewayWebhookReady: (webhookUrl) => {
         if (catchup) return; // idempotency guard: channel-registry retries the WHOLE setup() body on NetworkError (channel-registry.ts:68-87) — a re-fired hook must not build a second engine + duplicate unref()'d timers
         catchup = createDiscordCatchup({
           botToken,
+          botUserId: discordApplicationId,
           webhookUrl,
           monitoredChannelIds: channelIds,
           env: catchupEnv,
@@ -421,17 +432,62 @@ export type YenteDiscordWrapOptions = {
   routeLeaseMs?: number;
   onGatewayEvent?: (type: string) => void;
   now?: () => string;
+  /**
+   * Consume-on-read acceptance probe wired from the bridge's onInboundForwarded
+   * hook: returns true exactly once per message id a dispatch handler actually
+   * forwarded.
+   */
+  wasMessageHandled: (messageId: string) => boolean;
 };
+
+/**
+ * Acceptance tracker shared by the chat-sdk bridge's onInboundForwarded hook
+ * (writer) and the wrapped adapter's outcome block (consume-on-read reader
+ * via Set.delete). Entries are added only by a successful inbound forward and
+ * always consumed by the consult that the same forward reaches, so the set
+ * stays near zero by construction. Exported so production and tests build the
+ * tracker from the SAME constructor.
+ */
+export function createDiscordHandledTracker(): {
+  noteHandled: (id: string) => void;
+  wasHandled: (id: string) => boolean;
+} {
+  const handled = new Set<string>();
+  return {
+    noteHandled: (id) => {
+      handled.add(id);
+    },
+    wasHandled: (id) => handled.delete(id),
+  };
+}
+
+/**
+ * SDK incoming-message dedupe TTL derived from the configured route lease:
+ * the lease is the minimum catch-up re-presentation cadence, so a TTL of one
+ * quarter guarantees every re-presentation lands after the SDK dedupe entry
+ * expired and genuinely re-dispatches. Clamped to >= 1ms because the dedupe
+ * TTL path treats 0 as no-expiry (permanent dedupe).
+ * Strictly smaller than the lease for every lease >= 2 ms by construction;
+ * the floor clamp keeps a 1 ms lease non-zero (0 would mean permanent dedupe
+ * in the SDK). Degenerate sub-2 ms leases are outside the supported
+ * configuration range (production: 120 s). The quarter-of-lease derivation
+ * also bounds how late the SDK dedupe stamp may land after the route claim
+ * before a retried claim is swallowed. Accepted residual, delta review round 6.
+ */
+export function dedupeTtlForRouteLease(routeLeaseMs: number): number {
+  return Math.max(1, Math.floor(routeLeaseMs / 4));
+}
 
 export function wrapYenteDiscordChannelIds(
   adapter: DiscordAdapterInstance,
   botToken: string,
   autoCreateThreadChannelIds: Set<string> = new Set(),
-  options: YenteDiscordWrapOptions = {},
+  options: YenteDiscordWrapOptions,
 ): DiscordAdapterInstance {
   const monitoredChannelIds = options.monitoredChannelIds ?? ((): Set<string> => new Set());
   const routeLeaseMs = options.routeLeaseMs ?? DEFAULT_DISCORD_CATCHUP_ROUTE_LEASE_MS;
   const nowIso = options.now ?? ((): string => new Date().toISOString());
+  const wasMessageHandled = options.wasMessageHandled;
   // Replace the vendored adapter's single-shot Gateway event forwarder with
   // the bounded-retry version. The adapter awaits forwardGatewayEvent per
   // event, so sequencing is unchanged — a retry only delays that one event.
@@ -492,6 +548,16 @@ export function wrapYenteDiscordChannelIds(
       return originalHandleForwardedMessage(dataArg, opts, ...rest);
     }
 
+    // The bot's own messages are intentionally never dispatched (the SDK
+    // filters isMe messages before dispatch), so no dispatch handler can ever
+    // accept one. Bypass the ledger and the forward entirely: a route row
+    // could only ever be a lie against the invariant "'routed' means a
+    // dispatch handler accepted the message".
+    const authorId = (data?.author as { id?: string } | undefined)?.id;
+    if (authorId !== undefined && authorId === rawAdapter.botUserId) {
+      return undefined;
+    }
+
     // 1. Idempotency gate: claim before forwarding. Live and catch-up
     //    messages traverse this same choke point, so one claim covers both.
     //    FAIL-OPEN on DB errors: a state bug must never silence live messages.
@@ -544,16 +610,30 @@ export function wrapYenteDiscordChannelIds(
       }
     }
 
-    // 3. Forward, then record the outcome (fail-open on state errors).
+    // 3. Forward, then record the outcome (fail-open on state errors). The
+    //    bridge dispatches with concurrency 'concurrent', so the acceptance
+    //    hook written during dispatch is synchronously visible by the time the
+    //    vendored forward resolves.
     try {
       const result = await originalHandleForwardedMessage(dataArg, opts, ...rest);
       try {
         const routedAt = nowIso();
-        markDiscordMessageRouted(channelId, messageId, routedAt);
-        const monitored = monitoredChannelIds();
-        const parentId = (dataArg as Record<string, any>)?.thread?.parent_id as string | undefined;
-        if (monitored.has(channelId) || (parentId !== undefined && monitored.has(parentId))) {
-          advanceDiscordChannelCursor(channelId, messageId, routedAt);
+        if (wasMessageHandled(messageId)) {
+          markDiscordMessageRouted(channelId, messageId, routedAt);
+          const monitored = monitoredChannelIds();
+          const parentId = (dataArg as Record<string, any>)?.thread?.parent_id as string | undefined;
+          if (monitored.has(channelId) || (parentId !== undefined && monitored.has(parentId))) {
+            advanceDiscordChannelCursor(channelId, messageId, routedAt);
+          }
+        } else {
+          // No dispatch handler accepted this message. Record it failed (not
+          // routed) and leave the cursor behind so catch-up keeps
+          // re-presenting it; the attempts cap still bounds a poison message.
+          log.warn('Discord message accepted by no dispatch handler; marked failed for catch-up', {
+            channelId,
+            messageId,
+          });
+          markDiscordMessageFailed(channelId, messageId, routedAt, 'no dispatch handler accepted the message');
         }
       } catch (error) {
         log.error('Discord route bookkeeping failed', { channelId, messageId, error: String(error) });

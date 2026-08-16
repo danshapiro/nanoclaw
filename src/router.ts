@@ -17,6 +17,8 @@
  * drops (no agent wired, no trigger match); the access gate writes rows
  * for policy refusals.
  */
+import fs from 'fs';
+
 import { getChannelAdapter } from './channels/channel-registry.js';
 import { gateCommand } from './command-gate.js';
 import { getAgentGroup } from './db/agent-groups.js';
@@ -32,12 +34,20 @@ import {
   findActiveSessionThreadIdEndingWithForAgent,
   findLatestArchivedSessionForAgent,
   findSessionForAgent,
+  findSessionsForAgentRouteKey,
   getSession,
+  getSessionsByAgentGroup,
 } from './db/sessions.js';
 import { deliverSessionMessages, getDeliveryAdapter, suppressSessionOutbound } from './delivery.js';
 import { startTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
-import { resolveSession, writeSessionMessage, writeOutboundDirect } from './session-manager.js';
+import {
+  getSessionMessageRouteIdentity,
+  inboundDbPath,
+  resolveSession,
+  writeSessionMessage,
+  writeOutboundDirect,
+} from './session-manager.js';
 import { wakeContainer } from './container-runner.js';
 import type { AgentGroup, MessagingGroup, MessagingGroupAgent, Session } from './types.js';
 import type { InboundEvent } from './channels/adapter.js';
@@ -603,22 +613,115 @@ async function deliverToAgent(
     }
   }
 
-  writeSessionMessage(session.agent_group_id, session.id, {
-    id: messageIdForAgent(agentEvent.message.id, agent.agent_group_id),
-    kind: agentEvent.message.kind,
-    timestamp: agentEvent.message.timestamp,
-    platformId: deliveryAddr.platformId,
-    platformMessageId: agentEvent.message.id || null,
-    channelType: deliveryAddr.channelType,
-    threadId: deliveryAddr.threadId,
-    content: agentEvent.message.content,
-    trigger: wake ? 1 : 0,
-    // Host-stamped route identity from the resolved messaging group. Lets the
-    // container normalizer collapse DM aliases safely and isolate distinct
-    // group threads, without inferring from nullable thread ids.
-    messagingGroupId: mg.id,
-    isGroup: mg.is_group === 1 ? 1 : 0,
-  });
+  const routedMessageId = messageIdForAgent(agentEvent.message.id, agent.agent_group_id);
+  const storedRoute = getSessionMessageRouteIdentity(session.agent_group_id, session.id, routedMessageId);
+  if (storedRoute) {
+    const sameDelivery =
+      storedRoute.platformMessageId === (agentEvent.message.id || null) &&
+      storedRoute.platformId === deliveryAddr.platformId &&
+      storedRoute.channelType === deliveryAddr.channelType &&
+      storedRoute.threadId === deliveryAddr.threadId &&
+      storedRoute.messagingGroupId === mg.id &&
+      storedRoute.timestamp === agentEvent.message.timestamp;
+    if (!sameDelivery) {
+      // A distinct message reusing this id: do NOT silently skip (delta
+      // review round 8). Throwing keeps the collision loud — on the strict
+      // inbound path the route stays failed and retriable.
+      throw new Error(
+        `Refusing to skip distinct message with colliding route id ${routedMessageId}: stored identity does not match inbound event`,
+      );
+    }
+    // Catch-up replay after a partial delivery: the row from the first
+    // attempt is already durable; re-writing would hit the PK and abort the
+    // retry. Skip the write; the wake below is what actually needs retrying.
+    log.info('Replay of already-recorded routed message — skipping session write', {
+      sessionId: session.id,
+      agentGroup: agent.agent_group_id,
+      messageId: routedMessageId,
+    });
+  } else {
+    // Rollover guard (delta review rounds 9-10): if an earlier delivery
+    // attempt recorded this message into a session that has since been
+    // archived (/new, /clear), re-writing it into the freshly resolved
+    // session would duplicate the event and contaminate the user's
+    // deliberately fresh session.
+    //
+    // Gate: only a session created AT OR AFTER this message's platform
+    // timestamp can be the post-reset fresh session for it — when the
+    // resolved session predates the message, the message arrived in the
+    // normal live order and no earlier attempt can have written elsewhere,
+    // so ordinary traffic never sweeps (cost stays constant per message).
+    // Note a session created BY this message's first attempt stamps its
+    // host receipt time as created_at — later than the platform timestamp —
+    // so first-message-created sessions still pass the gate.
+    if (session.created_at >= agentEvent.message.timestamp) {
+      // agent-shared sessions are canonical per agent and can have been
+      // created under another messaging group / null thread, so they are
+      // only reachable by sweeping the agent's whole history.
+      const candidates =
+        effectiveSessionMode === 'agent-shared'
+          ? getSessionsByAgentGroup(agent.agent_group_id)
+          : findSessionsForAgentRouteKey(agent.agent_group_id, mg.id, agentEvent.threadId);
+      for (const sibling of candidates) {
+        if (sibling.id === session.id) continue;
+        if (sibling.status === 'active') continue; // active siblings can't hold an archived-attempt row
+        // Archived session folders may have been cleaned up on disk while
+        // the central row remains — never let a missing/corrupt sibling DB
+        // abort routing (delta review round 10).
+        if (!fs.existsSync(inboundDbPath(agent.agent_group_id, sibling.id))) continue;
+        let priorRoute: ReturnType<typeof getSessionMessageRouteIdentity>;
+        try {
+          priorRoute = getSessionMessageRouteIdentity(agent.agent_group_id, sibling.id, routedMessageId);
+        } catch (err) {
+          log.warn('Skipping unreadable sibling session DB during replay sweep', {
+            siblingSessionId: sibling.id,
+            messageId: routedMessageId,
+            err,
+          });
+          continue;
+        }
+        if (!priorRoute) continue;
+        const sameDelivery =
+          priorRoute.platformMessageId === (agentEvent.message.id || null) &&
+          priorRoute.platformId === deliveryAddr.platformId &&
+          priorRoute.channelType === deliveryAddr.channelType &&
+          priorRoute.threadId === deliveryAddr.threadId &&
+          priorRoute.messagingGroupId === mg.id &&
+          priorRoute.timestamp === agentEvent.message.timestamp;
+        if (!sameDelivery) {
+          throw new Error(
+            `Refusing to skip distinct message with colliding route id ${routedMessageId}: stored identity does not match inbound event`,
+          );
+        }
+        log.info(
+          'Replay already recorded in a since-archived sibling session — not writing into the post-reset session',
+          {
+            sessionId: session.id,
+            siblingSessionId: sibling.id,
+            agentGroup: agent.agent_group_id,
+            messageId: routedMessageId,
+          },
+        );
+        return;
+      }
+    }
+    writeSessionMessage(session.agent_group_id, session.id, {
+      id: routedMessageId,
+      kind: agentEvent.message.kind,
+      timestamp: agentEvent.message.timestamp,
+      platformId: deliveryAddr.platformId,
+      platformMessageId: agentEvent.message.id || null,
+      channelType: deliveryAddr.channelType,
+      threadId: deliveryAddr.threadId,
+      content: agentEvent.message.content,
+      trigger: wake ? 1 : 0,
+      // Host-stamped route identity from the resolved messaging group. Lets the
+      // container normalizer collapse DM aliases safely and isolate distinct
+      // group threads, without inferring from nullable thread ids.
+      messagingGroupId: mg.id,
+      isGroup: mg.is_group === 1 ? 1 : 0,
+    });
+  }
 
   log.info('Message routed', {
     sessionId: session.id,

@@ -15,7 +15,7 @@ import {
 } from './db/index.js';
 import { findSessionForAgent, getSession, getSessionsByAgentGroup } from './db/sessions.js';
 import { setDeliveryAdapter } from './delivery.js';
-import { inboundDbPath, outboundDbPath, writeOutboundDirect } from './session-manager.js';
+import { inboundDbPath, outboundDbPath, sessionDir, writeOutboundDirect } from './session-manager.js';
 import { getScheduledTask } from './modules/scheduling/ledger.js';
 
 const cleanupContainerForSessionMock = vi.hoisted(() => vi.fn().mockResolvedValue(true));
@@ -32,7 +32,7 @@ vi.mock('./container-runner.js', () => ({
 
 vi.mock('./config.js', async () => {
   const actual = await vi.importActual('./config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-router' };
+  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-router', GROUPS_DIR: '/tmp/nanoclaw-test-router/groups' };
 });
 
 function now(): string {
@@ -44,6 +44,8 @@ const DISCORD_PLATFORM_ID = 'channel';
 const DISCORD_THREAD_ID = 'discord:guild:channel';
 const DISCORD_RAW_CONVERSATION_THREAD_ID = 'thread-123';
 const DISCORD_CANONICAL_CONVERSATION_THREAD_ID = `discord:guild:${DISCORD_PLATFORM_ID}:${DISCORD_RAW_CONVERSATION_THREAD_ID}`;
+const SHARED_PLATFORM_ID = 'shared-platform';
+const SHARED_THREAD_ID = 'discord:guild:shared';
 let currentUserId: string | null = 'discord:admin';
 
 beforeEach(async () => {
@@ -99,7 +101,7 @@ afterEach(() => {
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
 });
 
-function grantAdmin(userId: string): void {
+function grantAdmin(userId: string, agentGroupId = 'ag-yente'): void {
   getDb()
     .prepare('INSERT OR IGNORE INTO users (id, kind, display_name, created_at) VALUES (?, ?, ?, ?)')
     .run(userId, 'discord', userId, now());
@@ -107,7 +109,7 @@ function grantAdmin(userId: string): void {
     .prepare(
       'INSERT OR IGNORE INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at) VALUES (?, ?, ?, ?, ?)',
     )
-    .run(userId, 'admin', 'ag-yente', null, now());
+    .run(userId, 'admin', agentGroupId, null, now());
 }
 
 function event(
@@ -119,6 +121,22 @@ function event(
     channelType: 'discord',
     platformId: DISCORD_PLATFORM_ID,
     threadId,
+    message: {
+      id,
+      kind: 'chat',
+      content,
+      timestamp: now(),
+      isMention: true,
+      isGroup: true,
+    },
+  };
+}
+
+function sharedEvent(content: string, id: string): InboundEvent {
+  return {
+    channelType: 'discord',
+    platformId: SHARED_PLATFORM_ID,
+    threadId: SHARED_THREAD_ID,
     message: {
       id,
       kind: 'chat',
@@ -177,6 +195,69 @@ function deliveredRows(sessionId: string): Array<{
 }
 
 describe('Yente host command routing', () => {
+  it('routes an attachment-only message (empty text) to the session and wakes the container', async () => {
+    const { routeInbound } = await import('./router.js');
+    const { wakeContainer } = await import('./container-runner.js');
+    vi.mocked(wakeContainer).mockClear();
+
+    const raw = 'todo list contents';
+    await routeInbound({
+      channelType: 'discord',
+      platformId: DISCORD_PLATFORM_ID,
+      threadId: DISCORD_THREAD_ID,
+      message: {
+        id: 'msg-attach-only',
+        kind: 'chat-sdk',
+        content: JSON.stringify({
+          sender: 'discord:admin',
+          senderId: 'discord:admin',
+          senderName: 'Admin',
+          text: '',
+          attachments: [
+            {
+              id: 'att-1',
+              name: 'message.txt',
+              mimeType: 'text/plain; charset=utf-8',
+              size: Buffer.from(raw).length,
+              data: Buffer.from(raw).toString('base64'),
+            },
+          ],
+        }),
+        timestamp: now(),
+        isMention: false,
+        isGroup: true,
+      },
+    });
+
+    const session = getSessionsByAgentGroup('ag-yente')[0];
+    expect(session).toBeDefined();
+    const db = new Database(inboundDbPath('ag-yente', session.id));
+    const rows = db
+      .prepare("SELECT content, trigger FROM messages_in WHERE id LIKE 'msg-attach-only%'")
+      .all() as Array<{ content: string; trigger: number }>;
+    db.close();
+    expect(rows).toHaveLength(1);
+
+    const parsed = JSON.parse(rows[0].content) as {
+      text: string;
+      attachments: Array<{ workspacePath: string }>;
+    };
+    expect(rows[0].trigger).toBe(1); // engage '.' fired — this message wakes the session
+    expect(parsed.text).toContain('message.txt');
+    expect(parsed.text).toContain('/workspace/agent/attachments/discord/');
+    expect(parsed.attachments[0].workspacePath).toMatch(/^\/workspace\/agent\/attachments\/discord\//);
+
+    // Derive the host path from the workspace path exactly as the container
+    // mount maps it, instead of hardcoding the sanitized message folder name.
+    const hostPath = parsed.attachments[0].workspacePath.replace(
+      '/workspace/agent',
+      '/tmp/nanoclaw-test-router/groups/yente',
+    );
+    expect(fs.readFileSync(hostPath, 'utf8')).toBe(raw);
+
+    expect(wakeContainer).toHaveBeenCalled();
+  });
+
   it('writes /help and bare help as host-authored responses without waking a container', async () => {
     const { routeInbound } = await import('./router.js');
     const { wakeContainer } = await import('./container-runner.js');
@@ -654,6 +735,293 @@ describe('Yente host command routing', () => {
       platform_message_id: null,
       status: 'delivered',
     });
+  });
+});
+
+describe('replay idempotency', () => {
+  it('recovers a write-succeeded/wake-failed route when catch-up replays the same message', async () => {
+    const { routeInbound } = await import('./router.js');
+    const { wakeContainer } = await import('./container-runner.js');
+    const wakeMock = vi.mocked(wakeContainer);
+    wakeMock.mockClear();
+
+    // First attempt: the session write lands durably, then the wake throws —
+    // the strict inbound path propagates so catch-up re-presents the message.
+    // The replay is the IDENTICAL event object: production catch-up
+    // re-presents the original message, whose timestamp (the platform's
+    // message-creation time) is stable across re-presentations.
+    const replayed = event('ping', 'msg-replay');
+    wakeMock.mockRejectedValueOnce(new Error('container spawn failed'));
+    await expect(routeInbound(replayed)).rejects.toThrow('container spawn failed');
+
+    // Catch-up replay of the SAME message: the durable row must not collide.
+    wakeMock.mockResolvedValue(undefined);
+    await routeInbound(replayed);
+
+    const session = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
+    expect(session).toBeDefined();
+    const db = new Database(inboundDbPath('ag-yente', session.id));
+    const rows = db.prepare("SELECT id FROM messages_in WHERE id LIKE 'msg-replay%'").all() as Array<{ id: string }>;
+    db.close();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].id).toBe('msg-replay:ag-yente');
+
+    const wakesForAgent = wakeMock.mock.calls.filter((call) => call[0].agent_group_id === 'ag-yente');
+    expect(wakesForAgent).toHaveLength(2); // failed attempt + successful retry
+  });
+
+  it('replays a multi-agent fan-out without colliding on the earlier row and retries the later agent', async () => {
+    const { routeInbound } = await import('./router.js');
+    const { wakeContainer } = await import('./container-runner.js');
+    const wakeMock = vi.mocked(wakeContainer);
+    wakeMock.mockClear();
+
+    createAgentGroup({
+      id: 'ag-second',
+      name: 'Second',
+      folder: 'second',
+      agent_provider: null,
+      created_at: now(),
+    });
+    createMessagingGroupAgent({
+      id: 'mga-second',
+      messaging_group_id: 'mg-discord',
+      agent_group_id: 'ag-second',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'per-thread',
+      // Fan-out orders by priority DESC; pin below mga-yente (0) so the wake
+      // sequence below maps deterministically to ag-yente then ag-second.
+      priority: -1,
+      created_at: now(),
+    });
+
+    // First pass: fan-out is sequential in agent order; the first wake
+    // succeeds, the second agent's wake fails after BOTH rows are durable.
+    // The replay is the IDENTICAL event object: production catch-up
+    // re-presents the original message, whose timestamp (the platform's
+    // message-creation time) is stable across re-presentations.
+    const replayed = event('ping', 'msg-multi');
+    wakeMock.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error('second agent spawn failed'));
+    await expect(routeInbound(replayed)).rejects.toThrow('second agent spawn failed');
+
+    // Catch-up replay: neither deterministic id may collide; both wakes retry.
+    wakeMock.mockResolvedValue(undefined);
+    await routeInbound(replayed);
+
+    for (const agentGroupId of ['ag-yente', 'ag-second']) {
+      const session = getSessionsByAgentGroup(agentGroupId)[0];
+      expect(session).toBeDefined();
+      const db = new Database(inboundDbPath(agentGroupId, session.id));
+      const rows = db.prepare("SELECT id FROM messages_in WHERE id LIKE 'msg-multi%'").all() as Array<{
+        id: string;
+      }>;
+      db.close();
+      expect(rows).toHaveLength(1);
+      expect(rows[0].id).toBe(`msg-multi:${agentGroupId}`);
+    }
+    expect(wakeMock).toHaveBeenCalledTimes(4); // 2 attempts on first pass, 2 retries on replay
+  });
+
+  it('throws loudly when a distinct message reuses a provider-local id instead of silently skipping', async () => {
+    const { routeInbound } = await import('./router.js');
+    await routeInbound(event(JSON.stringify({ text: 'first' }), 'msg-x'));
+    // Distinct message, same provider-local id (different timestamp/content):
+    // the guard must refuse, not silently swallow.
+    const distinct = event(JSON.stringify({ text: 'second' }), 'msg-x');
+    distinct.message = { ...distinct.message, timestamp: '2026-08-15T05:00:00.000Z' };
+    await expect(routeInbound(distinct)).rejects.toThrow(/Refusing to skip distinct message/);
+    const session = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
+    const db = new Database(inboundDbPath('ag-yente', session.id));
+    const rows = db.prepare("SELECT content FROM messages_in WHERE id = 'msg-x:ag-yente'").all() as Array<{
+      content: string;
+    }>;
+    db.close();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].content).toContain('first');
+  });
+
+  it('does not write a catch-up replay into the fresh session after /new rolled the original session', async () => {
+    const { routeInbound } = await import('./router.js');
+    const { wakeContainer } = await import('./container-runner.js');
+    const wakeMock = vi.mocked(wakeContainer);
+    wakeMock.mockClear();
+
+    // First message on this route: 'ping msg-roll' itself creates S1 — no
+    // earlier message seeds the route. The event timestamp models the
+    // platform's message-creation time, which predates the host's receipt;
+    // S1.created_at is stamped at host receipt, AFTER the platform
+    // timestamp. This is exactly the first-message shape the masked round-9
+    // bound skipped (delta review round 10). Capture the event object ONCE:
+    // production catch-up re-presents the original platform message whose
+    // dateSent timestamp is stable.
+    const replay = event('ping', 'msg-roll');
+    replay.message = { ...replay.message, timestamp: new Date(Date.now() - 60_000).toISOString() };
+    wakeMock.mockRejectedValueOnce(new Error('container spawn failed'));
+    await expect(routeInbound(replay)).rejects.toThrow('container spawn failed');
+    const original = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
+
+    // Before catch-up replays, /new archives S1 and creates a deliberately
+    // fresh S2 for the same route key.
+    wakeMock.mockResolvedValue(undefined);
+    await routeInbound(event('/new', 'msg-reset'));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const fresh = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
+    expect(fresh.id).not.toBe(original.id);
+
+    const wakesBeforeReplay = wakeMock.mock.calls.length;
+    await routeInbound(replay);
+
+    // The pre-reset row must NOT be duplicated into the post-reset session.
+    const freshDb = new Database(inboundDbPath('ag-yente', fresh.id));
+    const freshRows = freshDb.prepare("SELECT id FROM messages_in WHERE id LIKE 'msg-roll%'").all();
+    freshDb.close();
+    expect(freshRows).toHaveLength(0);
+
+    // Exactly one row across every session of the agent — it stays in the
+    // archived original session's inbound DB.
+    let total = 0;
+    for (const s of getSessionsByAgentGroup('ag-yente')) {
+      const db = new Database(inboundDbPath('ag-yente', s.id));
+      const rows = db.prepare("SELECT id FROM messages_in WHERE id = 'msg-roll:ag-yente'").all() as Array<{
+        id: string;
+      }>;
+      db.close();
+      total += rows.length;
+    }
+    expect(total).toBe(1);
+
+    // The delivery was already recorded by attempt 1: the replay is a
+    // skip-without-wake, not a fresh route.
+    expect(wakeMock.mock.calls.length).toBe(wakesBeforeReplay);
+  });
+
+  it('does not write a catch-up replay into a fresh agent-shared session after /new rolled the canonical session', async () => {
+    const { routeInbound } = await import('./router.js');
+    const { wakeContainer } = await import('./container-runner.js');
+    const wakeMock = vi.mocked(wakeContainer);
+    wakeMock.mockClear();
+
+    // agent-shared session mode: one canonical session per agent group,
+    // stored with a NULL thread id regardless of the messaging group and
+    // thread the event arrived on — after a rollover it is reachable only
+    // by sweeping the agent's whole session history (delta review round
+    // 10), never by the (messaging group, thread) route key.
+    createAgentGroup({
+      id: 'ag-shared',
+      name: 'Shared',
+      folder: 'shared',
+      agent_provider: null,
+      created_at: now(),
+    });
+    createMessagingGroup({
+      id: 'mg-shared',
+      channel_type: 'discord',
+      platform_id: SHARED_PLATFORM_ID,
+      name: 'Shared Test',
+      is_group: 1,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    createMessagingGroupAgent({
+      id: 'mga-shared',
+      messaging_group_id: 'mg-shared',
+      agent_group_id: 'ag-shared',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'agent-shared',
+      priority: 0,
+      created_at: now(),
+    });
+    grantAdmin('discord:admin', 'ag-shared');
+
+    // First message on this route creates the canonical shared session S1.
+    // The event timestamp models the platform's message-creation time,
+    // which predates the host's receipt (and thus S1.created_at).
+    const replay = sharedEvent('ping', 'msg-shared');
+    replay.message = { ...replay.message, timestamp: new Date(Date.now() - 60_000).toISOString() };
+    wakeMock.mockRejectedValueOnce(new Error('container spawn failed'));
+    await expect(routeInbound(replay)).rejects.toThrow('container spawn failed');
+    const original = getSessionsByAgentGroup('ag-shared')[0];
+    expect(original).toBeDefined();
+
+    // /new rolls the canonical agent-shared session: S1 archived, S2 fresh.
+    wakeMock.mockResolvedValue(undefined);
+    await routeInbound(sharedEvent('/new', 'msg-shared-reset'));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const fresh = getSessionsByAgentGroup('ag-shared').find((s) => s.status === 'active')!;
+    expect(fresh.id).not.toBe(original.id);
+
+    const wakesBeforeReplay = wakeMock.mock.calls.length;
+    await routeInbound(replay);
+
+    // The pre-reset row must NOT be duplicated into the post-reset session:
+    // no row in the fresh shared session, exactly one row across all of the
+    // agent's sessions (in the archived original), and no re-wake.
+    const freshDb = new Database(inboundDbPath('ag-shared', fresh.id));
+    const freshRows = freshDb.prepare("SELECT id FROM messages_in WHERE id = 'msg-shared:ag-shared'").all();
+    freshDb.close();
+    expect(freshRows).toHaveLength(0);
+
+    let total = 0;
+    for (const s of getSessionsByAgentGroup('ag-shared')) {
+      const db = new Database(inboundDbPath('ag-shared', s.id));
+      const rows = db.prepare("SELECT id FROM messages_in WHERE id = 'msg-shared:ag-shared'").all() as Array<{
+        id: string;
+      }>;
+      db.close();
+      total += rows.length;
+    }
+    expect(total).toBe(1);
+
+    expect(wakeMock.mock.calls.length).toBe(wakesBeforeReplay);
+  });
+
+  it('routes normally when an archived sibling session folder has been cleaned up', async () => {
+    const { routeInbound } = await import('./router.js');
+    const { wakeContainer } = await import('./container-runner.js');
+    const wakeMock = vi.mocked(wakeContainer);
+    wakeMock.mockClear();
+
+    // Same rollover setup: first message creates S1 and fails its wake,
+    // then /new archives S1 and creates the fresh S2 on the route key.
+    const replay = event('ping', 'msg-orphan');
+    replay.message = { ...replay.message, timestamp: new Date(Date.now() - 60_000).toISOString() };
+    wakeMock.mockRejectedValueOnce(new Error('container spawn failed'));
+    await expect(routeInbound(replay)).rejects.toThrow('container spawn failed');
+    const original = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
+
+    wakeMock.mockResolvedValue(undefined);
+    await routeInbound(event('/new', 'msg-orphan-reset'));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const fresh = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
+    expect(fresh.id).not.toBe(original.id);
+
+    // The repo supports archived session folders being cleaned up while the
+    // central sessions row remains — opening that sibling's missing DB must
+    // never abort routing for later messages on this route (delta review
+    // round 10).
+    fs.rmSync(sessionDir('ag-yente', original.id), { recursive: true, force: true });
+
+    // A NEW message (distinct id) must resolve and write into the fresh
+    // session normally. Stamp it between the archived and fresh sessions'
+    // creation times so the replay sweep actually consults the orphaned
+    // sibling instead of being gated out of the sweep entirely.
+    const followup = event('after cleanup', 'msg-after-cleanup');
+    followup.message = { ...followup.message, timestamp: fresh.created_at };
+
+    const wakesBefore = wakeMock.mock.calls.length;
+    await routeInbound(followup);
+
+    const freshDb = new Database(inboundDbPath('ag-yente', fresh.id));
+    const rows = freshDb.prepare("SELECT id FROM messages_in WHERE id = 'msg-after-cleanup:ag-yente'").all();
+    freshDb.close();
+    expect(rows).toHaveLength(1);
+    expect(wakeMock.mock.calls.length).toBe(wakesBefore + 1);
   });
 });
 

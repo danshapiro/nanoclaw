@@ -52,6 +52,26 @@ export function findSessionForAgent(
     .get(agentGroupId, messagingGroupId) as Session | undefined;
 }
 
+/**
+ * ALL sessions (any status) for an agent on one route key — used by the
+ * router's replay guard to find a row recorded by an earlier delivery
+ * attempt into a since-archived sibling session (delta review round 9).
+ */
+export function findSessionsForAgentRouteKey(
+  agentGroupId: string,
+  messagingGroupId: string,
+  threadId: string | null,
+): Session[] {
+  if (threadId) {
+    return getDb()
+      .prepare('SELECT * FROM sessions WHERE agent_group_id = ? AND messaging_group_id = ? AND thread_id = ?')
+      .all(agentGroupId, messagingGroupId, threadId) as Session[];
+  }
+  return getDb()
+    .prepare('SELECT * FROM sessions WHERE agent_group_id = ? AND messaging_group_id = ? AND thread_id IS NULL')
+    .all(agentGroupId, messagingGroupId) as Session[];
+}
+
 export function findActiveSessionThreadIdEndingWithForAgent(
   agentGroupId: string,
   messagingGroupId: string,

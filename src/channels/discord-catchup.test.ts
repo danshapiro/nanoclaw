@@ -153,6 +153,7 @@ const CHANNEL_INFO = { id: 'chan-1', guild_id: 'guild-1', last_message_id: '500'
 function makeEngine(fetchImpl: typeof fetch, env: NodeJS.ProcessEnv = {}, nowMs = () => 1753900000000) {
   return createDiscordCatchup({
     botToken: 'test-token',
+    botUserId: 'bot-1',
     webhookUrl: 'http://127.0.0.1:9999/webhook',
     monitoredChannelIds: () => new Set(['chan-1']),
     env,
@@ -378,6 +379,7 @@ describe('createDiscordCatchup runOnce', () => {
     });
     const engine = createDiscordCatchup({
       botToken: 'test-token',
+      botUserId: 'bot-1',
       webhookUrl: 'http://127.0.0.1:9999/webhook',
       monitoredChannelIds: () => new Set(['chan-1']),
       env: {},
@@ -497,6 +499,31 @@ describe('createDiscordCatchup runOnce', () => {
     expect(getDiscordMessageRouteStatus('chan-1', '498')).toBe('routed');
     expect(getDiscordChannelCursor('chan-1')).toBe('500'); // the sweep NEVER moves the cursor
   });
+
+  it("skips the bot's own messages in the walk (advance cursor, no POST, no stall)", async () => {
+    advanceDiscordChannelCursor('chan-1', '500', '2026-07-30T00:00:00.000Z');
+    const page = [
+      restMessage('601', { author: { id: 'bot-1', bot: true }, content: 'yente reply' }),
+      restMessage('602', { content: 'missed question' }),
+    ];
+    const { fetchImpl, webhookPosts } = fakeTransport({
+      // Insertion order matters: the page URL also contains '/channels/chan-1'.
+      'messages?after=': [json(page), json([])],
+      '/channels/chan-1': [json(CHANNEL_INFO)],
+    });
+    const engine = makeEngine(fetchImpl);
+    const summary = await engine.runOnce('periodic');
+
+    // Without the skip, the own-bot message 601 POSTs too, stays row-less
+    // (the wrapper bypass never writes a row), and the walk stops at it
+    // forever — the user message 602 behind it is never presented.
+    expect(webhookPosts.map((p) => p.data.id)).toEqual(['602']);
+    expect(summary?.skippedOwnBot).toBe(1);
+    expect(summary?.routed).toBe(1);
+    // The skip advanced the cursor past the own-bot message (no stall, no
+    // unbounded re-presentation; the user's message advanced it to its own id).
+    expect(getDiscordChannelCursor('chan-1')).toBe('602');
+  });
 });
 
 describe('createDiscordCatchup triggers', () => {
@@ -522,6 +549,7 @@ describe('createDiscordCatchup triggers', () => {
     });
     const engine = createDiscordCatchup({
       botToken: 'test-token',
+      botUserId: 'bot-1',
       webhookUrl: 'http://127.0.0.1:9999/webhook',
       monitoredChannelIds: () => new Set(['chan-1']),
       env,

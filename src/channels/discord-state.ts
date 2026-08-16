@@ -90,6 +90,8 @@ export function markDiscordMessageRouted(channelId: string, messageId: string, r
  * only after this runs, so the live forwarder's immediate HTTP retries hit an
  * unexpired lease and are duplicate-dropped instead of burning attempts 2–3
  * within ~1.3 s. Catch-up reclaims normally once the lease expires.
+ * Routed is terminal and monotonic: a late duplicate consult from an
+ * overlapping re-claim must never regress the row (delta-review round 4).
  */
 export function markDiscordMessageFailed(channelId: string, messageId: string, failedAt: string, error: string): void {
   getDb()
@@ -98,7 +100,8 @@ export function markDiscordMessageFailed(channelId: string, messageId: string, f
           SET status = 'failed',
               failed_at = ?,
               last_error = ?
-        WHERE channel_id = ? AND message_id = ?`,
+        WHERE channel_id = ? AND message_id = ?
+          AND status != 'routed'`,
     )
     .run(failedAt, error.slice(0, 2000), channelId, messageId);
 }

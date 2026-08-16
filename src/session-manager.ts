@@ -506,6 +506,43 @@ export function writeSessionMessage(
   updateSession(sessionId, { last_active: new Date().toISOString() });
 }
 
+/** Route identity of a stored session inbound row, as stamped at write time. */
+export interface SessionMessageRouteIdentity {
+  platformId: string | null;
+  platformMessageId: string | null;
+  channelType: string | null;
+  threadId: string | null;
+  messagingGroupId: string | null;
+  timestamp: string;
+}
+
+/**
+ * Read-only lookup of a session inbound row's route identity by message id.
+ * Host-only. Used by the router's replay guard: the route ledger can
+ * re-present a message after a partial delivery failure, and replay must be
+ * detected by ROUTE IDENTITY, not by id alone — the deterministic
+ * messageIdForAgent id carries no channel/platform/thread scope, so a
+ * distinct message reusing a provider-local id must stay loud (throw at the
+ * caller) rather than be silently skipped (delta review round 8).
+ */
+export function getSessionMessageRouteIdentity(
+  agentGroupId: string,
+  sessionId: string,
+  messageId: string,
+): SessionMessageRouteIdentity | null {
+  const db = openInboundDb(agentGroupId, sessionId);
+  try {
+    const row = db
+      .prepare(
+        'SELECT platform_id AS platformId, platform_message_id AS platformMessageId, channel_type AS channelType, thread_id AS threadId, messaging_group_id AS messagingGroupId, timestamp AS timestamp FROM messages_in WHERE id = ?',
+      )
+      .get(messageId) as SessionMessageRouteIdentity | undefined;
+    return row ?? null;
+  } finally {
+    db.close();
+  }
+}
+
 /**
  * If message content has attachments with base64 `data`, save them to
  * the agent group's mounted workspace and add prompt metadata.

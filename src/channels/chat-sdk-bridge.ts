@@ -146,6 +146,28 @@ export interface ChatSdkBridgeConfig {
    * exactly once per setup().
    */
   onGatewayWebhookReady?: (webhookUrl: string) => void;
+  /**
+   * Called with the platform message id immediately after a message is
+   * actually forwarded inbound — i.e. a registered Chat SDK handler accepted
+   * it and the host `onInbound` completed. Chat SDK dispatch resolves void
+   * whether or not any handler matched, and the vendored adapters' forwards
+   * resolve either way, so channels that keep route bookkeeping (Discord) use
+   * this to distinguish "dispatched to a handler" from "no handler matched".
+   * REQUIRED (not optional) so that wiring it is compile-gated: an optional
+   * hook could be silently dropped by a channel factory, leaving every routed
+   * message recorded as failed (plan-review round-2 finding 2).
+   */
+  onInboundForwarded: (messageId: string) => void;
+  /**
+   * Override for the Chat SDK's incoming-message dedupe TTL (default 300s).
+   * Channels with their own idempotent claim/replay layer (Discord's
+   * message-route claim + catch-up) set this BELOW their re-presentation
+   * cadence so a re-presented message id dispatches again; the SDK layer
+   * then only absorbs same-process duplicate bursts. Never set 0: the dedupe
+   * TTL path (chat core + the sqlite state adapter's setIfNotExists) treats 0
+   * as no-expiry (permanent dedupe).
+   */
+  dedupeTtlMs?: number;
 }
 
 type SerializableAttachment = Record<string, unknown>;
@@ -323,8 +345,10 @@ export async function forwardChatSdkInboundMessage<
   source: ChatSdkForwardSource;
   onInbound: ChannelSetup['onInbound'];
   toInbound: (message: TMessage, isMention: boolean, isGroup: boolean) => Promise<InboundMessage>;
+  onForwarded?: (messageId: string) => void;
 }): Promise<'dropped' | 'forwarded'> {
-  const { adapterName, channelId, threadId, message, isMention, isGroup, source, onInbound, toInbound } = opts;
+  const { adapterName, channelId, threadId, message, isMention, isGroup, source, onInbound, toInbound, onForwarded } =
+    opts;
   if (isOwnChatSdkMessageForTest(message)) {
     const author = message.author;
     log.warn('chat_sdk_same_bot_message_dropped', {
@@ -340,6 +364,7 @@ export async function forwardChatSdkInboundMessage<
   }
 
   await onInbound(channelId, threadId, await toInbound(message, isMention, isGroup));
+  onForwarded?.(message.id);
   return 'forwarded';
 }
 
@@ -433,8 +458,13 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       isMention,
       isGroup,
       source,
-      onInbound: setupConfig.onInbound,
+      // Prefer the strict inbound variant when the host provides it: it
+      // propagates router failures instead of swallowing them, so the
+      // acceptance hook stays silent on failure and the message remains
+      // catch-up eligible instead of being falsely marked routed.
+      onInbound: setupConfig.onInboundStrict ?? setupConfig.onInbound,
       toInbound: messageToInbound,
+      onForwarded: config.onInboundForwarded,
     });
   }
 
@@ -454,6 +484,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         concurrency: config.concurrency ?? 'concurrent',
         state,
         logger: 'silent',
+        dedupeTtlMs: config.dedupeTtlMs,
       });
 
       // Four SDK dispatch paths — bridge just forwards. All per-wiring
@@ -494,15 +525,18 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
 
       // Plain messages in unsubscribed threads.
       //
-      // Chat SDK dispatch (handling-events.mdx §"Handler dispatch order") is
+      // Chat SDK dispatch (handling-events.mdx §"How routing works") is
       // exclusive: subscribed → onSubscribedMessage; unsubscribed+mention →
       // onNewMention; unsubscribed+pattern-match → onNewMessage. Registering
-      // with `/./` lets the router see every plain message on every
-      // unsubscribed thread the bot can see. The router short-circuits via
+      // with `/[\s\S]*/` — which intentionally also matches the empty string —
+      // lets the router see every plain message on every unsubscribed thread
+      // the bot can see, including attachment-only posts: Discord sends those
+      // with empty content, and the previous `/./` silently dropped them
+      // (2026-08-15 incident). The router short-circuits via
       // getMessagingGroupWithAgentCount (~1 DB read) for unwired channels,
       // so forwarding every one is cheap enough to not need a bridge-side
       // flood gate.
-      chat.onNewMessage(/./, async (thread, message) => {
+      chat.onNewMessage(/[\s\S]*/, async (thread, message) => {
         const channelId = adapter.channelIdFromThreadId(thread.id);
         await forwardInboundMessage(channelId, thread.id, message, false, true, 'plain');
       });
