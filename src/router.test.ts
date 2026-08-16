@@ -15,7 +15,7 @@ import {
 } from './db/index.js';
 import { findSessionForAgent, getSession, getSessionsByAgentGroup } from './db/sessions.js';
 import { setDeliveryAdapter } from './delivery.js';
-import { inboundDbPath, outboundDbPath, writeOutboundDirect } from './session-manager.js';
+import { inboundDbPath, outboundDbPath, sessionDir, writeOutboundDirect } from './session-manager.js';
 import { getScheduledTask } from './modules/scheduling/ledger.js';
 
 const cleanupContainerForSessionMock = vi.hoisted(() => vi.fn().mockResolvedValue(true));
@@ -44,6 +44,8 @@ const DISCORD_PLATFORM_ID = 'channel';
 const DISCORD_THREAD_ID = 'discord:guild:channel';
 const DISCORD_RAW_CONVERSATION_THREAD_ID = 'thread-123';
 const DISCORD_CANONICAL_CONVERSATION_THREAD_ID = `discord:guild:${DISCORD_PLATFORM_ID}:${DISCORD_RAW_CONVERSATION_THREAD_ID}`;
+const SHARED_PLATFORM_ID = 'shared-platform';
+const SHARED_THREAD_ID = 'discord:guild:shared';
 let currentUserId: string | null = 'discord:admin';
 
 beforeEach(async () => {
@@ -99,7 +101,7 @@ afterEach(() => {
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
 });
 
-function grantAdmin(userId: string): void {
+function grantAdmin(userId: string, agentGroupId = 'ag-yente'): void {
   getDb()
     .prepare('INSERT OR IGNORE INTO users (id, kind, display_name, created_at) VALUES (?, ?, ?, ?)')
     .run(userId, 'discord', userId, now());
@@ -107,7 +109,7 @@ function grantAdmin(userId: string): void {
     .prepare(
       'INSERT OR IGNORE INTO user_roles (user_id, role, agent_group_id, granted_by, granted_at) VALUES (?, ?, ?, ?, ?)',
     )
-    .run(userId, 'admin', 'ag-yente', null, now());
+    .run(userId, 'admin', agentGroupId, null, now());
 }
 
 function event(
@@ -119,6 +121,22 @@ function event(
     channelType: 'discord',
     platformId: DISCORD_PLATFORM_ID,
     threadId,
+    message: {
+      id,
+      kind: 'chat',
+      content,
+      timestamp: now(),
+      isMention: true,
+      isGroup: true,
+    },
+  };
+}
+
+function sharedEvent(content: string, id: string): InboundEvent {
+  return {
+    channelType: 'discord',
+    platformId: SHARED_PLATFORM_ID,
+    threadId: SHARED_THREAD_ID,
     message: {
       id,
       kind: 'chat',
@@ -831,21 +849,19 @@ describe('replay idempotency', () => {
     const wakeMock = vi.mocked(wakeContainer);
     wakeMock.mockClear();
 
-    // Session S1 exists before the replayed message arrives. (The rollover
-    // guard sweeps siblings created at/before the platform message
-    // timestamp; routing a prior message keeps that ordering deterministic
-    // even when everything lands in the same millisecond.)
-    await routeInbound(event('hello first', 'msg-first-before-rollover'));
-    const original = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
-
-    // Attempt 1: the durable session write lands in S1, then the wake throws
-    // — the strict inbound path stays catch-up eligible. Capture the event
-    // object ONCE: the helper stamps a fresh timestamp per call, while
+    // First message on this route: 'ping msg-roll' itself creates S1 — no
+    // earlier message seeds the route. The event timestamp models the
+    // platform's message-creation time, which predates the host's receipt;
+    // S1.created_at is stamped at host receipt, AFTER the platform
+    // timestamp. This is exactly the first-message shape the masked round-9
+    // bound skipped (delta review round 10). Capture the event object ONCE:
     // production catch-up re-presents the original platform message whose
     // dateSent timestamp is stable.
     const replay = event('ping', 'msg-roll');
+    replay.message = { ...replay.message, timestamp: new Date(Date.now() - 60_000).toISOString() };
     wakeMock.mockRejectedValueOnce(new Error('container spawn failed'));
     await expect(routeInbound(replay)).rejects.toThrow('container spawn failed');
+    const original = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
 
     // Before catch-up replays, /new archives S1 and creates a deliberately
     // fresh S2 for the same route key.
@@ -880,6 +896,132 @@ describe('replay idempotency', () => {
     // The delivery was already recorded by attempt 1: the replay is a
     // skip-without-wake, not a fresh route.
     expect(wakeMock.mock.calls.length).toBe(wakesBeforeReplay);
+  });
+
+  it('does not write a catch-up replay into a fresh agent-shared session after /new rolled the canonical session', async () => {
+    const { routeInbound } = await import('./router.js');
+    const { wakeContainer } = await import('./container-runner.js');
+    const wakeMock = vi.mocked(wakeContainer);
+    wakeMock.mockClear();
+
+    // agent-shared session mode: one canonical session per agent group,
+    // stored with a NULL thread id regardless of the messaging group and
+    // thread the event arrived on — after a rollover it is reachable only
+    // by sweeping the agent's whole session history (delta review round
+    // 10), never by the (messaging group, thread) route key.
+    createAgentGroup({
+      id: 'ag-shared',
+      name: 'Shared',
+      folder: 'shared',
+      agent_provider: null,
+      created_at: now(),
+    });
+    createMessagingGroup({
+      id: 'mg-shared',
+      channel_type: 'discord',
+      platform_id: SHARED_PLATFORM_ID,
+      name: 'Shared Test',
+      is_group: 1,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    createMessagingGroupAgent({
+      id: 'mga-shared',
+      messaging_group_id: 'mg-shared',
+      agent_group_id: 'ag-shared',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'agent-shared',
+      priority: 0,
+      created_at: now(),
+    });
+    grantAdmin('discord:admin', 'ag-shared');
+
+    // First message on this route creates the canonical shared session S1.
+    // The event timestamp models the platform's message-creation time,
+    // which predates the host's receipt (and thus S1.created_at).
+    const replay = sharedEvent('ping', 'msg-shared');
+    replay.message = { ...replay.message, timestamp: new Date(Date.now() - 60_000).toISOString() };
+    wakeMock.mockRejectedValueOnce(new Error('container spawn failed'));
+    await expect(routeInbound(replay)).rejects.toThrow('container spawn failed');
+    const original = getSessionsByAgentGroup('ag-shared')[0];
+    expect(original).toBeDefined();
+
+    // /new rolls the canonical agent-shared session: S1 archived, S2 fresh.
+    wakeMock.mockResolvedValue(undefined);
+    await routeInbound(sharedEvent('/new', 'msg-shared-reset'));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const fresh = getSessionsByAgentGroup('ag-shared').find((s) => s.status === 'active')!;
+    expect(fresh.id).not.toBe(original.id);
+
+    const wakesBeforeReplay = wakeMock.mock.calls.length;
+    await routeInbound(replay);
+
+    // The pre-reset row must NOT be duplicated into the post-reset session:
+    // no row in the fresh shared session, exactly one row across all of the
+    // agent's sessions (in the archived original), and no re-wake.
+    const freshDb = new Database(inboundDbPath('ag-shared', fresh.id));
+    const freshRows = freshDb.prepare("SELECT id FROM messages_in WHERE id = 'msg-shared:ag-shared'").all();
+    freshDb.close();
+    expect(freshRows).toHaveLength(0);
+
+    let total = 0;
+    for (const s of getSessionsByAgentGroup('ag-shared')) {
+      const db = new Database(inboundDbPath('ag-shared', s.id));
+      const rows = db.prepare("SELECT id FROM messages_in WHERE id = 'msg-shared:ag-shared'").all() as Array<{
+        id: string;
+      }>;
+      db.close();
+      total += rows.length;
+    }
+    expect(total).toBe(1);
+
+    expect(wakeMock.mock.calls.length).toBe(wakesBeforeReplay);
+  });
+
+  it('routes normally when an archived sibling session folder has been cleaned up', async () => {
+    const { routeInbound } = await import('./router.js');
+    const { wakeContainer } = await import('./container-runner.js');
+    const wakeMock = vi.mocked(wakeContainer);
+    wakeMock.mockClear();
+
+    // Same rollover setup: first message creates S1 and fails its wake,
+    // then /new archives S1 and creates the fresh S2 on the route key.
+    const replay = event('ping', 'msg-orphan');
+    replay.message = { ...replay.message, timestamp: new Date(Date.now() - 60_000).toISOString() };
+    wakeMock.mockRejectedValueOnce(new Error('container spawn failed'));
+    await expect(routeInbound(replay)).rejects.toThrow('container spawn failed');
+    const original = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
+
+    wakeMock.mockResolvedValue(undefined);
+    await routeInbound(event('/new', 'msg-orphan-reset'));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const fresh = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
+    expect(fresh.id).not.toBe(original.id);
+
+    // The repo supports archived session folders being cleaned up while the
+    // central sessions row remains — opening that sibling's missing DB must
+    // never abort routing for later messages on this route (delta review
+    // round 10).
+    fs.rmSync(sessionDir('ag-yente', original.id), { recursive: true, force: true });
+
+    // A NEW message (distinct id) must resolve and write into the fresh
+    // session normally. Stamp it between the archived and fresh sessions'
+    // creation times so the replay sweep actually consults the orphaned
+    // sibling instead of being gated out of the sweep entirely.
+    const followup = event('after cleanup', 'msg-after-cleanup');
+    followup.message = { ...followup.message, timestamp: fresh.created_at };
+
+    const wakesBefore = wakeMock.mock.calls.length;
+    await routeInbound(followup);
+
+    const freshDb = new Database(inboundDbPath('ag-yente', fresh.id));
+    const rows = freshDb.prepare("SELECT id FROM messages_in WHERE id = 'msg-after-cleanup:ag-yente'").all();
+    freshDb.close();
+    expect(rows).toHaveLength(1);
+    expect(wakeMock.mock.calls.length).toBe(wakesBefore + 1);
   });
 });
 
