@@ -66,6 +66,23 @@ describe('shared Playwriter runtime', () => {
     ]);
   });
 
+  it('exposes stock enabled-target cardinality, title/URL discovery, and wrapped HTTP errors', () => {
+    const archivePath = repoPath('container', 'playwriter', CLIENT_FILENAME);
+    const relaySource = execFileSync('tar', ['-xOzf', archivePath, 'package/dist/cdp-relay.js'], {
+      encoding: 'utf8',
+    });
+    const cliSource = execFileSync('tar', ['-xOzf', archivePath, 'package/dist/cli.js'], {
+      encoding: 'utf8',
+    });
+
+    expect(relaySource).toContain("app.get('/extensions/status'");
+    expect(relaySource).toContain('activeTargets: ext.connectedTargets.size');
+    expect(relaySource).toContain(".on(['GET', 'PUT'], '/json/list'");
+    expect(relaySource).toContain('title: t.targetInfo.title');
+    expect(relaySource).toContain('url: t.targetInfo.url');
+    expect(cliSource).toContain('console.error(`Error: ${response.status} ${text}`)');
+  });
+
   it('rejects optional dependencies that resolve from the installed Playwriter runtime', () => {
     const verifierPath = repoPath('container', 'playwriter', 'verify-no-optional-dependencies.mjs');
     const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'playwriter-resolution-'));
