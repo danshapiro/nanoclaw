@@ -170,6 +170,7 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
 # pinned preparation receipt remain the authoritative identity.
 COPY playwriter/playwriter-client-0303f56f07c838bb4686870cc03c9374ccff46f8.tgz /usr/local/share/nanoclaw/playwriter/playwriter-client-0303f56f07c838bb4686870cc03c9374ccff46f8.tgz
 COPY playwriter/client-identity.json /usr/local/share/nanoclaw/playwriter/
+COPY playwriter/verify-no-optional-dependencies.mjs /usr/local/share/nanoclaw/playwriter/
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     export PATH="/pnpm/bin:/pnpm:$PATH" && \
     test "$(wc -c <"/usr/local/share/nanoclaw/playwriter/playwriter-client-0303f56f07c838bb4686870cc03c9374ccff46f8.tgz")" = "1066577" && \
@@ -179,10 +180,7 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
     playwriter_version="$(playwriter --version 2>&1)" && \
     printf '%s\n' "$playwriter_version" | grep -Eq '^playwriter/0[.]4[.]0([[:space:]]|$)' && \
     playwriter_bin="$(readlink -f "$(command -v playwriter)")" && \
-    playwriter_deps="$(dirname "$(dirname "$playwriter_bin")")" && \
-    for optional in '@playwriter/patchright-core' 'sharp'; do \
-      test ! -e "$playwriter_deps/$optional"; \
-    done
+    node /usr/local/share/nanoclaw/playwriter/verify-no-optional-dependencies.mjs "$playwriter_bin"
 
 # ---- YouTube media downloader ------------------------------------------------
 # Pin the official nightly zipimport executable: distro packages and stable

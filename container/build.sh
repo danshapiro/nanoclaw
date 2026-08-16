@@ -91,10 +91,7 @@ test "$(wc -c <"$archive")" = "1066577"
 printf "%s  %s\n" "15bdc6b333ef539de575b8b14fd41fd622b57d9af69fbc4c678d339788d823ea" "$archive" | sha256sum --check --strict
 jq -e ".artifact.filename == \"playwriter-client-0303f56f07c838bb4686870cc03c9374ccff46f8.tgz\" and .artifact.sha256 == \"15bdc6b333ef539de575b8b14fd41fd622b57d9af69fbc4c678d339788d823ea\" and .preparation_receipt.sha256 == \"72e943cb6a6ba4fd49e52d0abca8af7834894fc3c61b626580ae2d50fce2749a\"" "$identity" >/dev/null
 playwriter_bin="$(readlink -f "$(command -v playwriter)")"
-playwriter_deps="$(dirname "$(dirname "$playwriter_bin")")"
-for optional in @playwriter/patchright-core sharp; do
-    test ! -e "$playwriter_deps/$optional"
-done'
+node /usr/local/share/nanoclaw/playwriter/verify-no-optional-dependencies.mjs "$playwriter_bin"'
 
 echo ""
 echo "Build complete!"

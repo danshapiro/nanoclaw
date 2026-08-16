@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import { execFileSync } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import { describe, expect, it } from 'vitest';
@@ -65,6 +66,46 @@ describe('shared Playwriter runtime', () => {
     ]);
   });
 
+  it('rejects optional dependencies that resolve from the installed Playwriter runtime', () => {
+    const verifierPath = repoPath('container', 'playwriter', 'verify-no-optional-dependencies.mjs');
+    const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'playwriter-resolution-'));
+    const resolutionRoot = path.join(fixtureRoot, 'global', '5', 'node_modules');
+    const cliPath = path.join(resolutionRoot, 'playwriter', 'dist', 'cli.js');
+
+    fs.mkdirSync(path.dirname(cliPath), { recursive: true });
+    fs.writeFileSync(cliPath, '', 'utf8');
+
+    try {
+      expect(() => execFileSync(process.execPath, [verifierPath, cliPath], { stdio: 'pipe' })).not.toThrow();
+
+      for (const optional of ['@playwriter/patchright-core', 'sharp']) {
+        const optionalRoot = path.join(resolutionRoot, ...optional.split('/'));
+        fs.mkdirSync(optionalRoot, { recursive: true });
+        fs.writeFileSync(
+          path.join(optionalRoot, 'package.json'),
+          JSON.stringify({ name: optional, main: 'index.js' }),
+          'utf8',
+        );
+        fs.writeFileSync(path.join(optionalRoot, 'index.js'), '', 'utf8');
+
+        let failure: { stderr?: Buffer } | undefined;
+        try {
+          execFileSync(process.execPath, [verifierPath, cliPath], { stdio: 'pipe' });
+        } catch (error) {
+          failure = error as { stderr?: Buffer };
+        }
+        expect(failure).toBeDefined();
+        expect(failure?.stderr?.toString()).toContain(
+          `Optional Playwriter dependency resolves at runtime: ${optional}`,
+        );
+
+        fs.rmSync(optionalRoot, { recursive: true, force: true });
+      }
+    } finally {
+      fs.rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  });
+
   it('installs only the exact local archive at image build time with optional dependencies omitted', () => {
     const dockerfile = fs.readFileSync(repoPath('container', 'Dockerfile'), 'utf8');
     const section = dockerfile.match(/# ---- Playwriter stock client -+\n(?<body>[\s\S]*?)\n# ---- [^-]/)?.groups?.body;
@@ -84,7 +125,12 @@ describe('shared Playwriter runtime', () => {
     );
     expect(section).toContain('playwriter_version="$(playwriter --version 2>&1)"');
     expect(section).toContain("grep -Eq '^playwriter/0[.]4[.]0([[:space:]]|$)'");
-    expect(section).toContain("'@playwriter/patchright-core' 'sharp'");
+    expect(section).toContain(
+      'COPY playwriter/verify-no-optional-dependencies.mjs /usr/local/share/nanoclaw/playwriter/',
+    );
+    expect(section).toContain(
+      'node /usr/local/share/nanoclaw/playwriter/verify-no-optional-dependencies.mjs "$playwriter_bin"',
+    );
     expect(section).not.toContain('@latest');
     expect(section).not.toMatch(/playwriter@/);
     expect(section).not.toMatch(/https?:\/\/(?:registry\.)?npmjs/);
@@ -106,5 +152,8 @@ describe('shared Playwriter runtime', () => {
     expect(buildScript).toContain(CLIENT_FILENAME);
     expect(buildScript).toContain(CLIENT_SHA256);
     expect(buildScript).toContain(`test "$(wc -c <\"$archive\")" = "${CLIENT_BYTES}"`);
+    expect(buildScript).toContain(
+      'node /usr/local/share/nanoclaw/playwriter/verify-no-optional-dependencies.mjs "$playwriter_bin"',
+    );
   });
 });
