@@ -76,6 +76,7 @@ describe('shared Playwriter runtime', () => {
     });
 
     expect(relaySource).toContain("app.get('/extensions/status'");
+    expect(relaySource).toContain('stableKey: ext.stableKey');
     expect(relaySource).toContain('activeTargets: ext.connectedTargets.size');
     expect(relaySource).toContain(".on(['GET', 'PUT'], '/json/list'");
     expect(relaySource).toContain('title: t.targetInfo.title');
