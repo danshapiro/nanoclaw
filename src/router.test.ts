@@ -1023,6 +1023,49 @@ describe('replay idempotency', () => {
     expect(rows).toHaveLength(1);
     expect(wakeMock.mock.calls.length).toBe(wakesBefore + 1);
   });
+
+  it('writes normally when an unrelated archived sibling holds a colliding provider-local id', async () => {
+    const { routeInbound } = await import('./router.js');
+    const { wakeContainer } = await import('./container-runner.js');
+    const wakeMock = vi.mocked(wakeContainer);
+    wakeMock.mockClear();
+
+    // First write: 'msg-x' routes into S-old on the default route and wakes.
+    await routeInbound(event(JSON.stringify({ text: 'first' }), 'msg-x'));
+    const original = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
+
+    // /new archives S-old and creates the deliberately fresh session on the
+    // same route key, so the archived S-old stays in the sweep candidates.
+    await routeInbound(event('/new', 'msg-reset'));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const fresh = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
+    expect(fresh.id).not.toBe(original.id);
+
+    // A DIFFERENT message reuses the same provider-local id 'msg-x' (different
+    // content/timestamp). The colliding row in the archived sibling is
+    // unrelated history, not a write conflict — sibling rows are not
+    // write-target candidates and must not veto this delivery (delta review
+    // round 11). Capture the event helper output and override the timestamp
+    // explicitly, stamping it at the fresh session's creation time so the
+    // replay-sweep gate passes and the archived sibling is actually consulted.
+    const distinct = event(JSON.stringify({ text: 'second' }), 'msg-x');
+    distinct.message = { ...distinct.message, timestamp: fresh.created_at };
+
+    // Must RESOLVE (today it rejects with 'Refusing to skip distinct message').
+    const wakesBefore = wakeMock.mock.calls.length;
+    await routeInbound(distinct);
+
+    // Exactly one 'msg-x:ag-yente' row lands in the FRESH session's inbound
+    // db, carrying the new content, and the delivery wakes the container.
+    const freshDb = new Database(inboundDbPath('ag-yente', fresh.id));
+    const rows = freshDb.prepare("SELECT content FROM messages_in WHERE id = 'msg-x:ag-yente'").all() as Array<{
+      content: string;
+    }>;
+    freshDb.close();
+    expect(rows).toHaveLength(1);
+    expect(rows[0].content).toContain('second');
+    expect(wakeMock.mock.calls.length).toBe(wakesBefore + 1);
+  });
 });
 
 function deferred(): { promise: Promise<void>; resolve: () => void } {
