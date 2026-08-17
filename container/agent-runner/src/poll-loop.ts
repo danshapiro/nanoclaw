@@ -391,6 +391,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   // hasHostReceiptStamp). Persists for this container run; the host sweep's
   // quarantine is the durable fix spanning restarts.
   let parkedUnroutableIds = new Set<string>();
+  // Session identity for the parked-row event, forwarded from the container
+  // env (the host stamps NANOCLAW_SESSION_ID at spawn; unset only in tests).
+  const sessionId = process.env.NANOCLAW_SESSION_ID ?? null;
   while (!config.signal?.aborted) {
     // Per-wake guard: at most one user-facing provider-error row per route per
     // wake ("once per turn"). Resets each wake; the durable retry schedule's
@@ -418,6 +421,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           JSON.stringify({
             severity: 'error',
             event: 'unroutable_pending_rows_parked',
+            session_id: sessionId,
             message_ids: [...unbackedIds].sort(),
             route_keys: routes,
           }),

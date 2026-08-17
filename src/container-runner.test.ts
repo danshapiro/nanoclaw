@@ -1482,6 +1482,32 @@ describe('unexpected-exit recovery gating (R1)', () => {
     }
   });
 
+  it('cancels armed recovery timers at drain for crashed sessions with no active container', async () => {
+    vi.useFakeTimers();
+    const harness = await loadContainerRunnerHarness();
+    try {
+      harness.oneCliRelease.resolve();
+      await harness.containerRunner.wakeContainer(harness.session);
+      harness.spawnedProcesses[0].emit('close', 1);
+      // Finalization settles: the session left activeContainers BEFORE its
+      // recovery timer was armed, so the drain's active-entry snapshot never
+      // sees it — without an all-timers cancel, the unref'd timer fires
+      // mid-shutdown and spawns a replacement that missed the drain.
+      await vi.advanceTimersByTimeAsync(10);
+      expect(harness.containerRunner.getActiveContainerCount()).toBe(0);
+
+      await harness.containerRunner.drainAllContainers(30);
+      await vi.advanceTimersByTimeAsync(120_000);
+
+      expect(harness.unexpectedExitRecoveryMock).not.toHaveBeenCalled();
+      // No replacement spawn after drain either.
+      expect(harness.spawnedProcesses).toHaveLength(1);
+    } finally {
+      harness.close();
+      vi.useRealTimers();
+    }
+  });
+
   it('R1b: two concurrent targeted recoveries for one session join a single spawn (single-winner invariant)', async () => {
     // Regression lock — no new spawn-enforcement mechanism: concurrent
     // recoverSessionAfterUnexpectedExit passes both resolve to wakeContainer,

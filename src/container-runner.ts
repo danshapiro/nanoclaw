@@ -223,6 +223,12 @@ export function waitForContainerExit(sessionId: string, timeoutMs = 30000): Prom
  * daemon probes (container name and session label) report no writer.
  */
 export async function drainAllContainers(graceSeconds = 30): Promise<void> {
+  // Cancel EVERY armed unexpected-exit recovery timer FIRST, including timers
+  // for sessions no longer in activeContainers (a crash deletes the active
+  // entry before arming its timer, so the per-entry loop below never sees
+  // them): an unref'd timer firing mid-shutdown would spawn a replacement
+  // container that missed the drain.
+  cancelAllUnexpectedExitRecoveries();
   if (activeContainers.size === 0) return;
 
   const entries = [...activeContainers.entries()];
@@ -236,10 +242,9 @@ export async function drainAllContainers(graceSeconds = 30): Promise<void> {
     entries.map(async ([sessionId, entry]) => {
       try {
         // R1a: a drain stop is intentional — declare it before the stop so the
-        // post-stop finalization never schedules crash recovery, and cancel any
-        // armed recovery timer so the unref'd timer cannot fire mid-shutdown.
+        // post-stop finalization never schedules crash recovery. Any timer
+        // armed BEFORE the drain (tracked or not) was already cancelled above.
         entry.expectedStopReason = 'shutdown-drain';
-        clearUnexpectedExitRecovery(sessionId);
         await stopContainerAsync(entry.containerName, graceSeconds);
         await verifyContainerProcessExited(sessionId, entry, 'shutdown-drain');
         const clientClosed = await waitForProcessClose(entry, SHUTDOWN_CLIENT_EXIT_TIMEOUT_MS);
@@ -655,6 +660,19 @@ function clearUnexpectedExitRecovery(sessionId: string): void {
   const state = unexpectedExitRecovery.get(sessionId);
   if (state?.timer) clearTimeout(state.timer);
   unexpectedExitRecovery.delete(sessionId);
+}
+
+/**
+ * Cancel ALL armed unexpected-exit recovery timers, including sessions whose
+ * entry already left activeContainers when the timer was armed (the crash
+ * path deletes the active entry before scheduling recovery). Used by the
+ * shutdown drain: per-session snapshot cancelation can never reach those.
+ */
+function cancelAllUnexpectedExitRecoveries(): void {
+  for (const state of unexpectedExitRecovery.values()) {
+    if (state.timer) clearTimeout(state.timer);
+  }
+  unexpectedExitRecovery.clear();
 }
 
 function scheduleUnexpectedExitRecovery(

@@ -2918,6 +2918,69 @@ describe('sweepSession orphan inbound row quarantine + claim-expiry guard (R1)',
     expect(wakeContainer).not.toHaveBeenCalled();
   });
 
+  it('retires the running container as parked-only when the quarantine takes its last due rows', async () => {
+    // Incident chain the fix targets: container spawned for a young unstamped
+    // row parks it container-side, sleeps heartbeatless (SLA-exempt), and the
+    // >24h host quarantine finally lands — the running container must retire
+    // WITH the quarantine, via the intentional-stop path (the declared
+    // expectedStopReason 'orphaned-rows-quarantined' gates unexpected-exit
+    // recovery, pinned by the container-runner R1a suite), and due==0 must
+    // not wake a replacement.
+    const session = r1Session('sess-r1-parked-retire');
+    initSessionFolder('ag-r1', session.id);
+    inboundRow(session.id, 'm-parked-only', { ageMs: ORPHAN_AGE_MS });
+    vi.mocked(isContainerRunning).mockReturnValue(true);
+    const infoSpy = vi.spyOn(log, 'info');
+
+    try {
+      await sweepSessionForTest(session);
+
+      expect(inboundStatus(session.id, 'm-parked-only')).toBe('quarantined');
+      expect(stopContainerAndVerify).toHaveBeenCalledWith(session.id, 'orphaned-rows-quarantined');
+      expect(wakeContainer).not.toHaveBeenCalled();
+      expect(infoSpy).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({
+          event: 'parked_only_container_retired',
+          sessionId: session.id,
+          quarantinedMessageIds: ['m-parked-only'],
+        }),
+      );
+    } finally {
+      infoSpy.mockRestore();
+    }
+  });
+
+  it('does not retire a running container for a young unbacked row (SLA preserved)', async () => {
+    // Below the orphan max age the row stays pending (and due) — the running
+    // container's SLA, not the quarantine retire, owns its lifecycle.
+    const session = r1Session('sess-r1-young-running');
+    initSessionFolder('ag-r1', session.id);
+    inboundRow(session.id, 'm-young-running', { ageMs: 60_000 });
+    vi.mocked(isContainerRunning).mockReturnValue(true);
+
+    await sweepSessionForTest(session);
+
+    expect(inboundStatus(session.id, 'm-young-running')).toBe('pending');
+    expect(stopContainerAndVerify).not.toHaveBeenCalled();
+  });
+
+  it('does not retire a running container when due rows remain after quarantine', async () => {
+    // The retire is parked-ONLY: any remaining due row means the container
+    // still has real work to claim.
+    const session = r1Session('sess-r1-due-remains');
+    initSessionFolder('ag-r1', session.id);
+    inboundRow(session.id, 'm-old-unbacked-due', { ageMs: ORPHAN_AGE_MS });
+    inboundRow(session.id, 'm-stamped-due', { stamped: true, ageMs: 60_000 });
+    vi.mocked(isContainerRunning).mockReturnValue(true);
+
+    await sweepSessionForTest(session);
+
+    expect(inboundStatus(session.id, 'm-old-unbacked-due')).toBe('quarantined');
+    expect(inboundStatus(session.id, 'm-stamped-due')).toBe('pending');
+    expect(stopContainerAndVerify).not.toHaveBeenCalled();
+  });
+
   it('claim-expiry guard: kills the container (claim-stuck) for a processing row with a heartbeat silent past tolerance', async () => {
     // Sweep-level wiring pin: decideStuckAction covers the pure decision (see
     // the decideStuckAction suite above); this asserts the running-container

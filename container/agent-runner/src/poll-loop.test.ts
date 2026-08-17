@@ -2448,8 +2448,10 @@ describe('poll-loop unbacked pending row parking (R1c)', () => {
       );
       clearHostStamps('unbacked-1');
 
-      const parkedEvents: Array<{ message_ids?: string[] }> = [];
+      const parkedEvents: Array<{ message_ids?: string[]; session_id?: string | null }> = [];
       const origError = console.error;
+      const prevSessionIdEnv = process.env.NANOCLAW_SESSION_ID;
+      process.env.NANOCLAW_SESSION_ID = 'sess-park-test';
       console.error = (...args: unknown[]) => {
         const line = typeof args[0] === 'string' ? args[0] : '';
         if (line.includes('unroutable_pending_rows_parked')) {
@@ -2482,9 +2484,11 @@ describe('poll-loop unbacked pending row parking (R1c)', () => {
       });
 
       try {
-        // Set change 1: the initial unbacked row is parked — exactly one log.
+        // Set change 1: the initial unbacked row is parked — exactly one log,
+        // carrying the session identity (forwarded from the container env).
         await waitFor(() => parkedEvents.length === 1, 4000);
         expect(parkedEvents[0].message_ids).toEqual(['unbacked-1']);
+        expect(parkedEvents[0].session_id).toBe('sess-park-test');
 
         // Silence across later polls with an unchanged park set, and the parked
         // row never reaches pre-task scripts (no 1/sec heartbeat burn).
@@ -2505,6 +2509,7 @@ describe('poll-loop unbacked pending row parking (R1c)', () => {
         await waitFor(() => parkedEvents.length === 2, 4000);
         await sleep(1300);
         expect(parkedEvents).toHaveLength(2);
+        expect(parkedEvents[1].session_id).toBe('sess-park-test');
         expect(preTaskCalls).toBe(0);
         expect(provider.calls).toBe(0);
 
@@ -2523,6 +2528,8 @@ describe('poll-loop unbacked pending row parking (R1c)', () => {
         expect(parkedEvents).toHaveLength(2);
       } finally {
         console.error = origError;
+        if (prevSessionIdEnv === undefined) delete process.env.NANOCLAW_SESSION_ID;
+        else process.env.NANOCLAW_SESSION_ID = prevSessionIdEnv;
         controller.abort();
         await loopPromise.catch(() => {});
       }

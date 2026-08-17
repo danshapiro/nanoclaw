@@ -598,8 +598,9 @@ async function sweepSession(session: Session): Promise<void> {
     // 3.75 R1c: quarantine aged, never-host-stamped wake rows BEFORE the wake
     // gate so they stop driving container wakes this same pass. Contained per
     // session: a failed pass must never block the wake decision below.
+    let quarantinedOrphanIds: string[] = [];
     try {
-      quarantineOrphanInboundRows(inDb, session.id, Date.now());
+      quarantinedOrphanIds = quarantineOrphanInboundRows(inDb, session.id, Date.now());
     } catch (err) {
       log.error('Orphan inbound quarantine pass failed', { sessionId: session.id, err });
     }
@@ -610,12 +611,48 @@ async function sweepSession(session: Session): Promise<void> {
     // do not trigger a redundant container wake. Fall back to the inbound-only
     // count when outDb does not exist yet (brand-new session: no outbound DB
     // means no recovery rows either, so the counts are equivalent).
+    const dueCountInboundOnly = countDueMessages(inDb);
     const dueCount = outDb
       ? countDueMessagesExcludingRecovery(inDb, outDb, {
           nowMs: Date.now(),
           recoveryWakeTtlMs: RECOVERY_WAKE_TTL_MS,
         })
-      : countDueMessages(inDb);
+      : dueCountInboundOnly;
+
+    // 4.5 R1c: retire a container left parked-only by the quarantine. The
+    // container parked the now-quarantined rows in memory and sleeps
+    // heartbeatless — the wake gate below won't re-wake it (due==0) and the
+    // running-container SLA exempts heartbeatless containers, so without this
+    // explicit stop it idles forever. Goes through the intentional-stop path
+    // with a declared expectedStopReason so no unexpected-exit recovery fires.
+    // Both due counts must be zero (any real OR recovery-owned due work keeps
+    // the container), and the gate requires THIS pass to have quarantined rows
+    // so an idle-but-legit long-lived container between turns is never
+    // retired here.
+    if (
+      quarantinedOrphanIds.length > 0 &&
+      dueCountInboundOnly === 0 &&
+      dueCount === 0 &&
+      isContainerRunning(session.id)
+    ) {
+      log.info('Retiring parked-only container after orphan row quarantine', {
+        event: 'parked_only_container_retired',
+        sessionId: session.id,
+        quarantinedMessageIds: quarantinedOrphanIds,
+      });
+      try {
+        await stopContainerAndVerify(session.id, 'orphaned-rows-quarantined');
+      } catch (err) {
+        // Contained per session: a failed retire must not fail the sweep; the
+        // next pass retries it (and the SLA remains a backstop).
+        log.error('Failed to retire parked-only container after orphan row quarantine', {
+          sessionId: session.id,
+          quarantinedMessageIds: quarantinedOrphanIds,
+          err,
+        });
+      }
+    }
+
     if (dueCount > 0 && !isContainerRunning(session.id)) {
       log.info('Waking container for due messages', { sessionId: session.id, count: dueCount });
       try {
