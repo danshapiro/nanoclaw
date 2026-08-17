@@ -2648,6 +2648,77 @@ describe('poll-loop unbacked pending row parking (R1c)', () => {
     },
     30_000,
   );
+
+  it(
+    'starvation window: parked ids are excluded at the SQL level, so newer orphans cannot starve the older host-backed row',
+    // R4 MAJOR: the pending window is ORDER BY seq DESC LIMIT
+    // maxMessagesPerPrompt (=10 in tests). When 10+ NEWER orphan rows fill
+    // that window, a park filter applied AFTER the fetch never even sees the
+    // older VALID host-backed row — it starves until host quarantine (~24h).
+    // The park set must be passed INTO the pending query so each poll
+    // discovers+parks more orphans until the window reveals the valid row.
+    async () => {
+      const route = {
+        platformId: 'chan-starve',
+        channelType: 'discord',
+        messagingGroupId: 'mg-starve',
+        isGroup: 0 as const,
+      };
+      insertChannelDestination('discord-starve', 'chan-starve');
+      insertMessage('valid-oldest', 'chat', { sender: 'User', text: 'oldest valid' }, route);
+      const orphanIds: string[] = [];
+      for (let i = 1; i <= 11; i++) {
+        const id = `orphan-${String(i).padStart(2, '0')}`;
+        orphanIds.push(id);
+        insertMessage(id, 'chat', { sender: 'Ghost', text: `orphan ${i}` }, route);
+        clearHostStamps(id);
+      }
+      // The window orders seq DESC: pin the valid row to the SMALLEST seq
+      // (oldest) and give every orphan a newer seq + timestamp, so an
+      // unfiltered fetch always returns the newest 10 orphans and never the
+      // valid row.
+      const db = getInboundDb();
+      db.prepare('UPDATE messages_in SET seq = 1, timestamp = ? WHERE id = ?').run(
+        new Date(Date.now() - 60_000).toISOString(),
+        'valid-oldest',
+      );
+      orphanIds.forEach((id, index) => {
+        db.prepare('UPDATE messages_in SET seq = ?, timestamp = ? WHERE id = ?').run(
+          index + 2,
+          new Date(Date.now() - 30_000 + index).toISOString(),
+          id,
+        );
+      });
+
+      const queriedBatches: string[][] = [];
+      const provider = new ScriptedProvider(async function* (input) {
+        queriedBatches.push((input.messages ?? []).map((m) => m.id));
+        yield { type: 'result', text: '<message to="discord-starve">starve reply</message>' };
+      });
+      const controller = new AbortController();
+      const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+      try {
+        // Poll 1 parks the 10 newest orphans; poll 2's fetch excludes them,
+        // parks the 11th, and the revealed batch is the oldest valid row —
+        // at most 2 polls despite a full window of orphans.
+        await waitFor(() => getAckStatus('valid-oldest') === 'completed', 6000);
+        expect(provider.calls).toBe(1);
+        expect(queriedBatches).toEqual([['valid-oldest']]);
+        // Every orphan is parked in memory, never claimed.
+        for (const id of orphanIds) {
+          expect(getAckStatus(id)).toBeNull();
+        }
+        // Limit semantics are unchanged for an unfiltered read: still the
+        // newest 10 pending rows, in ascending order.
+        expect(getPendingMessages().map((m) => m.id)).toEqual(orphanIds.slice(1));
+      } finally {
+        controller.abort();
+        await loopPromise.catch(() => {});
+      }
+    },
+    30_000,
+  );
 });
 
 describe('poll-loop active-input stamping (follow-up correlation)', () => {

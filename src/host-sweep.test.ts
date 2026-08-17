@@ -39,6 +39,7 @@ import {
   recoverGwsClaimPartitions,
   recoverInterruptedTurn,
   recoverInterruptedTurnBounded,
+  recoverSessionAfterUnexpectedExit,
   resetStuckProcessingRows,
   sealAndDrainAcceptedGwsClaims,
   sweepSessionForTest,
@@ -49,11 +50,17 @@ import {
   initSessionFolder,
   outboundDbPath,
   readSpawnSkillGeneration,
+  resolveSession,
   skillGenerationPath,
   writeSpawnSkillGeneration,
 } from './session-manager.js';
-import { closeDb, createAgentGroup, initTestDb, runMigrations } from './db/index.js';
-import { isContainerRunning, stopContainerAndVerify, wakeContainer } from './container-runner.js';
+import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from './db/index.js';
+import {
+  isContainerRunning,
+  isRecoveryDrainShutdownActive,
+  stopContainerAndVerify,
+  wakeContainer,
+} from './container-runner.js';
 import type { Session } from './types.js';
 
 // R9 heal-gate harness: the gate under test is host-local container knowledge,
@@ -70,6 +77,7 @@ vi.mock('./container-runner.js', () => ({
   cleanupContainerForSession: vi.fn().mockResolvedValue(true),
   stopContainerAndVerify: vi.fn().mockResolvedValue(true),
   isSessionOutboundWriterRunning: vi.fn().mockResolvedValue(false),
+  isRecoveryDrainShutdownActive: vi.fn().mockReturnValue(false),
 }));
 
 // sweepSession resolves session DB paths under DATA_DIR; point it at a
@@ -2925,7 +2933,8 @@ describe('sweepSession orphan inbound row quarantine + claim-expiry guard (R1)',
     // WITH the quarantine, via the intentional-stop path (the declared
     // expectedStopReason 'orphaned-rows-quarantined' gates unexpected-exit
     // recovery, pinned by the container-runner R1a suite), and due==0 must
-    // not wake a replacement.
+    // not wake a replacement. The marker is then consumed ('parked_retired')
+    // so the retire gate cannot re-fire on a later warm container.
     const session = r1Session('sess-r1-parked-retire');
     initSessionFolder('ag-r1', session.id);
     inboundRow(session.id, 'm-parked-only', { ageMs: ORPHAN_AGE_MS });
@@ -2935,7 +2944,7 @@ describe('sweepSession orphan inbound row quarantine + claim-expiry guard (R1)',
     try {
       await sweepSessionForTest(session);
 
-      expect(inboundStatus(session.id, 'm-parked-only')).toBe('quarantined');
+      expect(inboundStatus(session.id, 'm-parked-only')).toBe('parked_retired');
       expect(stopContainerAndVerify).toHaveBeenCalledWith(session.id, 'orphaned-rows-quarantined');
       expect(wakeContainer).not.toHaveBeenCalled();
       expect(infoSpy).toHaveBeenCalledWith(
@@ -2980,6 +2989,61 @@ describe('sweepSession orphan inbound row quarantine + claim-expiry guard (R1)',
       expect(vi.mocked(stopContainerAndVerify).mock.calls[1]).toEqual([session.id, 'orphaned-rows-quarantined']);
     } finally {
       errorSpy.mockRestore();
+    }
+  });
+
+  it('consumes the quarantine marker after a successful parked-only retire; a later zero-due container is never retired', async () => {
+    // R3 MINOR: the marker query is persistent, so an unconsumed marker would
+    // retire ANY later zero-due running container in this session on every
+    // sweep (cold-start storm + misleading parked_only_container_retired
+    // events). After a VERIFIED stop the marker rows must flip to the
+    // terminal 'parked_retired' status so the gate goes dark; a failed stop
+    // (pinned above) keeps the 'quarantined' marker and retries.
+    const session = r1Session('sess-r1-parked-retire-consummable');
+    initSessionFolder('ag-r1', session.id);
+    inboundRow(session.id, 'm-parked-consume', { ageMs: ORPHAN_AGE_MS });
+    vi.mocked(isContainerRunning).mockReturnValue(true);
+
+    await sweepSessionForTest(session);
+    expect(stopContainerAndVerify).toHaveBeenCalledTimes(1);
+    expect(stopContainerAndVerify).toHaveBeenCalledWith(session.id, 'orphaned-rows-quarantined');
+    expect(inboundStatus(session.id, 'm-parked-consume')).toBe('parked_retired');
+
+    // Sweeps 2-3: simulates a FRESH (warm, between-turns) container for this
+    // session with due==0 — the consumed marker keeps the retire gate dark;
+    // the container's lifecycle is back with the normal idle-reap SLA.
+    await sweepSessionForTest(session);
+    await sweepSessionForTest(session);
+    expect(stopContainerAndVerify).toHaveBeenCalledTimes(1);
+    expect(wakeContainer).not.toHaveBeenCalled();
+  });
+
+  it('recoverSessionAfterUnexpectedExit early-returns while the shutdown drain gate is engaged', async () => {
+    // R3 MAJOR (host-side leg): a recovery timer callback that began before
+    // the drain starts can still be async mid-flight; both the callback
+    // continuation (container-runner) AND this entry point consult the same
+    // module gate, so no replacement container can spawn past the drain.
+    // A session with real due work WOULD wake a replacement without the gate.
+    createMessagingGroup({
+      id: 'mg-r1-drain-gate',
+      channel_type: 'telegram',
+      platform_id: 'telegram:789',
+      name: 'Drain Gate Chat',
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at: new Date().toISOString(),
+    });
+    const { session } = resolveSession('ag-r1', 'mg-r1-drain-gate', null, 'shared');
+    initSessionFolder('ag-r1', session.id);
+    inboundRow(session.id, 'm-due-for-wake', { stamped: true });
+    vi.mocked(isContainerRunning).mockReturnValue(false);
+    vi.mocked(isRecoveryDrainShutdownActive).mockReturnValue(true);
+
+    try {
+      await recoverSessionAfterUnexpectedExit(session.id);
+      expect(wakeContainer).not.toHaveBeenCalled();
+    } finally {
+      vi.mocked(isRecoveryDrainShutdownActive).mockReturnValue(false);
     }
   });
 

@@ -59,20 +59,29 @@ function getMaxMessagesPerPrompt(): number {
  * context (trigger=0) rides along with the wake-eligible rows so the agent
  * sees the prior context it missed. Host's countDueMessages gates waking on
  * trigger=1 separately (see src/db/session-db.ts).
+ *
+ * `excludeIds` (the poll loop's in-memory park set) is applied INSIDE the
+ * query, before the LIMIT: exclusion after the fetch would let a full window
+ * of newer parked orphans crowd out an older valid row unseen, starving it
+ * until host quarantine. NOT IN with zero ids would match nothing, so the
+ * clause is omitted entirely when the set is empty.
  */
-export function getPendingMessages(): MessageInRow[] {
+export function getPendingMessages(excludeIds?: ReadonlySet<string> | readonly string[]): MessageInRow[] {
   const inbound = getInboundDb();
   const outbound = getOutboundDb();
 
+  const excluded = excludeIds ? [...excludeIds] : [];
+  const excludeClause = excluded.length > 0 ? `AND id NOT IN (${excluded.map(() => '?').join(',')})` : '';
   const pending = inbound
     .prepare(
       `SELECT * FROM messages_in
        WHERE status = 'pending'
          AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))
+         ${excludeClause}
        ORDER BY seq DESC
        LIMIT ?`,
     )
-    .all(getMaxMessagesPerPrompt()) as MessageInRow[];
+    .all(...excluded, getMaxMessagesPerPrompt()) as MessageInRow[];
 
   if (pending.length === 0) return [];
 

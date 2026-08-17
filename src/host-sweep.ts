@@ -91,6 +91,7 @@ import {
 import {
   getContainerStartedAtMs,
   isContainerRunning,
+  isRecoveryDrainShutdownActive,
   killContainer,
   stopContainerAndVerify,
   wakeContainer,
@@ -213,7 +214,9 @@ export function quarantineOrphanInboundRows(inDb: Database.Database, sessionId: 
  * rows (markMessageQuarantined via the side-effect import failure path) carry
  * host stamps and are excluded. This is what lets the parked-only container
  * retire gate below retry a failed stop on the next sweep instead of leaking
- * the container forever.
+ * the container forever. The marker is CONSUMMABLE: after a verified stop the
+ * retire gate flips the rows to 'parked_retired' (consumeOrphanQuarantineMarkers),
+ * so an unconsumed marker still gates retries while a consumed one goes dark.
  */
 export function listOrphanQuarantineMarkerIds(inDb: Database.Database): string[] {
   const rows = inDb
@@ -225,6 +228,27 @@ export function listOrphanQuarantineMarkerIds(inDb: Database.Database): string[]
     )
     .all() as Array<{ id: string }>;
   return rows.map((row) => row.id);
+}
+
+/**
+ * R3: flip orphan-quarantine marker rows to the terminal 'parked_retired'
+ * status after a VERIFIED parked-only retirement. Without the flip the
+ * persistent marker would retire ANY later zero-due running container in the
+ * session on every sweep (cold-start storm + misleading
+ * parked_only_container_retired events). Rows stay on disk for operator
+ * review and remain invisible to every due/pending read (status='pending')
+ * and to the marker query (status='quarantined').
+ */
+export function consumeOrphanQuarantineMarkers(inDb: Database.Database, ids: string[]): void {
+  if (ids.length === 0) return;
+  const stmt = inDb.prepare(
+    `UPDATE messages_in
+        SET status = 'parked_retired'
+      WHERE id = ?
+        AND status = 'quarantined'
+        AND (host_input_id IS NULL OR host_route_key IS NULL OR host_received_at IS NULL)`,
+  );
+  for (const id of ids) stmt.run(id);
 }
 
 export type QuarantineDecision =
@@ -402,6 +426,14 @@ export async function sweepSessionForTest(session: Session): Promise<void> {
  * runner bounds and backs off calls to this entrypoint.
  */
 export async function recoverSessionAfterUnexpectedExit(sessionId: string): Promise<void> {
+  // R3: shutdown drain gate. A recovery timer callback that began before the
+  // drain engaged its gate (container-runner.ts) can still arrive here
+  // mid-flight; during/after the drain no replacement container may spawn —
+  // its wake would miss the drain's active-container snapshot.
+  if (isRecoveryDrainShutdownActive()) {
+    log.info('Skipping unexpected-exit recovery: shutdown drain in progress', { sessionId });
+    return;
+  }
   const session = getSession(sessionId);
   if (!session || session.status !== 'active') return;
   await sweepSession(session);
@@ -653,8 +685,10 @@ async function sweepSession(session: Session): Promise<void> {
     // the container), and the gate reads the PERSISTENT quarantine marker
     // (status='quarantined' rows still missing host receipt stamps — see
     // listOrphanQuarantineMarkerIds), so a failed stop is retried on every
-    // later sweep until it lands. A session with no marker — an ordinary idle
-    // long-lived container between turns, with an empty inbox or only
+    // later sweep until it lands. The marker is consummable: a VERIFIED stop
+    // flips the marker rows to 'parked_retired', so a later warm zero-due
+    // container is never re-retired. A session with no marker — an ordinary
+    // idle long-lived container between turns, with an empty inbox or only
     // normally-processed rows — is never retired here; its lifecycle stays
     // with the idle-reap SLA.
     let orphanQuarantineMarkerIds: string[] = [];
@@ -676,6 +710,11 @@ async function sweepSession(session: Session): Promise<void> {
       });
       try {
         await stopContainerAndVerify(session.id, 'orphaned-rows-quarantined');
+        // Marker is consummable: flip it to 'parked_retired' ONLY after the
+        // verified stop, so the retire gate never fires again for these rows.
+        // A failed stop (catch below) keeps the 'quarantined' marker and
+        // every later sweep retries the stop.
+        consumeOrphanQuarantineMarkers(inDb, orphanQuarantineMarkerIds);
       } catch (err) {
         // Contained per session: a failed retire must not fail the sweep; the
         // persistent marker above makes every later sweep retry the stop.

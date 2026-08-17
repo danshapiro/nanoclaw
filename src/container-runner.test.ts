@@ -1508,6 +1508,59 @@ describe('unexpected-exit recovery gating (R1)', () => {
     }
   });
 
+  it('shutdown gate: a recovery callback already mid-flight when the drain starts cannot spawn a replacement', async () => {
+    // R3 MAJOR: once the recovery timer callback STARTS it clears its timer
+    // field and runs asynchronously (dynamic import → recover via wake), so
+    // cancelAllUnexpectedExitRecoveries can never reach it. Without a
+    // module-level drain gate that BOTH the callback continuation and
+    // recoverSessionAfterUnexpectedExit consult, the async continuation can
+    // enter wakeContainer AFTER the drain's active-container snapshot —
+    // spawning a replacement container post-drain.
+    vi.useFakeTimers();
+    const harness = await loadContainerRunnerHarness();
+    try {
+      harness.oneCliRelease.resolve();
+      await harness.containerRunner.wakeContainer(harness.session);
+      expect(harness.spawnedProcesses).toHaveLength(1);
+
+      // Simulate the real recovery's terminal action (sweep → wake a
+      // replacement) if the recovery callback reaches it.
+      harness.unexpectedExitRecoveryMock.mockImplementation(async () => {
+        await harness.containerRunner.wakeContainer(harness.session);
+      });
+
+      harness.spawnedProcesses[0].emit('close', 1);
+      // Settle finalization: the recovery timer is armed and the session has
+      // left activeContainers.
+      await vi.advanceTimersByTimeAsync(10);
+      expect(harness.containerRunner.getActiveContainerCount()).toBe(0);
+
+      // Fire the timer callback SYNCHRONOUSLY (no microtask flush between the
+      // timer phase and the drain call): the callback has begun — its timer
+      // field is already cleared — but its dynamic-import continuation (the
+      // part that would invoke recovery) has not run yet.
+      vi.advanceTimersByTime(harness.containerRunner.UNEXPECTED_EXIT_RECOVERY_BASE_MS);
+
+      // The drain starts now; it must engage the shutdown gate BEFORE its
+      // cancel-all and container-stop phase.
+      const drain = harness.containerRunner.drainAllContainers(30);
+
+      // Flush everything: the callback continuation runs — it must observe
+      // the gate and early-return, never invoking recovery.
+      await vi.advanceTimersByTimeAsync(harness.containerRunner.UNEXPECTED_EXIT_RECOVERY_BASE_MS * 4);
+      await drain;
+
+      expect(harness.unexpectedExitRecoveryMock).not.toHaveBeenCalled();
+      expect(harness.spawnedProcesses).toHaveLength(1); // no post-drain spawn
+      expect(harness.containerRunner.isContainerRunning(harness.session.id)).toBe(false);
+      // No timer leaks: the fired recovery timer left nothing armed.
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      harness.close();
+      vi.useRealTimers();
+    }
+  });
+
   it('R1b: two concurrent targeted recoveries for one session join a single spawn (single-winner invariant)', async () => {
     // Regression lock — no new spawn-enforcement mechanism: concurrent
     // recoverSessionAfterUnexpectedExit passes both resolve to wakeContainer,
