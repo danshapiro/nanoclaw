@@ -129,6 +129,26 @@ function recoveryIdFor(routeKey: string): string {
   return `rec-${routeKey}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 }
 
+/**
+ * R1c: true when the host stamped the row's receipt identity at intake. A
+ * wake-triggering row missing any of these can never be claimed (the claim
+ * needs host_input_id; acceptance binds host_route_key/host_received_at), so
+ * without intervention it loops forever: the batch gate below would reject it
+ * every second, burning pre-task scripts/heartbeats. The poll loop parks such
+ * rows in memory (see runPollLoop); the host sweep durably quarantines them
+ * once aged (quarantineOrphanInboundRows in src/host-sweep.ts). Keep this
+ * predicate in sync with that host quarantine predicate — separate packages,
+ * comment-only link.
+ */
+function hasHostReceiptStamp(m: MessageInRow): boolean {
+  return (
+    Boolean(m.host_input_id) &&
+    Boolean(m.host_route_key) &&
+    typeof m.host_received_at === 'string' &&
+    Number.isFinite(Date.parse(m.host_received_at))
+  );
+}
+
 async function ownExhaustedPreacceptRetry(
   scope: ProviderRecoveryScope,
   messageIds: string[],
@@ -359,15 +379,72 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   await withSqliteRetry(() => clearStaleProcessingAcks(), { label: 'clearStaleProcessingAcks' });
 
   let pollCount = 0;
+  // Session identity for the parked-row event, forwarded from the container
+  // env (the host stamps NANOCLAW_SESSION_ID at spawn; unset only in tests).
+  const sessionId = process.env.NANOCLAW_SESSION_ID ?? null;
+
+  // R1c: in-memory park set of unbacked wake-triggering rows (see
+  // hasHostReceiptStamp). The set ACCUMULATES for this container run (a
+  // stamped-later row is never re-read: parking is only for rows missing the
+  // receipt identity written atomically at intake); the host sweep's
+  // quarantine is the durable fix spanning restarts.
+  //
+  // R1c park-and-quiet, shared by BOTH poll paths (the top-level idle poll
+  // below and the active-query follow-up poll inside processQuery): unbacked
+  // wake rows are filtered out BEFORE the accumulate gate, route split,
+  // pre-task scripts, and any claimed follow-up batch, so they stop burning
+  // work (and heartbeats) every tick — and so an orphan row can never ride a
+  // later stamped follow-up into a claimed batch under that follow-up's
+  // trusted identity. Both paths ALSO pass the set into getPendingMessages so
+  // the exclusion applies before the LIMIT window: a full window of newer
+  // orphans can no longer crowd out an older valid row unseen (starvation).
+  // Log ONE severity=error event when the park set grows (first detection or
+  // new ids parked); quiet sets stay silent per poll. The provider retry
+  // schedule for the newly parked routes is cleared only on growth, not per
+  // tick.
+  const parkedUnroutableIds = new Set<string>();
+  async function parkUnbackedRows(rawRows: MessageInRow[]): Promise<MessageInRow[]> {
+    const newUnbacked = rawRows.filter(
+      (m) => m.trigger === 1 && !hasHostReceiptStamp(m) && !parkedUnroutableIds.has(m.id),
+    );
+    if (newUnbacked.length > 0) {
+      for (const m of newUnbacked) parkedUnroutableIds.add(m.id);
+      log(
+        JSON.stringify({
+          severity: 'error',
+          event: 'unroutable_pending_rows_parked',
+          session_id: sessionId,
+          message_ids: [...parkedUnroutableIds].sort(),
+          route_keys: [...new Set(newUnbacked.map((m) => routeKeyForMessage(config.providerName, m)))],
+        }),
+      );
+      for (const routeKey of new Set(newUnbacked.map((m) => routeKeyForMessage(config.providerName, m)))) {
+        await withSqliteRetry(() => clearProviderRetrySchedule(config.providerName, routeKey), {
+          label: 'clearProviderRetrySchedule',
+        });
+      }
+    }
+    return rawRows.filter((m) => !parkedUnroutableIds.has(m.id));
+  }
+
   while (!config.signal?.aborted) {
     // Per-wake guard: at most one user-facing provider-error row per route per
     // wake ("once per turn"). Resets each wake; the durable retry schedule's
     // userErrorEmittedAt covers de-dup across wakes within one retry series.
     const userErrorEmittedRoutes = new Set<string>();
-    // Skip system messages — they're responses for MCP tools (e.g., ask_user_question)
-    const messages = (await withSqliteRetry(() => getPendingMessages(), { label: 'getPendingMessages' })).filter(
-      (m) => m.kind !== 'system',
-    );
+    // Skip system messages — they're responses for MCP tools (e.g., ask_user_question).
+    // The park set is excluded at the SQL level (see parkUnbackedRows above)
+    // so already-parked orphans cannot refill the LIMIT window and starve an
+    // older valid row behind them.
+    const rawMessages = (
+      await withSqliteRetry(() => getPendingMessages(parkedUnroutableIds), { label: 'getPendingMessages' })
+    ).filter((m) => m.kind !== 'system');
+
+    // R1c: park unbacked wake rows before the accumulate gate, route split,
+    // and pre-task scripts. The SAME filter (shared park set, same quiet
+    // semantics) runs inside the active-query follow-up poll — see
+    // parkUnbackedRows above.
+    const messages = await parkUnbackedRows(rawMessages);
     pollCount++;
 
     // Periodic heartbeat so we know the loop is alive
@@ -552,6 +629,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
       // Derive provider identity only from the FINAL pre-task-filtered batch.
       // A context-only survivor cannot invent an input id or reach a provider.
+      // R1c: rows that never received host receipt stamps are parked in memory
+      // BEFORE the batch reaches pre-task scripts (see the park gate at the
+      // top of the loop); this check remains for pre-task-dropped triggers and
+      // stamped rows whose host route key does not match the active route.
       const finalTriggerRows = keep.filter((message) => message.trigger === 1);
       const hostTrigger = finalTriggerRows.at(-1);
       if (
@@ -721,6 +802,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         config.inspectAttachmentFile,
         config.signal,
         config,
+        parkUnbackedRows,
+        parkedUnroutableIds,
       );
       if (result.clearContinuation) {
         // Authoritative clear (explicit provider clear-continuation, positive
@@ -1066,6 +1149,17 @@ async function processQuery(
   inspectAttachmentFile?: (filePath: string) => Promise<InspectedFile | null>,
   signal?: AbortSignal,
   config?: PollLoopConfig,
+  // R1c: the shared park-and-quiet filter from runPollLoop (same in-memory
+  // park set + one-log-per-set-growth). pollFollowups applies it before any
+  // follow-up batching/claim so an unbacked row can never enter the active
+  // turn under a stamped follow-up's trusted identity. Optional only because
+  // it trails existing optional params; the sole production caller passes it.
+  parkFilter?: (rows: MessageInRow[]) => Promise<MessageInRow[]>,
+  // The SAME in-memory park set, read at fetch time so the pending query
+  // excludes parked ids before its LIMIT window (starvation guard). Optional
+  // only because it trails existing optional params; the sole production
+  // caller passes it.
+  parkedIds?: ReadonlySet<string>,
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let clearContinuationRequested = false;
@@ -1255,10 +1349,17 @@ async function processQuery(
   async function pollFollowups(): Promise<void> {
     // Only claim follow-ups on the ACTIVE route. Rows on other routes remain
     // pending and are excluded from this turn (route splitting also applies to
-    // follow-ups, not just the initial batch).
-    const candidates = (await withSqliteRetry(() => getPendingMessages(), { label: 'getPendingMessages' })).filter(
-      (m) => m.kind !== 'system',
-    );
+    // follow-ups, not just the initial batch). The shared park set is excluded
+    // at the SQL level here too (same starvation window as the idle poll).
+    const rawCandidates = (
+      await withSqliteRetry(() => getPendingMessages(parkedIds), { label: 'getPendingMessages' })
+    ).filter((m) => m.kind !== 'system');
+    // R1c: the SAME park filter as the top-level idle poll (shared in-memory
+    // park set, one error log per set change). Without it an unbacked
+    // follow-up spam-logs followup_missing_host_backed_trigger every tick
+    // and, worse, would be claimed+processed under a later stamped
+    // follow-up's trusted identity.
+    const candidates = parkFilter ? await parkFilter(rawCandidates) : rawCandidates;
     const routeMessages = candidates.filter((m) => routeKeyForMessage(providerName, m) === ledgerCtx.activeRouteKey);
     const stopMessages = routeMessages.filter(isStopControlMessage);
     if (stopMessages.length > 0) {

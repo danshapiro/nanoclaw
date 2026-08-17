@@ -125,9 +125,38 @@ type ActiveContainer = {
   stderrState: { carry: string };
   /** Real exit code recorded by the 'close' handler — the verify path finalizes with code=null. */
   observedExitCode?: number | null;
+  /**
+   * R1a: declared BEFORE an intentional stop (kill-idle, session reset,
+   * shutdown drain, …) so the finalizer — whichever path wins the race — can
+   * distinguish it from an unexpected crash. A nonzero exit code with an
+   * expected stop reason NEVER schedules unexpected-exit recovery.
+   */
+  expectedStopReason?: string;
 };
 const activeContainers = new Map<string, ActiveContainer>();
 const unexpectedExitRecovery = new Map<string, { attempts: number; lastExitAtMs: number; timer?: NodeJS.Timeout }>();
+/**
+ * R3: shutdown drain gate. Engaged at the START of drainAllContainers (before
+ * the recovery-timer cancel-all and before any container stop) and never
+ * disengaged for the process's remaining life: from then on, BOTH the
+ * recovery timer callback's async continuation AND
+ * recoverSessionAfterUnexpectedExit's own entry (host-sweep.ts) early-return,
+ * so no replacement container can spawn past the drain's active-container
+ * snapshot. Reset only by a fresh daemon start
+ * (resetRecoveryDrainShutdownForDaemonStart).
+ */
+let recoveryDrainShutdown = false;
+/** In-flight unexpected-exit recovery invocations, so the drain can await them before snapshotting/stopping containers. */
+const inFlightUnexpectedExitRecoveries = new Set<Promise<unknown>>();
+
+export function isRecoveryDrainShutdownActive(): boolean {
+  return recoveryDrainShutdown;
+}
+
+/** Daemon-start reset for the shutdown drain gate (src/index.ts main). The gate otherwise stays engaged for the process's life after a drain. */
+export function resetRecoveryDrainShutdownForDaemonStart(): void {
+  recoveryDrainShutdown = false;
+}
 const activeMcpBridges = new Map<string, AgentMcpBridge[]>();
 const containerExitWaiters = new Map<string, Set<() => void>>();
 const CONTAINER_SKILLS_BIN = '/app/skills/.bin';
@@ -216,6 +245,26 @@ export function waitForContainerExit(sessionId: string, timeoutMs = 30000): Prom
  * daemon probes (container name and session label) report no writer.
  */
 export async function drainAllContainers(graceSeconds = 30): Promise<void> {
+  // R3: engage the shutdown drain gate FIRST — before the cancel-all below
+  // and before any container stop. Once a recovery timer callback has STARTED
+  // it clears its timer field and runs asynchronously, unreachable by the
+  // cancel; the gate makes both that callback's continuation and
+  // recoverSessionAfterUnexpectedExit itself early-return, so no replacement
+  // container can spawn from a recovery past this point.
+  recoveryDrainShutdown = true;
+  // Cancel EVERY armed unexpected-exit recovery timer FIRST, including timers
+  // for sessions no longer in activeContainers (a crash deletes the active
+  // entry before arming its timer, so the per-entry loop below never sees
+  // them): an unref'd timer firing mid-shutdown would spawn a replacement
+  // container that missed the drain.
+  cancelAllUnexpectedExitRecoveries();
+  // A recovery invocation that already entered before the gate engaged is
+  // in-flight: await it so any replacement it spawns (racing the gate at its
+  // wake) lands BEFORE the active-container snapshot below — and is stopped
+  // with everything else instead of surviving the drain.
+  if (inFlightUnexpectedExitRecoveries.size > 0) {
+    await Promise.allSettled([...inFlightUnexpectedExitRecoveries]);
+  }
   if (activeContainers.size === 0) return;
 
   const entries = [...activeContainers.entries()];
@@ -228,6 +277,10 @@ export async function drainAllContainers(graceSeconds = 30): Promise<void> {
   await Promise.all(
     entries.map(async ([sessionId, entry]) => {
       try {
+        // R1a: a drain stop is intentional — declare it before the stop so the
+        // post-stop finalization never schedules crash recovery. Any timer
+        // armed BEFORE the drain (tracked or not) was already cancelled above.
+        entry.expectedStopReason = 'shutdown-drain';
         await stopContainerAsync(entry.containerName, graceSeconds);
         await verifyContainerProcessExited(sessionId, entry, 'shutdown-drain');
         const clientClosed = await waitForProcessClose(entry, SHUTDOWN_CLIENT_EXIT_TIMEOUT_MS);
@@ -379,6 +432,10 @@ async function spawnContainer(session: Session): Promise<void> {
     // A synchronous spawn failure means no container exists. The only
     // post-spawn synchronous failure is a missing/broken stdin pipe; stop and
     // verify that runtime instance before closing its execution interval.
+    // R1a note: no expectedStopReason is declared here — the container is not
+    // yet registered in activeContainers, so this stop can never reach the
+    // unexpected-exit recovery gate (which only runs during finalization of a
+    // registered entry).
     if (container) {
       const spawnedContainer = container;
       await stopContainerAsync(containerName).catch(() => {
@@ -611,8 +668,24 @@ async function finalizeVerifiedContainerStop(
   stopTypingRefresh(sessionId);
   notifyContainerExit(sessionId);
   log.info('Container exited', { sessionId, code, containerName: current.containerName });
-  if (reason === 'docker-client-close' && typeof code === 'number' && code !== 0) {
-    scheduleUnexpectedExitRecovery(sessionId, current.containerName, code, current.startedAtMs);
+  // R1a: even a nonzero docker-client close is expected when the session
+  // declared an intentional stop (kill-idle, session reset, shutdown drain).
+  // Whichever finalizer won reads the same entry field, so the gate holds
+  // regardless of the winner.
+  if (
+    reason === 'docker-client-close' &&
+    typeof code === 'number' &&
+    code !== 0 &&
+    current.expectedStopReason == null
+  ) {
+    scheduleUnexpectedExitRecovery(
+      sessionId,
+      current.containerName,
+      code,
+      current.startedAtMs,
+      reason,
+      current.expectedStopReason ?? null,
+    );
   } else {
     clearUnexpectedExitRecovery(sessionId);
   }
@@ -625,11 +698,26 @@ function clearUnexpectedExitRecovery(sessionId: string): void {
   unexpectedExitRecovery.delete(sessionId);
 }
 
+/**
+ * Cancel ALL armed unexpected-exit recovery timers, including sessions whose
+ * entry already left activeContainers when the timer was armed (the crash
+ * path deletes the active entry before scheduling recovery). Used by the
+ * shutdown drain: per-session snapshot cancelation can never reach those.
+ */
+function cancelAllUnexpectedExitRecoveries(): void {
+  for (const state of unexpectedExitRecovery.values()) {
+    if (state.timer) clearTimeout(state.timer);
+  }
+  unexpectedExitRecovery.clear();
+}
+
 function scheduleUnexpectedExitRecovery(
   sessionId: string,
   containerName: string,
   code: number,
   startedAtMs: number,
+  reason: string,
+  expectedStopReason: string | null,
 ): void {
   const now = Date.now();
   const previous = unexpectedExitRecovery.get(sessionId);
@@ -640,10 +728,15 @@ function scheduleUnexpectedExitRecovery(
     now - startedAtMs < UNEXPECTED_EXIT_RECOVERY_RESET_MS
       ? previous.attempts + 1
       : 1;
+  // expectedStopReason is always null here (the recovery gate requires it);
+  // logging it keeps the journal line self-describing about WHY this exit was
+  // classified as unexpected.
   const context = {
     sessionId,
     containerName,
     code,
+    reason,
+    expectedStopReason,
     consecutiveUnexpectedExits: attempts,
   };
 
@@ -659,14 +752,33 @@ function scheduleUnexpectedExitRecovery(
     if (state?.timer === timer) {
       state.timer = undefined;
     }
-    void import('./host-sweep.js')
-      .then(({ recoverSessionAfterUnexpectedExit }) => recoverSessionAfterUnexpectedExit(sessionId))
+    // R3: from here the callback runs asynchronously and cancelAll can no
+    // longer reach it (the timer field is already cleared). Consult the
+    // shutdown drain gate at entry AND again after the dynamic import
+    // resolves, so a drain that starts mid-flight still blocks the recovery;
+    // recoverSessionAfterUnexpectedExit re-checks the same gate at its own
+    // entry (host-sweep.ts).
+    const skipForShutdownDrain = (): boolean => {
+      if (!recoveryDrainShutdown) return false;
+      log.info('Skipping targeted unexpected-exit recovery: shutdown drain in progress', { sessionId });
+      return true;
+    };
+    if (skipForShutdownDrain()) return;
+    const invocation: Promise<void> = import('./host-sweep.js')
+      .then(async ({ recoverSessionAfterUnexpectedExit }) => {
+        if (skipForShutdownDrain()) return;
+        await recoverSessionAfterUnexpectedExit(sessionId);
+      })
       .catch((err) => {
         log.error('Targeted recovery after unexpected container exit failed', {
           ...context,
           err,
         });
+      })
+      .finally(() => {
+        inFlightUnexpectedExitRecoveries.delete(invocation);
       });
+    inFlightUnexpectedExitRecoveries.add(invocation);
   }, delayMs);
   timer.unref();
   unexpectedExitRecovery.set(sessionId, { attempts, lastExitAtMs: now, timer });
@@ -721,6 +833,11 @@ async function waitForProcessClose(entry: ActiveContainer, timeoutMs: number): P
 export async function cleanupContainerForSession(sessionId: string, reason: string): Promise<boolean> {
   const entry = activeContainers.get(sessionId);
   if (!entry) return false;
+
+  // R1a: declare the intentional stop BEFORE initiating it, so whichever
+  // finalizer wins the race (docker-client close with e.g. code 137, or the
+  // verify path) gates unexpected-exit recovery on it instead of respawning.
+  entry.expectedStopReason = reason;
 
   log.info('Cleaning up container for superseded session', {
     sessionId,

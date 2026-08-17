@@ -135,6 +135,10 @@ export function cleanupOrphans(): void {
       { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8' },
     );
     const orphans = output.trim().split('\n').filter(Boolean);
+    // R1a note: orphan reaping deliberately declares no expectedStopReason —
+    // startup reaping has no session context (no entry is registered in
+    // container-runner's activeContainers), so these stops can never reach
+    // the unexpected-exit recovery gate, which requires a registered entry.
     for (const name of orphans) {
       try {
         stopContainer(name);
@@ -158,6 +162,9 @@ export function cleanupOrphansVerified(): void {
     return output.trim().split('\n').filter(Boolean);
   };
   const orphans = list();
+  // R1a note: same as cleanupOrphans — no expectedStopReason; startup reaping
+  // runs before any session is registered in activeContainers, so these stops
+  // cannot reach the unexpected-exit recovery gate.
   for (const name of orphans) stopContainer(name);
   const survivors = list();
   if (survivors.length > 0) {

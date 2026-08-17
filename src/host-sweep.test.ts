@@ -39,20 +39,28 @@ import {
   recoverGwsClaimPartitions,
   recoverInterruptedTurn,
   recoverInterruptedTurnBounded,
+  recoverSessionAfterUnexpectedExit,
   resetStuckProcessingRows,
   sealAndDrainAcceptedGwsClaims,
   sweepSessionForTest,
   writeHostInterruptedRecovery,
 } from './host-sweep.js';
 import {
+  inboundDbPath,
   initSessionFolder,
   outboundDbPath,
   readSpawnSkillGeneration,
+  resolveSession,
   skillGenerationPath,
   writeSpawnSkillGeneration,
 } from './session-manager.js';
-import { closeDb, createAgentGroup, initTestDb, runMigrations } from './db/index.js';
-import { isContainerRunning } from './container-runner.js';
+import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from './db/index.js';
+import {
+  isContainerRunning,
+  isRecoveryDrainShutdownActive,
+  stopContainerAndVerify,
+  wakeContainer,
+} from './container-runner.js';
 import type { Session } from './types.js';
 
 // R9 heal-gate harness: the gate under test is host-local container knowledge,
@@ -69,6 +77,7 @@ vi.mock('./container-runner.js', () => ({
   cleanupContainerForSession: vi.fn().mockResolvedValue(true),
   stopContainerAndVerify: vi.fn().mockResolvedValue(true),
   isSessionOutboundWriterRunning: vi.fn().mockResolvedValue(false),
+  isRecoveryDrainShutdownActive: vi.fn().mockReturnValue(false),
 }));
 
 // sweepSession resolves session DB paths under DATA_DIR; point it at a
@@ -2763,6 +2772,360 @@ describe('recoverInterruptedTurnBounded (quarantine wiring for wedged side-effec
 
     inDb.close();
     outDb.close();
+  });
+});
+
+/**
+ * R1c sweep seams: stale pending rows that never received host receipt stamps
+ * (host_input_id / host_route_key / host_received_at) are quarantined before
+ * the wake gate so they stop driving container wakes; the container-side
+ * mirror is the in-memory park in poll-loop.ts.
+ */
+describe('sweepSession orphan inbound row quarantine + claim-expiry guard (R1)', () => {
+  const R1_DATA_DIR = '/tmp/nanoclaw-test-host-sweep-r9'; // matches the file-level config mock
+  const ORPHAN_AGE_MS = 25 * 60 * 60 * 1000; // beyond the default 24h orphan max age
+
+  function r1Session(id: string): Session {
+    return {
+      id,
+      agent_group_id: 'ag-r1',
+      messaging_group_id: null,
+      thread_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: new Date().toISOString(),
+      created_at: new Date().toISOString(),
+    };
+  }
+
+  function inboundRow(
+    sessionId: string,
+    messageId: string,
+    opts: { kind?: string; ageMs?: number; stamped?: boolean } = {},
+  ): void {
+    const db = new Database(inboundDbPath('ag-r1', sessionId));
+    try {
+      const timestamp = new Date(Date.now() - (opts.ageMs ?? 0)).toISOString();
+      const stamped = opts.stamped ?? false;
+      db.prepare(
+        `INSERT INTO messages_in
+           (id, kind, timestamp, status, trigger, host_input_id, host_route_key, host_received_at, content)
+         VALUES (?, ?, ?, 'pending', 1, ?, ?, ?, ?)`,
+      ).run(
+        messageId,
+        opts.kind ?? 'chat',
+        timestamp,
+        stamped ? `in-${messageId}` : null,
+        stamped ? `route-${messageId}` : null,
+        stamped ? timestamp : null,
+        JSON.stringify({ text: 'hello' }),
+      );
+    } finally {
+      db.close();
+    }
+  }
+
+  function inboundStatus(sessionId: string, messageId: string): string | null {
+    const db = new Database(inboundDbPath('ag-r1', sessionId), { readonly: true });
+    try {
+      const row = db.prepare('SELECT status FROM messages_in WHERE id = ?').get(messageId) as
+        | { status: string }
+        | undefined;
+      return row?.status ?? null;
+    } finally {
+      db.close();
+    }
+  }
+
+  beforeEach(() => {
+    fs.rmSync(R1_DATA_DIR, { recursive: true, force: true });
+    fs.mkdirSync(R1_DATA_DIR, { recursive: true });
+    runMigrations(initTestDb());
+    createAgentGroup({
+      id: 'ag-r1',
+      name: 'R1 Agent',
+      folder: 'r1-agent',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    vi.mocked(isContainerRunning).mockReturnValue(false);
+    vi.mocked(wakeContainer).mockClear();
+    vi.mocked(stopContainerAndVerify).mockClear().mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    vi.mocked(isContainerRunning).mockReturnValue(false);
+    vi.mocked(stopContainerAndVerify).mockReset().mockResolvedValue(undefined);
+    closeDb();
+    fs.rmSync(R1_DATA_DIR, { recursive: true, force: true });
+  });
+
+  it('quarantines an old unbacked pending chat row and logs the structured event', async () => {
+    const session = r1Session('sess-r1-old-unbacked');
+    initSessionFolder('ag-r1', session.id);
+    inboundRow(session.id, 'm-old-unbacked', { ageMs: ORPHAN_AGE_MS });
+    const errorSpy = vi.spyOn(log, 'error');
+
+    try {
+      await sweepSessionForTest(session);
+
+      expect(inboundStatus(session.id, 'm-old-unbacked')).toBe('quarantined');
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({
+          event: 'inbound_row_quarantined_no_host_backing',
+          sessionId: session.id,
+          messageIds: ['m-old-unbacked'],
+        }),
+      );
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('leaves a young unbacked row untouched (below the orphan max age)', async () => {
+    const session = r1Session('sess-r1-young-unbacked');
+    initSessionFolder('ag-r1', session.id);
+    inboundRow(session.id, 'm-young-unbacked', { ageMs: 60_000 });
+    const errorSpy = vi.spyOn(log, 'error');
+
+    try {
+      await sweepSessionForTest(session);
+
+      expect(inboundStatus(session.id, 'm-young-unbacked')).toBe('pending');
+      expect(errorSpy).not.toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ event: 'inbound_row_quarantined_no_host_backing' }),
+      );
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('never quarantines task-kind rows even when old and unbacked (projection resurrection guard)', async () => {
+    // Mandatory guard: scheduler projections re-stamp task rows to pending, so
+    // quarantining them would just resurrect them every sweep pass.
+    const session = r1Session('sess-r1-task-row');
+    initSessionFolder('ag-r1', session.id);
+    inboundRow(session.id, 'm-old-unbacked-task', { kind: 'task', ageMs: ORPHAN_AGE_MS });
+
+    await sweepSessionForTest(session);
+
+    expect(inboundStatus(session.id, 'm-old-unbacked-task')).toBe('pending');
+  });
+
+  it('does not wake a session whose only due rows were quarantined in the same pass', async () => {
+    const session = r1Session('sess-r1-no-wake');
+    initSessionFolder('ag-r1', session.id);
+    inboundRow(session.id, 'm-only-due', { ageMs: ORPHAN_AGE_MS });
+
+    await sweepSessionForTest(session);
+
+    expect(inboundStatus(session.id, 'm-only-due')).toBe('quarantined');
+    expect(wakeContainer).not.toHaveBeenCalled();
+  });
+
+  it('retires the running container as parked-only when the quarantine takes its last due rows', async () => {
+    // Incident chain the fix targets: container spawned for a young unstamped
+    // row parks it container-side, sleeps heartbeatless (SLA-exempt), and the
+    // >24h host quarantine finally lands — the running container must retire
+    // WITH the quarantine, via the intentional-stop path (the declared
+    // expectedStopReason 'orphaned-rows-quarantined' gates unexpected-exit
+    // recovery, pinned by the container-runner R1a suite), and due==0 must
+    // not wake a replacement. The marker is then consumed ('parked_retired')
+    // so the retire gate cannot re-fire on a later warm container.
+    const session = r1Session('sess-r1-parked-retire');
+    initSessionFolder('ag-r1', session.id);
+    inboundRow(session.id, 'm-parked-only', { ageMs: ORPHAN_AGE_MS });
+    vi.mocked(isContainerRunning).mockReturnValue(true);
+    const infoSpy = vi.spyOn(log, 'info');
+
+    try {
+      await sweepSessionForTest(session);
+
+      expect(inboundStatus(session.id, 'm-parked-only')).toBe('parked_retired');
+      expect(stopContainerAndVerify).toHaveBeenCalledWith(session.id, 'orphaned-rows-quarantined');
+      expect(wakeContainer).not.toHaveBeenCalled();
+      expect(infoSpy).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({
+          event: 'parked_only_container_retired',
+          sessionId: session.id,
+          quarantinedMessageIds: ['m-parked-only'],
+        }),
+      );
+    } finally {
+      infoSpy.mockRestore();
+    }
+  });
+
+  it('retries the parked-only retire on a later sweep after a failed stop (persistent quarantine marker)', async () => {
+    // The quarantine pass returns ids only on the FIRST transition (one-shot):
+    // after it, the row is 'quarantined' forever and the pass goes silent. The
+    // retire gate must therefore read the persistent marker, or a failed stop
+    // leaks the parked-only container on every later sweep.
+    const session = r1Session('sess-r1-parked-retire-retry');
+    initSessionFolder('ag-r1', session.id);
+    inboundRow(session.id, 'm-parked-retry', { ageMs: ORPHAN_AGE_MS });
+    vi.mocked(isContainerRunning).mockReturnValue(true);
+    // First retire attempt fails; later attempts succeed (default mock).
+    vi.mocked(stopContainerAndVerify).mockRejectedValueOnce(new Error('stop race lost'));
+    const errorSpy = vi.spyOn(log, 'error');
+
+    try {
+      await sweepSessionForTest(session);
+      expect(inboundStatus(session.id, 'm-parked-retry')).toBe('quarantined');
+      expect(stopContainerAndVerify).toHaveBeenCalledTimes(1);
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ sessionId: session.id, quarantinedMessageIds: ['m-parked-retry'] }),
+      );
+
+      // Second sweep: the quarantine pass finds nothing new, but the marker
+      // persists, so the stop is retried and the retirement completes.
+      await sweepSessionForTest(session);
+      expect(stopContainerAndVerify).toHaveBeenCalledTimes(2);
+      expect(vi.mocked(stopContainerAndVerify).mock.calls[1]).toEqual([session.id, 'orphaned-rows-quarantined']);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('consumes the quarantine marker after a successful parked-only retire; a later zero-due container is never retired', async () => {
+    // R3 MINOR: the marker query is persistent, so an unconsumed marker would
+    // retire ANY later zero-due running container in this session on every
+    // sweep (cold-start storm + misleading parked_only_container_retired
+    // events). After a VERIFIED stop the marker rows must flip to the
+    // terminal 'parked_retired' status so the gate goes dark; a failed stop
+    // (pinned above) keeps the 'quarantined' marker and retries.
+    const session = r1Session('sess-r1-parked-retire-consummable');
+    initSessionFolder('ag-r1', session.id);
+    inboundRow(session.id, 'm-parked-consume', { ageMs: ORPHAN_AGE_MS });
+    vi.mocked(isContainerRunning).mockReturnValue(true);
+
+    await sweepSessionForTest(session);
+    expect(stopContainerAndVerify).toHaveBeenCalledTimes(1);
+    expect(stopContainerAndVerify).toHaveBeenCalledWith(session.id, 'orphaned-rows-quarantined');
+    expect(inboundStatus(session.id, 'm-parked-consume')).toBe('parked_retired');
+
+    // Sweeps 2-3: simulates a FRESH (warm, between-turns) container for this
+    // session with due==0 — the consumed marker keeps the retire gate dark;
+    // the container's lifecycle is back with the normal idle-reap SLA.
+    await sweepSessionForTest(session);
+    await sweepSessionForTest(session);
+    expect(stopContainerAndVerify).toHaveBeenCalledTimes(1);
+    expect(wakeContainer).not.toHaveBeenCalled();
+  });
+
+  it('recoverSessionAfterUnexpectedExit early-returns while the shutdown drain gate is engaged', async () => {
+    // R3 MAJOR (host-side leg): a recovery timer callback that began before
+    // the drain starts can still be async mid-flight; both the callback
+    // continuation (container-runner) AND this entry point consult the same
+    // module gate, so no replacement container can spawn past the drain.
+    // A session with real due work WOULD wake a replacement without the gate.
+    createMessagingGroup({
+      id: 'mg-r1-drain-gate',
+      channel_type: 'telegram',
+      platform_id: 'telegram:789',
+      name: 'Drain Gate Chat',
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at: new Date().toISOString(),
+    });
+    const { session } = resolveSession('ag-r1', 'mg-r1-drain-gate', null, 'shared');
+    initSessionFolder('ag-r1', session.id);
+    inboundRow(session.id, 'm-due-for-wake', { stamped: true });
+    vi.mocked(isContainerRunning).mockReturnValue(false);
+    vi.mocked(isRecoveryDrainShutdownActive).mockReturnValue(true);
+
+    try {
+      await recoverSessionAfterUnexpectedExit(session.id);
+      expect(wakeContainer).not.toHaveBeenCalled();
+    } finally {
+      vi.mocked(isRecoveryDrainShutdownActive).mockReturnValue(false);
+    }
+  });
+
+  it('never retires a running idle container in a session with no rows at all', async () => {
+    // Ordinary long-lived session between turns: warm container, empty inbox,
+    // no quarantine marker — the retire gate must stay dark; this container's
+    // lifecycle belongs to the idle-reap SLA alone.
+    const session = r1Session('sess-r1-empty-idle');
+    initSessionFolder('ag-r1', session.id);
+    vi.mocked(isContainerRunning).mockReturnValue(true);
+
+    await sweepSessionForTest(session);
+
+    expect(stopContainerAndVerify).not.toHaveBeenCalled();
+    expect(wakeContainer).not.toHaveBeenCalled();
+  });
+
+  it('does not retire a running container for a young unbacked row (SLA preserved)', async () => {
+    // Below the orphan max age the row stays pending (and due) — the running
+    // container's SLA, not the quarantine retire, owns its lifecycle.
+    const session = r1Session('sess-r1-young-running');
+    initSessionFolder('ag-r1', session.id);
+    inboundRow(session.id, 'm-young-running', { ageMs: 60_000 });
+    vi.mocked(isContainerRunning).mockReturnValue(true);
+
+    await sweepSessionForTest(session);
+
+    expect(inboundStatus(session.id, 'm-young-running')).toBe('pending');
+    expect(stopContainerAndVerify).not.toHaveBeenCalled();
+  });
+
+  it('does not retire a running container when due rows remain after quarantine', async () => {
+    // The retire is parked-ONLY: any remaining due row means the container
+    // still has real work to claim.
+    const session = r1Session('sess-r1-due-remains');
+    initSessionFolder('ag-r1', session.id);
+    inboundRow(session.id, 'm-old-unbacked-due', { ageMs: ORPHAN_AGE_MS });
+    inboundRow(session.id, 'm-stamped-due', { stamped: true, ageMs: 60_000 });
+    vi.mocked(isContainerRunning).mockReturnValue(true);
+
+    await sweepSessionForTest(session);
+
+    expect(inboundStatus(session.id, 'm-old-unbacked-due')).toBe('quarantined');
+    expect(inboundStatus(session.id, 'm-stamped-due')).toBe('pending');
+    expect(stopContainerAndVerify).not.toHaveBeenCalled();
+  });
+
+  it('claim-expiry guard: kills the container (claim-stuck) for a processing row with a heartbeat silent past tolerance', async () => {
+    // Sweep-level wiring pin: decideStuckAction covers the pure decision (see
+    // the decideStuckAction suite above); this asserts the running-container
+    // path actually issues the claim-stuck kill.
+    const session = r1Session('sess-r1-claim-stuck');
+    initSessionFolder('ag-r1', session.id);
+    // Stamped + young: isolate the kill behavior from the orphan quarantine.
+    inboundRow(session.id, 'm-claimed', { stamped: true });
+    const outDb = new Database(outboundDbPath('ag-r1', session.id));
+    try {
+      outDb
+        .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES (?, 'processing', ?)")
+        .run('m-claimed', new Date(Date.now() - 10 * 60_000).toISOString());
+    } finally {
+      outDb.close();
+    }
+
+    let alive = true;
+    vi.mocked(isContainerRunning).mockImplementation(() => alive);
+    // Once the kill lands, the container is down (mirrors the real stop).
+    vi.mocked(stopContainerAndVerify).mockImplementation(async () => {
+      alive = false;
+    });
+
+    await sweepSessionForTest(session);
+
+    expect(stopContainerAndVerify).toHaveBeenCalledWith(session.id, 'claim-stuck');
+    // The genuinely unaccepted claim was returned to pending, not stranded.
+    const ackDb = new Database(outboundDbPath('ag-r1', session.id), { readonly: true });
+    try {
+      expect(ackDb.prepare('SELECT COUNT(*) AS n FROM processing_ack').get()).toEqual({ n: 0 });
+    } finally {
+      ackDb.close();
+    }
+    expect(inboundStatus(session.id, 'm-claimed')).toBe('pending');
   });
 });
 
