@@ -1392,6 +1392,120 @@ describe('session wake lifecycle', () => {
   });
 });
 
+describe('unexpected-exit recovery gating (R1)', () => {
+  it('schedules no recovery when an intentional stop races a nonzero docker-client close (kill-idle)', async () => {
+    vi.useFakeTimers();
+    const harness = await loadContainerRunnerHarness();
+    try {
+      harness.oneCliRelease.resolve();
+      await harness.containerRunner.wakeContainer(harness.session);
+      expect(harness.spawnedProcesses).toHaveLength(1);
+
+      // Intentional stop (host-sweep kill-idle path). The close handler wins
+      // the finalization race with a nonzero code (137 = SIGKILL'd), which
+      // must NOT be misread as an unexpected exit: cleanupContainerForSession
+      // declares the stop before starting it.
+      const cleanup = harness.containerRunner.cleanupContainerForSession(harness.session.id, 'kill-idle');
+      harness.spawnedProcesses[0].emit('close', 137);
+      await cleanup;
+      await vi.advanceTimersByTimeAsync(120_000);
+
+      expect(harness.containerRunner.getActiveContainerCount()).toBe(0);
+      expect(harness.unexpectedExitRecoveryMock).not.toHaveBeenCalled();
+    } finally {
+      harness.close();
+      vi.useRealTimers();
+    }
+  });
+
+  it('still schedules targeted recovery for an unexpected nonzero exit with no intentional stop', async () => {
+    // Existing-behavior pin: the same code-137 close WITHOUT a declared
+    // intentional stop remains an unexpected exit and recovers.
+    vi.useFakeTimers();
+    const harness = await loadContainerRunnerHarness();
+    try {
+      harness.oneCliRelease.resolve();
+      await harness.containerRunner.wakeContainer(harness.session);
+
+      harness.spawnedProcesses[0].emit('close', 137);
+      await vi.advanceTimersByTimeAsync(harness.containerRunner.UNEXPECTED_EXIT_RECOVERY_BASE_MS);
+
+      expect(harness.containerRunner.getActiveContainerCount()).toBe(0);
+      expect(harness.unexpectedExitRecoveryMock).toHaveBeenCalledOnce();
+      expect(harness.unexpectedExitRecoveryMock).toHaveBeenCalledWith(harness.session.id);
+    } finally {
+      harness.close();
+      vi.useRealTimers();
+    }
+  });
+
+  it('clears a pending recovery timer for each drained session during shutdown drain', async () => {
+    vi.useFakeTimers();
+    const harness = await loadContainerRunnerHarness();
+    try {
+      harness.oneCliRelease.resolve();
+      await harness.containerRunner.wakeContainer(harness.session);
+      harness.spawnedProcesses[0].emit('close', 1);
+      // Let finalization settle; the recovery timer (BASE_MS) stays pending.
+      await vi.advanceTimersByTimeAsync(10);
+      expect(harness.containerRunner.getActiveContainerCount()).toBe(0);
+
+      // Re-wake before the timer fires: a live container now tracks the session.
+      await harness.containerRunner.wakeContainer(harness.session);
+      expect(harness.spawnedProcesses).toHaveLength(2);
+
+      // Hold docker stop so the drain is mid-flight when the stale timer
+      // would fire — the drain must have cancelled it up front.
+      let completeStop!: () => void;
+      harness.execFileMock.mockImplementation((_file, args: string[], _options, cb) => {
+        if (args[0] === 'stop') {
+          completeStop = () => (cb as (err: null) => void)(null);
+          return;
+        }
+        (cb as (err: null, stdout: string, stderr: string) => void)(null, '', '');
+      });
+
+      const drain = harness.containerRunner.drainAllContainers(30);
+      await vi.advanceTimersByTimeAsync(harness.containerRunner.UNEXPECTED_EXIT_RECOVERY_BASE_MS * 4);
+      expect(harness.unexpectedExitRecoveryMock).not.toHaveBeenCalled();
+
+      completeStop();
+      harness.spawnedProcesses[1].emit('close', 0);
+      await drain;
+      await vi.advanceTimersByTimeAsync(120_000);
+
+      expect(harness.containerRunner.getActiveContainerCount()).toBe(0);
+      expect(harness.unexpectedExitRecoveryMock).not.toHaveBeenCalled();
+    } finally {
+      harness.close();
+      vi.useRealTimers();
+    }
+  });
+
+  it('R1b: two concurrent targeted recoveries for one session join a single spawn (single-winner invariant)', async () => {
+    // Regression lock — no new spawn-enforcement mechanism: concurrent
+    // recoverSessionAfterUnexpectedExit passes both resolve to wakeContainer,
+    // whose in-flight wakePromises/activeContainers dedup must yield exactly
+    // ONE container per session even when the second recovery lands mid-setup.
+    const harness = await loadContainerRunnerHarness();
+    try {
+      const first = harness.containerRunner.wakeContainer(harness.session);
+      const second = harness.containerRunner.wakeContainer(harness.session);
+      harness.oneCliRelease.resolve();
+      await Promise.all([first, second]);
+
+      expect(harness.spawnedProcesses).toHaveLength(1);
+      expect(harness.containerRunner.getActiveContainerCount()).toBe(1);
+
+      // A recovery arriving after the container is also registered is a no-op.
+      await harness.containerRunner.wakeContainer(harness.session);
+      expect(harness.spawnedProcesses).toHaveLength(1);
+    } finally {
+      harness.close();
+    }
+  });
+});
+
 describe('local skills mount', () => {
   const baseGroup: AgentGroup = {
     id: 'ag-main',

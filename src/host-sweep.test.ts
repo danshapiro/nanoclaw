@@ -45,6 +45,7 @@ import {
   writeHostInterruptedRecovery,
 } from './host-sweep.js';
 import {
+  inboundDbPath,
   initSessionFolder,
   outboundDbPath,
   readSpawnSkillGeneration,
@@ -52,7 +53,7 @@ import {
   writeSpawnSkillGeneration,
 } from './session-manager.js';
 import { closeDb, createAgentGroup, initTestDb, runMigrations } from './db/index.js';
-import { isContainerRunning } from './container-runner.js';
+import { isContainerRunning, stopContainerAndVerify, wakeContainer } from './container-runner.js';
 import type { Session } from './types.js';
 
 // R9 heal-gate harness: the gate under test is host-local container knowledge,
@@ -2763,6 +2764,195 @@ describe('recoverInterruptedTurnBounded (quarantine wiring for wedged side-effec
 
     inDb.close();
     outDb.close();
+  });
+});
+
+/**
+ * R1c sweep seams: stale pending rows that never received host receipt stamps
+ * (host_input_id / host_route_key / host_received_at) are quarantined before
+ * the wake gate so they stop driving container wakes; the container-side
+ * mirror is the in-memory park in poll-loop.ts.
+ */
+describe('sweepSession orphan inbound row quarantine + claim-expiry guard (R1)', () => {
+  const R1_DATA_DIR = '/tmp/nanoclaw-test-host-sweep-r9'; // matches the file-level config mock
+  const ORPHAN_AGE_MS = 25 * 60 * 60 * 1000; // beyond the default 24h orphan max age
+
+  function r1Session(id: string): Session {
+    return {
+      id,
+      agent_group_id: 'ag-r1',
+      messaging_group_id: null,
+      thread_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: new Date().toISOString(),
+      created_at: new Date().toISOString(),
+    };
+  }
+
+  function inboundRow(
+    sessionId: string,
+    messageId: string,
+    opts: { kind?: string; ageMs?: number; stamped?: boolean } = {},
+  ): void {
+    const db = new Database(inboundDbPath('ag-r1', sessionId));
+    try {
+      const timestamp = new Date(Date.now() - (opts.ageMs ?? 0)).toISOString();
+      const stamped = opts.stamped ?? false;
+      db.prepare(
+        `INSERT INTO messages_in
+           (id, kind, timestamp, status, trigger, host_input_id, host_route_key, host_received_at, content)
+         VALUES (?, ?, ?, 'pending', 1, ?, ?, ?, ?)`,
+      ).run(
+        messageId,
+        opts.kind ?? 'chat',
+        timestamp,
+        stamped ? `in-${messageId}` : null,
+        stamped ? `route-${messageId}` : null,
+        stamped ? timestamp : null,
+        JSON.stringify({ text: 'hello' }),
+      );
+    } finally {
+      db.close();
+    }
+  }
+
+  function inboundStatus(sessionId: string, messageId: string): string | null {
+    const db = new Database(inboundDbPath('ag-r1', sessionId), { readonly: true });
+    try {
+      const row = db.prepare('SELECT status FROM messages_in WHERE id = ?').get(messageId) as
+        | { status: string }
+        | undefined;
+      return row?.status ?? null;
+    } finally {
+      db.close();
+    }
+  }
+
+  beforeEach(() => {
+    fs.rmSync(R1_DATA_DIR, { recursive: true, force: true });
+    fs.mkdirSync(R1_DATA_DIR, { recursive: true });
+    runMigrations(initTestDb());
+    createAgentGroup({
+      id: 'ag-r1',
+      name: 'R1 Agent',
+      folder: 'r1-agent',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    vi.mocked(isContainerRunning).mockReturnValue(false);
+    vi.mocked(wakeContainer).mockClear();
+    vi.mocked(stopContainerAndVerify).mockClear().mockResolvedValue(undefined);
+  });
+
+  afterEach(() => {
+    vi.mocked(isContainerRunning).mockReturnValue(false);
+    vi.mocked(stopContainerAndVerify).mockReset().mockResolvedValue(undefined);
+    closeDb();
+    fs.rmSync(R1_DATA_DIR, { recursive: true, force: true });
+  });
+
+  it('quarantines an old unbacked pending chat row and logs the structured event', async () => {
+    const session = r1Session('sess-r1-old-unbacked');
+    initSessionFolder('ag-r1', session.id);
+    inboundRow(session.id, 'm-old-unbacked', { ageMs: ORPHAN_AGE_MS });
+    const errorSpy = vi.spyOn(log, 'error');
+
+    try {
+      await sweepSessionForTest(session);
+
+      expect(inboundStatus(session.id, 'm-old-unbacked')).toBe('quarantined');
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({
+          event: 'inbound_row_quarantined_no_host_backing',
+          sessionId: session.id,
+          messageIds: ['m-old-unbacked'],
+        }),
+      );
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('leaves a young unbacked row untouched (below the orphan max age)', async () => {
+    const session = r1Session('sess-r1-young-unbacked');
+    initSessionFolder('ag-r1', session.id);
+    inboundRow(session.id, 'm-young-unbacked', { ageMs: 60_000 });
+    const errorSpy = vi.spyOn(log, 'error');
+
+    try {
+      await sweepSessionForTest(session);
+
+      expect(inboundStatus(session.id, 'm-young-unbacked')).toBe('pending');
+      expect(errorSpy).not.toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ event: 'inbound_row_quarantined_no_host_backing' }),
+      );
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('never quarantines task-kind rows even when old and unbacked (projection resurrection guard)', async () => {
+    // Mandatory guard: scheduler projections re-stamp task rows to pending, so
+    // quarantining them would just resurrect them every sweep pass.
+    const session = r1Session('sess-r1-task-row');
+    initSessionFolder('ag-r1', session.id);
+    inboundRow(session.id, 'm-old-unbacked-task', { kind: 'task', ageMs: ORPHAN_AGE_MS });
+
+    await sweepSessionForTest(session);
+
+    expect(inboundStatus(session.id, 'm-old-unbacked-task')).toBe('pending');
+  });
+
+  it('does not wake a session whose only due rows were quarantined in the same pass', async () => {
+    const session = r1Session('sess-r1-no-wake');
+    initSessionFolder('ag-r1', session.id);
+    inboundRow(session.id, 'm-only-due', { ageMs: ORPHAN_AGE_MS });
+
+    await sweepSessionForTest(session);
+
+    expect(inboundStatus(session.id, 'm-only-due')).toBe('quarantined');
+    expect(wakeContainer).not.toHaveBeenCalled();
+  });
+
+  it('claim-expiry guard: kills the container (claim-stuck) for a processing row with a heartbeat silent past tolerance', async () => {
+    // Sweep-level wiring pin: decideStuckAction covers the pure decision (see
+    // the decideStuckAction suite above); this asserts the running-container
+    // path actually issues the claim-stuck kill.
+    const session = r1Session('sess-r1-claim-stuck');
+    initSessionFolder('ag-r1', session.id);
+    // Stamped + young: isolate the kill behavior from the orphan quarantine.
+    inboundRow(session.id, 'm-claimed', { stamped: true });
+    const outDb = new Database(outboundDbPath('ag-r1', session.id));
+    try {
+      outDb
+        .prepare("INSERT INTO processing_ack (message_id, status, status_changed) VALUES (?, 'processing', ?)")
+        .run('m-claimed', new Date(Date.now() - 10 * 60_000).toISOString());
+    } finally {
+      outDb.close();
+    }
+
+    let alive = true;
+    vi.mocked(isContainerRunning).mockImplementation(() => alive);
+    // Once the kill lands, the container is down (mirrors the real stop).
+    vi.mocked(stopContainerAndVerify).mockImplementation(async () => {
+      alive = false;
+    });
+
+    await sweepSessionForTest(session);
+
+    expect(stopContainerAndVerify).toHaveBeenCalledWith(session.id, 'claim-stuck');
+    // The genuinely unaccepted claim was returned to pending, not stranded.
+    const ackDb = new Database(outboundDbPath('ag-r1', session.id), { readonly: true });
+    try {
+      expect(ackDb.prepare('SELECT COUNT(*) AS n FROM processing_ack').get()).toEqual({ n: 0 });
+    } finally {
+      ackDb.close();
+    }
+    expect(inboundStatus(session.id, 'm-claimed')).toBe('pending');
   });
 });
 

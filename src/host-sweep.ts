@@ -156,6 +156,54 @@ const BACKOFF_BASE_MS = 5000;
 // NANOCLAW_QUARANTINE_THRESHOLD (same pattern as NANOCLAW_IDLE_REAP_MS).
 export const QUARANTINE_THRESHOLD = Number(process.env.NANOCLAW_QUARANTINE_THRESHOLD) || 5;
 
+// R1c: a wake-triggering pending row this old that never received host receipt
+// stamps (host_input_id / host_route_key / host_received_at) can never be
+// claimed — the container's claim path requires them — so it eternally drives
+// wakes (the "stuck pending row" incident). Quarantined past this age.
+// Operator-overridable (same pattern as NANOCLAW_IDLE_REAP_MS).
+export const ORPHAN_INBOUND_MAX_AGE_MS = Number(process.env.NANOCLAW_ORPHAN_INBOUND_MAX_AGE_MS) || 24 * 60 * 60 * 1000;
+
+/**
+ * R1c: quarantine stale, wake-triggering pending rows that were never
+ * host-stamped. The kind != 'task' guard is MANDATORY: scheduler projections
+ * re-stamp task rows to pending (modules/scheduling/projection.ts), so a
+ * quarantined task row would just resurrect every pass; chat/cli rows are
+ * unaffected. Runs before the sweep's due-count wake gate so quarantined rows
+ * drop out of countDueMessages* the same pass (every due read filters
+ * status='pending'; 'quarantined' is a terminal parked status — the rows stay
+ * on disk for operator review, never deleted).
+ *
+ * The stamp predicate mirrors the container-side park predicate
+ * (hasHostReceiptStamp in container/agent-runner/src/poll-loop.ts) — separate
+ * packages, comment-only sync.
+ */
+export function quarantineOrphanInboundRows(inDb: Database.Database, sessionId: string, nowMs = Date.now()): string[] {
+  const candidates = inDb
+    .prepare(
+      `SELECT id, timestamp FROM messages_in
+        WHERE status = 'pending'
+          AND trigger = 1
+          AND kind != 'task'
+          AND (host_input_id IS NULL OR host_route_key IS NULL OR host_received_at IS NULL)`,
+    )
+    .all() as Array<{ id: string; timestamp: string }>;
+  const orphans = candidates.filter((row) => {
+    if (typeof row.timestamp !== 'string') return false;
+    const ts = parseSqliteUtc(row.timestamp);
+    return Number.isFinite(ts) && nowMs - ts > ORPHAN_INBOUND_MAX_AGE_MS;
+  });
+  if (orphans.length === 0) return [];
+  for (const row of orphans) {
+    markMessageQuarantined(inDb, row.id);
+  }
+  log.error('Quarantined orphan inbound rows with no host backing', {
+    event: 'inbound_row_quarantined_no_host_backing',
+    sessionId,
+    messageIds: orphans.map((row) => row.id),
+  });
+  return orphans.map((row) => row.id);
+}
+
 export type QuarantineDecision =
   | { action: 'track'; consecutive: number }
   | { action: 'quarantine'; consecutive: number };
@@ -545,6 +593,15 @@ async function sweepSession(session: Session): Promise<void> {
       } catch (err) {
         log.error('Recovery wake TTL pass failed', { sessionId: session.id, err });
       }
+    }
+
+    // 3.75 R1c: quarantine aged, never-host-stamped wake rows BEFORE the wake
+    // gate so they stop driving container wakes this same pass. Contained per
+    // session: a failed pass must never block the wake decision below.
+    try {
+      quarantineOrphanInboundRows(inDb, session.id, Date.now());
+    } catch (err) {
+      log.error('Orphan inbound quarantine pass failed', { sessionId: session.id, err });
     }
 
     // 4. Wake a container if work is due and nothing is running.

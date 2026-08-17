@@ -125,6 +125,13 @@ type ActiveContainer = {
   stderrState: { carry: string };
   /** Real exit code recorded by the 'close' handler — the verify path finalizes with code=null. */
   observedExitCode?: number | null;
+  /**
+   * R1a: declared BEFORE an intentional stop (kill-idle, session reset,
+   * shutdown drain, …) so the finalizer — whichever path wins the race — can
+   * distinguish it from an unexpected crash. A nonzero exit code with an
+   * expected stop reason NEVER schedules unexpected-exit recovery.
+   */
+  expectedStopReason?: string;
 };
 const activeContainers = new Map<string, ActiveContainer>();
 const unexpectedExitRecovery = new Map<string, { attempts: number; lastExitAtMs: number; timer?: NodeJS.Timeout }>();
@@ -228,6 +235,11 @@ export async function drainAllContainers(graceSeconds = 30): Promise<void> {
   await Promise.all(
     entries.map(async ([sessionId, entry]) => {
       try {
+        // R1a: a drain stop is intentional — declare it before the stop so the
+        // post-stop finalization never schedules crash recovery, and cancel any
+        // armed recovery timer so the unref'd timer cannot fire mid-shutdown.
+        entry.expectedStopReason = 'shutdown-drain';
+        clearUnexpectedExitRecovery(sessionId);
         await stopContainerAsync(entry.containerName, graceSeconds);
         await verifyContainerProcessExited(sessionId, entry, 'shutdown-drain');
         const clientClosed = await waitForProcessClose(entry, SHUTDOWN_CLIENT_EXIT_TIMEOUT_MS);
@@ -379,6 +391,10 @@ async function spawnContainer(session: Session): Promise<void> {
     // A synchronous spawn failure means no container exists. The only
     // post-spawn synchronous failure is a missing/broken stdin pipe; stop and
     // verify that runtime instance before closing its execution interval.
+    // R1a note: no expectedStopReason is declared here — the container is not
+    // yet registered in activeContainers, so this stop can never reach the
+    // unexpected-exit recovery gate (which only runs during finalization of a
+    // registered entry).
     if (container) {
       const spawnedContainer = container;
       await stopContainerAsync(containerName).catch(() => {
@@ -611,8 +627,24 @@ async function finalizeVerifiedContainerStop(
   stopTypingRefresh(sessionId);
   notifyContainerExit(sessionId);
   log.info('Container exited', { sessionId, code, containerName: current.containerName });
-  if (reason === 'docker-client-close' && typeof code === 'number' && code !== 0) {
-    scheduleUnexpectedExitRecovery(sessionId, current.containerName, code, current.startedAtMs);
+  // R1a: even a nonzero docker-client close is expected when the session
+  // declared an intentional stop (kill-idle, session reset, shutdown drain).
+  // Whichever finalizer won reads the same entry field, so the gate holds
+  // regardless of the winner.
+  if (
+    reason === 'docker-client-close' &&
+    typeof code === 'number' &&
+    code !== 0 &&
+    current.expectedStopReason == null
+  ) {
+    scheduleUnexpectedExitRecovery(
+      sessionId,
+      current.containerName,
+      code,
+      current.startedAtMs,
+      reason,
+      current.expectedStopReason ?? null,
+    );
   } else {
     clearUnexpectedExitRecovery(sessionId);
   }
@@ -630,6 +662,8 @@ function scheduleUnexpectedExitRecovery(
   containerName: string,
   code: number,
   startedAtMs: number,
+  reason: string,
+  expectedStopReason: string | null,
 ): void {
   const now = Date.now();
   const previous = unexpectedExitRecovery.get(sessionId);
@@ -640,10 +674,15 @@ function scheduleUnexpectedExitRecovery(
     now - startedAtMs < UNEXPECTED_EXIT_RECOVERY_RESET_MS
       ? previous.attempts + 1
       : 1;
+  // expectedStopReason is always null here (the recovery gate requires it);
+  // logging it keeps the journal line self-describing about WHY this exit was
+  // classified as unexpected.
   const context = {
     sessionId,
     containerName,
     code,
+    reason,
+    expectedStopReason,
     consecutiveUnexpectedExits: attempts,
   };
 
@@ -721,6 +760,11 @@ async function waitForProcessClose(entry: ActiveContainer, timeoutMs: number): P
 export async function cleanupContainerForSession(sessionId: string, reason: string): Promise<boolean> {
   const entry = activeContainers.get(sessionId);
   if (!entry) return false;
+
+  // R1a: declare the intentional stop BEFORE initiating it, so whichever
+  // finalizer wins the race (docker-client close with e.g. code 137, or the
+  // verify path) gates unexpected-exit recovery on it instead of respawning.
+  entry.expectedStopReason = reason;
 
   log.info('Cleaning up container for superseded session', {
     sessionId,

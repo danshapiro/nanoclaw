@@ -114,7 +114,12 @@ export interface Session {
 // ── Session DB entities ──
 
 export type MessageInKind = 'chat' | 'chat-sdk' | 'task' | 'webhook' | 'system';
-export type MessageInStatus = 'pending' | 'processing' | 'completed' | 'failed';
+// 'quarantined' is the terminal parked state: route-quarantine frees wedged
+// rows with it (route-quarantine.ts), and the host sweep quarantines
+// aged-out unbacked rows with it (host-sweep.ts quarantineOrphanInboundRows).
+// Every due/pending read filters status='pending', so quarantined rows are
+// invisible to wake decisions and container polls while remaining on disk.
+export type MessageInStatus = 'pending' | 'processing' | 'completed' | 'failed' | 'quarantined';
 
 export interface MessageIn {
   id: string;

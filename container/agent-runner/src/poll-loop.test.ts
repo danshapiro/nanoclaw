@@ -172,6 +172,13 @@ function stampHostInput(id: string, inputId: string, routeKey: string, receivedA
     .run(inputId, routeKey, receivedAt, id);
 }
 
+/** Simulate a pre-stamp inbound row: insertMessage stamps by default, so strip the receipt fields. */
+function clearHostStamps(id: string): void {
+  getInboundDb()
+    .prepare('UPDATE messages_in SET host_input_id = NULL, host_route_key = NULL, host_received_at = NULL WHERE id = ?')
+    .run(id);
+}
+
 class ScriptedProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = false;
   calls = 0;
@@ -2422,6 +2429,106 @@ describe('poll-loop final host-backed input selection', () => {
       await loopPromise.catch(() => {});
     }
   });
+});
+
+describe('poll-loop unbacked pending row parking (R1c)', () => {
+  // Long explicit timeout: the silence assertions span multiple 1s poll
+  // intervals, which would otherwise blow bun's 5s per-test default (a timeout
+  // abandons the body mid-flight and leaks the still-running poll loop into
+  // the next test's fresh DB).
+  it(
+    'parks unbacked rows before pre-task: one error log per park-set change, then silence; host-backed rows still process',
+    async () => {
+      insertChannelDestination('discord-park', 'chan-park');
+      insertMessage(
+        'unbacked-1',
+        'chat',
+        { sender: 'Ghost', text: 'pre-stamp row' },
+        { platformId: 'chan-park', channelType: 'discord', messagingGroupId: 'mg-park', isGroup: 0 },
+      );
+      clearHostStamps('unbacked-1');
+
+      const parkedEvents: Array<{ message_ids?: string[] }> = [];
+      const origError = console.error;
+      console.error = (...args: unknown[]) => {
+        const line = typeof args[0] === 'string' ? args[0] : '';
+        if (line.includes('unroutable_pending_rows_parked')) {
+          const m = /(\{.*\})/.exec(line);
+          if (m) {
+            try {
+              parkedEvents.push(JSON.parse(m[1]));
+            } catch {
+              /* ignore unparsable */
+            }
+          }
+        }
+        origError(...(args as []));
+      };
+
+      let preTaskCalls = 0;
+      const provider = new ScriptedProvider(async function* () {
+        yield { type: 'result', text: '<message to="discord-park">park test reply</message>' };
+      });
+      const controller = new AbortController();
+      const loopPromise = runPollLoop({
+        provider,
+        providerName: 'test',
+        cwd: '/tmp',
+        signal: controller.signal,
+        runPreTaskScripts: async (messages) => {
+          preTaskCalls++;
+          return { keep: messages, skipped: [] };
+        },
+      });
+
+      try {
+        // Set change 1: the initial unbacked row is parked — exactly one log.
+        await waitFor(() => parkedEvents.length === 1, 4000);
+        expect(parkedEvents[0].message_ids).toEqual(['unbacked-1']);
+
+        // Silence across later polls with an unchanged park set, and the parked
+        // row never reaches pre-task scripts (no 1/sec heartbeat burn).
+        await sleep(2100);
+        expect(parkedEvents).toHaveLength(1);
+        expect(preTaskCalls).toBe(0);
+        expect(provider.calls).toBe(0);
+
+        // Set change 2: a second unbacked id appears → one more log line, then
+        // silence again.
+        insertMessage(
+          'unbacked-2',
+          'chat',
+          { sender: 'Ghost', text: 'another pre-stamp row' },
+          { platformId: 'chan-park', channelType: 'discord', messagingGroupId: 'mg-park', isGroup: 0 },
+        );
+        clearHostStamps('unbacked-2');
+        await waitFor(() => parkedEvents.length === 2, 4000);
+        await sleep(1300);
+        expect(parkedEvents).toHaveLength(2);
+        expect(preTaskCalls).toBe(0);
+        expect(provider.calls).toBe(0);
+
+        // Regression: a normal host-backed row on the same route still processes
+        // while the parked rows stay pending.
+        insertMessage(
+          'backed-1',
+          'chat',
+          { sender: 'User', text: 'real message' },
+          { platformId: 'chan-park', channelType: 'discord', messagingGroupId: 'mg-park', isGroup: 0 },
+        );
+        await waitFor(() => getAckStatus('backed-1') === 'completed', 4000);
+        expect(provider.calls).toBe(1);
+        expect(preTaskCalls).toBeGreaterThan(0);
+        expect(getPendingMessages().map((m) => m.id).sort()).toEqual(['unbacked-1', 'unbacked-2']);
+        expect(parkedEvents).toHaveLength(2);
+      } finally {
+        console.error = origError;
+        controller.abort();
+        await loopPromise.catch(() => {});
+      }
+    },
+    30_000,
+  );
 });
 
 describe('poll-loop active-input stamping (follow-up correlation)', () => {

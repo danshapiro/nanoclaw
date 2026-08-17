@@ -129,6 +129,34 @@ function recoveryIdFor(routeKey: string): string {
   return `rec-${routeKey}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 }
 
+/**
+ * R1c: true when the host stamped the row's receipt identity at intake. A
+ * wake-triggering row missing any of these can never be claimed (the claim
+ * needs host_input_id; acceptance binds host_route_key/host_received_at), so
+ * without intervention it loops forever: the batch gate below would reject it
+ * every second, burning pre-task scripts/heartbeats. The poll loop parks such
+ * rows in memory (see runPollLoop); the host sweep durably quarantines them
+ * once aged (quarantineOrphanInboundRows in src/host-sweep.ts). Keep this
+ * predicate in sync with that host quarantine predicate — separate packages,
+ * comment-only link.
+ */
+function hasHostReceiptStamp(m: MessageInRow): boolean {
+  return (
+    Boolean(m.host_input_id) &&
+    Boolean(m.host_route_key) &&
+    typeof m.host_received_at === 'string' &&
+    Number.isFinite(Date.parse(m.host_received_at))
+  );
+}
+
+function sameMessageIdSet(a: Set<string>, b: Set<string>): boolean {
+  if (a.size !== b.size) return false;
+  for (const id of a) {
+    if (!b.has(id)) return false;
+  }
+  return true;
+}
+
 async function ownExhaustedPreacceptRetry(
   scope: ProviderRecoveryScope,
   messageIds: string[],
@@ -359,15 +387,50 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   await withSqliteRetry(() => clearStaleProcessingAcks(), { label: 'clearStaleProcessingAcks' });
 
   let pollCount = 0;
+  // R1c: in-memory park set of unbacked wake-triggering rows (see
+  // hasHostReceiptStamp). Persists for this container run; the host sweep's
+  // quarantine is the durable fix spanning restarts.
+  let parkedUnroutableIds = new Set<string>();
   while (!config.signal?.aborted) {
     // Per-wake guard: at most one user-facing provider-error row per route per
     // wake ("once per turn"). Resets each wake; the durable retry schedule's
     // userErrorEmittedAt covers de-dup across wakes within one retry series.
     const userErrorEmittedRoutes = new Set<string>();
     // Skip system messages — they're responses for MCP tools (e.g., ask_user_question)
-    const messages = (await withSqliteRetry(() => getPendingMessages(), { label: 'getPendingMessages' })).filter(
+    const rawMessages = (await withSqliteRetry(() => getPendingMessages(), { label: 'getPendingMessages' })).filter(
       (m) => m.kind !== 'system',
     );
+
+    // R1c park-and-quiet: unbacked wake rows are filtered out BEFORE the
+    // accumulate gate, route split, and pre-task scripts so they stop burning
+    // work (and heartbeats) every second. Log ONE severity=error event when
+    // the park set changes (first detection, new id parked, or all parked rows
+    // resolved); untouched sets stay silent per poll. The provider retry
+    // schedule for the parked routes is cleared only on set change, not per
+    // tick. A set that shrinks to empty resolves quietly — the host quarantine
+    // already logged the durable disposition.
+    const unbacked = rawMessages.filter((m) => m.trigger === 1 && !hasHostReceiptStamp(m));
+    const unbackedIds = new Set(unbacked.map((m) => m.id));
+    if (!sameMessageIdSet(unbackedIds, parkedUnroutableIds)) {
+      const routes = [...new Set(unbacked.map((m) => routeKeyForMessage(config.providerName, m)))];
+      if (unbackedIds.size > 0) {
+        log(
+          JSON.stringify({
+            severity: 'error',
+            event: 'unroutable_pending_rows_parked',
+            message_ids: [...unbackedIds].sort(),
+            route_keys: routes,
+          }),
+        );
+      }
+      for (const routeKey of routes) {
+        await withSqliteRetry(() => clearProviderRetrySchedule(config.providerName, routeKey), {
+          label: 'clearProviderRetrySchedule',
+        });
+      }
+      parkedUnroutableIds = unbackedIds;
+    }
+    const messages = rawMessages.filter((m) => !parkedUnroutableIds.has(m.id));
     pollCount++;
 
     // Periodic heartbeat so we know the loop is alive
@@ -552,6 +615,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
       // Derive provider identity only from the FINAL pre-task-filtered batch.
       // A context-only survivor cannot invent an input id or reach a provider.
+      // R1c: rows that never received host receipt stamps are parked in memory
+      // BEFORE the batch reaches pre-task scripts (see the park gate at the
+      // top of the loop); this check remains for pre-task-dropped triggers and
+      // stamped rows whose host route key does not match the active route.
       const finalTriggerRows = keep.filter((message) => message.trigger === 1);
       const hostTrigger = finalTriggerRows.at(-1);
       if (
