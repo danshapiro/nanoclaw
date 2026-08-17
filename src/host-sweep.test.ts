@@ -2951,6 +2951,52 @@ describe('sweepSession orphan inbound row quarantine + claim-expiry guard (R1)',
     }
   });
 
+  it('retries the parked-only retire on a later sweep after a failed stop (persistent quarantine marker)', async () => {
+    // The quarantine pass returns ids only on the FIRST transition (one-shot):
+    // after it, the row is 'quarantined' forever and the pass goes silent. The
+    // retire gate must therefore read the persistent marker, or a failed stop
+    // leaks the parked-only container on every later sweep.
+    const session = r1Session('sess-r1-parked-retire-retry');
+    initSessionFolder('ag-r1', session.id);
+    inboundRow(session.id, 'm-parked-retry', { ageMs: ORPHAN_AGE_MS });
+    vi.mocked(isContainerRunning).mockReturnValue(true);
+    // First retire attempt fails; later attempts succeed (default mock).
+    vi.mocked(stopContainerAndVerify).mockRejectedValueOnce(new Error('stop race lost'));
+    const errorSpy = vi.spyOn(log, 'error');
+
+    try {
+      await sweepSessionForTest(session);
+      expect(inboundStatus(session.id, 'm-parked-retry')).toBe('quarantined');
+      expect(stopContainerAndVerify).toHaveBeenCalledTimes(1);
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ sessionId: session.id, quarantinedMessageIds: ['m-parked-retry'] }),
+      );
+
+      // Second sweep: the quarantine pass finds nothing new, but the marker
+      // persists, so the stop is retried and the retirement completes.
+      await sweepSessionForTest(session);
+      expect(stopContainerAndVerify).toHaveBeenCalledTimes(2);
+      expect(vi.mocked(stopContainerAndVerify).mock.calls[1]).toEqual([session.id, 'orphaned-rows-quarantined']);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('never retires a running idle container in a session with no rows at all', async () => {
+    // Ordinary long-lived session between turns: warm container, empty inbox,
+    // no quarantine marker — the retire gate must stay dark; this container's
+    // lifecycle belongs to the idle-reap SLA alone.
+    const session = r1Session('sess-r1-empty-idle');
+    initSessionFolder('ag-r1', session.id);
+    vi.mocked(isContainerRunning).mockReturnValue(true);
+
+    await sweepSessionForTest(session);
+
+    expect(stopContainerAndVerify).not.toHaveBeenCalled();
+    expect(wakeContainer).not.toHaveBeenCalled();
+  });
+
   it('does not retire a running container for a young unbacked row (SLA preserved)', async () => {
     // Below the orphan max age the row stays pending (and due) — the running
     // container's SLA, not the quarantine retire, owns its lifecycle.

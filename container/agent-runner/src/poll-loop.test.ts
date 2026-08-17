@@ -2536,6 +2536,118 @@ describe('poll-loop unbacked pending row parking (R1c)', () => {
     },
     30_000,
   );
+
+  it(
+    'active-query follow-up poll parks unbacked rows too: no warn spam; a parked row never joins a stamped follow-up batch',
+    // R3: the park filter must cover the ACTIVE-QUERY follow-up path as well.
+    // Without it, pollFollowups() logs followup_missing_host_backed_trigger
+    // every 500ms tick for a parked row, and when a valid stamped follow-up
+    // arrives the WHOLE batch — orphan included — is claimed under the valid
+    // row's trusted identity. Same one-log-per-set-change quiet semantics as
+    // the top-level idle poll.
+    async () => {
+      const route = { platformId: 'chan-fu-park', channelType: 'discord', messagingGroupId: 'mg-fu-park', isGroup: 0 };
+      insertMessage('init-fu', 'chat', { sender: 'User', text: 'initial' }, route);
+
+      let followupWarnCount = 0;
+      const parkedEvents: Array<{ message_ids?: string[] }> = [];
+      const origError = console.error;
+      console.error = (...args: unknown[]) => {
+        const line = typeof args[0] === 'string' ? args[0] : '';
+        if (line.includes('followup_missing_host_backed_trigger')) followupWarnCount++;
+        if (line.includes('unroutable_pending_rows_parked')) {
+          const m = /(\{.*\})/.exec(line);
+          if (m) {
+            try {
+              parkedEvents.push(JSON.parse(m[1]));
+            } catch {
+              /* ignore unparsable */
+            }
+          }
+        }
+        origError(...(args as []));
+      };
+
+      let releaseQuery!: () => void;
+      const queryStarted = deferred();
+      const pushes: QueryTurnInput[] = [];
+      const provider: AgentProvider = {
+        supportsNativeSlashCommands: false,
+        isSessionInvalid: () => false,
+        query(input) {
+          queryStarted.resolve();
+          return {
+            push(turn) {
+              if (typeof turn !== 'string') pushes.push(turn);
+            },
+            end() {
+              releaseQuery?.();
+            },
+            abort() {
+              releaseQuery?.();
+            },
+            events: (async function* () {
+              await input.acceptInput();
+              yield { type: 'init', continuation: 'fu-park-query' };
+              yield { type: 'input-accepted', inputId: input.inputId, scope: 'initial' };
+              await new Promise<void>((resolve) => {
+                releaseQuery = resolve;
+              });
+              const followup = pushes[0];
+              const resolvedInputIds = [input.inputId];
+              if (followup) {
+                await followup.acceptInput();
+                yield { type: 'input-accepted', inputId: followup.inputId, scope: 'followup' };
+                resolvedInputIds.push(followup.inputId);
+              }
+              yield { type: 'result', text: 'done', resolvedInputIds };
+            })(),
+          };
+        },
+      };
+
+      const controller = new AbortController();
+      const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+      try {
+        await queryStarted.promise;
+
+        // Phase 1: an unbacked row arrives DURING the active query. It must be
+        // parked (one error log per park-set change), not warn-spammed every
+        // 500ms tick.
+        insertMessage('parked-fu-orphan', 'chat', { sender: 'Ghost', text: 'pre-stamp follow-up' }, route);
+        clearHostStamps('parked-fu-orphan');
+        await waitFor(() => parkedEvents.length === 1 || followupWarnCount >= 2, 4000);
+        await sleep(1300); // spans several follow-up poll ticks
+        expect(followupWarnCount).toBe(0);
+        expect(parkedEvents.map((e) => e.message_ids)).toEqual([['parked-fu-orphan']]);
+
+        // Phase 2: a later VALID stamped follow-up on the same route claims
+        // only itself — the parked row must not ride the trusted batch.
+        insertMessage('valid-fu', 'chat', { sender: 'User', text: 'real follow-up' }, route);
+        await waitFor(() => pushes.length === 1, 4000);
+        expect(pushes[0].messages?.map((m) => m.id)).toEqual(['valid-fu']);
+        expect(getAckStatus('parked-fu-orphan')).toBeNull(); // never claimed
+        expect(parkedEvents).toHaveLength(1); // park set unchanged — quiet
+
+        // The valid follow-up processes normally to completion; the parked row
+        // stays pending, and the resumed top-level poll does not re-log the
+        // unchanged park set.
+        releaseQuery();
+        await waitFor(() => getAckStatus('valid-fu') === 'completed', 4000);
+        expect(getPendingMessages().map((m) => m.id)).toEqual(['parked-fu-orphan']);
+        await sleep(250);
+        expect(parkedEvents).toHaveLength(1);
+        expect(followupWarnCount).toBe(0);
+      } finally {
+        console.error = origError;
+        controller.abort();
+        releaseQuery?.();
+        await loopPromise.catch(() => {});
+      }
+    },
+    30_000,
+  );
 });
 
 describe('poll-loop active-input stamping (follow-up correlation)', () => {

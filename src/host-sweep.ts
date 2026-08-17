@@ -204,6 +204,29 @@ export function quarantineOrphanInboundRows(inDb: Database.Database, sessionId: 
   return orphans.map((row) => row.id);
 }
 
+/**
+ * R1c: the PERSISTENT form of the orphan-quarantine marker. A row quarantined
+ * by quarantineOrphanInboundRows keeps status='quarantined' and never gains
+ * host receipt stamps afterwards (quarantine is terminal, operator-reviewed),
+ * so this predicate stays true on every later sweep — unlike the one-shot id
+ * list the quarantine pass returns only on first transition. Route-quarantined
+ * rows (markMessageQuarantined via the side-effect import failure path) carry
+ * host stamps and are excluded. This is what lets the parked-only container
+ * retire gate below retry a failed stop on the next sweep instead of leaking
+ * the container forever.
+ */
+export function listOrphanQuarantineMarkerIds(inDb: Database.Database): string[] {
+  const rows = inDb
+    .prepare(
+      `SELECT id FROM messages_in
+        WHERE status = 'quarantined'
+          AND (host_input_id IS NULL OR host_route_key IS NULL OR host_received_at IS NULL)
+        ORDER BY id`,
+    )
+    .all() as Array<{ id: string }>;
+  return rows.map((row) => row.id);
+}
+
 export type QuarantineDecision =
   | { action: 'track'; consecutive: number }
   | { action: 'quarantine'; consecutive: number };
@@ -597,10 +620,11 @@ async function sweepSession(session: Session): Promise<void> {
 
     // 3.75 R1c: quarantine aged, never-host-stamped wake rows BEFORE the wake
     // gate so they stop driving container wakes this same pass. Contained per
-    // session: a failed pass must never block the wake decision below.
-    let quarantinedOrphanIds: string[] = [];
+    // session: a failed pass must never block the wake decision below. The
+    // pass's returned id list is one-shot (first transition only); the retire
+    // gate below reads the persistent marker instead.
     try {
-      quarantinedOrphanIds = quarantineOrphanInboundRows(inDb, session.id, Date.now());
+      quarantineOrphanInboundRows(inDb, session.id, Date.now());
     } catch (err) {
       log.error('Orphan inbound quarantine pass failed', { sessionId: session.id, err });
     }
@@ -626,11 +650,21 @@ async function sweepSession(session: Session): Promise<void> {
     // explicit stop it idles forever. Goes through the intentional-stop path
     // with a declared expectedStopReason so no unexpected-exit recovery fires.
     // Both due counts must be zero (any real OR recovery-owned due work keeps
-    // the container), and the gate requires THIS pass to have quarantined rows
-    // so an idle-but-legit long-lived container between turns is never
-    // retired here.
+    // the container), and the gate reads the PERSISTENT quarantine marker
+    // (status='quarantined' rows still missing host receipt stamps — see
+    // listOrphanQuarantineMarkerIds), so a failed stop is retried on every
+    // later sweep until it lands. A session with no marker — an ordinary idle
+    // long-lived container between turns, with an empty inbox or only
+    // normally-processed rows — is never retired here; its lifecycle stays
+    // with the idle-reap SLA.
+    let orphanQuarantineMarkerIds: string[] = [];
+    try {
+      orphanQuarantineMarkerIds = listOrphanQuarantineMarkerIds(inDb);
+    } catch (err) {
+      log.error('Orphan quarantine marker read failed', { sessionId: session.id, err });
+    }
     if (
-      quarantinedOrphanIds.length > 0 &&
+      orphanQuarantineMarkerIds.length > 0 &&
       dueCountInboundOnly === 0 &&
       dueCount === 0 &&
       isContainerRunning(session.id)
@@ -638,16 +672,16 @@ async function sweepSession(session: Session): Promise<void> {
       log.info('Retiring parked-only container after orphan row quarantine', {
         event: 'parked_only_container_retired',
         sessionId: session.id,
-        quarantinedMessageIds: quarantinedOrphanIds,
+        quarantinedMessageIds: orphanQuarantineMarkerIds,
       });
       try {
         await stopContainerAndVerify(session.id, 'orphaned-rows-quarantined');
       } catch (err) {
         // Contained per session: a failed retire must not fail the sweep; the
-        // next pass retries it (and the SLA remains a backstop).
+        // persistent marker above makes every later sweep retry the stop.
         log.error('Failed to retire parked-only container after orphan row quarantine', {
           sessionId: session.id,
-          quarantinedMessageIds: quarantinedOrphanIds,
+          quarantinedMessageIds: orphanQuarantineMarkerIds,
           err,
         });
       }
