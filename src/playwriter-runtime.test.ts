@@ -7,8 +7,8 @@ import path from 'path';
 import { describe, expect, it } from 'vitest';
 
 const CLIENT_FILENAME = 'playwriter-client-0303f56f07c838bb4686870cc03c9374ccff46f8.tgz';
-const CLIENT_SHA256 = '991c1c3cc43fbcf9de3303aab97b7482fbe3891c1ea02a97ccc42636cbaa2c9c';
-const CLIENT_BYTES = 1066572;
+const CLIENT_SHA256 = '3fee9107df5bceb1c5dd75793595294dcc6d7ac1944764f43a03825509bc9cee';
+const CLIENT_BYTES = 1066574;
 
 function repoPath(...parts: string[]): string {
   return path.join(process.cwd(), ...parts);
@@ -38,7 +38,7 @@ describe('shared Playwriter runtime', () => {
       },
       preparation_receipt: {
         filename: 'playwriter-0303f56f07c838bb4686870cc03c9374ccff46f8.json',
-        sha256: '4c87c8c47ee8d77d71511ea96347f023147bd33e3bba56e9e4252569751f8fc1',
+        sha256: '5d9d6c70188220a84119d43a57d5729934f1aadccc79c607877bbe5595539bec',
       },
       package: {
         name: 'playwriter',
