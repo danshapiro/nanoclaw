@@ -169,7 +169,7 @@ describe('shared Playwriter runtime', () => {
     expect(buildScript).toContain('grep -Eq "^playwriter/0[.]4[.]0([[:space:]]|$)"');
     expect(buildScript).toContain(CLIENT_FILENAME);
     expect(buildScript).toContain(CLIENT_SHA256);
-    expect(buildScript).toContain(`test "$(wc -c <\"$archive\")" = "${CLIENT_BYTES}"`);
+    expect(buildScript).toContain(`test "$(wc -c <"$archive")" = "${CLIENT_BYTES}"`);
     expect(buildScript).toContain(
       'node /usr/local/share/nanoclaw/playwriter/verify-no-optional-dependencies.mjs "$playwriter_bin"',
     );
