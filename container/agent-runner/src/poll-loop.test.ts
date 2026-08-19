@@ -172,6 +172,13 @@ function stampHostInput(id: string, inputId: string, routeKey: string, receivedA
     .run(inputId, routeKey, receivedAt, id);
 }
 
+/** Simulate a pre-stamp inbound row: insertMessage stamps by default, so strip the receipt fields. */
+function clearHostStamps(id: string): void {
+  getInboundDb()
+    .prepare('UPDATE messages_in SET host_input_id = NULL, host_route_key = NULL, host_received_at = NULL WHERE id = ?')
+    .run(id);
+}
+
 class ScriptedProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = false;
   calls = 0;
@@ -2422,6 +2429,296 @@ describe('poll-loop final host-backed input selection', () => {
       await loopPromise.catch(() => {});
     }
   });
+});
+
+describe('poll-loop unbacked pending row parking (R1c)', () => {
+  // Long explicit timeout: the silence assertions span multiple 1s poll
+  // intervals, which would otherwise blow bun's 5s per-test default (a timeout
+  // abandons the body mid-flight and leaks the still-running poll loop into
+  // the next test's fresh DB).
+  it(
+    'parks unbacked rows before pre-task: one error log per park-set change, then silence; host-backed rows still process',
+    async () => {
+      insertChannelDestination('discord-park', 'chan-park');
+      insertMessage(
+        'unbacked-1',
+        'chat',
+        { sender: 'Ghost', text: 'pre-stamp row' },
+        { platformId: 'chan-park', channelType: 'discord', messagingGroupId: 'mg-park', isGroup: 0 },
+      );
+      clearHostStamps('unbacked-1');
+
+      const parkedEvents: Array<{ message_ids?: string[]; session_id?: string | null }> = [];
+      const origError = console.error;
+      const prevSessionIdEnv = process.env.NANOCLAW_SESSION_ID;
+      process.env.NANOCLAW_SESSION_ID = 'sess-park-test';
+      console.error = (...args: unknown[]) => {
+        const line = typeof args[0] === 'string' ? args[0] : '';
+        if (line.includes('unroutable_pending_rows_parked')) {
+          const m = /(\{.*\})/.exec(line);
+          if (m) {
+            try {
+              parkedEvents.push(JSON.parse(m[1]));
+            } catch {
+              /* ignore unparsable */
+            }
+          }
+        }
+        origError(...(args as []));
+      };
+
+      let preTaskCalls = 0;
+      const provider = new ScriptedProvider(async function* () {
+        yield { type: 'result', text: '<message to="discord-park">park test reply</message>' };
+      });
+      const controller = new AbortController();
+      const loopPromise = runPollLoop({
+        provider,
+        providerName: 'test',
+        cwd: '/tmp',
+        signal: controller.signal,
+        runPreTaskScripts: async (messages) => {
+          preTaskCalls++;
+          return { keep: messages, skipped: [] };
+        },
+      });
+
+      try {
+        // Set change 1: the initial unbacked row is parked — exactly one log,
+        // carrying the session identity (forwarded from the container env).
+        await waitFor(() => parkedEvents.length === 1, 4000);
+        expect(parkedEvents[0].message_ids).toEqual(['unbacked-1']);
+        expect(parkedEvents[0].session_id).toBe('sess-park-test');
+
+        // Silence across later polls with an unchanged park set, and the parked
+        // row never reaches pre-task scripts (no 1/sec heartbeat burn).
+        await sleep(2100);
+        expect(parkedEvents).toHaveLength(1);
+        expect(preTaskCalls).toBe(0);
+        expect(provider.calls).toBe(0);
+
+        // Set change 2: a second unbacked id appears → one more log line, then
+        // silence again.
+        insertMessage(
+          'unbacked-2',
+          'chat',
+          { sender: 'Ghost', text: 'another pre-stamp row' },
+          { platformId: 'chan-park', channelType: 'discord', messagingGroupId: 'mg-park', isGroup: 0 },
+        );
+        clearHostStamps('unbacked-2');
+        await waitFor(() => parkedEvents.length === 2, 4000);
+        await sleep(1300);
+        expect(parkedEvents).toHaveLength(2);
+        expect(parkedEvents[1].session_id).toBe('sess-park-test');
+        expect(preTaskCalls).toBe(0);
+        expect(provider.calls).toBe(0);
+
+        // Regression: a normal host-backed row on the same route still processes
+        // while the parked rows stay pending.
+        insertMessage(
+          'backed-1',
+          'chat',
+          { sender: 'User', text: 'real message' },
+          { platformId: 'chan-park', channelType: 'discord', messagingGroupId: 'mg-park', isGroup: 0 },
+        );
+        await waitFor(() => getAckStatus('backed-1') === 'completed', 4000);
+        expect(provider.calls).toBe(1);
+        expect(preTaskCalls).toBeGreaterThan(0);
+        expect(getPendingMessages().map((m) => m.id).sort()).toEqual(['unbacked-1', 'unbacked-2']);
+        expect(parkedEvents).toHaveLength(2);
+      } finally {
+        console.error = origError;
+        if (prevSessionIdEnv === undefined) delete process.env.NANOCLAW_SESSION_ID;
+        else process.env.NANOCLAW_SESSION_ID = prevSessionIdEnv;
+        controller.abort();
+        await loopPromise.catch(() => {});
+      }
+    },
+    30_000,
+  );
+
+  it(
+    'active-query follow-up poll parks unbacked rows too: no warn spam; a parked row never joins a stamped follow-up batch',
+    // R3: the park filter must cover the ACTIVE-QUERY follow-up path as well.
+    // Without it, pollFollowups() logs followup_missing_host_backed_trigger
+    // every 500ms tick for a parked row, and when a valid stamped follow-up
+    // arrives the WHOLE batch — orphan included — is claimed under the valid
+    // row's trusted identity. Same one-log-per-set-change quiet semantics as
+    // the top-level idle poll.
+    async () => {
+      const route = { platformId: 'chan-fu-park', channelType: 'discord', messagingGroupId: 'mg-fu-park', isGroup: 0 };
+      insertMessage('init-fu', 'chat', { sender: 'User', text: 'initial' }, route);
+
+      let followupWarnCount = 0;
+      const parkedEvents: Array<{ message_ids?: string[] }> = [];
+      const origError = console.error;
+      console.error = (...args: unknown[]) => {
+        const line = typeof args[0] === 'string' ? args[0] : '';
+        if (line.includes('followup_missing_host_backed_trigger')) followupWarnCount++;
+        if (line.includes('unroutable_pending_rows_parked')) {
+          const m = /(\{.*\})/.exec(line);
+          if (m) {
+            try {
+              parkedEvents.push(JSON.parse(m[1]));
+            } catch {
+              /* ignore unparsable */
+            }
+          }
+        }
+        origError(...(args as []));
+      };
+
+      let releaseQuery!: () => void;
+      const queryStarted = deferred();
+      const pushes: QueryTurnInput[] = [];
+      const provider: AgentProvider = {
+        supportsNativeSlashCommands: false,
+        isSessionInvalid: () => false,
+        query(input) {
+          queryStarted.resolve();
+          return {
+            push(turn) {
+              if (typeof turn !== 'string') pushes.push(turn);
+            },
+            end() {
+              releaseQuery?.();
+            },
+            abort() {
+              releaseQuery?.();
+            },
+            events: (async function* () {
+              await input.acceptInput();
+              yield { type: 'init', continuation: 'fu-park-query' };
+              yield { type: 'input-accepted', inputId: input.inputId, scope: 'initial' };
+              await new Promise<void>((resolve) => {
+                releaseQuery = resolve;
+              });
+              const followup = pushes[0];
+              const resolvedInputIds = [input.inputId];
+              if (followup) {
+                await followup.acceptInput();
+                yield { type: 'input-accepted', inputId: followup.inputId, scope: 'followup' };
+                resolvedInputIds.push(followup.inputId);
+              }
+              yield { type: 'result', text: 'done', resolvedInputIds };
+            })(),
+          };
+        },
+      };
+
+      const controller = new AbortController();
+      const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+      try {
+        await queryStarted.promise;
+
+        // Phase 1: an unbacked row arrives DURING the active query. It must be
+        // parked (one error log per park-set change), not warn-spammed every
+        // 500ms tick.
+        insertMessage('parked-fu-orphan', 'chat', { sender: 'Ghost', text: 'pre-stamp follow-up' }, route);
+        clearHostStamps('parked-fu-orphan');
+        await waitFor(() => parkedEvents.length === 1 || followupWarnCount >= 2, 4000);
+        await sleep(1300); // spans several follow-up poll ticks
+        expect(followupWarnCount).toBe(0);
+        expect(parkedEvents.map((e) => e.message_ids)).toEqual([['parked-fu-orphan']]);
+
+        // Phase 2: a later VALID stamped follow-up on the same route claims
+        // only itself — the parked row must not ride the trusted batch.
+        insertMessage('valid-fu', 'chat', { sender: 'User', text: 'real follow-up' }, route);
+        await waitFor(() => pushes.length === 1, 4000);
+        expect(pushes[0].messages?.map((m) => m.id)).toEqual(['valid-fu']);
+        expect(getAckStatus('parked-fu-orphan')).toBeNull(); // never claimed
+        expect(parkedEvents).toHaveLength(1); // park set unchanged — quiet
+
+        // The valid follow-up processes normally to completion; the parked row
+        // stays pending, and the resumed top-level poll does not re-log the
+        // unchanged park set.
+        releaseQuery();
+        await waitFor(() => getAckStatus('valid-fu') === 'completed', 4000);
+        expect(getPendingMessages().map((m) => m.id)).toEqual(['parked-fu-orphan']);
+        await sleep(250);
+        expect(parkedEvents).toHaveLength(1);
+        expect(followupWarnCount).toBe(0);
+      } finally {
+        console.error = origError;
+        controller.abort();
+        releaseQuery?.();
+        await loopPromise.catch(() => {});
+      }
+    },
+    30_000,
+  );
+
+  it(
+    'starvation window: parked ids are excluded at the SQL level, so newer orphans cannot starve the older host-backed row',
+    // R4 MAJOR: the pending window is ORDER BY seq DESC LIMIT
+    // maxMessagesPerPrompt (=10 in tests). When 10+ NEWER orphan rows fill
+    // that window, a park filter applied AFTER the fetch never even sees the
+    // older VALID host-backed row — it starves until host quarantine (~24h).
+    // The park set must be passed INTO the pending query so each poll
+    // discovers+parks more orphans until the window reveals the valid row.
+    async () => {
+      const route = {
+        platformId: 'chan-starve',
+        channelType: 'discord',
+        messagingGroupId: 'mg-starve',
+        isGroup: 0 as const,
+      };
+      insertChannelDestination('discord-starve', 'chan-starve');
+      insertMessage('valid-oldest', 'chat', { sender: 'User', text: 'oldest valid' }, route);
+      const orphanIds: string[] = [];
+      for (let i = 1; i <= 11; i++) {
+        const id = `orphan-${String(i).padStart(2, '0')}`;
+        orphanIds.push(id);
+        insertMessage(id, 'chat', { sender: 'Ghost', text: `orphan ${i}` }, route);
+        clearHostStamps(id);
+      }
+      // The window orders seq DESC: pin the valid row to the SMALLEST seq
+      // (oldest) and give every orphan a newer seq + timestamp, so an
+      // unfiltered fetch always returns the newest 10 orphans and never the
+      // valid row.
+      const db = getInboundDb();
+      db.prepare('UPDATE messages_in SET seq = 1, timestamp = ? WHERE id = ?').run(
+        new Date(Date.now() - 60_000).toISOString(),
+        'valid-oldest',
+      );
+      orphanIds.forEach((id, index) => {
+        db.prepare('UPDATE messages_in SET seq = ?, timestamp = ? WHERE id = ?').run(
+          index + 2,
+          new Date(Date.now() - 30_000 + index).toISOString(),
+          id,
+        );
+      });
+
+      const queriedBatches: string[][] = [];
+      const provider = new ScriptedProvider(async function* (input) {
+        queriedBatches.push((input.messages ?? []).map((m) => m.id));
+        yield { type: 'result', text: '<message to="discord-starve">starve reply</message>' };
+      });
+      const controller = new AbortController();
+      const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+
+      try {
+        // Poll 1 parks the 10 newest orphans; poll 2's fetch excludes them,
+        // parks the 11th, and the revealed batch is the oldest valid row —
+        // at most 2 polls despite a full window of orphans.
+        await waitFor(() => getAckStatus('valid-oldest') === 'completed', 6000);
+        expect(provider.calls).toBe(1);
+        expect(queriedBatches).toEqual([['valid-oldest']]);
+        // Every orphan is parked in memory, never claimed.
+        for (const id of orphanIds) {
+          expect(getAckStatus(id)).toBeNull();
+        }
+        // Limit semantics are unchanged for an unfiltered read: still the
+        // newest 10 pending rows, in ascending order.
+        expect(getPendingMessages().map((m) => m.id)).toEqual(orphanIds.slice(1));
+      } finally {
+        controller.abort();
+        await loopPromise.catch(() => {});
+      }
+    },
+    30_000,
+  );
 });
 
 describe('poll-loop active-input stamping (follow-up correlation)', () => {

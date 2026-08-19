@@ -658,10 +658,13 @@ async function deliverToAgent(
       // agent-shared sessions are canonical per agent and can have been
       // created under another messaging group / null thread, so they are
       // only reachable by sweeping the agent's whole history.
-      const candidates =
+      const candidates = (
         effectiveSessionMode === 'agent-shared'
           ? getSessionsByAgentGroup(agent.agent_group_id)
-          : findSessionsForAgentRouteKey(agent.agent_group_id, mg.id, agentEvent.threadId);
+          : findSessionsForAgentRouteKey(agent.agent_group_id, mg.id, agentEvent.threadId)
+      ).sort((a, b) =>
+        a.created_at === b.created_at ? a.id.localeCompare(b.id) : a.created_at < b.created_at ? -1 : 1,
+      );
       for (const sibling of candidates) {
         if (sibling.id === session.id) continue;
         if (sibling.status === 'active') continue; // active siblings can't hold an archived-attempt row
@@ -689,9 +692,13 @@ async function deliverToAgent(
           priorRoute.messagingGroupId === mg.id &&
           priorRoute.timestamp === agentEvent.message.timestamp;
         if (!sameDelivery) {
-          throw new Error(
-            `Refusing to skip distinct message with colliding route id ${routedMessageId}: stored identity does not match inbound event`,
-          );
+          // Sibling rows are not write-target candidates: a colliding id
+          // with a different route identity belongs to unrelated history
+          // (agent-shared sweeps span messaging groups), so it must not veto
+          // this delivery. Ignore it and keep searching for an exact match;
+          // if no sibling holds one, the message is written normally (delta
+          // review round 11).
+          continue;
         }
         log.info(
           'Replay already recorded in a since-archived sibling session — not writing into the post-reset session',

@@ -91,6 +91,7 @@ import {
 import {
   getContainerStartedAtMs,
   isContainerRunning,
+  isRecoveryDrainShutdownActive,
   killContainer,
   stopContainerAndVerify,
   wakeContainer,
@@ -155,6 +156,100 @@ const BACKOFF_BASE_MS = 5000;
 // operator-only (no automatic retry-out). Operator-overridable via
 // NANOCLAW_QUARANTINE_THRESHOLD (same pattern as NANOCLAW_IDLE_REAP_MS).
 export const QUARANTINE_THRESHOLD = Number(process.env.NANOCLAW_QUARANTINE_THRESHOLD) || 5;
+
+// R1c: a wake-triggering pending row this old that never received host receipt
+// stamps (host_input_id / host_route_key / host_received_at) can never be
+// claimed — the container's claim path requires them — so it eternally drives
+// wakes (the "stuck pending row" incident). Quarantined past this age.
+// Operator-overridable (same pattern as NANOCLAW_IDLE_REAP_MS).
+export const ORPHAN_INBOUND_MAX_AGE_MS = Number(process.env.NANOCLAW_ORPHAN_INBOUND_MAX_AGE_MS) || 24 * 60 * 60 * 1000;
+
+/**
+ * R1c: quarantine stale, wake-triggering pending rows that were never
+ * host-stamped. The kind != 'task' guard is MANDATORY: scheduler projections
+ * re-stamp task rows to pending (modules/scheduling/projection.ts), so a
+ * quarantined task row would just resurrect every pass; chat/cli rows are
+ * unaffected. Runs before the sweep's due-count wake gate so quarantined rows
+ * drop out of countDueMessages* the same pass (every due read filters
+ * status='pending'; 'quarantined' is a terminal parked status — the rows stay
+ * on disk for operator review, never deleted).
+ *
+ * The stamp predicate mirrors the container-side park predicate
+ * (hasHostReceiptStamp in container/agent-runner/src/poll-loop.ts) — separate
+ * packages, comment-only sync.
+ */
+export function quarantineOrphanInboundRows(inDb: Database.Database, sessionId: string, nowMs = Date.now()): string[] {
+  const candidates = inDb
+    .prepare(
+      `SELECT id, timestamp FROM messages_in
+        WHERE status = 'pending'
+          AND trigger = 1
+          AND kind != 'task'
+          AND (host_input_id IS NULL OR host_route_key IS NULL OR host_received_at IS NULL)`,
+    )
+    .all() as Array<{ id: string; timestamp: string }>;
+  const orphans = candidates.filter((row) => {
+    if (typeof row.timestamp !== 'string') return false;
+    const ts = parseSqliteUtc(row.timestamp);
+    return Number.isFinite(ts) && nowMs - ts > ORPHAN_INBOUND_MAX_AGE_MS;
+  });
+  if (orphans.length === 0) return [];
+  for (const row of orphans) {
+    markMessageQuarantined(inDb, row.id);
+  }
+  log.error('Quarantined orphan inbound rows with no host backing', {
+    event: 'inbound_row_quarantined_no_host_backing',
+    sessionId,
+    messageIds: orphans.map((row) => row.id),
+  });
+  return orphans.map((row) => row.id);
+}
+
+/**
+ * R1c: the PERSISTENT form of the orphan-quarantine marker. A row quarantined
+ * by quarantineOrphanInboundRows keeps status='quarantined' and never gains
+ * host receipt stamps afterwards (quarantine is terminal, operator-reviewed),
+ * so this predicate stays true on every later sweep — unlike the one-shot id
+ * list the quarantine pass returns only on first transition. Route-quarantined
+ * rows (markMessageQuarantined via the side-effect import failure path) carry
+ * host stamps and are excluded. This is what lets the parked-only container
+ * retire gate below retry a failed stop on the next sweep instead of leaking
+ * the container forever. The marker is CONSUMMABLE: after a verified stop the
+ * retire gate flips the rows to 'parked_retired' (consumeOrphanQuarantineMarkers),
+ * so an unconsumed marker still gates retries while a consumed one goes dark.
+ */
+export function listOrphanQuarantineMarkerIds(inDb: Database.Database): string[] {
+  const rows = inDb
+    .prepare(
+      `SELECT id FROM messages_in
+        WHERE status = 'quarantined'
+          AND (host_input_id IS NULL OR host_route_key IS NULL OR host_received_at IS NULL)
+        ORDER BY id`,
+    )
+    .all() as Array<{ id: string }>;
+  return rows.map((row) => row.id);
+}
+
+/**
+ * R3: flip orphan-quarantine marker rows to the terminal 'parked_retired'
+ * status after a VERIFIED parked-only retirement. Without the flip the
+ * persistent marker would retire ANY later zero-due running container in the
+ * session on every sweep (cold-start storm + misleading
+ * parked_only_container_retired events). Rows stay on disk for operator
+ * review and remain invisible to every due/pending read (status='pending')
+ * and to the marker query (status='quarantined').
+ */
+export function consumeOrphanQuarantineMarkers(inDb: Database.Database, ids: string[]): void {
+  if (ids.length === 0) return;
+  const stmt = inDb.prepare(
+    `UPDATE messages_in
+        SET status = 'parked_retired'
+      WHERE id = ?
+        AND status = 'quarantined'
+        AND (host_input_id IS NULL OR host_route_key IS NULL OR host_received_at IS NULL)`,
+  );
+  for (const id of ids) stmt.run(id);
+}
 
 export type QuarantineDecision =
   | { action: 'track'; consecutive: number }
@@ -331,6 +426,14 @@ export async function sweepSessionForTest(session: Session): Promise<void> {
  * runner bounds and backs off calls to this entrypoint.
  */
 export async function recoverSessionAfterUnexpectedExit(sessionId: string): Promise<void> {
+  // R3: shutdown drain gate. A recovery timer callback that began before the
+  // drain engaged its gate (container-runner.ts) can still arrive here
+  // mid-flight; during/after the drain no replacement container may spawn —
+  // its wake would miss the drain's active-container snapshot.
+  if (isRecoveryDrainShutdownActive()) {
+    log.info('Skipping unexpected-exit recovery: shutdown drain in progress', { sessionId });
+    return;
+  }
   const session = getSession(sessionId);
   if (!session || session.status !== 'active') return;
   await sweepSession(session);
@@ -547,18 +650,82 @@ async function sweepSession(session: Session): Promise<void> {
       }
     }
 
+    // 3.75 R1c: quarantine aged, never-host-stamped wake rows BEFORE the wake
+    // gate so they stop driving container wakes this same pass. Contained per
+    // session: a failed pass must never block the wake decision below. The
+    // pass's returned id list is one-shot (first transition only); the retire
+    // gate below reads the persistent marker instead.
+    try {
+      quarantineOrphanInboundRows(inDb, session.id, Date.now());
+    } catch (err) {
+      log.error('Orphan inbound quarantine pass failed', { sessionId: session.id, err });
+    }
+
     // 4. Wake a container if work is due and nothing is running.
     // Use the outbound-aware count when outDb is available so that
     // recovery-owned rows (processing_ack.status='recovery') are excluded and
     // do not trigger a redundant container wake. Fall back to the inbound-only
     // count when outDb does not exist yet (brand-new session: no outbound DB
     // means no recovery rows either, so the counts are equivalent).
+    const dueCountInboundOnly = countDueMessages(inDb);
     const dueCount = outDb
       ? countDueMessagesExcludingRecovery(inDb, outDb, {
           nowMs: Date.now(),
           recoveryWakeTtlMs: RECOVERY_WAKE_TTL_MS,
         })
-      : countDueMessages(inDb);
+      : dueCountInboundOnly;
+
+    // 4.5 R1c: retire a container left parked-only by the quarantine. The
+    // container parked the now-quarantined rows in memory and sleeps
+    // heartbeatless — the wake gate below won't re-wake it (due==0) and the
+    // running-container SLA exempts heartbeatless containers, so without this
+    // explicit stop it idles forever. Goes through the intentional-stop path
+    // with a declared expectedStopReason so no unexpected-exit recovery fires.
+    // Both due counts must be zero (any real OR recovery-owned due work keeps
+    // the container), and the gate reads the PERSISTENT quarantine marker
+    // (status='quarantined' rows still missing host receipt stamps — see
+    // listOrphanQuarantineMarkerIds), so a failed stop is retried on every
+    // later sweep until it lands. The marker is consummable: a VERIFIED stop
+    // flips the marker rows to 'parked_retired', so a later warm zero-due
+    // container is never re-retired. A session with no marker — an ordinary
+    // idle long-lived container between turns, with an empty inbox or only
+    // normally-processed rows — is never retired here; its lifecycle stays
+    // with the idle-reap SLA.
+    let orphanQuarantineMarkerIds: string[] = [];
+    try {
+      orphanQuarantineMarkerIds = listOrphanQuarantineMarkerIds(inDb);
+    } catch (err) {
+      log.error('Orphan quarantine marker read failed', { sessionId: session.id, err });
+    }
+    if (
+      orphanQuarantineMarkerIds.length > 0 &&
+      dueCountInboundOnly === 0 &&
+      dueCount === 0 &&
+      isContainerRunning(session.id)
+    ) {
+      log.info('Retiring parked-only container after orphan row quarantine', {
+        event: 'parked_only_container_retired',
+        sessionId: session.id,
+        quarantinedMessageIds: orphanQuarantineMarkerIds,
+      });
+      try {
+        await stopContainerAndVerify(session.id, 'orphaned-rows-quarantined');
+        // Marker is consummable: flip it to 'parked_retired' ONLY after the
+        // verified stop, so the retire gate never fires again for these rows.
+        // A failed stop (catch below) keeps the 'quarantined' marker and
+        // every later sweep retries the stop.
+        consumeOrphanQuarantineMarkers(inDb, orphanQuarantineMarkerIds);
+      } catch (err) {
+        // Contained per session: a failed retire must not fail the sweep; the
+        // persistent marker above makes every later sweep retry the stop.
+        log.error('Failed to retire parked-only container after orphan row quarantine', {
+          sessionId: session.id,
+          quarantinedMessageIds: orphanQuarantineMarkerIds,
+          err,
+        });
+      }
+    }
+
     if (dueCount > 0 && !isContainerRunning(session.id)) {
       log.info('Waking container for due messages', { sessionId: session.id, count: dueCount });
       try {

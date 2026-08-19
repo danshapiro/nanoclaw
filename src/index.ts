@@ -15,7 +15,11 @@ import { acquireProcessSingletonLock } from './process-singleton.js';
 import { ensureContainerRuntimeRunning, cleanupOrphansVerified } from './container-runtime.js';
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
-import { cleanupStaleContainerEnvFiles, drainAllContainers } from './container-runner.js';
+import {
+  cleanupStaleContainerEnvFiles,
+  drainAllContainers,
+  resetRecoveryDrainShutdownForDaemonStart,
+} from './container-runner.js';
 import { routeInbound } from './router.js';
 import { reconcileLegacyTaskImportsOnStartup } from './modules/scheduling/startup-import.js';
 import { log } from './log.js';
@@ -66,6 +70,11 @@ import { initChannelAdapters, teardownChannelAdapters, getChannelAdapter } from 
 
 async function main(): Promise<void> {
   log.info('NanoClaw starting');
+
+  // 0a. A fresh daemon start disengages the container drain's
+  // unexpected-exit-recovery shutdown gate (it otherwise stays engaged for
+  // the process's remaining life once a drain ran). No-op on first boot.
+  resetRecoveryDrainShutdownForDaemonStart();
 
   // 0. Process-singleton guard — MUST precede initDb: two overlapping
   // service processes must never both write v2.db (in-process runtime

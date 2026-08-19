@@ -114,7 +114,16 @@ export interface Session {
 // ── Session DB entities ──
 
 export type MessageInKind = 'chat' | 'chat-sdk' | 'task' | 'webhook' | 'system';
-export type MessageInStatus = 'pending' | 'processing' | 'completed' | 'failed';
+// 'quarantined' is the terminal parked state: route-quarantine frees wedged
+// rows with it (route-quarantine.ts), and the host sweep quarantines
+// aged-out unbacked rows with it (host-sweep.ts quarantineOrphanInboundRows).
+// 'parked_retired' is the terminal CONSUMED form of the orphan-quarantine
+// marker: the sweep's parked-only retirement flips its marker rows to it
+// after a verified stop (host-sweep.ts consumeOrphanQuarantineMarkers) so the
+// retire gate cannot re-fire on a later warm container. Every due/pending
+// read filters status='pending', so quarantined/parked_retired rows are
+// invisible to wake decisions and container polls while remaining on disk.
+export type MessageInStatus = 'pending' | 'processing' | 'completed' | 'failed' | 'quarantined' | 'parked_retired';
 
 export interface MessageIn {
   id: string;
