@@ -175,7 +175,7 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
     export PATH="/pnpm/bin:/pnpm:$PATH" && \
     test "$(wc -c <"/usr/local/share/nanoclaw/playwriter/playwriter-client-0303f56f07c838bb4686870cc03c9374ccff46f8.tgz")" = "1066577" && \
     printf '%s\n' '15bdc6b333ef539de575b8b14fd41fd622b57d9af69fbc4c678d339788d823ea  /usr/local/share/nanoclaw/playwriter/playwriter-client-0303f56f07c838bb4686870cc03c9374ccff46f8.tgz' | sha256sum --check --strict && \
-    jq -e '.artifact.sha256 == "15bdc6b333ef539de575b8b14fd41fd622b57d9af69fbc4c678d339788d823ea" and .artifact.bytes == 1066577 and .source.commit == "0303f56f07c838bb4686870cc03c9374ccff46f8" and .preparation_receipt.sha256 == "72e943cb6a6ba4fd49e52d0abca8af7834894fc3c61b626580ae2d50fce2749a" and .optional_dependencies_omitted == ["@playwriter/patchright-core", "sharp"]' /usr/local/share/nanoclaw/playwriter/client-identity.json >/dev/null && \
+    jq -e '.artifact.sha256 == "15bdc6b333ef539de575b8b14fd41fd622b57d9af69fbc4c678d339788d823ea" and .artifact.bytes == 1066577 and .source.commit == "0303f56f07c838bb4686870cc03c9374ccff46f8" and .preparation_receipt.sha256 == "94d712d3bd63df54e6d8386a097dad2e778ade97ab76e0a85c1cd8491a1030ed" and .optional_dependencies_omitted == ["@playwriter/patchright-core", "sharp"]' /usr/local/share/nanoclaw/playwriter/client-identity.json >/dev/null && \
     pnpm install -g --prod --no-optional "/usr/local/share/nanoclaw/playwriter/playwriter-client-0303f56f07c838bb4686870cc03c9374ccff46f8.tgz" && \
     playwriter_version="$(playwriter --version 2>&1)" && \
     printf '%s\n' "$playwriter_version" | grep -Eq '^playwriter/0[.]4[.]0([[:space:]]|$)' && \

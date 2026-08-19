@@ -16,7 +16,7 @@
   },
   "preparation_receipt": {
     "filename": "playwriter-0303f56f07c838bb4686870cc03c9374ccff46f8.json",
-    "sha256": "72e943cb6a6ba4fd49e52d0abca8af7834894fc3c61b626580ae2d50fce2749a"
+    "sha256": "94d712d3bd63df54e6d8386a097dad2e778ade97ab76e0a85c1cd8491a1030ed"
   },
   "package": {
     "name": "playwriter",
