@@ -87,9 +87,9 @@ identity=/usr/local/share/nanoclaw/playwriter/client-identity.json
 test -x "$(command -v playwriter)"
 playwriter_version="$(playwriter --version 2>&1)"
 printf "%s\n" "$playwriter_version" | grep -Eq "^playwriter/0[.]4[.]0([[:space:]]|$)"
-test "$(wc -c <"$archive")" = "1066577"
-printf "%s  %s\n" "15bdc6b333ef539de575b8b14fd41fd622b57d9af69fbc4c678d339788d823ea" "$archive" | sha256sum --check --strict
-jq -e ".artifact.filename == \"playwriter-client-0303f56f07c838bb4686870cc03c9374ccff46f8.tgz\" and .artifact.sha256 == \"15bdc6b333ef539de575b8b14fd41fd622b57d9af69fbc4c678d339788d823ea\" and .preparation_receipt.sha256 == \"94d712d3bd63df54e6d8386a097dad2e778ade97ab76e0a85c1cd8491a1030ed\"" "$identity" >/dev/null
+test "$(wc -c <"$archive")" = "1066572"
+printf "%s  %s\n" "991c1c3cc43fbcf9de3303aab97b7482fbe3891c1ea02a97ccc42636cbaa2c9c" "$archive" | sha256sum --check --strict
+jq -e ".artifact.filename == \"playwriter-client-0303f56f07c838bb4686870cc03c9374ccff46f8.tgz\" and .artifact.sha256 == \"991c1c3cc43fbcf9de3303aab97b7482fbe3891c1ea02a97ccc42636cbaa2c9c\" and .preparation_receipt.sha256 == \"4c87c8c47ee8d77d71511ea96347f023147bd33e3bba56e9e4252569751f8fc1\"" "$identity" >/dev/null
 playwriter_bin="$(readlink -f "$(command -v playwriter)")"
 node /usr/local/share/nanoclaw/playwriter/verify-no-optional-dependencies.mjs "$playwriter_bin"'
 
