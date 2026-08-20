@@ -3,8 +3,8 @@
   "artifact": {
     "kind": "client_npm_pack",
     "filename": "playwriter-client-0303f56f07c838bb4686870cc03c9374ccff46f8.tgz",
-    "bytes": 1066574,
-    "sha256": "3fee9107df5bceb1c5dd75793595294dcc6d7ac1944764f43a03825509bc9cee"
+    "bytes": 1066577,
+    "sha256": "29af65feb673528c70cf06c284b2bb52d3179da74930b158622fa6693d2296b0"
   },
   "source": {
     "repository": "https://github.com/remorses/playwriter.git",
@@ -16,7 +16,7 @@
   },
   "preparation_receipt": {
     "filename": "playwriter-0303f56f07c838bb4686870cc03c9374ccff46f8.json",
-    "sha256": "5d9d6c70188220a84119d43a57d5729934f1aadccc79c607877bbe5595539bec"
+    "sha256": "f68a7ea5afabab788fe299f033d995f69dfca4f3608f470f836f313b5b65e96c"
   },
   "package": {
     "name": "playwriter",
