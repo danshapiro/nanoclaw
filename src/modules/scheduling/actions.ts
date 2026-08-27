@@ -56,6 +56,16 @@ function nullableRecurrence(value: unknown): string | null {
   return typeof value === 'string' && value.length > 0 ? value : null;
 }
 
+/**
+ * Short line the host posts to the channel before this task's run output,
+ * with the run's messages threaded under it. Empty string clears it.
+ */
+function nullableHeadline(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
 function nullableScript(value: unknown): string | null {
   return typeof value === 'string' ? value : null;
 }
@@ -230,6 +240,7 @@ export function applyScheduleTaskAction(
   const prompt = stringField(content, 'prompt');
   const processAfter = stringField(content, 'processAfter');
   const script = nullableScript(content.script);
+  const headline = nullableHeadline(content.headline);
   const existing = getScheduledTask(session.agent_group_id, taskId);
 
   if (existing && !isLiveTask(existing)) {
@@ -259,7 +270,9 @@ export function applyScheduleTaskAction(
       isGroup: isGroupField(content.isGroup),
       processAfter,
       recurrence: nullableRecurrence(content.recurrence),
-      content: JSON.stringify({ prompt, script }),
+      // Only tasks that asked for a headline carry the key, so a task that
+      // doesn't use run threads keeps exactly the content it always had.
+      content: JSON.stringify(headline === null ? { prompt, script } : { prompt, script, headline }),
       sessionId: session.id,
       sourceMessageId: options.sourceMessageId,
     },
@@ -425,6 +438,9 @@ export function applyUpdateTaskAction(
   }
   if (content.script === null || typeof content.script === 'string') {
     update.script = content.script as string | null;
+  }
+  if (content.headline === null || typeof content.headline === 'string') {
+    update.headline = nullableHeadline(content.headline);
   }
 
   const changed = updateScheduledTask(

@@ -4,6 +4,15 @@ For any recurring task, use `schedule_task`. This is the scheduling path — tas
 
 To inspect or change existing tasks, use `list_tasks` (returns one row per series with the stable id) and `update_task` / `cancel_task` / `pause_task` / `resume_task`. Prefer `update_task` over cancel + reschedule.
 
+### Keeping a chatty task out of the channel
+
+A task that reports several things per run fills the channel with separate
+messages. Give it a `headline` (for example `"Nightly run results"`) and the
+run posts that one short line to the channel instead; everything the run says
+afterwards is delivered in a thread under it, including progress notices. Use
+it for tasks that produce more than one message. Leave it off for a task that
+says one thing. On channels without threads it is ignored.
+
 Frequent recurring scheduled tasks — more than a few times a day — consume API credits and can risk account restrictions. You can add a `script` that runs first, and you will only be called when the check passes.
 
 ### How it works

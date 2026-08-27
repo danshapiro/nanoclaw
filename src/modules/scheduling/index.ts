@@ -19,7 +19,7 @@
  * Durable scheduler intent lives in central scheduler tables. Per-session
  * `messages_in.kind='task'` rows are active-session projections.
  */
-import { registerDeliveryAction } from '../../delivery.js';
+import { registerDeliveryAction, registerOutboundThreadResolver } from '../../delivery.js';
 import {
   handleCancelTask,
   handlePauseTask,
@@ -27,9 +27,14 @@ import {
   handleScheduleTask,
   handleUpdateTask,
 } from './actions.js';
+import { resolveScheduledRunThread } from './run-thread.js';
 
 registerDeliveryAction('schedule_task', handleScheduleTask);
 registerDeliveryAction('cancel_task', handleCancelTask);
 registerDeliveryAction('pause_task', handlePauseTask);
 registerDeliveryAction('resume_task', handleResumeTask);
 registerDeliveryAction('update_task', handleUpdateTask);
+
+// A task that declares a `headline` collects its whole run under one short
+// anchor message in the channel instead of posting each message top-level.
+registerOutboundThreadResolver(resolveScheduledRunThread);

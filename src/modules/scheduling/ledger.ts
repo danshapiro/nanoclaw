@@ -70,6 +70,7 @@ export interface TombstoneLegacyArchivedTaskInput {
 export interface ScheduledTaskUpdate {
   prompt?: string;
   script?: string | null;
+  headline?: string | null;
   recurrence?: string | null;
   processAfter?: string;
 }
@@ -612,6 +613,7 @@ export function updateScheduledTask(
     const updatesRequested =
       update.prompt !== undefined ||
       update.script !== undefined ||
+      update.headline !== undefined ||
       update.processAfter !== undefined ||
       update.recurrence !== undefined;
     if (!updatesRequested) {
@@ -620,7 +622,7 @@ export function updateScheduledTask(
     }
 
     let content = row.content;
-    if (update.prompt !== undefined || update.script !== undefined) {
+    if (update.prompt !== undefined || update.script !== undefined || update.headline !== undefined) {
       let parsed: Record<string, unknown>;
       try {
         parsed = JSON.parse(row.content) as Record<string, unknown>;
@@ -629,6 +631,8 @@ export function updateScheduledTask(
       }
       if (update.prompt !== undefined) parsed.prompt = update.prompt;
       if (update.script !== undefined) parsed.script = update.script;
+      if (update.headline === null) delete parsed.headline;
+      else if (update.headline !== undefined) parsed.headline = update.headline;
       content = JSON.stringify(parsed);
     }
 

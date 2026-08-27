@@ -785,11 +785,21 @@ Schedule a one-shot or recurring task.
     processAfter: string,       // ISO timestamp for first run
     recurrence?: string,        // cron expression (optional)
     script?: string,            // pre-agent script (optional)
+    headline?: string,          // short line to post above this run's output (optional)
   }
 }
 ```
 
 Implementation: write a `messages_in` row (to self) with `kind: 'task'`, `process_after`, and optionally `recurrence`. The host sweep picks it up when due.
+
+`headline` turns the task's output into one thread instead of a pile of
+top-level messages. The first time a run produces a user-visible message, the
+host posts the headline to the channel, opens a platform thread on it, and
+delivers that message and every later one of the same run into the thread —
+including progress notices the runtime writes itself. A run that produces
+nothing posts no headline. Channels that cannot open threads (everything but
+Discord today) ignore the headline and deliver as before. State lives in the
+central `scheduled_run_threads` table, one row per run.
 
 #### list_tasks
 
@@ -815,7 +825,8 @@ Modify a scheduled task.
 }
 // pause_task: set status = 'paused' (new status value for recurring tasks)
 // resume_task: set status = 'pending'
-// update_task: merge { prompt?, recurrence?, processAfter?, script? } into the live row
+// update_task: merge { prompt?, recurrence?, processAfter?, script?, headline? } into the live row
+//              (headline: '' clears it)
 ```
 
 Implementation: cancel/pause/resume update the live row(s) directly. update_task is sent as a system action — the host reads current content, merges supplied fields, and writes back. All four match by `(id = ? OR series_id = ?) AND kind='task' AND status IN ('pending','paused')`, so they reach the live next occurrence of a recurring task even when the agent passes the original (now-completed) id.
