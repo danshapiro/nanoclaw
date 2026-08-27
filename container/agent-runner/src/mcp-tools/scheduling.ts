@@ -52,6 +52,10 @@ export const scheduleTask: McpToolDefinition = {
             'Cron expression for recurring tasks (e.g., "0 9 * * 1-5" = weekdays at 9am user-local). Evaluated in the user\'s timezone.',
         },
         script: { type: 'string', description: 'Optional pre-agent script to run before processing' },
+        headline: {
+          type: 'string',
+          description: 'Optional short line (e.g. "Nightly run results") posted to the channel when this task runs. Everything the run says is then delivered in a thread under it, instead of filling the channel with separate messages. Only works on channels that support threads.',
+        },
       },
       required: ['prompt', 'processAfter'],
     },
@@ -74,6 +78,7 @@ export const scheduleTask: McpToolDefinition = {
     const r = routing();
     const recurrence = (args.recurrence as string) || null;
     const script = (args.script as string) || null;
+    const headline = (args.headline as string) || null;
 
     // Write as a system action — host will insert into inbound.db
     writeMessageOut({
@@ -89,6 +94,7 @@ export const scheduleTask: McpToolDefinition = {
         taskId: id,
         prompt,
         script,
+        headline,
         processAfter,
         recurrence,
         platformId: r.platform_id,
@@ -267,6 +273,11 @@ export const updateTask: McpToolDefinition = {
           type: 'string',
           description: 'New pre-agent script (optional). Pass empty string to clear.',
         },
+        headline: {
+          type: 'string',
+          description:
+            'New short line posted to the channel above this task\'s run output, with the run threaded under it (optional). Pass empty string to clear.',
+        },
       },
       required: ['taskId'],
     },
@@ -289,6 +300,7 @@ export const updateTask: McpToolDefinition = {
     // Empty string clears recurrence/script; undefined leaves them as-is.
     if (typeof args.recurrence === 'string') update.recurrence = args.recurrence === '' ? null : args.recurrence;
     if (typeof args.script === 'string') update.script = args.script === '' ? null : args.script;
+    if (typeof args.headline === 'string') update.headline = args.headline === '' ? null : args.headline;
 
     if (Object.keys(update).length === 1) return err('at least one field to update is required');
 

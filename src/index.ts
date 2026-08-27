@@ -191,6 +191,19 @@ async function main(): Promise<void> {
       const adapter = getChannelAdapter(channelType);
       await adapter?.setTyping?.(platformId, threadId);
     },
+    canOpenThread(channelType: string): boolean {
+      return typeof getChannelAdapter(channelType)?.openThread === 'function';
+    },
+    async openThread(
+      channelType: string,
+      platformId: string,
+      anchorMessageId: string,
+      name: string,
+    ): Promise<string | null> {
+      const adapter = getChannelAdapter(channelType);
+      if (!adapter?.openThread) return null;
+      return adapter.openThread(platformId, anchorMessageId, name);
+    },
   };
   setDeliveryAdapter(deliveryAdapter);
 

@@ -10,9 +10,11 @@ import { log } from '../log.js';
 import { createChatSdkBridge } from './chat-sdk-bridge.js';
 import {
   createDiscordHandledTracker,
+  discordThreadName,
   forwardDiscordGatewayEventWithRetry,
   monitoredDiscordChannelIds,
   normalizeDiscordOutboundMarkdown,
+  openDiscordThreadOnMessage,
   toDiscordThreadId,
   wrapYenteDiscordChannelIds,
   yenteDiscordPlatformIdFromThreadId,
@@ -137,6 +139,41 @@ describe('Discord v1 channel-id compatibility', () => {
       headers: { Authorization: 'Bot bot-token' },
     });
     globalThis.fetch = originalFetch;
+  });
+});
+
+describe('Discord threads opened on a bot message', () => {
+  it('opens a thread named after the anchor text and returns its id', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({ id: 'thread-9' }), { status: 201 }));
+
+    await expect(
+      openDiscordThreadOnMessage('channel-1', 'message-7', 'Nightly run results', 'bot-token'),
+    ).resolves.toBe('thread-9');
+
+    expect(globalThis.fetch).toHaveBeenCalledWith(
+      'https://discord.com/api/v10/channels/channel-1/messages/message-7/threads',
+      {
+        method: 'POST',
+        headers: { Authorization: 'Bot bot-token', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'Nightly run results' }),
+      },
+    );
+    globalThis.fetch = originalFetch;
+  });
+
+  it('returns null instead of throwing when Discord refuses', async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response('missing access', { status: 403 }));
+
+    await expect(openDiscordThreadOnMessage('channel-1', 'message-7', 'Nightly', 'bot-token')).resolves.toBeNull();
+    globalThis.fetch = originalFetch;
+  });
+
+  it('fits multi-line anchor text into a usable thread name', () => {
+    expect(discordThreadName('Nightly run results\n\nfor 2026-08-27')).toBe('Nightly run results for 2026-08-27');
+    expect(discordThreadName('x'.repeat(140))).toHaveLength(100);
+    expect(discordThreadName('   ')).toBe('Scheduled run');
   });
 });
 

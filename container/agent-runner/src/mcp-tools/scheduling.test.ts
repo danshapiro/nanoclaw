@@ -76,6 +76,22 @@ function insertTaskProjection(args: {
 }
 
 describe('scheduling MCP tools', () => {
+  it('passes a run headline through schedule_task and clears it through update_task', async () => {
+    await scheduleTask.handler({
+      prompt: 'morning pass',
+      processAfter: '2026-06-06T12:00:00Z',
+      recurrence: '40 4 * * *',
+      headline: 'Nightly run results',
+    });
+    const [scheduled] = outboxPayloads();
+    expect(scheduled.content.headline).toBe('Nightly run results');
+
+    await updateTask.handler({ taskId: scheduled.content.taskId as string, headline: '' });
+    const cleared = outboxPayloads().at(-1)!;
+    expect(cleared.content.action).toBe('update_task');
+    expect(cleared.content.headline).toBeNull();
+  });
+
   it('schedule_task emits a routed system action payload', async () => {
     const result = await scheduleTask.handler({
       prompt: 'heartbeat',
