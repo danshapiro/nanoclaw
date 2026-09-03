@@ -2376,6 +2376,52 @@ describe('side-effect ledger container env', () => {
   });
 });
 
+describe('container resource fences (item D: no runaway process should trigger a global OOM)', () => {
+  async function buildArgs(harness: Awaited<ReturnType<typeof loadContainerRunnerHarness>>): Promise<string[]> {
+    const wake = harness.containerRunner.wakeContainer(harness.session);
+    await harness.oneCliStarted.promise;
+    harness.oneCliRelease.resolve();
+    await wake;
+    return harness.spawnMock.mock.calls[0][1] as string[];
+  }
+
+  it('caps memory, memory-swap, and pids on every spawned container by default', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      const args = await buildArgs(harness);
+      expect(args).toContain('--memory=12g');
+      expect(args).toContain('--memory-swap=16g');
+      expect(args).toContain('--pids-limit=4096');
+    } finally {
+      harness.close();
+    }
+  });
+
+  it('honors NANOCLAW_CONTAINER_MEMORY_LIMIT / _MEMORY_SWAP_LIMIT / _PIDS_LIMIT overrides', async () => {
+    const savedMem = process.env.NANOCLAW_CONTAINER_MEMORY_LIMIT;
+    const savedSwap = process.env.NANOCLAW_CONTAINER_MEMORY_SWAP_LIMIT;
+    const savedPids = process.env.NANOCLAW_CONTAINER_PIDS_LIMIT;
+    process.env.NANOCLAW_CONTAINER_MEMORY_LIMIT = '4g';
+    process.env.NANOCLAW_CONTAINER_MEMORY_SWAP_LIMIT = '6g';
+    process.env.NANOCLAW_CONTAINER_PIDS_LIMIT = '512';
+    const harness = await loadContainerRunnerHarness();
+    try {
+      const args = await buildArgs(harness);
+      expect(args).toContain('--memory=4g');
+      expect(args).toContain('--memory-swap=6g');
+      expect(args).toContain('--pids-limit=512');
+    } finally {
+      harness.close();
+      if (savedMem === undefined) delete process.env.NANOCLAW_CONTAINER_MEMORY_LIMIT;
+      else process.env.NANOCLAW_CONTAINER_MEMORY_LIMIT = savedMem;
+      if (savedSwap === undefined) delete process.env.NANOCLAW_CONTAINER_MEMORY_SWAP_LIMIT;
+      else process.env.NANOCLAW_CONTAINER_MEMORY_SWAP_LIMIT = savedSwap;
+      if (savedPids === undefined) delete process.env.NANOCLAW_CONTAINER_PIDS_LIMIT;
+      else process.env.NANOCLAW_CONTAINER_PIDS_LIMIT = savedPids;
+    }
+  });
+});
+
 describe('assembled managed-skill runtime matrix', () => {
   it('gives Claude, Codex, OpenCode, and threaded sessions the same effective GWS mount and gateway wiring', async () => {
     const managedRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-gws-runtime-matrix-'));
