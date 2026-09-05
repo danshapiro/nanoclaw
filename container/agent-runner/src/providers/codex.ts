@@ -894,7 +894,7 @@ export async function* runOneTurn(
         break;
       }
       // NOTE: `turn/failed` is NOT part of the codex app-server v2 protocol
-      // (verified against openai/codex@rust-v0.144.1 — the deployed pin; the
+      // (verified against openai/codex@rust-v0.153.4 — the deployed pin; the
       // ServerNotification enum has no `turn/failed`). A terminal failure arrives
       // as an `error` notification (willRetry:false) plus `turn/completed` with
       // status:"failed" and turn.error.message — both handled below. Retained as a
