@@ -176,7 +176,7 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
     test "$(wc -c <"/usr/local/share/nanoclaw/playwriter/playwriter-client-0303f56f07c838bb4686870cc03c9374ccff46f8.tgz")" = "1066577" && \
     printf '%s\n' '29af65feb673528c70cf06c284b2bb52d3179da74930b158622fa6693d2296b0  /usr/local/share/nanoclaw/playwriter/playwriter-client-0303f56f07c838bb4686870cc03c9374ccff46f8.tgz' | sha256sum --check --strict && \
     jq -e '.artifact.sha256 == "29af65feb673528c70cf06c284b2bb52d3179da74930b158622fa6693d2296b0" and .artifact.bytes == 1066577 and .source.commit == "0303f56f07c838bb4686870cc03c9374ccff46f8" and .preparation_receipt.sha256 == "f68a7ea5afabab788fe299f033d995f69dfca4f3608f470f836f313b5b65e96c" and .optional_dependencies_omitted == ["@playwriter/patchright-core", "sharp"]' /usr/local/share/nanoclaw/playwriter/client-identity.json >/dev/null && \
-    pnpm install -g --prod --no-optional "/usr/local/share/nanoclaw/playwriter/playwriter-client-0303f56f07c838bb4686870cc03c9374ccff46f8.tgz" && \
+    pnpm install -g "/usr/local/share/nanoclaw/playwriter/playwriter-client-0303f56f07c838bb4686870cc03c9374ccff46f8.tgz" && \
     playwriter_version="$(playwriter --version 2>&1)" && \
     printf '%s\n' "$playwriter_version" | grep -Eq '^playwriter/0[.]4[.]0([[:space:]]|$)' && \
     playwriter_bin="$(readlink -f "$(command -v playwriter)")" && \

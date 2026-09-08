@@ -138,9 +138,7 @@ describe('shared Playwriter runtime', () => {
     expect(section).toContain(
       `test "$(wc -c <"/usr/local/share/nanoclaw/playwriter/${CLIENT_FILENAME}")" = "${CLIENT_BYTES}"`,
     );
-    expect(section).toContain(
-      `pnpm install -g --prod --no-optional "/usr/local/share/nanoclaw/playwriter/${CLIENT_FILENAME}"`,
-    );
+    expect(section).toContain(`pnpm install -g "/usr/local/share/nanoclaw/playwriter/${CLIENT_FILENAME}"`);
     expect(section).toContain('playwriter_version="$(playwriter --version 2>&1)"');
     expect(section).toContain("grep -Eq '^playwriter/0[.]4[.]0([[:space:]]|$)'");
     expect(section).toContain(
