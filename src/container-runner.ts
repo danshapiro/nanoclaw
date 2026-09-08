@@ -162,6 +162,16 @@ const containerExitWaiters = new Map<string, Set<() => void>>();
 const CONTAINER_SKILLS_BIN = '/app/skills/.bin';
 const AGENT_CONTAINER_PATH = `${CONTAINER_SKILLS_BIN}:/pnpm/bin:/pnpm:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin`;
 const SESSION_CONTAINER_LABEL_KEY = 'nanoclaw-session';
+// Item D (2026-08-24 global-OOM storm): a runaway process in one agent
+// container consumed the entire host's RAM+zram budget because no container
+// carried a memory fence, forcing a host-wide kernel OOM instead of a
+// contained per-container one. These defaults are sized generously above any
+// observed legitimate workload (the killed process alone reached ~24 GiB RSS)
+// so a runaway process is contained to its own container well before the host
+// itself is threatened; env-tunable for hosts with a different memory budget.
+const DEFAULT_CONTAINER_MEMORY_LIMIT = '12g';
+const DEFAULT_CONTAINER_MEMORY_SWAP_LIMIT = '16g';
+const DEFAULT_CONTAINER_PIDS_LIMIT = '4096';
 const CLEANUP_PROCESS_EXIT_TIMEOUT_MS = 30_000;
 const SHUTDOWN_CLIENT_EXIT_TIMEOUT_MS = 10_000;
 
@@ -1698,6 +1708,9 @@ async function buildContainerArgs(
     '--cap-drop=ALL',
     '--security-opt=no-new-privileges',
     '--ulimit=core=0',
+    `--memory=${process.env.NANOCLAW_CONTAINER_MEMORY_LIMIT || DEFAULT_CONTAINER_MEMORY_LIMIT}`,
+    `--memory-swap=${process.env.NANOCLAW_CONTAINER_MEMORY_SWAP_LIMIT || DEFAULT_CONTAINER_MEMORY_SWAP_LIMIT}`,
+    `--pids-limit=${process.env.NANOCLAW_CONTAINER_PIDS_LIMIT || DEFAULT_CONTAINER_PIDS_LIMIT}`,
   ];
 
   // Environment — only vars read by code we don't own.

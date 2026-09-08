@@ -1738,6 +1738,7 @@ export interface OutboundMessage {
   id: string;
   seq: number | null;
   kind: string;
+  in_reply_to: string | null;
   platform_id: string | null;
   channel_type: string | null;
   thread_id: string | null;

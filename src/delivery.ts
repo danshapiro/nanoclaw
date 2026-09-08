@@ -67,6 +67,57 @@ export interface ChannelDeliveryAdapter {
     files?: OutboundFile[],
   ): Promise<string | undefined>;
   setTyping?(channelType: string, platformId: string, threadId: string | null): Promise<void>;
+  /**
+   * Open a platform thread hanging off an already-delivered message and
+   * return its thread id, or null when the platform refused. Present only on
+   * channels that model threads (Discord); absent everywhere else.
+   */
+  openThread?(channelType: string, platformId: string, anchorMessageId: string, name: string): Promise<string | null>;
+  /**
+   * Whether this channel type can open threads at all. Asked before anything
+   * is posted, so a caller never leaves an anchor message stranded on a
+   * platform that was never going to thread under it.
+   */
+  canOpenThread?(channelType: string): boolean;
+}
+
+/**
+ * What a thread resolver gets to decide where a user-visible channel message
+ * lands. `inDb`/`outDb` are the session's already-open handles; `adapter` is
+ * the live delivery adapter, so a resolver can post its own anchor message
+ * before the message it was asked about.
+ */
+export interface OutboundThreadContext {
+  session: Session;
+  message: {
+    id: string;
+    kind: string;
+    inReplyTo: string | null;
+    channelType: string;
+    platformId: string;
+  };
+  inDb: Database.Database;
+  outDb: Database.Database;
+  adapter: ChannelDeliveryAdapter;
+}
+
+/**
+ * Chooses a thread for an outbound message that carries none, or returns null
+ * to leave it in the channel. Registered by modules (scheduling uses it for
+ * per-run result threads); core stays generic and delivers unchanged when no
+ * resolver is registered or the resolver throws.
+ */
+export type OutboundThreadResolver = (ctx: OutboundThreadContext) => Promise<string | null>;
+
+let outboundThreadResolver: OutboundThreadResolver | null = null;
+
+export function registerOutboundThreadResolver(resolver: OutboundThreadResolver): void {
+  if (outboundThreadResolver) log.warn('Outbound thread resolver overwritten');
+  outboundThreadResolver = resolver;
+}
+
+export function clearOutboundThreadResolverForTest(): void {
+  outboundThreadResolver = null;
 }
 
 let deliveryAdapter: ChannelDeliveryAdapter | null = null;
@@ -346,7 +397,7 @@ async function drainSession(session: Session, options: DrainSessionOptions = {})
       }
 
       try {
-        const platformMsgId = await deliverMessage(msg, session, inDb);
+        const platformMsgId = await deliverMessage(msg, session, inDb, outDb);
         markDelivered(inDb, msg.id, platformMsgId ?? null);
         deliveryAttempts.delete(msg.id);
 
@@ -411,10 +462,56 @@ function isReactionOutbound(msg: { content: string }): boolean {
   }
 }
 
+/**
+ * Thread this message should be delivered into: the one it already carries,
+ * or one a registered resolver opens for it. Fail-open — a resolver that
+ * throws leaves the message going exactly where it was.
+ */
+async function resolveOutboundThread(
+  msg: {
+    id: string;
+    kind: string;
+    in_reply_to?: string | null;
+    platform_id: string | null;
+    channel_type: string | null;
+    thread_id: string | null;
+  },
+  session: Session,
+  inDb: Database.Database,
+  outDb: Database.Database,
+  content: { operation?: unknown },
+): Promise<string | null> {
+  if (msg.thread_id) return msg.thread_id;
+  if (!outboundThreadResolver || !deliveryAdapter) return null;
+  if (!msg.channel_type || !msg.platform_id) return null;
+  // Edits and reactions name a message that already lives somewhere.
+  if (content.operation === 'edit' || content.operation === 'reaction') return null;
+
+  try {
+    return await outboundThreadResolver({
+      session,
+      message: {
+        id: msg.id,
+        kind: msg.kind,
+        inReplyTo: msg.in_reply_to ?? null,
+        channelType: msg.channel_type,
+        platformId: msg.platform_id,
+      },
+      inDb,
+      outDb,
+      adapter: deliveryAdapter,
+    });
+  } catch (err) {
+    log.warn('Outbound thread resolver failed; delivering to the channel', { messageId: msg.id, err });
+    return null;
+  }
+}
+
 async function deliverMessage(
   msg: {
     id: string;
     kind: string;
+    in_reply_to?: string | null;
     platform_id: string | null;
     channel_type: string | null;
     thread_id: string | null;
@@ -422,6 +519,7 @@ async function deliverMessage(
   },
   session: Session,
   inDb: Database.Database,
+  outDb: Database.Database,
 ): Promise<string | undefined> {
   if (!deliveryAdapter) {
     log.warn('No delivery adapter configured, dropping message', { id: msg.id });
@@ -503,6 +601,13 @@ async function deliverMessage(
     }
   }
 
+  // A registered resolver may place this message in a thread it opens on the
+  // fly (scheduling uses it to collect a whole run under one headline). Only
+  // for messages that carry no thread of their own and address a real
+  // conversation: edits and reactions name a message that already lives
+  // somewhere, and retargeting those would break them.
+  const threadId = await resolveOutboundThread(msg, session, inDb, outDb, content);
+
   // Track pending questions for ask_user_question flow.
   // Guarded: without the interactive module, `pending_questions` doesn't
   // exist and we skip persistence — the card still delivers to the user,
@@ -521,7 +626,7 @@ async function deliverMessage(
         message_out_id: msg.id,
         platform_id: msg.platform_id,
         channel_type: msg.channel_type,
-        thread_id: msg.thread_id,
+        thread_id: threadId,
         title,
         options: normalizeOptions(rawOptions as never),
         created_at: new Date().toISOString(),
@@ -549,7 +654,7 @@ async function deliverMessage(
   const platformMsgId = await deliveryAdapter.deliver(
     msg.channel_type,
     msg.platform_id,
-    msg.thread_id,
+    threadId,
     msg.kind,
     msg.content,
     files,
@@ -558,6 +663,7 @@ async function deliverMessage(
     id: msg.id,
     channelType: msg.channel_type,
     platformId: msg.platform_id,
+    threadId,
     platformMsgId,
     fileCount: files?.length,
   });

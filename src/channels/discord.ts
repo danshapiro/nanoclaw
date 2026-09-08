@@ -99,7 +99,7 @@ registerChannelAdapter('discord', {
     const channelIds = (): Set<string> => monitoredDiscordChannelIds(autoCreateThreadChannelIds);
     let catchup: DiscordCatchup | null = null;
     const handledTracker = createDiscordHandledTracker();
-    return createChatSdkBridge({
+    const bridge = createChatSdkBridge({
       adapter: wrapYenteDiscordChannelIds(discordAdapter, botToken, autoCreateThreadChannelIds, {
         monitoredChannelIds: channelIds,
         routeLeaseMs: catchupConfig.routeLeaseMs,
@@ -130,8 +130,57 @@ registerChannelAdapter('discord', {
         catchup.start(); // startup run + periodic timer (kill switch handled inside)
       },
     });
+    bridge.openThread = (platformId, anchorMessageId, name) =>
+      openDiscordThreadOnMessage(yenteDiscordPlatformIdFromThreadId(platformId), anchorMessageId, name, botToken);
+    return bridge;
   },
 });
+
+/**
+ * Discord thread names are capped at 100 characters and collapse badly on
+ * newlines. Keep the first line's worth of the anchor text so the thread is
+ * recognizable in the sidebar.
+ */
+export function discordThreadName(text: string): string {
+  const collapsed = text.replace(/\s+/g, ' ').trim();
+  if (!collapsed) return 'Scheduled run';
+  return collapsed.length > 100 ? `${collapsed.slice(0, 99)}\u2026` : collapsed;
+}
+
+/**
+ * Open a Discord thread on a message the bot already posted.
+ *
+ * The vendored adapter has its own createDiscordThread, but it names every
+ * thread "Thread <locale timestamp>" -- useless in a sidebar. This posts the
+ * same endpoint with the caller's name. Returns null (never throws) when
+ * Discord refuses, so the caller can fall back to channel delivery.
+ */
+export async function openDiscordThreadOnMessage(
+  channelId: string,
+  messageId: string,
+  name: string,
+  botToken: string,
+): Promise<string | null> {
+  const response = await fetch(
+    `${DISCORD_API_BASE}/channels/${encodeURIComponent(channelId)}/messages/${encodeURIComponent(messageId)}/threads`,
+    {
+      method: 'POST',
+      headers: { Authorization: `Bot ${botToken}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: discordThreadName(name) }),
+    },
+  );
+  if (!response.ok) {
+    log.warn('Failed to open Discord thread on anchor message', {
+      channelId,
+      messageId,
+      status: response.status,
+      body: await response.text(),
+    });
+    return null;
+  }
+  const body = (await response.json()) as { id?: unknown };
+  return typeof body.id === 'string' && body.id.length > 0 ? body.id : null;
+}
 
 export function normalizeDiscordOutboundMarkdown(text: string): string {
   const stats: NormalizeStats = { urlLabeledLinks: 0, bareUrls: 0 };

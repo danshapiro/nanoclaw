@@ -13,7 +13,7 @@ import { acquireRuntimeLock, releaseRuntimeLock } from '../../db/runtime-locks.j
 import { clearDeliveryAdapterForTest } from '../../delivery.js';
 import { openInboundDb, resolveSession } from '../../session-manager.js';
 import { getScheduledTask } from './ledger.js';
-import { handleScheduleTask } from './actions.js';
+import { handleScheduleTask, handleUpdateTask } from './actions.js';
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
@@ -42,6 +42,39 @@ afterEach(() => {
 });
 
 describe('scheduling delivery actions', () => {
+  it('carries a run headline into the ledger and clears it on request', async () => {
+    const { session } = resolveSession('ag-yente', 'mg-discord', 'thread-1', 'per-thread');
+    const inDb = openInboundDb(session.agent_group_id, session.id);
+
+    await handleScheduleTask(
+      {
+        taskId: 'task-nightly',
+        prompt: 'morning pass',
+        processAfter: '2026-08-28T11:40:00.000Z',
+        recurrence: '40 4 * * *',
+        script: null,
+        headline: 'Nightly run results',
+        platformId: 'channel',
+        channelType: 'discord',
+        threadId: null,
+        messagingGroupId: 'mg-discord',
+        isGroup: 1,
+      },
+      session,
+      inDb,
+      'sys-headline-1',
+    );
+
+    const scheduled = getScheduledTask('ag-yente', 'task-nightly');
+    expect(JSON.parse(scheduled!.content).headline).toBe('Nightly run results');
+
+    await handleUpdateTask({ taskId: 'task-nightly', headline: '' }, session, inDb, 'sys-headline-2');
+
+    const cleared = getScheduledTask('ag-yente', 'task-nightly');
+    expect(JSON.parse(cleared!.content)).not.toHaveProperty('headline');
+    inDb.close();
+  });
+
   it('waits for scheduler lock contention instead of dropping a delivered schedule_task', async () => {
     const { session } = resolveSession('ag-yente', 'mg-discord', 'thread-1', 'per-thread');
     const inDb = openInboundDb(session.agent_group_id, session.id);

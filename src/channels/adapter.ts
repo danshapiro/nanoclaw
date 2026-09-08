@@ -173,6 +173,18 @@ export interface ChannelAdapter {
    * Returning the same platform_id on repeated calls is expected.
    */
   openDM?(userHandle: string): Promise<string>;
+
+  /**
+   * Open a thread hanging off a message this bot already posted, returning
+   * the new thread's id (or null when the platform refused). Used by the
+   * host to collect a burst of related messages -- a scheduled run's output
+   * -- under one short anchor message instead of filling the channel.
+   *
+   * Implement only on platforms where a thread can be created from an
+   * existing message (Discord). Callers treat absence as "this channel
+   * cannot thread" and deliver to the channel unchanged.
+   */
+  openThread?(platformId: string, anchorMessageId: string, name: string): Promise<string | null>;
 }
 
 /** Factory function that creates a channel adapter (returns null if credentials missing). */
