@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { spawnSync } from 'child_process';
-import { generateKeyPairSync } from 'crypto';
+import { generateKeyPairSync, sign, verify, type KeyObject } from 'crypto';
 import { EventEmitter } from 'events';
 import fs from 'fs';
 import net from 'net';
@@ -323,10 +323,35 @@ type YenteDevSshFixture = {
   signerDir: string;
   socketPath: string;
   groupDir: string;
+  privateKey: KeyObject;
+  publicKeyBlob: Buffer;
   closeSocket(): Promise<void>;
   createSocket(): Promise<void>;
   cleanup(): Promise<void>;
 };
+
+function sshString(value: Buffer): Buffer {
+  const length = Buffer.alloc(4);
+  length.writeUInt32BE(value.length, 0);
+  return Buffer.concat([length, value]);
+}
+
+function disposableEd25519Identity(comment = 'yente-dev'): {
+  privateKey: KeyObject;
+  publicKey: string;
+  publicKeyBlob: Buffer;
+} {
+  const pair = generateKeyPairSync('ed25519');
+  const publicDer = pair.publicKey.export({ format: 'der', type: 'spki' });
+  const rawPublicKey = publicDer.subarray(-32);
+  const type = Buffer.from('ssh-ed25519');
+  const publicKeyBlob = Buffer.concat([sshString(type), sshString(rawPublicKey)]);
+  return {
+    privateKey: pair.privateKey,
+    publicKey: `ssh-ed25519 ${publicKeyBlob.toString('base64')} ${comment}`,
+    publicKeyBlob,
+  };
+}
 
 async function createYenteDevSshFixture(): Promise<YenteDevSshFixture> {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-yente-dev-ssh-'));
@@ -352,16 +377,14 @@ async function createYenteDevSshFixture(): Promise<YenteDevSshFixture> {
     ].join('\n'),
     { mode: 0o644 },
   );
-  fs.writeFileSync(path.join(sshDir, 'known_hosts'), 'garageserver ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest\n', {
+  const identity = disposableEd25519Identity();
+  const publicKey = identity.publicKey;
+  fs.writeFileSync(path.join(sshDir, 'known_hosts'), `[192.168.3.150]:22 ${publicKey}\n`, {
     mode: 0o644,
   });
-  fs.writeFileSync(
-    path.join(sshDir, 'garageserver_login.pub'),
-    'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest yente-dev\n',
-    {
-      mode: 0o644,
-    },
-  );
+  fs.writeFileSync(path.join(sshDir, 'garageserver_login.pub'), `${publicKey}\n`, {
+    mode: 0o644,
+  });
   for (const file of ['config', 'known_hosts', 'garageserver_login.pub']) {
     fs.chmodSync(path.join(sshDir, file), 0o444);
   }
@@ -371,11 +394,24 @@ async function createYenteDevSshFixture(): Promise<YenteDevSshFixture> {
     await new Promise<void>((resolve, reject) => {
       server = net.createServer((connection) => {
         connection.once('data', (request) => {
-          // SSH_AGENTC_SIGN_REQUEST (13) is enough to prove the socket is
-          // reachable by this process; the response is a deterministic test
-          // signature reply (SSH_AGENT_SIGN_RESPONSE, 14).
-          if (request.at(4) === 13) connection.end(Buffer.from([0, 0, 0, 1, 14]));
-          else connection.destroy(new Error('expected SSH agent sign request'));
+          const keyLength = request.readUInt32BE(5);
+          const keyStart = 9;
+          const dataLength = request.readUInt32BE(keyStart + keyLength);
+          const dataStart = keyStart + keyLength + 4;
+          const key = request.subarray(keyStart, keyStart + keyLength);
+          const data = request.subarray(dataStart, dataStart + dataLength);
+          if (
+            request.at(4) !== 13 ||
+            !key.equals(identity.publicKeyBlob) ||
+            request.readUInt32BE(dataStart + dataLength) !== 0
+          ) {
+            connection.destroy(new Error('expected a valid SSH agent sign request for the selected identity'));
+            return;
+          }
+          const signature = sign(null, data, identity.privateKey);
+          const signatureBlob = Buffer.concat([sshString(Buffer.from('ssh-ed25519')), sshString(signature)]);
+          const response = Buffer.concat([Buffer.from([14]), sshString(signatureBlob)]);
+          connection.end(Buffer.concat([Buffer.from([0, 0, 0, response.length]), response]));
         });
       });
       server.once('error', reject);
@@ -397,6 +433,8 @@ async function createYenteDevSshFixture(): Promise<YenteDevSshFixture> {
     signerDir,
     socketPath,
     groupDir,
+    privateKey: identity.privateKey,
+    publicKeyBlob: identity.publicKeyBlob,
     closeSocket,
     createSocket,
     async cleanup() {
@@ -414,6 +452,26 @@ function yenteDevSshConfig(socketDir: string): ContainerConfig {
     skills: 'all',
     yenteDevSshSocketDir: socketDir,
   };
+}
+
+async function signThroughFixture(fixture: YenteDevSshFixture, data: Buffer): Promise<Buffer> {
+  const payload = Buffer.concat([
+    Buffer.from([13]),
+    sshString(fixture.publicKeyBlob),
+    sshString(data),
+    Buffer.alloc(4),
+  ]);
+  const response = await new Promise<Buffer>((resolve, reject) => {
+    const client = net.createConnection(fixture.socketPath);
+    const chunks: Buffer[] = [];
+    client.once('connect', () => client.write(Buffer.concat([Buffer.from([0, 0, 0, payload.length]), payload])));
+    client.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+    client.once('end', () => resolve(Buffer.concat(chunks)));
+    client.once('error', reject);
+  });
+  const signatureBlobStart = 9;
+  const signatureStart = signatureBlobStart + 4 + response.readUInt32BE(signatureBlobStart);
+  return response.subarray(signatureStart + 4, signatureStart + 4 + response.readUInt32BE(signatureStart));
 }
 
 describe('Yente Dev fixed SSH contribution', () => {
@@ -457,19 +515,16 @@ describe('Yente Dev fixed SSH contribution', () => {
         'SSH_AUTH_SOCK=/run/yente-dev-garageserver-ssh-agent/agent.sock',
       ]);
 
-      const signature = await new Promise<Buffer>((resolve, reject) => {
-        const client = net.createConnection(fixture.socketPath);
-        const chunks: Buffer[] = [];
-        client.once('connect', () => client.write(Buffer.from([0, 0, 0, 1, 13])));
-        client.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
-        client.once('end', () => resolve(Buffer.concat(chunks)));
-        client.once('error', reject);
-      });
-      expect(signature).toEqual(Buffer.from([0, 0, 0, 1, 14]));
+      const signed = Buffer.from('first signed request');
+      expect(verify(null, signed, fixture.privateKey, await signThroughFixture(fixture, signed))).toBe(true);
       expect(fs.lstatSync(fixture.socketPath).uid).toBe(process.getuid?.());
 
       await fixture.closeSocket();
       await fixture.createSocket();
+      const signedAfterRecreate = Buffer.from('second signed request');
+      expect(
+        verify(null, signedAfterRecreate, fixture.privateKey, await signThroughFixture(fixture, signedAfterRecreate)),
+      ).toBe(true);
       expect(
         resolveYenteDevSshContribution(
           yenteDevGroup,
@@ -538,7 +593,7 @@ describe('Yente Dev fixed SSH contribution', () => {
       const identityFile = path.join(fixture.groupDir, 'ssh', 'garageserver_login.pub');
       fs.unlinkSync(identityFile);
       assertRejected();
-      fs.writeFileSync(identityFile, 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAItest yente-dev\n', { mode: 0o444 });
+      fs.writeFileSync(identityFile, `${disposableEd25519Identity().publicKey}\n`, { mode: 0o444 });
       fs.chmodSync(identityFile, 0o444);
 
       fs.chmodSync(publicFile, 0o666);
@@ -555,6 +610,117 @@ describe('Yente Dev fixed SSH contribution', () => {
       assertRejected();
     } finally {
       await fixture.cleanup();
+    }
+  });
+
+  it('rejects a symlinked public SSH directory before resolving its files', async () => {
+    const fixture = await createYenteDevSshFixture();
+    try {
+      const sshDir = path.join(fixture.groupDir, 'ssh');
+      const movedDir = path.join(fixture.root, 'moved-ssh');
+      fs.renameSync(sshDir, movedDir);
+      fs.symlinkSync(movedDir, sshDir);
+
+      expect(() =>
+        resolveYenteDevSshContribution(
+          yenteDevGroup,
+          yenteDevSshConfig(fixture.signerDir),
+          fixture.signerDir,
+          fixture.groupDir,
+        ),
+      ).toThrow(/SSH directory.*not a link/i);
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  it.each([
+    ['malformed public-key content', 'not a public identity\n'],
+    ['private-key content', '-----BEGIN OPENSSH PRIVATE KEY-----\nnot-a-key\n-----END OPENSSH PRIVATE KEY-----\n'],
+  ])('rejects %s in garageserver_login.pub', async (_label, content) => {
+    const fixture = await createYenteDevSshFixture();
+    try {
+      const identityFile = path.join(fixture.groupDir, 'ssh', 'garageserver_login.pub');
+      fs.chmodSync(identityFile, 0o644);
+      fs.writeFileSync(identityFile, content, { mode: 0o444 });
+      fs.chmodSync(identityFile, 0o444);
+
+      expect(() =>
+        resolveYenteDevSshContribution(
+          yenteDevGroup,
+          yenteDevSshConfig(fixture.signerDir),
+          fixture.signerDir,
+          fixture.groupDir,
+        ),
+      ).toThrow(/public key/i);
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+
+  it.each([
+    ['an earlier garageserver User override', ['Host garageserver', '  User wrong-user', ''].join('\n')],
+    [
+      'directives under an unrelated Host scope',
+      [
+        'Host not-garageserver',
+        '  HostName 192.168.3.150',
+        '  User yente-dev',
+        '  IdentityAgent /run/yente-dev-garageserver-ssh-agent/agent.sock',
+        '  IdentityFile /home/node/.ssh/garageserver_login.pub',
+        '  IdentitiesOnly yes',
+        '  StrictHostKeyChecking yes',
+        '  UserKnownHostsFile /home/node/.ssh/known_hosts',
+        '  BatchMode yes',
+        '',
+      ].join('\n'),
+    ],
+  ])('rejects SSH config with %s', async (_label, prefix) => {
+    const fixture = await createYenteDevSshFixture();
+    try {
+      const configPath = path.join(fixture.groupDir, 'ssh', 'config');
+      fs.chmodSync(configPath, 0o644);
+      fs.writeFileSync(configPath, `${prefix}${fs.readFileSync(configPath, 'utf8')}`, { mode: 0o444 });
+      fs.chmodSync(configPath, 0o444);
+
+      expect(() =>
+        resolveYenteDevSshContribution(
+          yenteDevGroup,
+          yenteDevSshConfig(fixture.signerDir),
+          fixture.signerDir,
+          fixture.groupDir,
+        ),
+      ).toThrow(/SSH config/i);
+    } finally {
+      await fixture.cleanup();
+    }
+  });
+});
+
+describe('Yente Dev SSH spawn cleanup', () => {
+  it('removes the managed skill root when SSH validation fails before spawn', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      const db = await import('./db/index.js');
+      db.getDb().prepare("UPDATE agent_groups SET folder = 'discord_yente-dev' WHERE id = 'ag-1'").run();
+      const groupDir = path.join(harness.groupsDir, 'discord_yente-dev');
+      fs.mkdirSync(groupDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(groupDir, 'container.json'),
+        JSON.stringify({
+          mcpServers: {},
+          packages: { apt: [], npm: [] },
+          additionalMounts: [],
+          skills: 'all',
+          yenteDevSshSocketDir: '/run/yente-dev-garageserver-ssh-agent',
+        }),
+      );
+
+      await expect(harness.containerRunner.wakeContainer(harness.session)).rejects.toThrow(/signer directory/i);
+      expect(fs.readdirSync(harness.dataDir).filter((entry) => entry.startsWith('.nanoclaw-skills-'))).toEqual([]);
+      expect(harness.spawnMock).not.toHaveBeenCalled();
+    } finally {
+      harness.close();
     }
   });
 });

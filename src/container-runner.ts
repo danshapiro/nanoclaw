@@ -386,10 +386,10 @@ async function spawnContainer(session: Session): Promise<void> {
   let skillGeneration = '';
   try {
     const buildResult = buildMounts(agentGroup, session, containerConfig, contribution);
-    const yenteDevSsh = resolveYenteDevSshContribution(agentGroup, containerConfig);
-    const mounts = [...buildResult.mounts, ...(yenteDevSsh?.mounts ?? [])];
     managedSkillsRoot = buildResult.managedSkillsRoot;
     skillGeneration = buildResult.skillGeneration;
+    const yenteDevSsh = resolveYenteDevSshContribution(agentGroup, containerConfig);
+    const mounts = [...buildResult.mounts, ...(yenteDevSsh?.mounts ?? [])];
     bridges = await attachAgentMcpBridges(agentGroup, containerConfig, mounts);
     const built = await buildContainerArgs(
       mounts,
@@ -1313,11 +1313,15 @@ export function resolveYenteDevSshContribution(
   }
   assertSocketWithoutLink(path.join(expectedSignerDir, 'agent.sock'), 'Yente Dev SSH agent socket');
 
+  assertDirectoryWithoutLink(groupDir, 'Yente Dev SSH group directory');
   const sshDir = path.join(groupDir, 'ssh');
+  assertDirectoryWithoutLink(sshDir, 'Yente Dev SSH directory');
   for (const file of YENTE_DEV_SSH_FILES) {
     assertReadOnlyRegularFileWithoutLink(path.join(sshDir, file), `Yente Dev SSH ${file}`);
   }
   assertYenteDevSshConfig(path.join(sshDir, 'config'));
+  assertYenteDevPublicKey(path.join(sshDir, 'garageserver_login.pub'));
+  assertYenteDevKnownHosts(path.join(sshDir, 'known_hosts'));
 
   return {
     mounts: [
@@ -1367,7 +1371,6 @@ function assertReadOnlyRegularFileWithoutLink(filePath: string, label: string): 
 }
 
 function assertYenteDevSshConfig(configPath: string): void {
-  const config = fs.readFileSync(configPath, 'utf8');
   const requiredLines = [
     'Host garageserver',
     'HostName 192.168.3.150',
@@ -1379,10 +1382,49 @@ function assertYenteDevSshConfig(configPath: string): void {
     'UserKnownHostsFile /home/node/.ssh/known_hosts',
     'BatchMode yes',
   ];
-  for (const line of requiredLines) {
-    if (!config.split(/\r?\n/).some((actual) => actual.trim() === line)) {
-      throw new Error(`Yente Dev SSH config is missing required directive: ${line}`);
-    }
+  const actualLines = fs
+    .readFileSync(configPath, 'utf8')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith('#'));
+  if (actualLines.length !== requiredLines.length || actualLines.some((line, index) => line !== requiredLines[index])) {
+    throw new Error('Yente Dev SSH config must contain exactly one fixed garageserver stanza');
+  }
+}
+
+function parseSshPublicKey(line: string): boolean {
+  const match = /^ssh-ed25519\s+([A-Za-z0-9+/]+={0,2})(?:\s+[^\r\n]*)?$/.exec(line.trim());
+  if (!match) return false;
+  let blob: Buffer;
+  try {
+    blob = Buffer.from(match[1], 'base64');
+  } catch {
+    return false;
+  }
+  if (blob.length !== 51 || blob.readUInt32BE(0) !== 11 || blob.subarray(4, 15).toString('utf8') !== 'ssh-ed25519')
+    return false;
+  return blob.readUInt32BE(15) === 32;
+}
+
+function assertYenteDevPublicKey(publicKeyPath: string): void {
+  if (!parseSshPublicKey(fs.readFileSync(publicKeyPath, 'utf8'))) {
+    throw new Error(`Yente Dev SSH public key must be a usable ssh-ed25519 public key: ${publicKeyPath}`);
+  }
+}
+
+function assertYenteDevKnownHosts(knownHostsPath: string): void {
+  const hasGarageHost = fs
+    .readFileSync(knownHostsPath, 'utf8')
+    .split(/\r?\n/)
+    .some((line) => {
+      const [hosts, type, key] = line.trim().split(/\s+/, 3);
+      return (
+        (hosts === '192.168.3.150' || hosts === '[192.168.3.150]:22' || hosts.split(',').includes('192.168.3.150')) &&
+        parseSshPublicKey(`${type} ${key}`)
+      );
+    });
+  if (!hasGarageHost) {
+    throw new Error(`Yente Dev SSH known_hosts must contain a usable key for 192.168.3.150: ${knownHostsPath}`);
   }
 }
 

@@ -20,6 +20,9 @@ describe('register Discord channel', () => {
       process.chdir(root);
       fs.mkdirSync(path.join(root, 'container'));
       fs.writeFileSync(path.join(root, 'container', 'CLAUDE.md'), '# Andy\nGlobal instructions\n');
+      fs.mkdirSync(path.join(root, 'groups', 'unrelated'), { recursive: true });
+      fs.writeFileSync(path.join(root, 'groups', 'unrelated', 'CLAUDE.md'), '# Andy\nUnrelated instructions\n');
+      fs.writeFileSync(path.join(root, '.env'), 'ASSISTANT_NAME="Andy"\nEXISTING_INSTANCE=unchanged\n');
       vi.resetModules();
       vi.doMock('../src/container-runner.js', () => ({ wakeContainer }));
 
@@ -52,9 +55,44 @@ describe('register Discord channel', () => {
       const group = getAgentGroupByFolder('discord_yente-dev');
       expect(group?.name).toBe('Yente Dev');
       expect(getMessagingGroupByPlatform('discord', 'parent-channel')?.platform_id).toBe('parent-channel');
-      expect(fs.existsSync(path.join(root, '.env'))).toBe(false);
-      expect(process.env.ASSISTANT_NAME).not.toBe('Yente Dev');
+      expect(fs.readFileSync(path.join(root, '.env'), 'utf8')).toBe('ASSISTANT_NAME="Andy"\nEXISTING_INSTANCE=unchanged\n');
       expect(fs.readFileSync(path.join(root, 'container', 'CLAUDE.md'), 'utf8')).toBe('# Andy\nGlobal instructions\n');
+      expect(fs.readFileSync(path.join(root, 'groups', 'unrelated', 'CLAUDE.md'), 'utf8')).toBe(
+        '# Andy\nUnrelated instructions\n',
+      );
+
+      await run([
+        '--platform-id',
+        'parent-channel',
+        '--name',
+        'Yente Dev channel',
+        '--group-name',
+        'Renamed Yente Dev',
+        '--folder',
+        'discord_yente-dev',
+        '--channel',
+        'discord',
+        '--session-mode',
+        'per-thread',
+      ]);
+      expect(getAgentGroupByFolder('discord_yente-dev')?.name).toBe('Renamed Yente Dev');
+      expect(fs.readFileSync(path.join(root, 'groups', 'unrelated', 'CLAUDE.md'), 'utf8')).toBe(
+        '# Andy\nUnrelated instructions\n',
+      );
+
+      await run([
+        '--platform-id',
+        'workspace-channel',
+        '--name',
+        'Slack channel',
+        '--folder',
+        'slack-agent',
+        '--channel',
+        'slack',
+      ]);
+      expect(getMessagingGroupByPlatform('slack', 'slack:workspace-channel')?.platform_id).toBe(
+        'slack:workspace-channel',
+      );
 
       registerChannelAdapter('discord', {
         factory: () => ({
