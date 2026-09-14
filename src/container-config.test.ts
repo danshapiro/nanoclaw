@@ -46,3 +46,17 @@ describe('initContainerConfig provider selection', () => {
     expect(fs.readFileSync(path.join(mocks.groupsDir, 'existing', 'container.json'), 'utf8')).toBe(original);
   });
 });
+
+describe('Yente Dev SSH config', () => {
+  it('preserves the fixed optional signer directory setting', () => {
+    writeContainerConfig('discord_yente-dev', {
+      mcpServers: {},
+      packages: { apt: [], npm: [] },
+      additionalMounts: [],
+      skills: 'all',
+      yenteDevSshSocketDir: '/run/yente-dev-garageserver-ssh-agent',
+    });
+
+    expect(readContainerConfig('discord_yente-dev').yenteDevSshSocketDir).toBe('/run/yente-dev-garageserver-ssh-agent');
+  });
+});

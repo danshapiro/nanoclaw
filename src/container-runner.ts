@@ -174,6 +174,11 @@ const DEFAULT_CONTAINER_MEMORY_SWAP_LIMIT = '16g';
 const DEFAULT_CONTAINER_PIDS_LIMIT = '4096';
 const CLEANUP_PROCESS_EXIT_TIMEOUT_MS = 30_000;
 const SHUTDOWN_CLIENT_EXIT_TIMEOUT_MS = 10_000;
+const YENTE_DEV_GROUP_FOLDER = 'discord_yente-dev';
+const YENTE_DEV_SIGNER_DIR = '/run/yente-dev-garageserver-ssh-agent';
+const YENTE_DEV_CONTAINER_SIGNER_DIR = '/run/yente-dev-garageserver-ssh-agent';
+const YENTE_DEV_CONTAINER_SIGNER_SOCKET = `${YENTE_DEV_CONTAINER_SIGNER_DIR}/agent.sock`;
+const YENTE_DEV_SSH_FILES = ['config', 'known_hosts', 'garageserver_login.pub'] as const;
 
 /**
  * In-flight wake promises, keyed by session id. Deduplicates concurrent
@@ -381,7 +386,8 @@ async function spawnContainer(session: Session): Promise<void> {
   let skillGeneration = '';
   try {
     const buildResult = buildMounts(agentGroup, session, containerConfig, contribution);
-    const mounts = buildResult.mounts;
+    const yenteDevSsh = resolveYenteDevSshContribution(agentGroup, containerConfig);
+    const mounts = [...buildResult.mounts, ...(yenteDevSsh?.mounts ?? [])];
     managedSkillsRoot = buildResult.managedSkillsRoot;
     skillGeneration = buildResult.skillGeneration;
     bridges = await attachAgentMcpBridges(agentGroup, containerConfig, mounts);
@@ -394,6 +400,7 @@ async function spawnContainer(session: Session): Promise<void> {
       provider,
       contribution,
       agentIdentifier,
+      yenteDevSsh?.sshAuthSock,
     );
     args = built.args;
     envFilePath = built.envFilePath;
@@ -1275,6 +1282,110 @@ async function stopAgentMcpBridges(bridges: AgentMcpBridge[]): Promise<void> {
   await Promise.allSettled(bridges.map((bridge) => bridge.stop()));
 }
 
+type YenteDevSshContribution = { mounts: VolumeMount[]; sshAuthSock: string };
+
+/**
+ * Adds the one fixed SSH-agent route for Yente Dev. This is deliberately not
+ * a general mount or environment mechanism: production callers accept only
+ * the fixed group, host signer directory, and group-owned public SSH files.
+ * The optional path arguments make the filesystem contract testable without
+ * touching the host's /run directory.
+ */
+export function resolveYenteDevSshContribution(
+  agentGroup: Pick<AgentGroup, 'folder'>,
+  containerConfig: ContainerConfig,
+  expectedSignerDir = YENTE_DEV_SIGNER_DIR,
+  groupDir = path.resolve(GROUPS_DIR, agentGroup.folder),
+): YenteDevSshContribution | null {
+  const configuredSignerDir = containerConfig.yenteDevSshSocketDir;
+  if (!configuredSignerDir) return null;
+  if (agentGroup.folder !== YENTE_DEV_GROUP_FOLDER) {
+    throw new Error('Yente Dev SSH is only available to discord_yente-dev');
+  }
+  if (configuredSignerDir !== expectedSignerDir) {
+    throw new Error(`Yente Dev SSH signer directory must be ${expectedSignerDir}`);
+  }
+
+  assertDirectoryWithoutLink(expectedSignerDir, 'Yente Dev SSH signer directory');
+  const signerEntries = fs.readdirSync(expectedSignerDir);
+  if (signerEntries.length !== 1 || signerEntries[0] !== 'agent.sock') {
+    throw new Error('Yente Dev SSH signer directory may contain only agent.sock');
+  }
+  assertSocketWithoutLink(path.join(expectedSignerDir, 'agent.sock'), 'Yente Dev SSH agent socket');
+
+  const sshDir = path.join(groupDir, 'ssh');
+  for (const file of YENTE_DEV_SSH_FILES) {
+    assertReadOnlyRegularFileWithoutLink(path.join(sshDir, file), `Yente Dev SSH ${file}`);
+  }
+  assertYenteDevSshConfig(path.join(sshDir, 'config'));
+
+  return {
+    mounts: [
+      { hostPath: expectedSignerDir, containerPath: YENTE_DEV_CONTAINER_SIGNER_DIR, readonly: true },
+      { hostPath: path.join(sshDir, 'config'), containerPath: '/home/node/.ssh/config', readonly: true },
+      { hostPath: path.join(sshDir, 'known_hosts'), containerPath: '/home/node/.ssh/known_hosts', readonly: true },
+      {
+        hostPath: path.join(sshDir, 'garageserver_login.pub'),
+        containerPath: '/home/node/.ssh/garageserver_login.pub',
+        readonly: true,
+      },
+    ],
+    sshAuthSock: YENTE_DEV_CONTAINER_SIGNER_SOCKET,
+  };
+}
+
+function lstatExisting(filePath: string, label: string): fs.Stats {
+  try {
+    return fs.lstatSync(filePath);
+  } catch (err) {
+    throw new Error(`${label} is missing: ${filePath}`, { cause: err });
+  }
+}
+
+function assertDirectoryWithoutLink(filePath: string, label: string): void {
+  const stat = lstatExisting(filePath, label);
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new Error(`${label} must be a directory, not a link: ${filePath}`);
+  }
+}
+
+function assertSocketWithoutLink(filePath: string, label: string): void {
+  const stat = lstatExisting(filePath, label);
+  if (stat.isSymbolicLink() || !stat.isSocket()) {
+    throw new Error(`${label} must be a Unix socket, not a link: ${filePath}`);
+  }
+}
+
+function assertReadOnlyRegularFileWithoutLink(filePath: string, label: string): void {
+  const stat = lstatExisting(filePath, label);
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    throw new Error(`${label} must be a regular file, not a link: ${filePath}`);
+  }
+  if ((stat.mode & 0o222) !== 0) {
+    throw new Error(`${label} must not be writable: ${filePath}`);
+  }
+}
+
+function assertYenteDevSshConfig(configPath: string): void {
+  const config = fs.readFileSync(configPath, 'utf8');
+  const requiredLines = [
+    'Host garageserver',
+    'HostName 192.168.3.150',
+    'User yente-dev',
+    `IdentityAgent ${YENTE_DEV_CONTAINER_SIGNER_SOCKET}`,
+    'IdentityFile /home/node/.ssh/garageserver_login.pub',
+    'IdentitiesOnly yes',
+    'StrictHostKeyChecking yes',
+    'UserKnownHostsFile /home/node/.ssh/known_hosts',
+    'BatchMode yes',
+  ];
+  for (const line of requiredLines) {
+    if (!config.split(/\r?\n/).some((actual) => actual.trim() === line)) {
+      throw new Error(`Yente Dev SSH config is missing required directive: ${line}`);
+    }
+  }
+}
+
 function buildMounts(
   agentGroup: AgentGroup,
   session: Session,
@@ -1694,6 +1805,7 @@ async function buildContainerArgs(
   _provider: string,
   providerContribution: ProviderContainerContribution,
   agentIdentifier?: string,
+  sshAuthSock?: string,
 ): Promise<{ args: string[]; envFilePath: string }> {
   const args: string[] = [
     'run',
@@ -1726,6 +1838,7 @@ async function buildContainerArgs(
   args.push('-e', `NANOCLAW_SESSION_ID=${sessionId}`);
   args.push('-e', `NANOCLAW_AGENT_GROUP_ID=${agentGroup.id}`);
   args.push('-e', `NANOCLAW_AGENT_GROUP_FOLDER=${agentGroup.folder}`);
+  addYenteDevSshEnv(args, sshAuthSock);
 
   // R9: container-side session-DB busy-timeout knob (runner defaults to 30s).
   const containerSqliteBusyTimeoutMs = process.env.NANOCLAW_CONTAINER_SQLITE_BUSY_TIMEOUT_MS;
@@ -1818,6 +1931,12 @@ async function buildContainerArgs(
 
   const envFilePath = path.join(containerEnvDir(), `${containerName}.env`);
   return { args: extractDockerEnvArgsToFile(args, envFilePath), envFilePath };
+}
+
+/** Adds the sole Yente Dev SSH environment value when its fixed contribution is active. */
+export function addYenteDevSshEnv(args: string[], sshAuthSock?: string): string[] {
+  if (sshAuthSock) args.push('-e', `SSH_AUTH_SOCK=${sshAuthSock}`);
+  return args;
 }
 
 // Bounded retry for the single OneCLI gateway choke point. Post-restart wake
