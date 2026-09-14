@@ -1331,13 +1331,14 @@ export function resolveYenteDevSshContribution(
   }
   assertSocketWithoutLink(path.join(signerDir, 'agent.sock'), 'Yente Dev SSH agent socket');
 
+  const canonicalGroupDir = canonicalizeYenteDevGroupDir(groupDir);
   assertPathComponentsWithoutLinks(
-    path.dirname(groupDir),
-    [path.basename(groupDir), 'ssh'],
+    path.dirname(canonicalGroupDir),
+    [path.basename(canonicalGroupDir), 'ssh'],
     'Yente Dev SSH group directory',
   );
-  assertDirectoryWithoutLink(groupDir, 'Yente Dev SSH group directory');
-  const sshDir = path.join(groupDir, 'ssh');
+  assertDirectoryWithoutLink(canonicalGroupDir, 'Yente Dev SSH group directory');
+  const sshDir = path.join(canonicalGroupDir, 'ssh');
   assertDirectoryWithoutLink(sshDir, 'Yente Dev SSH directory');
   for (const file of YENTE_DEV_SSH_FILES) {
     assertReadOnlyRegularFileWithoutLink(path.join(sshDir, file), `Yente Dev SSH ${file}`);
@@ -1359,6 +1360,20 @@ export function resolveYenteDevSshContribution(
     ],
     sshAuthSock: YENTE_DEV_CONTAINER_SIGNER_SOCKET,
   };
+}
+
+function canonicalizeYenteDevGroupDir(groupDir: string): string {
+  const groupRoot = path.dirname(groupDir);
+  let canonicalGroupRoot: string;
+  try {
+    // A deployed release exposes the persistent group root through
+    // releases/<sha>/groups -> shared/groups. Resolve only that boundary;
+    // the actual group directory and its SSH contribution remain link-free.
+    canonicalGroupRoot = fs.realpathSync(groupRoot);
+  } catch (err) {
+    throw new Error(`Yente Dev SSH group directory boundary is missing: ${groupRoot}`, { cause: err });
+  }
+  return path.join(canonicalGroupRoot, path.basename(groupDir));
 }
 
 function lstatExisting(filePath: string, label: string): fs.Stats {

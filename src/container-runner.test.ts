@@ -103,6 +103,7 @@ type StartBridgeResult = {
 
 async function loadContainerRunnerHarness(
   options: {
+    releaseGroupsAlias?: boolean;
     mcpConfigForGroup?: (folder: string) => AgentMcpConfigForGroup;
     startBridge?: (
       opts: AgentMcpBridgeOptions,
@@ -118,9 +119,18 @@ async function loadContainerRunnerHarness(
 ) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-container-runner-'));
   const dataDir = path.join(root, 'data');
-  const groupsDir = path.join(root, 'groups');
+  const groupsDir = options.releaseGroupsAlias
+    ? path.join(root, 'releases', 'test-release', 'groups')
+    : path.join(root, 'groups');
   fs.mkdirSync(dataDir, { recursive: true });
-  fs.mkdirSync(groupsDir, { recursive: true });
+  if (options.releaseGroupsAlias) {
+    const sharedGroupsDir = path.join(root, 'shared', 'groups');
+    fs.mkdirSync(sharedGroupsDir, { recursive: true });
+    fs.mkdirSync(path.dirname(groupsDir), { recursive: true });
+    fs.symlinkSync(sharedGroupsDir, groupsDir, 'dir');
+  } else {
+    fs.mkdirSync(groupsDir, { recursive: true });
+  }
 
   const oneCliStarted = deferred();
   const oneCliRelease = deferred();
@@ -645,22 +655,39 @@ describe('Yente Dev fixed SSH contribution', () => {
     }
   });
 
-  it('rejects a symlinked containing groups directory before resolving the group path', async () => {
+  it('canonicalizes the deployed release groups alias but rejects a symlinked actual group directory', async () => {
     const fixture = await createYenteDevSshFixture();
     try {
-      const groupsDir = path.dirname(fixture.groupDir);
-      const movedGroupsDir = path.join(fixture.root, 'actual-groups');
-      fs.renameSync(groupsDir, movedGroupsDir);
-      fs.symlinkSync(movedGroupsDir, groupsDir);
+      const sharedGroupsDir = path.dirname(fixture.groupDir);
+      const releaseGroupsDir = path.join(fixture.root, 'releases', 'test-release', 'groups');
+      fs.mkdirSync(path.dirname(releaseGroupsDir), { recursive: true });
+      fs.symlinkSync(sharedGroupsDir, releaseGroupsDir, 'dir');
+      const releaseGroupDir = path.join(releaseGroupsDir, 'discord_yente-dev');
+
+      const contribution = resolveYenteDevSshContribution(
+        yenteDevGroup,
+        yenteDevSshConfig(fixture.signerDir),
+        fixture.signerDir,
+        releaseGroupDir,
+      );
+      expect(contribution?.mounts).toContainEqual({
+        hostPath: path.join(fixture.groupDir, 'ssh', 'config'),
+        containerPath: '/home/node/.ssh/config',
+        readonly: true,
+      });
+
+      const movedGroupDir = path.join(fixture.root, 'moved-group');
+      fs.renameSync(fixture.groupDir, movedGroupDir);
+      fs.symlinkSync(movedGroupDir, fixture.groupDir, 'dir');
 
       expect(() =>
         resolveYenteDevSshContribution(
           yenteDevGroup,
           yenteDevSshConfig(fixture.signerDir),
           fixture.signerDir,
-          fixture.groupDir,
+          releaseGroupDir,
         ),
-      ).toThrow(/group directory boundary.*not a link/i);
+      ).toThrow(/group directory path component.*link/i);
     } finally {
       await fixture.cleanup();
     }
@@ -753,18 +780,19 @@ describe('Yente Dev fixed SSH contribution', () => {
 });
 
 describe('Yente Dev SSH spawn cleanup', () => {
-  it('passes the fixed SSH contribution through the real Yente Dev spawn and omits it for an unrelated group', async () => {
+  it('passes the fixed SSH contribution through the real Yente Dev spawn from the deployed release groups alias', async () => {
     const fixture = await createYenteDevSshFixture();
     try {
-      const harness = await loadContainerRunnerHarness();
+      const harness = await loadContainerRunnerHarness({ releaseGroupsAlias: true });
       try {
         const db = await import('./db/index.js');
         db.getDb().prepare("UPDATE agent_groups SET folder = 'discord_yente-dev' WHERE id = 'ag-1'").run();
-        const groupDir = path.join(harness.groupsDir, 'discord_yente-dev');
-        fs.mkdirSync(groupDir, { recursive: true });
-        fs.cpSync(path.join(fixture.groupDir, 'ssh'), path.join(groupDir, 'ssh'), { recursive: true });
+        expect(fs.lstatSync(harness.groupsDir).isSymbolicLink()).toBe(true);
+        const releaseGroupDir = path.join(harness.groupsDir, 'discord_yente-dev');
+        fs.mkdirSync(releaseGroupDir, { recursive: true });
+        fs.cpSync(path.join(fixture.groupDir, 'ssh'), path.join(releaseGroupDir, 'ssh'), { recursive: true });
         fs.writeFileSync(
-          path.join(groupDir, 'container.json'),
+          path.join(releaseGroupDir, 'container.json'),
           JSON.stringify({
             mcpServers: {},
             packages: { apt: [], npm: [] },
@@ -786,6 +814,7 @@ describe('Yente Dev SSH spawn cleanup', () => {
         await wake;
 
         const args = harness.spawnMock.mock.calls[0][1] as string[];
+        const groupDir = fs.realpathSync(releaseGroupDir);
         const signerMount = fixture.signerDir + ':/run/yente-dev-garageserver-ssh-agent:ro';
         const configMount = path.join(groupDir, 'ssh', 'config') + ':/home/node/.ssh/config:ro';
         const knownHostsMount = path.join(groupDir, 'ssh', 'known_hosts') + ':/home/node/.ssh/known_hosts:ro';
