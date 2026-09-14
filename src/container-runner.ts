@@ -179,6 +179,12 @@ const YENTE_DEV_SIGNER_DIR = '/run/yente-dev-garageserver-ssh-agent';
 const YENTE_DEV_CONTAINER_SIGNER_DIR = '/run/yente-dev-garageserver-ssh-agent';
 const YENTE_DEV_CONTAINER_SIGNER_SOCKET = `${YENTE_DEV_CONTAINER_SIGNER_DIR}/agent.sock`;
 const YENTE_DEV_SSH_FILES = ['config', 'known_hosts', 'garageserver_login.pub'] as const;
+let yenteDevSshSignerDirForTests: string | undefined;
+
+/** Keeps the production route fixed while letting the mocked spawn harness use a disposable signer directory. */
+export function setYenteDevSshSignerDirForTests(signerDir?: string): void {
+  yenteDevSshSignerDirForTests = signerDir;
+}
 
 /**
  * In-flight wake promises, keyed by session id. Deduplicates concurrent
@@ -388,7 +394,13 @@ async function spawnContainer(session: Session): Promise<void> {
     const buildResult = buildMounts(agentGroup, session, containerConfig, contribution);
     managedSkillsRoot = buildResult.managedSkillsRoot;
     skillGeneration = buildResult.skillGeneration;
-    const yenteDevSsh = resolveYenteDevSshContribution(agentGroup, containerConfig);
+    const yenteDevSsh = resolveYenteDevSshContribution(
+      agentGroup,
+      containerConfig,
+      YENTE_DEV_SIGNER_DIR,
+      undefined,
+      yenteDevSshSignerDirForTests,
+    );
     const mounts = [...buildResult.mounts, ...(yenteDevSsh?.mounts ?? [])];
     bridges = await attachAgentMcpBridges(agentGroup, containerConfig, mounts);
     const built = await buildContainerArgs(
@@ -1296,6 +1308,7 @@ export function resolveYenteDevSshContribution(
   containerConfig: ContainerConfig,
   expectedSignerDir = YENTE_DEV_SIGNER_DIR,
   groupDir = path.resolve(GROUPS_DIR, agentGroup.folder),
+  signerDir = expectedSignerDir,
 ): YenteDevSshContribution | null {
   const configuredSignerDir = containerConfig.yenteDevSshSocketDir;
   if (!configuredSignerDir) return null;
@@ -1306,13 +1319,23 @@ export function resolveYenteDevSshContribution(
     throw new Error(`Yente Dev SSH signer directory must be ${expectedSignerDir}`);
   }
 
-  assertDirectoryWithoutLink(expectedSignerDir, 'Yente Dev SSH signer directory');
-  const signerEntries = fs.readdirSync(expectedSignerDir);
+  assertPathComponentsWithoutLinks(
+    path.dirname(signerDir),
+    [path.basename(signerDir), 'agent.sock'],
+    'Yente Dev SSH signer directory',
+  );
+  assertDirectoryWithoutLink(signerDir, 'Yente Dev SSH signer directory');
+  const signerEntries = fs.readdirSync(signerDir);
   if (signerEntries.length !== 1 || signerEntries[0] !== 'agent.sock') {
     throw new Error('Yente Dev SSH signer directory may contain only agent.sock');
   }
-  assertSocketWithoutLink(path.join(expectedSignerDir, 'agent.sock'), 'Yente Dev SSH agent socket');
+  assertSocketWithoutLink(path.join(signerDir, 'agent.sock'), 'Yente Dev SSH agent socket');
 
+  assertPathComponentsWithoutLinks(
+    path.dirname(groupDir),
+    [path.basename(groupDir), 'ssh'],
+    'Yente Dev SSH group directory',
+  );
   assertDirectoryWithoutLink(groupDir, 'Yente Dev SSH group directory');
   const sshDir = path.join(groupDir, 'ssh');
   assertDirectoryWithoutLink(sshDir, 'Yente Dev SSH directory');
@@ -1325,7 +1348,7 @@ export function resolveYenteDevSshContribution(
 
   return {
     mounts: [
-      { hostPath: expectedSignerDir, containerPath: YENTE_DEV_CONTAINER_SIGNER_DIR, readonly: true },
+      { hostPath: signerDir, containerPath: YENTE_DEV_CONTAINER_SIGNER_DIR, readonly: true },
       { hostPath: path.join(sshDir, 'config'), containerPath: '/home/node/.ssh/config', readonly: true },
       { hostPath: path.join(sshDir, 'known_hosts'), containerPath: '/home/node/.ssh/known_hosts', readonly: true },
       {
@@ -1350,6 +1373,18 @@ function assertDirectoryWithoutLink(filePath: string, label: string): void {
   const stat = lstatExisting(filePath, label);
   if (stat.isSymbolicLink() || !stat.isDirectory()) {
     throw new Error(`${label} must be a directory, not a link: ${filePath}`);
+  }
+}
+
+function assertPathComponentsWithoutLinks(boundaryPath: string, components: string[], label: string): void {
+  assertDirectoryWithoutLink(boundaryPath, `${label} boundary`);
+  let currentPath = boundaryPath;
+  for (const component of components) {
+    currentPath = path.join(currentPath, component);
+    const stat = lstatExisting(currentPath, label);
+    if (stat.isSymbolicLink()) {
+      throw new Error(`${label} path component must not be a link: ${currentPath}`);
+    }
   }
 }
 
@@ -1418,10 +1453,7 @@ function assertYenteDevKnownHosts(knownHostsPath: string): void {
     .split(/\r?\n/)
     .some((line) => {
       const [hosts, type, key] = line.trim().split(/\s+/, 3);
-      return (
-        (hosts === '192.168.3.150' || hosts === '[192.168.3.150]:22' || hosts.split(',').includes('192.168.3.150')) &&
-        parseSshPublicKey(`${type} ${key}`)
-      );
+      return hosts.split(',').includes('192.168.3.150') && parseSshPublicKey(`${type} ${key}`);
     });
   if (!hasGarageHost) {
     throw new Error(`Yente Dev SSH known_hosts must contain a usable key for 192.168.3.150: ${knownHostsPath}`);

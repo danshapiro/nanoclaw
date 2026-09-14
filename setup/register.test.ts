@@ -2,6 +2,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
+import { Message, parseMarkdown } from 'chat';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const originalCwd = process.cwd();
@@ -31,6 +32,8 @@ describe('register Discord channel', () => {
       const { registerChannelAdapter, initChannelAdapters, teardownChannelAdapters } =
         await import('../src/channels/channel-registry.js');
       const { routeInbound } = await import('../src/router.js');
+      const { createChatSdkBridge } = await import('../src/channels/chat-sdk-bridge.js');
+      const { createDiscordHandledTracker, wrapYenteDiscordChannelIds } = await import('../src/channels/discord.js');
       const { getMessagingGroupByPlatform } = await import('../src/db/messaging-groups.js');
       const { getAgentGroupByFolder } = await import('../src/db/agent-groups.js');
       const { getSessionsByAgentGroup } = await import('../src/db/sessions.js');
@@ -76,6 +79,7 @@ describe('register Discord channel', () => {
         'per-thread',
       ]);
       expect(getAgentGroupByFolder('discord_yente-dev')?.name).toBe('Renamed Yente Dev');
+      expect(fs.readFileSync(path.join(root, '.env'), 'utf8')).toBe('ASSISTANT_NAME="Andy"\nEXISTING_INSTANCE=unchanged\n');
       expect(fs.readFileSync(path.join(root, 'groups', 'unrelated', 'CLAUDE.md'), 'utf8')).toBe(
         '# Andy\nUnrelated instructions\n',
       );
@@ -94,32 +98,102 @@ describe('register Discord channel', () => {
         'slack:workspace-channel',
       );
 
-      registerChannelAdapter('discord', {
-        factory: () => ({
-          name: 'test-discord',
-          channelType: 'discord',
-          supportsThreads: true,
-          setup: async () => {},
-          teardown: async () => {},
-          isConnected: () => true,
-          deliver: async () => undefined,
-        }),
-      });
-      await initChannelAdapters(() => ({}), { firstAttemptWaitMs: 0 });
-
-      for (const threadId of ['thread-one', 'thread-two']) {
-        await routeInbound({
-          channelType: 'discord',
-          platformId: 'parent-channel',
-          threadId,
-          message: {
-            id: `message-${threadId}`,
-            kind: 'chat-sdk',
-            timestamp: new Date().toISOString(),
-            content: JSON.stringify({ text: 'start work' }),
-            isGroup: true,
+      const handledTracker = createDiscordHandledTracker();
+      let chat: {
+        handleIncomingMessage(adapter: unknown, threadId: string, message: Message): Promise<void>;
+      } | null = null;
+      const discordSdkAdapter = {
+        name: 'discord',
+        userName: 'yente-dev-test',
+        initialize: async (instance: unknown) => {
+          chat = instance as typeof chat;
+        },
+        channelIdFromThreadId: (threadId: string) => threadId,
+        postMessage: vi.fn(async () => ({ id: 'outbound-message' })),
+        editMessage: vi.fn(async () => undefined),
+        deleteMessage: vi.fn(async () => undefined),
+        addReaction: vi.fn(async () => undefined),
+        removeReaction: vi.fn(async () => undefined),
+        startTyping: vi.fn(async () => undefined),
+        handleForwardedMessage: vi.fn(
+          async (event: { id: string; channel_id: string; author: { id: string }; content: string }) => {
+            if (!chat) throw new Error('Chat SDK did not initialize the Discord adapter');
+            await chat.handleIncomingMessage(
+              discordSdkAdapter,
+              event.channel_id,
+              new Message({
+                id: event.id,
+                threadId: event.channel_id,
+                text: event.content,
+                formatted: parseMarkdown(event.content),
+                raw: event,
+                author: {
+                  userId: event.author.id,
+                  userName: event.author.id,
+                  fullName: event.author.id,
+                  isBot: false,
+                  isMe: false,
+                },
+                metadata: { dateSent: new Date(), edited: false },
+                attachments: [],
+              }),
+            );
           },
-        });
+        ),
+      };
+      const wrappedDiscordAdapter = wrapYenteDiscordChannelIds(discordSdkAdapter as never, 'test-token', new Set(), {
+        routeLeaseMs: 120000,
+        wasMessageHandled: handledTracker.wasHandled,
+      });
+      const discordBridge = createChatSdkBridge({
+        adapter: wrappedDiscordAdapter as never,
+        supportsThreads: true,
+        onInboundForwarded: handledTracker.noteHandled,
+      });
+      registerChannelAdapter('discord', {
+        factory: () => discordBridge,
+      });
+      await initChannelAdapters(
+        (adapter) => ({
+          onInbound: (platformId, threadId, message) =>
+            routeInbound({
+              channelType: adapter.channelType,
+              platformId,
+              threadId,
+              message: {
+                ...message,
+                content: JSON.stringify(message.content),
+              },
+            }),
+          onInboundEvent: async () => {},
+          onMetadata: () => {},
+          onAction: () => {},
+        }),
+        { firstAttemptWaitMs: 0 },
+      );
+
+      if (!chat) throw new Error('Chat SDK did not initialize the Discord bridge');
+      const wrappedForwarder = wrappedDiscordAdapter as unknown as {
+        handleForwardedMessage(event: unknown, options: unknown): Promise<void>;
+      };
+      const discordThreadIds = [
+        'discord:guild-1:parent-channel:thread-one',
+        'discord:guild-1:parent-channel:thread-two',
+      ];
+
+      for (const threadId of discordThreadIds) {
+        await wrappedForwarder.handleForwardedMessage(
+          {
+            id: `message-${threadId}`,
+            channel_id: threadId,
+            guild_id: 'guild-1',
+            author: { id: 'user-1', bot: false },
+            content: 'start work',
+            mentions: [],
+            attachments: [],
+          },
+          {},
+        );
       }
 
       expect(
@@ -127,7 +201,7 @@ describe('register Discord channel', () => {
           .map((session) => session.thread_id)
           .filter((threadId): threadId is string => threadId !== null)
           .sort(),
-      ).toEqual(['thread-one', 'thread-two']);
+      ).toEqual(discordThreadIds);
       expect(wakeContainer).toHaveBeenCalledTimes(2);
       await teardownChannelAdapters();
       db.closeDb();
