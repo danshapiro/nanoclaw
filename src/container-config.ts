@@ -76,6 +76,8 @@ export interface ContainerConfig {
   reasoningEffort?: string;
   /** Per-group Codex credential and egress paths, managed by host tooling. */
   codex?: CodexContainerConfig;
+  /** Fixed signer directory for the Yente Dev garage SSH route only. */
+  yenteDevSshSocketDir?: string;
 }
 
 function emptyConfig(provider?: string): ContainerConfig {
@@ -123,6 +125,7 @@ export function readContainerConfig(folder: string): ContainerConfig {
       agentGroupId: raw.agentGroupId,
       maxMessagesPerPrompt: raw.maxMessagesPerPrompt,
       codex: raw.codex,
+      yenteDevSshSocketDir: raw.yenteDevSshSocketDir,
     };
   } catch (err) {
     console.error(`[container-config] failed to parse ${p}: ${String(err)}`);

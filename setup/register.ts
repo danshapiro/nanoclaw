@@ -10,7 +10,7 @@ import path from 'path';
 import { DATA_DIR, DEFAULT_AGENT_PROVIDER } from '../src/config.js';
 import { initDb } from '../src/db/connection.js';
 import { runMigrations } from '../src/db/migrations/index.js';
-import { createAgentGroup, getAgentGroupByFolder } from '../src/db/agent-groups.js';
+import { createAgentGroup, getAgentGroupByFolder, updateAgentGroup } from '../src/db/agent-groups.js';
 import {
   createMessagingGroup,
   createMessagingGroupAgent,
@@ -39,6 +39,8 @@ interface RegisterArgs {
   requiresTrigger: boolean;
   /** Display name for the assistant */
   assistantName: string;
+  /** Display name for this group only */
+  groupName: string;
   /** Session mode: 'shared' (one session per channel) or 'per-thread' */
   sessionMode: string;
 }
@@ -52,6 +54,7 @@ function parseArgs(args: string[]): RegisterArgs {
     channel: 'discord',
     requiresTrigger: false,
     assistantName: 'Andy',
+    groupName: '',
     sessionMode: 'shared',
   };
 
@@ -77,6 +80,9 @@ function parseArgs(args: string[]): RegisterArgs {
         break;
       case '--assistant-name':
         result.assistantName = args[++i] || 'Andy';
+        break;
+      case '--group-name':
+        result.groupName = args[++i] || '';
         break;
       case '--session-mode':
         result.sessionMode = args[++i] || 'shared';
@@ -115,8 +121,12 @@ export async function run(args: string[]): Promise<void> {
 
   // Normalize platform_id to the same shape the adapter will emit at runtime,
   // so the router's (channel_type, platform_id) lookup matches what we store.
-  // Chat SDK adapters prefix, native adapters (WhatsApp/iMessage/Signal) don't.
-  parsed.platformId = namespacedPlatformId(parsed.channel, parsed.platformId);
+  // Discord uses the bare parent channel ID; its threaded adapter routes every
+  // thread through that parent. Other Chat SDK and native channels retain the
+  // established normalization behavior.
+  if (parsed.channel !== 'discord') {
+    parsed.platformId = namespacedPlatformId(parsed.channel, parsed.platformId);
+  }
 
   log.info('Registering channel', parsed);
 
@@ -133,7 +143,7 @@ export async function run(args: string[]): Promise<void> {
     const agId = generateId('ag');
     createAgentGroup({
       id: agId,
-      name: parsed.assistantName,
+      name: parsed.groupName || parsed.assistantName,
       folder: parsed.folder,
       agent_provider: null,
       created_at: new Date().toISOString(),
@@ -141,6 +151,10 @@ export async function run(args: string[]): Promise<void> {
     agentGroup = getAgentGroupByFolder(parsed.folder)!;
     createdAgentGroup = true;
     log.info('Created agent group', { id: agId, folder: parsed.folder });
+  } else if (parsed.groupName && agentGroup.name !== parsed.groupName) {
+    updateAgentGroup(agentGroup.id, { name: parsed.groupName });
+    agentGroup = getAgentGroupByFolder(parsed.folder)!;
+    log.info('Updated agent group display name', { id: agentGroup.id, folder: parsed.folder, name: parsed.groupName });
   }
   initGroupFilesystem(agentGroup, createdAgentGroup ? { provider: DEFAULT_AGENT_PROVIDER } : undefined);
 
@@ -196,7 +210,12 @@ export async function run(args: string[]): Promise<void> {
 
   // 4. Send onboarding message — only on first wiring, not re-registration
   if (newlyWired) {
-    const { session } = resolveSession(agentGroup.id, messagingGroup.id, null, parsed.sessionMode as 'shared' | 'per-thread' | 'agent-shared');
+    const { session } = resolveSession(
+      agentGroup.id,
+      messagingGroup.id,
+      null,
+      parsed.sessionMode as 'shared' | 'per-thread' | 'agent-shared',
+    );
     writeSessionMessage(agentGroup.id, session.id, {
       id: generateId('onboard'),
       kind: 'task',
