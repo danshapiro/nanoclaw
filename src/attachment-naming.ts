@@ -59,7 +59,7 @@ export function extForMime(mime: unknown): string {
 
 export function deriveAttachmentName(att: Record<string, unknown>): string {
   const explicit = att.name;
-  if (typeof explicit === 'string' && explicit) return explicit;
+  if (typeof explicit === 'string' && explicit.trim().length > 0) return explicit;
   let ext = extForMime(att.mimeType);
   if (!ext && typeof att.type === 'string') {
     ext = TYPE_TO_EXT[att.type.toLowerCase()] ?? '';

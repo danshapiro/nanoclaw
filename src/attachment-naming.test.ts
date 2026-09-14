@@ -34,12 +34,15 @@ describe('deriveAttachmentName', () => {
     expect(deriveAttachmentName({ name: 'photo.jpg', mimeType: 'application/pdf' })).toBe('photo.jpg');
   });
 
-  it('ignores empty / non-string explicit name and falls through to derivation', () => {
+  it('ignores empty / whitespace-only / non-string explicit name and falls through to derivation', () => {
     const out = deriveAttachmentName({ name: '', mimeType: 'application/pdf' });
     expect(out).toMatch(/^attachment-\d+\.pdf$/);
 
     const out2 = deriveAttachmentName({ name: 42, mimeType: 'application/pdf' });
     expect(out2).toMatch(/^attachment-\d+\.pdf$/);
+
+    const out3 = deriveAttachmentName({ name: '   ', mimeType: 'image/png' });
+    expect(out3).toMatch(/^attachment-\d+\.png$/);
   });
 
   it('derives extension from mimeType when no name', () => {
