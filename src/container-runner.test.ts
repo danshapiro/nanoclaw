@@ -881,7 +881,8 @@ describe('Yente Dev SSH spawn cleanup', () => {
     }
   });
 
-  it('removes the managed skill root when SSH validation fails before spawn', async () => {
+  it('removes the managed skill root when group SSH inputs fail before spawn', async () => {
+    const fixture = await createYenteDevSshFixture();
     const harness = await loadContainerRunnerHarness();
     try {
       const db = await import('./db/index.js');
@@ -899,11 +900,23 @@ describe('Yente Dev SSH spawn cleanup', () => {
         }),
       );
 
-      await expect(harness.containerRunner.wakeContainer(harness.session)).rejects.toThrow(/signer directory/i);
+      const testableRunner = harness.containerRunner as typeof harness.containerRunner & {
+        setYenteDevSshSignerDirForTests(signerDir?: string): void;
+      };
+      testableRunner.setYenteDevSshSignerDirForTests(fixture.signerDir);
+
+      await expect(harness.containerRunner.wakeContainer(harness.session)).rejects.toThrow(
+        /Yente Dev SSH group directory/i,
+      );
       expect(fs.readdirSync(harness.dataDir).filter((entry) => entry.startsWith('.nanoclaw-skills-'))).toEqual([]);
       expect(harness.spawnMock).not.toHaveBeenCalled();
     } finally {
+      const testableRunner = harness.containerRunner as typeof harness.containerRunner & {
+        setYenteDevSshSignerDirForTests(signerDir?: string): void;
+      };
+      testableRunner.setYenteDevSshSignerDirForTests?.();
       harness.close();
+      await fixture.cleanup();
     }
   });
 });
