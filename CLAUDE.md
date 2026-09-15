@@ -128,6 +128,8 @@ Symptom: container starts, the proxy + CA cert are wired correctly, but the agen
 
 The SDK does not expose `setSecretMode` — the only fix is the CLI (or the web UI at `http://127.0.0.1:10254`).
 
+Yente auto-grants two pools at every container spawn (`ensureOneCliAgentSecretAccess` in `src/yente/service-env.ts`): the REQUIRED fail-closed list plus the OPTIONAL research/browser records (`Tavily`, `Exa`, `Firecrawl`, `Browser Use` — granted when they exist in the vault, skipped without error when they do not). A new agent group therefore self-heals both pools on its first spawn; the CLI/web-UI grant path is only needed for records outside those pools or to make a grant take effect before the next spawn.
+
 ```bash
 # Find the agent (identifier is the agent group id)
 onecli agents list

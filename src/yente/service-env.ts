@@ -40,6 +40,14 @@ export const REQUIRED_YENTE_ONECLI_SECRET_NAMES = [
   'AssemblyAI',
   'Vercel',
 ] as const;
+
+// Optional research/browser capability records. Unlike REQUIRED, these are
+// granted when they exist in the vault and skipped (no error) when they do
+// not — a deployment may legitimately run without any of them. Auto-granting
+// them at spawn keeps newly registered groups from silently missing the
+// enrichment pool (the 2026-09-14 threaded/dev 401s); manual one-off grant
+// waves are no longer the only delivery path.
+export const OPTIONAL_YENTE_ONECLI_SECRET_NAMES = ['Tavily', 'Exa', 'Firecrawl', 'Browser Use'] as const;
 export const ONECLI_MANAGED_PLACEHOLDER = 'onecli-managed';
 function requireEnvValue(env: NodeJS.ProcessEnv, key: string): string {
   const value = env[key]?.trim();
@@ -157,12 +165,14 @@ export async function ensureOneCliAgentSecretAccess(options: {
   onecliGatewayUrl?: string;
   agentIdentifier: string;
   secretNames?: readonly string[];
+  optionalSecretNames?: readonly string[];
   fetchImpl?: FetchLike;
 }): Promise<void> {
   const onecliUrl = options.onecliUrl.replace(/\/+$/, '');
   const onecliGatewayUrl = options.onecliGatewayUrl ?? process.env.ONECLI_GATEWAY_URL?.replace(/\/+$/, '');
   const fetchImpl = options.fetchImpl ?? fetch;
   const secretNames = options.secretNames ?? REQUIRED_YENTE_ONECLI_SECRET_NAMES;
+  const optionalSecretNames = options.optionalSecretNames ?? OPTIONAL_YENTE_ONECLI_SECRET_NAMES;
   const headers = {
     Authorization: `Bearer ${options.onecliApiKey}`,
     'Content-Type': 'application/json',
@@ -185,6 +195,13 @@ export async function ensureOneCliAgentSecretAccess(options: {
     );
   }
 
+  // Optional records are granted only when they exist; an absent optional
+  // record is a normal deployment state, never an error.
+  const optionalIds = optionalSecretNames.flatMap((name) => {
+    const secret = secrets.find((candidate) => candidate.name === name);
+    return secret ? [secret.id] : [];
+  });
+
   const agent = agents.find((candidate) => candidate.identifier === options.agentIdentifier);
   if (!agent) {
     throw new Error(`OneCLI agent ${options.agentIdentifier} was not found after ensureAgent.`);
@@ -195,7 +212,7 @@ export async function ensureOneCliAgentSecretAccess(options: {
     if (!secret) throw new Error('internal error: required OneCLI secret lookup unexpectedly failed');
     return secret.id;
   });
-  const desiredIds = [...new Set([...existingIds, ...requiredIds])];
+  const desiredIds = [...new Set([...existingIds, ...requiredIds, ...optionalIds])];
   if (desiredIds.length === existingIds.length && desiredIds.every((id) => existingIds.includes(id))) {
     return;
   }

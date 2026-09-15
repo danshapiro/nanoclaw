@@ -5,6 +5,7 @@ import {
   buildNoProxy,
   ensureOneCliAgentSecretAccess,
   YENTE_BROWSER_HANDOFF_PRODUCTION_URL,
+  OPTIONAL_YENTE_ONECLI_SECRET_NAMES,
   REQUIRED_YENTE_PROXY_URLS,
   requireYenteHostEnv,
   YENTE_LOCAL_PROXY_HOSTS,
@@ -271,5 +272,163 @@ describe('Yente service env contract', () => {
     ).rejects.toThrow(
       'Missing OneCLI secret(s): Yente Browser Handoff, NanoClaw Anthropic, NanoClaw OpenAI Images, NanoClaw Gemini, NanoClaw OpenCode Go, NanoClaw OpenCode Go Messages, AssemblyAI, Vercel',
     );
+  });
+
+  const ALL_REQUIRED_AND_OPTIONAL_SECRETS = [
+    { id: 'secret-anthropic', name: 'NanoClaw Anthropic' },
+    { id: 'secret-gws', name: 'Yente GWS Proxy' },
+    { id: 'secret-msgvault', name: 'Yente Msgvault Proxy' },
+    { id: 'secret-browser-handoff', name: 'Yente Browser Handoff' },
+    { id: 'secret-openai', name: 'NanoClaw OpenAI Images' },
+    { id: 'secret-gemini', name: 'NanoClaw Gemini' },
+    { id: 'secret-opencode-go', name: 'NanoClaw OpenCode Go' },
+    { id: 'secret-opencode-go-messages', name: 'NanoClaw OpenCode Go Messages' },
+    { id: 'secret-assemblyai', name: 'AssemblyAI' },
+    { id: 'secret-vercel', name: 'Vercel' },
+    { id: 'secret-tavily', name: 'Tavily' },
+    { id: 'secret-exa', name: 'Exa' },
+    { id: 'secret-firecrawl', name: 'Firecrawl' },
+    { id: 'secret-browser-use', name: 'Browser Use' },
+  ];
+
+  function onecliFetchMock(options: {
+    existingSecretIds: string[];
+    secrets?: { id: string; name: string }[];
+    calls?: { url: string; init?: RequestInit }[];
+  }) {
+    const secrets = options.secrets ?? ALL_REQUIRED_AND_OPTIONAL_SECRETS;
+    return async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+      const url = String(input);
+      options.calls?.push({ url, init });
+      if (url.endsWith('/api/secrets')) return Response.json(secrets);
+      if (url.endsWith('/api/agents')) return Response.json([{ id: 'agent-main', identifier: 'ag-main' }]);
+      if (url.endsWith('/api/agents/agent-main/secrets') && init?.method !== 'PUT') {
+        return Response.json(options.existingSecretIds);
+      }
+      if (url.endsWith('/api/agents/agent-main/secrets') && init?.method === 'PUT') {
+        return Response.json({ success: true });
+      }
+      if (url === 'https://onecli-gateway.local/api/cache/invalidate' && init?.method === 'POST') {
+        return Response.json({ invalidated: true });
+      }
+      return new Response('not found', { status: 404 });
+    };
+  }
+
+  it('auto-grants optional research/browser records that exist in the vault', async () => {
+    const calls: { url: string; init?: RequestInit }[] = [];
+    const fetchImpl = onecliFetchMock({ existingSecretIds: ['secret-anthropic'], calls });
+
+    await ensureOneCliAgentSecretAccess({
+      onecliUrl: 'https://onecli.local',
+      onecliApiKey: 'onecli-key',
+      onecliGatewayUrl: 'https://onecli-gateway.local',
+      agentIdentifier: 'ag-main',
+      fetchImpl,
+    });
+
+    const update = calls.find((call) => call.init?.method === 'PUT');
+    expect(update?.init?.body).toBe(
+      JSON.stringify({
+        secretIds: [
+          'secret-anthropic',
+          'secret-gws',
+          'secret-msgvault',
+          'secret-browser-handoff',
+          'secret-openai',
+          'secret-gemini',
+          'secret-opencode-go',
+          'secret-opencode-go-messages',
+          'secret-assemblyai',
+          'secret-vercel',
+          'secret-tavily',
+          'secret-exa',
+          'secret-firecrawl',
+          'secret-browser-use',
+        ],
+      }),
+    );
+    expect(calls.some((call) => call.url === 'https://onecli-gateway.local/api/cache/invalidate')).toBe(true);
+  });
+
+  it('grants only the optional records that exist and skips absent ones without error', async () => {
+    const calls: { url: string; init?: RequestInit }[] = [];
+    const fetchImpl = onecliFetchMock({
+      existingSecretIds: [],
+      secrets: ALL_REQUIRED_AND_OPTIONAL_SECRETS.filter(
+        (secret) => !['Exa', 'Firecrawl', 'Browser Use'].includes(secret.name),
+      ),
+      calls,
+    });
+
+    await ensureOneCliAgentSecretAccess({
+      onecliUrl: 'https://onecli.local',
+      onecliApiKey: 'onecli-key',
+      onecliGatewayUrl: 'https://onecli-gateway.local',
+      agentIdentifier: 'ag-main',
+      fetchImpl,
+    });
+
+    const update = calls.find((call) => call.init?.method === 'PUT');
+    const body = JSON.parse(String(update?.init?.body)) as { secretIds: string[] };
+    expect(body.secretIds).toContain('secret-tavily');
+    expect(body.secretIds).not.toContain('secret-exa');
+  });
+
+  it('makes no update and needs no gateway URL when grants are already current and optional records are absent', async () => {
+    const calls: { url: string; init?: RequestInit }[] = [];
+    const fetchImpl = onecliFetchMock({
+      existingSecretIds: [
+        'secret-anthropic',
+        'secret-gws',
+        'secret-msgvault',
+        'secret-browser-handoff',
+        'secret-openai',
+        'secret-gemini',
+        'secret-opencode-go',
+        'secret-opencode-go-messages',
+        'secret-assemblyai',
+        'secret-vercel',
+      ],
+      secrets: ALL_REQUIRED_AND_OPTIONAL_SECRETS.filter(
+        (secret) => !['Tavily', 'Exa', 'Firecrawl', 'Browser Use'].includes(secret.name),
+      ),
+      calls,
+    });
+
+    await ensureOneCliAgentSecretAccess({
+      onecliUrl: 'https://onecli.local',
+      onecliApiKey: 'onecli-key',
+      // Deliberately no onecliGatewayUrl: nothing should change, so the cache
+      // invalidation must not be attempted.
+      agentIdentifier: 'ag-main',
+      fetchImpl,
+    });
+
+    expect(calls.some((call) => call.init?.method === 'PUT')).toBe(false);
+    expect(calls.some((call) => call.url.includes('/api/cache/invalidate'))).toBe(false);
+  });
+
+  it('can disable the optional pool with an explicit empty list', async () => {
+    const calls: { url: string; init?: RequestInit }[] = [];
+    const fetchImpl = onecliFetchMock({ existingSecretIds: [], calls });
+
+    await ensureOneCliAgentSecretAccess({
+      onecliUrl: 'https://onecli.local',
+      onecliApiKey: 'onecli-key',
+      onecliGatewayUrl: 'https://onecli-gateway.local',
+      agentIdentifier: 'ag-main',
+      optionalSecretNames: [],
+      fetchImpl,
+    });
+
+    const update = calls.find((call) => call.init?.method === 'PUT');
+    const body = JSON.parse(String(update?.init?.body)) as { secretIds: string[] };
+    expect(body.secretIds).not.toContain('secret-tavily');
+    expect(body.secretIds).not.toContain('secret-browser-use');
+  });
+
+  it('documents the optional pool as the four capability records', () => {
+    expect(OPTIONAL_YENTE_ONECLI_SECRET_NAMES).toEqual(['Tavily', 'Exa', 'Firecrawl', 'Browser Use']);
   });
 });
