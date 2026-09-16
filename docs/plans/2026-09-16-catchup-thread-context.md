@@ -18,7 +18,7 @@ Fix the NanoClaw Discord catch-up bug that silently drops thread messages arrivi
 ### Accepted tradeoffs and residuals
 - The one already-lost 00:21 message is not backfilled into the session; the fix protects future messages.
 
-**Goal:** A user message sent in an existing thread of a monitored channel while the gateway is down (or the service is restarting) is recovered by catch-up and routed into the correct per-thread session — with the same platform identity live traffic produces — instead of being silently swallowed with a terminal 'routed' row.
+**Goal:** A user message sent in an active thread of a monitored channel while the gateway is down (or the service is restarting) is recovered by catch-up and routed into the correct per-thread session — with the same platform identity live traffic produces — instead of being silently swallowed with a terminal 'routed' row. Threads archived between the message and the catch-up run remain outside walk coverage (no row exists for the sweep either) — an accepted residual carried over from the original 2026-07-30 design (spec §7), restated in Known residuals below.
 
 **Architecture:** The catch-up engine synthesizes `GATEWAY_MESSAGE_CREATE` events from REST-fetched messages. REST message objects lack the thread context (`data.thread` / `channel_type`) that live gateway events carry, so the vendored `@chat-adapter/discord` adapter cannot resolve a thread message's parent channel: it encodes the identity as `discord:<guild>:<threadId>` (two-part), the router's messaging-group lookup keys on the THREAD id, finds no wiring, and silently returns — while the choke point's acceptance bookkeeping marks the row terminal 'routed' (the 2026-09-16 00:21 incident: message lost, no trace, no retry). The fix injects the thread context the engine already knows (thread targets are enumerated from `/guilds/{id}/threads/active` with `parent_id` in hand; the sweep already GETs `/channels/{id}` for guild resolution, which returns `parent_id` for threads) into both synthesis sites, so synthesized payloads resolve to the same three-part identity `discord:<guild>:<parent>:<thread>` that live in-thread traffic produces. No router, wrapper, or vendored-dependency changes.
 
@@ -89,7 +89,7 @@ describe('vendored adapter thread-context contract (catch-up payload parity)', (
     info: () => {},
     warn: () => {},
     error: () => {},
-  } as unknown as NonNullable<Parameters<typeof createDiscordAdapter>[0]['logger']>;
+  } as unknown as NonNullable<Parameters<typeof createDiscordAdapter>[0]>['logger'];
 
   function vendoredAdapter() {
     const adapter = createDiscordAdapter({
@@ -573,9 +573,9 @@ In `docs/plans/2026-07-30-discord-catchup.md`, immediately after the line-69 bul
 
 - [ ] **Step 4: Run the focused test**
 
-Run: `rg -n "Correction (2026-09-16)" docs/plans/2026-07-30-discord-catchup.md`
+Run: `rg -nF "Correction (2026-09-16)" docs/plans/2026-07-30-discord-catchup.md`
 
-Expected: exactly one match, on the line after the original bullet.
+Expected: exactly one match (use `-F`: the parentheses are literal text, and the default `rg` pattern mode treats them as a regex capture group).
 
 - [ ] **Step 5: Refactor while green**
 
@@ -596,13 +596,16 @@ git commit -m "docs: correct the superseded catch-up payload-equivalence note �
 
 ### Task 5: Land, deploy, and verify on production (user-mandated; runs only after the delta review passes)
 
+This is the documented **coordinated GWS / NanoClaw / Ringdown release** (docs/nanoclaw/Deployment.md "Coordinated GWS, NanoClaw, and Ringdown release"; runbook: docs/nanoclaw/how-to-add-gws-google-account.md): a new runtime pin makes the deploy a new release, the strict new-release gate requires a fresh GWS source-sync receipt whose `wrapperSha` equals this deploy's wrapper, and the GWS cutover's outage contract stops `nanoclaw.service` plus the `ringdown` and `gws-proxy` containers behind an idle gate. Follow the documented sequence — do not use a partial or alternate one, and do not bypass the idle gate (no active Ringdown call, no active NanoClaw session tool operation).
+
 **Files:**
 - Modify (repo `danshapiro/nanoclaw`, branch `overlay/shapiroserver2`): merge of `the-usual/catchup-thread-context`
 - Modify (repo `danshapiro/shapiroserver2-private`, branch `main`): `srv/nanoclaw/source.conf`, `changes.md`
+- Modify (branch `deploy/nanoclaw`, generated publication): squashed sync from `main`
 
 **Interfaces:**
 - Consumes: the full-suite gate result on final HEAD (all tests green except the recorded baseline exception); the delta-review PASSED marker.
-- Produces: a deployed, smoke-verified production release pinned by `source.conf`.
+- Produces: a deployed, smoke-verified production release pinned by `source.conf` and published on `origin/deploy/nanoclaw`.
 
 - [ ] **Step 1: Land on `overlay/shapiroserver2` and push**
 
@@ -612,50 +615,93 @@ git fetch origin
 git checkout -B overlay/shapiroserver2 origin/overlay/shapiroserver2
 git merge --ff-only the-usual/catchup-thread-context   # if this refuses, rebase the work branch on origin/overlay/shapiroserver2, re-run the full suite, and retry
 git push origin overlay/shapiroserver2
-git rev-parse HEAD   # record this SHA as the release pin
+git rev-parse HEAD   # record this SHA as NANO_SHA
 ```
 
-- [ ] **Step 2: Pin the release in the shapiroserver2 repo and record the change**
+- [ ] **Step 2: Pin the release on shapiroserver2 `main`, push, and publish `deploy/nanoclaw`**
 
-In `/home/dan/code/shapiroserver2` (checkout on `main`, keep it on `main`):
+In `/home/dan/code/shapiroserver2` (checkout stays on `main`):
 
-- Set `ref=` in `srv/nanoclaw/source.conf` to the landed SHA.
-- Add a `changes.md` entry (match the file's existing dated-entry format at the top) describing the fix, the incident, the release SHA, and the smoke result placeholder.
-- Commit and push:
+- Set `ref=` in `srv/nanoclaw/source.conf` to NANO_SHA.
+- Add a `changes.md` entry (match the file's top-entry dated format) describing the fix, the incident, the release SHA, and a smoke-result placeholder.
+- Commit, push `main`, then publish the generated branch with a single squashed commit on the origin tip (tree = `main`, message carrying the full `main` SHA — the one-commit-per-publish shape; the deploy guard refuses otherwise):
 
 ```bash
 git add srv/nanoclaw/source.conf changes.md
 git commit -m "nanoclaw: pin catch-up thread-context fix (<short sha>)"
 git push origin main
+SHAPIRO_SHA="$(git rev-parse HEAD)"
+# Publish deploy/nanoclaw: one squashed commit on the origin tip, tree = main,
+# message carrying the full main SHA (the one-commit-per-publish shape the
+# deploy guard requires; there is no helper script — this is the documented
+# manual form from the 2026-09-16 deploy record).
+git fetch origin deploy/nanoclaw
+PUBLISH_SHA="$(git commit-tree "main^{tree}" -p origin/deploy/nanoclaw -m "publish shapiroserver2 main ${SHAPIRO_SHA} (catch-up thread-context pin)")"
+git push origin "$PUBLISH_SHA:refs/heads/deploy/nanoclaw"
+# Pre-check the guard's own invariant: the pin must be byte-identical across refs.
+diff <(git show origin/main:srv/nanoclaw/source.conf) <(git show origin/deploy/nanoclaw:srv/nanoclaw/source.conf)
 ```
 
-- [ ] **Step 3: Deploy via the standard lane**
+The publication step must leave `source.conf` byte-identical across worktree, `main`, `origin/main`, and `origin/deploy/nanoclaw` (deploy-host.sh `require_prod_publication_state`).
+
+- [ ] **Step 3: Resolve the deploy variables (all read-only, BEFORE stopping anything)**
+
+- `NANO_SHA` (Step 1), `SHAPIRO_SHA` (Step 2).
+- `GWS_SHA` = canonical `/home/dan/code/gws-skill` tip (`git -C /home/dan/code/gws-skill rev-parse HEAD`).
+- Ringdown restart receipts: read the live `/srv/ringdown/.deploy-source.json` (`sourceSha` components: ringdown, gws, familiar, local-skills) on the host before the outage so Step 7 can pin the exact expected SHAs (they are unchanged by this deploy).
+
+- [ ] **Step 4: Idle gate and three-service stop (runbook Step 4)**
+
+Run the documented `CUTOVER_QUIESCE_AND_STOP` block verbatim from `docs/nanoclaw/how-to-add-gws-google-account.md` §4 (idle gate: no in-progress Twilio calls; no `processing` claims, no active `current_tool`, no fresh session heartbeats; then stop `nanoclaw`, session containers, `ringdown`, `gws-proxy`; assert all three inactive). If the idle gate fails, stop and report — an approved outage does not authorize interrupting active calls or work.
+
+- [ ] **Step 5: GWS cutover (refreshes the receipt's wrapperSha)**
 
 ```bash
-bash srv/nanoclaw/deploy-host.sh
+bash srv/deploy.sh gws-proxy --expected-wrapper-sha "$SHAPIRO_SHA" --expected-source-sha "$GWS_SHA"
 ```
 
-Expected: the lane refuses to run while `srv-backup.service` is active (in-band lock); stages an immutable release under `/srv/nanoclaw/releases/<sha>/`, flips `current`/`previous`, and refreshes `nanoclaw.service`. It fails loudly on any pin mismatch — do not bypass.
+Expected: gws-proxy rebuilt and healthy; `/srv/gws-proxy/.source-sync.json` wrapperSha now `SHAPIRO_SHA`. (GWS content is unchanged — the 2026-09-16 and 2026-08-17 deploy records show exactly this step for new-release deploys with an unchanged GWS bundle.)
 
-- [ ] **Step 4: Run the canonical e2e smoke**
+- [ ] **Step 6: NanoClaw deploy (starts nanoclaw on the new release)**
+
+```bash
+bash srv/nanoclaw/deploy-host.sh --target prod --expected-wrapper-sha "$SHAPIRO_SHA" --expected-nano-sha "$NANO_SHA"
+```
+
+Expected: release staged under `/srv/nanoclaw/releases/<NANO_SHA>/`, `current`/`previous` flipped, `nanoclaw.service` active and healthy. The lane fails closed on any publication/pin mismatch or active backup window — do not bypass.
+
+- [ ] **Step 7: Restart Ringdown last (runbook Step 6 consumer order)**
+
+```bash
+bash srv/deploy.sh ringdown \
+  --expected-wrapper-sha "$SHAPIRO_SHA" \
+  --expected-ringdown-sha "$RINGDOWN_SHA" \
+  --expected-gws-sha "$GWS_SHA" \
+  --expected-familiar-sha "$FAMILIAR_SHA" \
+  --expected-local-skills-sha "$LOCAL_SKILLS_SHA"
+```
+
+(with the receipt SHAs read in Step 3). Then run the runbook §6 `VERIFY_RECEIPTS` block verbatim: `nanoclaw` active, `gws-proxy` and `ringdown` healthy, all deployment receipts match the reviewed inputs.
+
+- [ ] **Step 8: Run the canonical e2e smoke**
 
 ```bash
 ssh shapiroserver2-lan 'sudo /srv/nanoclaw/run-e2e-smoke.sh'
 ```
 
-Expected: full suite green (note: full-suite runs re-run up to 2 failed tests once in isolation; retry-passed rows are flake signals, not hidden failures).
+Expected: green, EXCEPT rows attributable to the two documented standing-red katas (the codex plan/todo tool-surface gap and the msgvault-e2e stale session-path check — both kata'd and pre-existing before this deploy; triage with evidence like the 2026-09-16 deploy record did). Any failure in a catch-up/Discord row — or any NEW red not covered by those katas — blocks the run. Full-suite runs re-run up to 2 failed tests once in isolation; a retry-passed row is a flake signal, not a hidden failure.
 
-- [ ] **Step 5: Record the smoke result**
+- [ ] **Step 9: Record the smoke result and close out**
 
-Update the `changes.md` entry's smoke placeholder with the actual result, commit, and push (a deploy must not leave local-only commits behind).
+Update the `changes.md` entry's smoke placeholder with the actual result (and the outage/receipt facts: wrapper SHA, GWS receipt, ringdown restart, previous release retained for rollback), commit, and push. A deploy must not leave local-only commits behind: verify `git log origin/main..main` is empty in shapiroserver2, the fork and `deploy/nanoclaw` are pushed, and both repos' `git status` is clean.
 
-- [ ] **Step 6: Run impacted-test verification**
+- [ ] **Step 10: Run impacted-test verification**
 
-Verify production behavior on the host (read-only checks): journal shows the new release running (`sudo journalctl -u nanoclaw -n 5`), and the deployed release dir matches the pinned SHA.
+Read-only production checks: journal shows the new release running (`sudo journalctl -u nanoclaw -n 5` on the host), the deployed `current` symlink resolves to `<NANO_SHA>`, and (for a few minutes of watch) Discord catch-up startup runs report `routed=…/failed=0` with no abandon lines.
 
-- [ ] **Step 7: Commit the task**
+- [ ] **Step 11: Commit the task**
 
-The commits are Steps 2 and 5 (config repo) plus the landed merge (fork). Verify `git status` is clean in both repos and `git log origin/main..main` is empty (nothing unpushed).
+The commits are Steps 2 and 9 (config repo), the landed merge (fork), and the published squash (deploy/nanoclaw). Verify nothing unpushed remains in any of the three refs.
 
 ---
 
@@ -666,4 +712,4 @@ The commits are Steps 2 and 5 (config repo) plus the landed merge (fork). Verify
 - **File/interface consistency:** `TargetInfo` discriminated union introduced in Task 1 is the only typed-interface change; Task 2's cache and synthesis reuse it; Task 3 consumes only the payload contract. Paths match the worktree layout (`src/channels/...`, `docs/plans/...`).
 - **Executable tests:** each red test names the exact assertion that fails pre-fix (`thread` field undefined) and passes post-fix; expected failure reasons match the missing behavior, not setup accidents. The Task 1 pins are explicitly green-by-design dependency pins.
 - **Operational completeness:** rollback = pin flip back to `83e7a849` (the immutable previous release; `srv/nanoclaw/rollback-host.sh`). The deploy lane enforces its own backup-window lock. No migrations, no new env keys, no config changes. Production verification is read-only journal checks + the canonical smoke.
-- **Known residuals (documented, not deferred):** first-sight threads/channels still skip history replay (original design, unchanged); the already-lost 00:21 message is not backfilled (accepted tradeoff); a monitored-channel message that genuinely fails router engagement after the fix still follows the design's existing terminal-'routed' semantics.
+- **Known residuals (documented, not deferred):** first-sight threads/channels still skip history replay (original design, unchanged); threads archived between a gap message and the catch-up run remain outside walk coverage and leave no row for the sweep (accepted residual carried over from the original 2026-07-30 design, spec §7 — the fix does not expand coverage there); the already-lost 00:21 message is not backfilled (accepted tradeoff); a monitored-channel message that genuinely fails router engagement after the fix still follows the design's existing terminal-'routed' semantics.
