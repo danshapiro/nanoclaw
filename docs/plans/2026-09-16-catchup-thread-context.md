@@ -652,7 +652,7 @@ git -C .worktrees/landing-overlay rev-parse HEAD   # record this SHA as NANO_SHA
 
 - [ ] **Step 2: Pin the release on shapiroserver2 `main`, push, and publish `deploy/nanoclaw`**
 
-All shapiroserver2 edits, commits, and pushes happen in a DEDICATED detached config worktree — the shared root checkout at /home/dan/code/shapiroserver2 is never edited or committed in; it is only fast-forwarded before the deploy lanes run (the lanes require a real `main`-branch checkout at the synchronized tip: deploy-host.sh's `require_exact_wrapper_handoff` refuses detached HEADs and requires HEAD == upstream == origin/main tip).
+All shapiroserver2 HAND-EDITED config (the source.conf pin and the placeholder changes.md entry) is edited, committed, and pushed in a DEDICATED detached config worktree — the shared root checkout at /home/dan/code/shapiroserver2 is never hand-edited or committed in for config; it is only fast-forwarded before the deploy lanes run (the lanes require a real `main`-branch checkout at the synchronized tip: deploy-host.sh's `require_exact_wrapper_handoff` refuses detached HEADs and requires HEAD == upstream == origin/main tip). The one deliberate exception is Step 9's post-acceptance evidence publication: the acceptance suites' machine-generated artifacts and the completed deploy record commit from the root, per the documented flow (see Step 9).
 
 ```bash
 # 1. Dedicated config worktree at the current pushed main tip (detached; never
@@ -746,7 +746,7 @@ Two kinds of shapiroserver2 output exist, with two commit paths — deliberate, 
 1. **Acceptance artifacts + the completed deploy record — committed FROM THE ROOT.** The acceptance block (Step 8) runs in the synchronized root checkout (the lanes and suites must run there), and its suites write tracked evidence under `tests/artifacts/nanoclaw-live/current/` (plus the runbook's `capture` path staging `current/deployed-release.json`). These machine-generated outputs can exist only in the root's tree; committing them from the root is the documented evidence-publication flow (the 2026-09-16 deploy record: "Artifacts for the three passing e2e suites are committed, each bound to <release> (releaseSha headers)"). In the root, update the `changes.md` entry with the actual results (smoke, Ringdown acceptance, standing-red triage, the Step 2 publication deviation, wrapper/GWS/ringdown receipts, previous release retained for rollback), commit the artifacts + record together, and push:
 
 ```bash
-cd /home/dan/code/shapiroserver2   # synchronized, on main, HEAD == SHAPIRO_SHA (Step 3's fast-forward)
+cd /home/dan/code/shapiroserver2   # synchronized, on main, HEAD == SHAPIRO_SHA (Step 2's guarded sync)
 # edit changes.md (complete the placeholder entry with actual results)
 git add tests/artifacts/nanoclaw-live/current changes.md
 git commit -m "nanoclaw: catch-up thread-context deploy record (<release short sha>) — smoke + acceptance evidence"
@@ -757,7 +757,11 @@ The never-edit-the-root rule guards human task work against racing other agents;
 
 2. **Human config edits (the Step 2 pin + placeholder entry) — already committed and pushed from the detached config worktree in Step 2.** If Step 9 needs any FURTHER hand-edited config (it should not), use that same detached-worktree flow, not the root.
 
-A deploy must not leave local-only commits behind: after Step 9's push, re-fetch and confirm `origin/main` equals the pushed SHA; `deploy/nanoclaw` is pushed (Step 2); the fork is pushed (Step 1); the root and all worktrees are clean. If another agent pushed to `main` between Step 2's push and the lanes, `origin/main` will have diverged past `SHAPIRO_SHA` and the lanes refuse (fail-closed by design) — re-run Step 2's pin+publication at the new main tip (Step 2 recreates its scratch worktree, so the re-run is executable) and re-verify the freeze before proceeding.
+A deploy must not leave local-only commits behind: after Step 9's push, re-fetch and confirm `origin/main` equals the pushed SHA; `deploy/nanoclaw` is pushed (Step 2); the fork is pushed (Step 1); the root and all worktrees are clean. If another agent pushed to `main` between Step 2's push and the lanes, the lanes refuse (fail-closed by design). The recovery is a RE-PUBLISH, not a re-pin — the pin is already in main's history:
+
+1. Verify the new tip still carries this run's pin: `git show origin/main:srv/nanoclaw/source.conf` must still show `ref=<NANO_SHA>` (if it does not, another deploy re-pinned the runtime — stop and reassess with the user).
+2. Set `SHAPIRO_SHA` to the new `origin/main` tip and re-publish `deploy/nanoclaw` from it (the Step 2 `git commit-tree` line, using the new tip's tree and the current `origin/deploy/nanoclaw` as parent). No new pin commit is created — the pin and the placeholder `changes.md` entry are already in main.
+3. Re-run the guarded root fast-forward (Step 2's sync block) and re-verify the freeze (Step 3).
 
 - [ ] **Step 10: Run impacted-test verification**
 
