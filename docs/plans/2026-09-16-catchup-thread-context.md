@@ -728,7 +728,23 @@ Run the `CUTOVER_RINGDOWN_ACCEPTANCE` and `CUTOVER_ACCEPTANCE` blocks verbatim. 
 
 - [ ] **Step 9: Record the deploy and push everything**
 
-Update the `changes.md` entry with the actual results (smoke, Ringdown acceptance, standing-red triage, the Step 2 publication deviation, wrapper/GWS/ringdown receipts, previous release retained for rollback) using the SAME dedicated config-worktree flow as Step 2 (detached worktree at the current `origin/main` tip, edit, commit, `git push origin HEAD:refs/heads/main`, then fast-forward the shared root with `git pull --ff-only`). A deploy must not leave local-only commits behind: after pushing, re-fetch and confirm `origin/main` equals the pushed SHA; `deploy/nanoclaw` is pushed; the fork is pushed; all checkouts are clean.
+Two kinds of shapiroserver2 output exist, with two commit paths — deliberate, not compressed:
+
+1. **Acceptance artifacts + the completed deploy record — committed FROM THE ROOT.** The acceptance block (Step 8) runs in the synchronized root checkout (the lanes and suites must run there), and its suites write tracked evidence under `tests/artifacts/nanoclaw-live/current/` (plus the runbook's `capture` path staging `current/deployed-release.json`). These machine-generated outputs can exist only in the root's tree; committing them from the root is the documented evidence-publication flow (the 2026-09-16 deploy record: "Artifacts for the three passing e2e suites are committed, each bound to <release> (releaseSha headers)"). In the root, update the `changes.md` entry with the actual results (smoke, Ringdown acceptance, standing-red triage, the Step 2 publication deviation, wrapper/GWS/ringdown receipts, previous release retained for rollback), commit the artifacts + record together, and push:
+
+```bash
+cd /home/dan/code/shapiroserver2   # synchronized, on main, HEAD == SHAPIRO_SHA (Step 3's fast-forward)
+# edit changes.md (complete the placeholder entry with actual results)
+git add tests/artifacts/nanoclaw-live/current changes.md
+git commit -m "nanoclaw: catch-up thread-context deploy record (<release short sha>) — smoke + acceptance evidence"
+git push origin main
+```
+
+The never-edit-the-root rule guards human task work against racing other agents; the post-acceptance record is the deploy ceremony's own evidence publication from its mandated checkout — the same flow the last two production deploys used.
+
+2. **Human config edits (the Step 2 pin + placeholder entry) — already committed and pushed from the detached config worktree in Step 2.** If Step 9 needs any FURTHER hand-edited config (it should not), use that same detached-worktree flow, not the root.
+
+A deploy must not leave local-only commits behind: after Step 9's push, re-fetch and confirm `origin/main` equals the pushed SHA; `deploy/nanoclaw` is pushed (Step 2); the fork is pushed (Step 1); the root and all worktrees are clean. If another agent pushed to `main` between Step 2's push and the lanes, `origin/main` will have diverged past `SHAPIRO_SHA` and the lanes refuse (fail-closed by design) — re-run Step 2's pin+publication at the new main tip and re-verify the freeze before proceeding.
 
 - [ ] **Step 10: Run impacted-test verification**
 
