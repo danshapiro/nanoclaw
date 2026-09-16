@@ -835,5 +835,10 @@ export function createCodexConfigOverrides(): string[] {
   // `model_reasoning_effort` is the strict-config key codex app-server accepts.
   const effort = process.env.CODEX_REASONING_EFFORT?.trim() || 'high';
   overrides.push(`model_reasoning_effort=${effort}`);
+  // codex >=0.152 gates the native update_plan tool behind
+  // [tools.update_plan] enabled (default OFF), which silently removed the
+  // plan/todo capability our FullQAPass codex profile relies on. The
+  // strict-config key was verified against the pinned CODEX_VERSION 0.153.4.
+  overrides.push('tools.update_plan.enabled=true');
   return overrides;
 }

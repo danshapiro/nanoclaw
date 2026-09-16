@@ -154,6 +154,10 @@ describe('Codex strict config compatibility', () => {
       delete process.env.CODEX_REASONING_EFFORT;
     }
   });
+
+  it('enables the native update_plan tool under strict config', () => {
+    expect(createCodexConfigOverrides()).toContain('tools.update_plan.enabled=true');
+  });
 });
 
 type CapturedCodexResponse = { id: number; result: unknown };
