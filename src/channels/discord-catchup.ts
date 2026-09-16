@@ -120,7 +120,9 @@ export type DiscordCatchup = {
 };
 
 type DiscordRestMessage = Record<string, unknown> & { id: string; type: number };
-type TargetInfo = { id: string; guildId: string; kind: 'channel' | 'thread' };
+type TargetInfo =
+  | { id: string; guildId: string; kind: 'channel' }
+  | { id: string; guildId: string; kind: 'thread'; parentId: string };
 
 export function createDiscordCatchup(deps: DiscordCatchupDeps): DiscordCatchup {
   const env = deps.env ?? process.env;
@@ -198,7 +200,9 @@ export function createDiscordCatchup(deps: DiscordCatchupDeps): DiscordCatchup {
         advanceDiscordChannelCursor(thread.id, thread.last_message_id ?? thread.id, nowIso());
         continue;
       }
-      targets.push({ id: thread.id, guildId, kind: 'thread' });
+      // parent_id is guaranteed non-null by the monitored.has(thread.parent_id) filter above.
+      if (!thread.parent_id) continue;
+      targets.push({ id: thread.id, guildId, kind: 'thread', parentId: thread.parent_id });
     }
     return targets;
   }
@@ -245,7 +249,15 @@ export function createDiscordCatchup(deps: DiscordCatchupDeps): DiscordCatchup {
         const event = {
           type: 'GATEWAY_MESSAGE_CREATE',
           timestamp: now(),
-          data: { ...message, guild_id: target.guildId },
+          data: {
+            ...message,
+            guild_id: target.guildId,
+            // REST message objects lack the thread context live gateway
+            // events carry; without it the vendored adapter resolves the
+            // identity as discord:<guild>:<thread> and the router sees an
+            // unwired channel (2026-09-16 incident).
+            ...(target.kind === 'thread' ? { thread: { id: target.id, parent_id: target.parentId } } : {}),
+          },
         };
         // SINGLE-ATTEMPT POST (A16): run-to-run cadence is the engine's retry
         // mechanism. Intra-call HTTP retries would burn one claim attempt each

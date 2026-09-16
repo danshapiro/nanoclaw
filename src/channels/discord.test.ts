@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Message, parseMarkdown } from 'chat';
+import { createDiscordAdapter } from '@chat-adapter/discord';
 
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../db/index.js';
 import { inboundDbPath, resolveSession, writeSessionMessage } from '../session-manager.js';
@@ -139,6 +140,74 @@ describe('Discord v1 channel-id compatibility', () => {
       headers: { Authorization: 'Bot bot-token' },
     });
     globalThis.fetch = originalFetch;
+  });
+});
+
+describe('vendored adapter thread-context contract (catch-up payload parity)', () => {
+  const silentLogger = {
+    debug: () => {},
+    info: () => {},
+    warn: () => {},
+    error: () => {},
+  } as unknown as NonNullable<Parameters<typeof createDiscordAdapter>[0]>['logger'];
+
+  function vendoredAdapter() {
+    const adapter = createDiscordAdapter({
+      botToken: 'test-token',
+      publicKey: 'a'.repeat(64),
+      applicationId: 'app-1',
+      logger: silentLogger,
+    });
+    const handleIncomingMessage = vi.fn();
+    return { adapter, handleIncomingMessage };
+  }
+
+  // The vendored adapter's .d.ts declares handleForwardedMessage private, but
+  // the runtime method is exactly what the bridge's webhook dispatches to.
+  // Cast structurally — the same pattern the integration tests already use on
+  // the wrapped adapter — so the host typecheck (tsc compiles src/**, tests
+  // included) stays green.
+  function vendoredForward(
+    adapter: ReturnType<typeof createDiscordAdapter>,
+  ): (data: unknown, options: unknown) => Promise<void> {
+    return (
+      adapter as unknown as {
+        handleForwardedMessage: (data: unknown, options: unknown) => Promise<void>;
+      }
+    ).handleForwardedMessage.bind(adapter);
+  }
+
+  const basePayload = {
+    id: 'm1',
+    channel_id: 'thread-1',
+    guild_id: 'guild-1',
+    content: 'missed in-thread message',
+    author: { id: 'user-1', username: 'dan', bot: false },
+    mentions: [],
+    attachments: [],
+    timestamp: '2026-07-30T00:00:00.000Z',
+  };
+
+  it('resolves a three-part identity from data.thread, like live in-thread events', async () => {
+    const { adapter, handleIncomingMessage } = vendoredAdapter();
+    await adapter.initialize({ handleIncomingMessage } as never);
+    await vendoredForward(adapter)({ ...basePayload, thread: { id: 'thread-1', parent_id: 'chan-1' } }, {});
+    expect(handleIncomingMessage).toHaveBeenCalledTimes(1);
+    expect(handleIncomingMessage.mock.calls[0]?.[1]).toBe('discord:guild-1:chan-1:thread-1');
+  });
+
+  it('encodes a two-part identity (thread AS the channel) when thread context is missing', async () => {
+    // The 2026-09-16 incident identity: without data.thread the vendored
+    // adapter treats the thread as a top-level channel. The router then keys
+    // on the thread id, finds no messaging group, and silently drops the
+    // message while the row goes terminal 'routed'. This pin documents the
+    // failure mode the catch-up thread-context injection exists to prevent.
+    const { adapter, handleIncomingMessage } = vendoredAdapter();
+    await adapter.initialize({ handleIncomingMessage } as never);
+    await vendoredForward(adapter)({ ...basePayload }, {});
+    const threadId = handleIncomingMessage.mock.calls[0]?.[1] as string;
+    expect(threadId).toBe('discord:guild-1:thread-1');
+    expect(yenteDiscordPlatformIdFromThreadId(threadId)).toBe('thread-1');
   });
 });
 

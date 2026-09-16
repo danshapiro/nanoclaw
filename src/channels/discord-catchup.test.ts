@@ -287,6 +287,33 @@ describe('createDiscordCatchup runOnce', () => {
     expect(getDiscordChannelCursor('thread-1')).toBe('601');
   });
 
+  it('injects thread context into thread-target payloads so the adapter resolves the parent channel', async () => {
+    // 2026-09-16 incident: without thread context the vendored adapter encoded
+    // a two-part identity (discord:guild:thread), the router keyed the
+    // messaging-group lookup on the THREAD id, found no wiring, and silently
+    // dropped the message while its route row went terminal 'routed'.
+    advanceDiscordChannelCursor('chan-1', '500', '2026-07-30T00:00:00.000Z');
+    advanceDiscordChannelCursor('thread-1', '600', '2026-07-30T00:00:00.000Z');
+    const { fetchImpl, webhookPosts } = fakeTransport({
+      '/channels/chan-1?': [json(CHANNEL_INFO)],
+      '/guilds/guild-1/threads/active': [
+        json({ threads: [{ id: 'thread-1', parent_id: 'chan-1', last_message_id: '601' }] }),
+      ],
+      '/channels/chan-1/messages': [json([restMessage('502')]), json([])],
+      '/channels/thread-1/messages': [json([restMessage('601', { channel_id: 'thread-1' })]), json([])],
+      '/channels/chan-1': [json(CHANNEL_INFO)],
+    });
+    const engine = makeEngine(fetchImpl);
+    const summary = await engine.runOnce('periodic');
+    expect(summary?.routed).toBe(2);
+    const threadPost = webhookPosts.find((p) => p.data.id === '601');
+    expect(threadPost?.data.thread).toEqual({ id: 'thread-1', parent_id: 'chan-1' });
+    expect(threadPost?.data.guild_id).toBe('guild-1');
+    const channelPost = webhookPosts.find((p) => p.data.id === '502');
+    expect(channelPost?.data.thread).toBeUndefined(); // channel targets carry no thread context
+    expect(getDiscordChannelCursor('thread-1')).toBe('601');
+  });
+
   it('clamps a stale cursor to the max-age horizon', async () => {
     // Cursor far older than maxAge: with maxAge=1000ms and now=1753900000000,
     // the clamp floor is snowflake(now-1000). The engine must query with
