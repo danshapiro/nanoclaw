@@ -627,17 +627,25 @@ Run, in the worktree, on the exact commit to be landed:
 pnpm run typecheck && pnpm run lint && pnpm test
 ```
 
-Expected: typecheck PASS, lint PASS, full vitest suite green excluding the ledger-recorded baseline exception (`src/gws-finalization.test.ts > sealAndDrainGwsCorrelation > accepts systemd credential mode 0440…`, WSL file-mode sensitivity, reproduction receipt in `reports/baseline-gws-failure-receipt.md`). The container/Bun suite (`container/agent-runner`, `bun test` in CI) is out of scope for this gate: this change touches no file under `container/` (reasoning recorded here; CI covers it independently). Any NEW red blocks the deploy.
+Expected: typecheck PASS, lint PASS, full vitest suite green, with ONE allowed exception — `src/gws-finalization.test.ts > sealAndDrainGwsCorrelation > accepts systemd credential mode 0440 only from its protected credential directory` (WSL file-mode environment sensitivity). The exception is procedural, not taken on faith: verify it at gate time with
 
-- [ ] **Step 1: Land on `overlay/shapiroserver2` and push**
+```bash
+pnpm exec vitest run src/gws-finalization.test.ts   # expect: 1 failed | 9 passed — the credential-mode row
+```
+
+If that test does NOT reproduce its failure exactly as described at the base commit `83e7a84935b1cc4f2529766f438c79d679c5e69f`, it is not an exception and blocks the deploy. The container/Bun suite (`container/agent-runner`, `bun test` in CI) is out of scope for this gate: this change touches no file under `container/` (reasoning recorded here; CI covers it independently). Any NEW red blocks the deploy.
+
+- [ ] **Step 1: Land on `overlay/shapiroserver2` from a dedicated landing worktree and push**
+
+Keep the primary checkout on `main` untouched; land from a second dedicated worktree:
 
 ```bash
 cd /home/dan/code/nanoclaw-catchup-threadctx
 git fetch origin
-git checkout -B overlay/shapiroserver2 origin/overlay/shapiroserver2
-git merge --ff-only the-usual/catchup-thread-context   # if this refuses, rebase the work branch on origin/overlay/shapiroserver2, re-run the full suite, and retry
-git push origin overlay/shapiroserver2
-git rev-parse HEAD   # record this SHA as NANO_SHA
+git worktree add --track -b overlay/shapiroserver2 .worktrees/landing-overlay origin/overlay/shapiroserver2
+git -C .worktrees/landing-overlay merge --ff-only the-usual/catchup-thread-context   # if this refuses, rebase the work branch on origin/overlay/shapiroserver2, re-run the Step 0 gate, and retry
+git -C .worktrees/landing-overlay push origin overlay/shapiroserver2
+git -C .worktrees/landing-overlay rev-parse HEAD   # record this SHA as NANO_SHA
 ```
 
 - [ ] **Step 2: Pin the release on shapiroserver2 `main`, push, and publish `deploy/nanoclaw`**
@@ -729,7 +737,7 @@ The commits are Steps 2 and 9 (config repo), the landed merge (fork), and the pu
 
 ## Self-review
 
-- **Spec coverage:** "Fix the catch-up bug" → Tasks 1–2 (both synthesis sites) + Task 3 (incident path through the real choke point). "Verify with tests" → red/green unit tests, dependency-contract pins, integration regression, full-suite gate with the recorded baseline exception. "Deploy via the standard lane" → Task 5 (source.conf pin + `deploy-host.sh`, both user-authorized). "Run the canonical e2e smoke" → Task 5 Step 4. "Push what is deployed" → Task 5 Steps 1–2, 5.
+- **Spec coverage:** "Fix the catch-up bug" → Tasks 1–2 (both synthesis sites) + Task 3 (incident path through the real choke point). "Verify with tests" → red/green unit tests, dependency-contract pins, integration regression, full-suite gate (Task 5 Step 0, with the baseline exception verified procedurally at gate time). "Deploy via the standard lane" → Task 5 (source.conf pin + the coordinated GWS/NanoClaw/Ringdown ceremony, user-authorized). "Run the canonical e2e smoke" → Task 5 Step 8. "Push what is deployed" → Task 5 Steps 1–2 (fork + main + deploy/nanoclaw publication) and Step 9 (post-smoke record push).
 - **No silent deferrals:** the vendored-adapter contract pins are deliberate dependency-contract tests (green by design, commented as such), not deferred behavior. The pre-existing `gws-finalization` WSL failure is a recorded baseline exception with a reproduction receipt, not a deferral introduced by this plan.
 - **File/interface consistency:** `TargetInfo` discriminated union introduced in Task 1 is the only typed-interface change; Task 2's cache and synthesis reuse it; Task 3 consumes only the payload contract. Paths match the worktree layout (`src/channels/...`, `docs/plans/...`).
 - **Executable tests:** each red test names the exact assertion that fails pre-fix (`thread` field undefined) and passes post-fix; expected failure reasons match the missing behavior, not setup accidents. The Task 1 pins are explicitly green-by-design dependency pins.
