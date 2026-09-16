@@ -608,7 +608,9 @@ git commit -m "docs: correct the superseded catch-up payload-equivalence note �
 
 ### Task 5: Land, deploy, and verify on production (user-mandated; runs only after the delta review passes)
 
-This is the documented **coordinated GWS / NanoClaw / Ringdown release** (docs/nanoclaw/Deployment.md "Coordinated GWS, NanoClaw, and Ringdown release"; runbook: docs/nanoclaw/how-to-add-gws-google-account.md): a new runtime pin makes the deploy a new release, the strict new-release gate requires a fresh GWS source-sync receipt whose `wrapperSha` equals this deploy's wrapper, and the GWS cutover's outage contract stops `nanoclaw.service` plus the `ringdown` and `gws-proxy` containers behind an idle gate. Follow the documented sequence — do not use a partial or alternate one, and do not bypass the idle gate (no active Ringdown call, no active NanoClaw session tool operation).
+This is the documented **coordinated GWS / NanoClaw / Ringdown release** (docs/nanoclaw/Deployment.md "Coordinated GWS, NanoClaw, and Ringdown release"). A new runtime pin makes the deploy a new release; the strict new-release gate requires a fresh GWS source-sync receipt at the same reviewed wrapper SHA, and the owning runbook — `docs/nanoclaw/how-to-add-gws-google-account.md`, which is explicitly "also the required coordinated-release procedure when a NanoClaw/Yente deployment needs a GWS proxy receipt at the same reviewed wrapper SHA" — is executed COMPLETE: source selection and freeze, the pre-outage contract gate, the idle-gated three-service stop, the stopped-state GWS/skills installation and proof, the Ringdown-last consumer start with receipt proof, and the full acceptance section (Ringdown offline suite and real-Twilio live-call harness are hard gates). Use one coordinated outage; Dan sends no requests during the window; stop on the first failed command; the `BACKUP_RECEIPT`-named backup is the recovery boundary.
+
+The plan does NOT duplicate the runbook's command blocks: run the blocks with these markers, verbatim, in the runbook's documented order — `CUTOVER_SOURCE_SELECTION`, `CUTOVER_FREEZE`, `CUTOVER_PRE_OUTAGE_NANO_GATE`, `CUTOVER_QUIESCE_AND_STOP`, `CUTOVER_STOPPED_INSTALL`, `CUTOVER_START_CONSUMERS`, `CUTOVER_RINGDOWN_ACCEPTANCE`, `CUTOVER_ACCEPTANCE` — resolving the nine inputs plus the backup receipt as this task's steps specify. Do not use a partial or alternate sequence, and do not declare success with any mandatory block unrun.
 
 **Files:**
 - Modify (repo `danshapiro/nanoclaw`, branch `overlay/shapiroserver2`): merge of `the-usual/catchup-thread-context`
@@ -616,8 +618,8 @@ This is the documented **coordinated GWS / NanoClaw / Ringdown release** (docs/n
 - Modify (branch `deploy/nanoclaw`, generated publication): squashed sync from `main`
 
 **Interfaces:**
-- Consumes: the full-suite gate result on final HEAD (Step 0 produces it; the executing stage's end-of-execution gate is the same evidence), plus the delta-review PASSED marker.
-- Produces: a deployed, smoke-verified production release pinned by `source.conf` and published on `origin/deploy/nanoclaw`.
+- Consumes: the full-suite gate result on final HEAD (Step 0 produces it), plus the delta-review PASSED marker.
+- Produces: a deployed release pinned by `source.conf`, published on `origin/deploy/nanoclaw`, with the runbook's receipt proof and acceptance evidence.
 
 - [ ] **Step 0: Full-suite gate on the final HEAD (the deploy precondition)**
 
@@ -650,11 +652,15 @@ git -C .worktrees/landing-overlay rev-parse HEAD   # record this SHA as NANO_SHA
 
 - [ ] **Step 2: Pin the release on shapiroserver2 `main`, push, and publish `deploy/nanoclaw`**
 
-In `/home/dan/code/shapiroserver2` (checkout stays on `main`):
+In `/home/dan/code/shapiroserver2` — FIRST verify the root checkout is clean and on `main` (another agent's in-flight uncommitted work aborts this step; retry when clean):
 
-- Set `ref=` in `srv/nanoclaw/source.conf` to NANO_SHA.
-- Add a `changes.md` entry (match the file's top-entry dated format) describing the fix, the incident, the release SHA, and a smoke-result placeholder.
-- Commit, push `main`, then publish the generated branch with a single squashed commit on the origin tip (tree = `main`, message carrying the full `main` SHA — the one-commit-per-publish shape; the deploy guard refuses otherwise):
+```bash
+git -C /home/dan/code/shapiroserver2 status --porcelain --untracked-files=all   # must be empty
+git -C /home/dan/code/shapiroserver2 symbolic-ref --quiet --short HEAD          # must be main
+git -C /home/dan/code/shapiroserver2 fetch origin && git status --branch --short
+```
+
+Then set `ref=` in `srv/nanoclaw/source.conf` to NANO_SHA, add a `changes.md` entry (top dated-entry format) describing the fix, the incident, the release SHA, and a smoke-result placeholder, and commit/push/publish:
 
 ```bash
 git add srv/nanoclaw/source.conf changes.md
@@ -662,72 +668,66 @@ git commit -m "nanoclaw: pin catch-up thread-context fix (<short sha>)"
 git push origin main
 SHAPIRO_SHA="$(git rev-parse HEAD)"
 # Publish deploy/nanoclaw: one squashed commit on the origin tip, tree = main,
-# message carrying the full main SHA (the one-commit-per-publish shape the
-# deploy guard requires; there is no helper script — this is the documented
-# manual form from the 2026-09-16 deploy record).
+# message carrying the full main SHA (the observed one-commit-per-publish
+# shape; verified byte-identical to main — origin/main and origin/deploy/nanoclaw
+# currently diff empty). The deploy guard enforces source.conf byte-identity
+# across worktree, main, origin/main, and origin/deploy/nanoclaw.
 git fetch origin deploy/nanoclaw
-PUBLISH_SHA="$(git commit-tree "main^{tree}" -p origin/deploy/nanoclaw -m "publish shapiroserver2 main ${SHAPIRO_SHA} (catch-up thread-context pin)")"
+PUBLISH_SHA="$(git commit-tree "main^{tree}" -p origin/deploy/nanoclaw -m "publish deploy/nanoclaw from main ${SHAPIRO_SHA}")"
 git push origin "$PUBLISH_SHA:refs/heads/deploy/nanoclaw"
-# Pre-check the guard's own invariant: the pin must be byte-identical across refs.
 diff <(git show origin/main:srv/nanoclaw/source.conf) <(git show origin/deploy/nanoclaw:srv/nanoclaw/source.conf)
 ```
 
-The publication step must leave `source.conf` byte-identical across worktree, `main`, `origin/main`, and `origin/deploy/nanoclaw` (deploy-host.sh `require_prod_publication_state`).
+Documented deviation, recorded not compressed: the runbook §0 freeze block also tests `rev-parse origin/deploy/nanoclaw = SHAPIRO_SHA` (publication tip == wrapper commit). That literal equality contradicts the repo's actual publication shape (squash commit with a different SHA, message carrying the wrapper SHA — the shape `origin/deploy/nanoclaw` itself has today, and the shape the 2026-09-16 deploy used). Follow the observed canonical shape and the deploy guard's byte-identity invariant; record this deviation in the changes.md entry.
 
-- [ ] **Step 3: Resolve the deploy variables (all read-only, BEFORE stopping anything)**
+- [ ] **Step 3: Source selection and freeze (runbook §0 + §1 + §2)**
 
-- `NANO_SHA` (Step 1), `SHAPIRO_SHA` (Step 2).
-- `GWS_SHA` = canonical `/home/dan/code/gws-skill` tip (`git -C /home/dan/code/gws-skill rev-parse HEAD`).
-- Ringdown restart receipts: read the live `/srv/ringdown/.deploy-source.json` (`sourceSha` components: ringdown, gws, familiar, local-skills) on the host before the outage so Step 7 can pin the exact expected SHAs (they are unchanged by this deploy).
+Resolve the nine inputs exactly as the runbook's `CUTOVER_SOURCE_SELECTION` and freeze blocks define:
 
-- [ ] **Step 4: Idle gate and three-service stop (runbook Step 4)**
+- `NANO_SHA` from `srv/nanoclaw/source.conf` (Step 1's landed SHA);
+- `GWS_SHA` from `srv/gws-proxy/reviewed-source.conf` and `RINGDOWN_SHA` from `srv/ringdown/reviewed-source.conf` via `bash srv/lib/read-reviewed-source.sh` (both unchanged by this run — no GWS or Ringdown content changes);
+- `SHAPIRO_SHA` (Step 2's main HEAD);
+- `LOCAL_SKILLS_SHA`, `YENTE_CONTEXT_SHA`, `FAMILIAR_SHA`, `NYNE_SHA`, `SUMMARIZE_DND_SHA` from the live receipts they must match (read the managed status `/srv/nanoclaw/shared/repos/projects/.managed/status.json` and the runtime manifest on the host read-only, matching what the runbook's `VERIFY_STOPPED`/`VERIFY_RECEIPTS` blocks assert, so the freeze inputs are the deployed-unchanged values);
+- `BACKUP_RECEIPT` = the newest complete backup set on the host (newest `daily/*/.backup-complete` set; a partial set never qualifies). All ten values must be nonempty; the nine SHAs must each match `^[0-9a-f]{40}$`.
 
-Run the documented `CUTOVER_QUIESCE_AND_STOP` block verbatim from `docs/nanoclaw/how-to-add-gws-google-account.md` §4 (idle gate: no in-progress Twilio calls; no `processing` claims, no active `current_tool`, no fresh session heartbeats; then stop `nanoclaw`, session containers, `ringdown`, `gws-proxy`; assert all three inactive). If the idle gate fails, stop and report — an approved outage does not authorize interrupting active calls or work.
+Run the runbook's `CUTOVER_FREEZE` block (the `prove_main`/`prove_overlay` clean-tree/upstream/remote-tip proofs over all repos, with the Step 2 publication deviation noted above). Record the input TSV as the runbook directs. If personal GWS OAuth consent has expired (runbook §1 verifier), stop and report — Dan must complete a Google consent page before the outage can proceed.
 
-- [ ] **Step 5: GWS cutover (refreshes the receipt's wrapperSha)**
-
-```bash
-bash srv/deploy.sh gws-proxy --expected-wrapper-sha "$SHAPIRO_SHA" --expected-source-sha "$GWS_SHA"
-```
-
-Expected: gws-proxy rebuilt and healthy; `/srv/gws-proxy/.source-sync.json` wrapperSha now `SHAPIRO_SHA`. (GWS content is unchanged — the 2026-09-16 and 2026-08-17 deploy records show exactly this step for new-release deploys with an unchanged GWS bundle.)
-
-- [ ] **Step 6: NanoClaw deploy (starts nanoclaw on the new release)**
+- [ ] **Step 4: Pre-outage NanoClaw contract gate (runbook §3)**
 
 ```bash
-bash srv/nanoclaw/deploy-host.sh --target prod --expected-wrapper-sha "$SHAPIRO_SHA" --expected-nano-sha "$NANO_SHA"
+bash tests/test-full-qa-pass-contract.sh
 ```
 
-Expected: release staged under `/srv/nanoclaw/releases/<NANO_SHA>/`, `current`/`previous` flipped, `nanoclaw.service` active and healthy. The lane fails closed on any publication/pin mismatch or active backup window — do not bypass.
+Expected: PASS. This is the repository-owned contract test that the pinned NanoClaw commit's FullQAPass producer matches the repo-owned consumer — a static contract gate, distinct from the live-agent proof capture in Step 8. It must pass before any stop command.
 
-- [ ] **Step 7: Restart Ringdown last (runbook Step 6 consumer order)**
+- [ ] **Step 5: Idle gate and three-service stop (runbook §4)**
 
-```bash
-bash srv/deploy.sh ringdown \
-  --expected-wrapper-sha "$SHAPIRO_SHA" \
-  --expected-ringdown-sha "$RINGDOWN_SHA" \
-  --expected-gws-sha "$GWS_SHA" \
-  --expected-familiar-sha "$FAMILIAR_SHA" \
-  --expected-local-skills-sha "$LOCAL_SKILLS_SHA"
-```
+Run the `CUTOVER_QUIESCE_AND_STOP` block verbatim (no in-progress Twilio calls; no `processing` claims, no active `current_tool`, no fresh session heartbeats; then stop `nanoclaw`, session containers, `ringdown`, `gws-proxy`; assert all three inactive). If the idle gate fails, stop and report — an approved outage does not authorize interrupting active calls or work.
 
-(with the receipt SHAs read in Step 3). Then run the runbook §6 `VERIFY_RECEIPTS` block verbatim: `nanoclaw` active, `gws-proxy` and `ringdown` healthy, all deployment receipts match the reviewed inputs.
+- [ ] **Step 6: Stopped-state installation and proof (runbook §5)**
 
-- [ ] **Step 8: Run the canonical e2e smoke**
+Run the `CUTOVER_STOPPED_INSTALL` block verbatim: side-effect signing setup, `setup-gws.sh` for both accounts, `srv/deploy.sh gws-proxy --expected-wrapper-sha "$SHAPIRO_SHA" --expected-source-sha "$GWS_SHA"`, `deploy-local-skills.sh`, `apply-managed-repos.sh`, then the full `VERIFY_STOPPED` proof (managed status, runtime manifest including the 25 `gws-*` skills at `GWS_SHA`, `.deploy-source.json` pairing, `promote-gws-skills.sh --validate-only`, and all three consumers still stopped).
 
-```bash
-ssh shapiroserver2-lan 'sudo /srv/nanoclaw/run-e2e-smoke.sh'
-```
+- [ ] **Step 7: Start consumers, Ringdown last, with receipt proof (runbook §6)**
 
-Expected: green, EXCEPT rows attributable to the two documented standing-red katas (the codex plan/todo tool-surface gap and the msgvault-e2e stale session-path check — both kata'd and pre-existing before this deploy; triage with evidence like the 2026-09-16 deploy record did). Any failure in a catch-up/Discord row — or any NEW red not covered by those katas — blocks the run. Full-suite runs re-run up to 2 failed tests once in isolation; a retry-passed row is a flake signal, not a hidden failure.
+Run the `CUTOVER_START_CONSUMERS` block verbatim: `srv/nanoclaw/deploy-host.sh --target prod --expected-wrapper-sha "$SHAPIRO_SHA" --expected-nano-sha "$NANO_SHA"`, then `srv/deploy.sh ringdown --expected-wrapper-sha "$SHAPIRO_SHA" --expected-ringdown-sha "$RINGDOWN_SHA" --expected-gws-sha "$GWS_SHA" --expected-familiar-sha "$FAMILIAR_SHA" --expected-local-skills-sha "$LOCAL_SKILLS_SHA"`, then the `VERIFY_RECEIPTS` block (nanoclaw active; gws-proxy and ringdown healthy; all deployment receipts match the reviewed inputs).
 
-- [ ] **Step 9: Record the smoke result and close out**
+- [ ] **Step 8: Full acceptance (runbook §7)**
 
-Update the `changes.md` entry's smoke placeholder with the actual result (and the outage/receipt facts: wrapper SHA, GWS receipt, ringdown restart, previous release retained for rollback), commit, and push. A deploy must not leave local-only commits behind: verify `git log origin/main..main` is empty in shapiroserver2, the fork and `deploy/nanoclaw` are pushed, and both repos' `git status` is clean.
+Run the `CUTOVER_RINGDOWN_ACCEPTANCE` and `CUTOVER_ACCEPTANCE` blocks verbatim. Hard gates and expectations:
+
+- Ringdown offline suite (`UV_PROJECT_ENVIRONMENT=.venv-wsl uv run pytest -q` in the reviewed `RINGDOWN_WORKTREE`) and the canonical real-Twilio live-call harness (`tests/live_test_all_functions.py`, credentials sourced from the production host into the process only) must both pass; live-call exit 1 is failure, exit 2 is inconclusive and must be rerun.
+- The canonical Discord/Yente smoke (`sudo /srv/nanoclaw/run-e2e-smoke.sh --allow-production-mutation`) — the user-requested smoke. Expect green for every GWS judgment scenario and every catch-up/Discord row; failures attributable to the two documented standing-red katas (codex plan/todo tool-surface gap; msgvault-e2e stale session-path check) are triaged with evidence like the 2026-09-16 deploy record, recorded separately and honestly — never described as green when they are not.
+- `test-nanoclaw-local-proxies-e2e.sh`, `test-gws-e2e.sh`, `test-full-qa-pass.sh`, current-state-docs, active-contracts: run as the block directs. The broader proof capture (`capture-nanoclaw-live-proof.sh`) is subject to the runbook's own triage: if it is blocked only by the identified unrelated standing red, record the exact blocker, keep focused acceptance standing, and describe broader proof as pending (no fabricated receipt, no hand-written `deployed-release.json`).
+- When the capture succeeds, `tests/validate.sh` must report `DEPLOY GATE PASS: deployed NanoClaw release receipt matches source.conf` before any success claim.
+
+- [ ] **Step 9: Record the deploy and push everything**
+
+Update the `changes.md` entry with the actual results (smoke, Ringdown acceptance, standing-red triage, the Step 2 publication deviation, wrapper/GWS/ringdown receipts, previous release retained for rollback), commit, and push main. A deploy must not leave local-only commits behind: verify `git log origin/main..main` is empty, `deploy/nanoclaw` is pushed, the fork is pushed, and all checkouts are clean.
 
 - [ ] **Step 10: Run impacted-test verification**
 
-Read-only production checks: journal shows the new release running (`sudo journalctl -u nanoclaw -n 5` on the host), the deployed `current` symlink resolves to `<NANO_SHA>`, and (for a few minutes of watch) Discord catch-up startup runs report `routed=…/failed=0` with no abandon lines.
+Read-only production checks: journal shows the new release running (`sudo journalctl -u nanoclaw -n 5` on the host), `current` resolves to `<NANO_SHA>`, and (for a few minutes of watch) Discord catch-up startup runs report `routed=…/failed=0` with no abandon lines.
 
 - [ ] **Step 11: Commit the task**
 
