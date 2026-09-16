@@ -757,9 +757,15 @@ cd /home/dan/code/shapiroserver2   # synchronized, on main, HEAD == SHAPIRO_SHA 
 git status --porcelain -- tests/artifacts/nanoclaw-live/   # enumerate this run's evidence (GWS_PROOF_LABEL dir + current/)
 git add tests/artifacts/nanoclaw-live/ changes.md
 git commit -m "nanoclaw: catch-up thread-context deploy record (<release short sha>) — smoke + acceptance evidence"
-# Another agent may have advanced main during the deploy/acceptance: integrate and retry, never force.
+# Another agent may have advanced main during the deploy/acceptance: integrate
+# and retry, never force — but only after proving the intervening commits did
+# not RE-PIN the runtime (a clean rebase onto a differently-pinned config
+# would publish this run's record atop another release).
 git push origin main || {
   git fetch origin
+  : "${NANO_SHA:?assign NANO_SHA from Step 1 before running this block}"
+  test "$(git show origin/main:srv/nanoclaw/source.conf | sed -n 's/^ref=//p')" = "$NANO_SHA" \
+    || { echo "source.conf was re-pinned by another deploy during acceptance — do not publish this record; stop and report"; exit 1; }
   git pull --rebase origin main   # replay the evidence commit onto the new tip
   git push origin main            # on rebase conflict (another deploy record touched the same lines): stop and report
 }
@@ -769,7 +775,7 @@ The never-edit-the-root rule guards human task work against racing other agents;
 
 2. **Human config edits (the Step 2 pin + placeholder entry) — already committed and pushed from the detached config worktree in Step 2.** If Step 9 needs any FURTHER hand-edited config (it should not), use that same detached-worktree flow, not the root.
 
-A deploy must not leave local-only commits behind: after Step 9's push, re-fetch and confirm `origin/main` equals the pushed SHA; `deploy/nanoclaw` is pushed (Step 2); the fork is pushed (Step 1); the root and all worktrees are clean. If another agent pushed to `main` between Step 2's push and the lanes, the lanes refuse (fail-closed by design). The recovery is a RE-PUBLISH, not a re-pin — the pin is already in main's history:
+A deploy must not leave local-only commits behind: after Step 9's push, re-fetch and confirm `origin/main` equals the pushed SHA AND `git show origin/main:srv/nanoclaw/source.conf` still pins `NANO_SHA` (the pin-preservation proof, closing the same race the rebase path guards); `deploy/nanoclaw` is pushed (Step 2); the fork is pushed (Step 1); the root and all worktrees are clean. If another agent pushed to `main` between Step 2's push and the lanes, the lanes refuse (fail-closed by design). The recovery is a RE-PUBLISH, not a re-pin — the pin is already in main's history:
 
 1. Verify the new tip still carries this run's pin: `git show origin/main:srv/nanoclaw/source.conf` must still show `ref=<NANO_SHA>` (if it does not, another deploy re-pinned the runtime — stop and reassess with the user).
 2. Set `SHAPIRO_SHA` to the new `origin/main` tip and re-publish `deploy/nanoclaw` from it (the Step 2 `git commit-tree` line, using the new tip's tree and the current `origin/deploy/nanoclaw` as parent). No new pin commit is created — the pin and the placeholder `changes.md` entry are already in main.
