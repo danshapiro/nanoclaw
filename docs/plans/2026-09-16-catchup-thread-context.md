@@ -20,7 +20,7 @@ Fix the NanoClaw Discord catch-up bug that silently drops thread messages arrivi
 
 **Goal:** A user message sent in an active thread of a monitored channel while the gateway is down (or the service is restarting) is recovered by catch-up and routed into the correct per-thread session — with the same platform identity live traffic produces — instead of being silently swallowed with a terminal 'routed' row. Threads archived between the message and the catch-up run remain outside walk coverage (no row exists for the sweep either) — an accepted residual carried over from the original 2026-07-30 design (spec §7), restated in Known residuals below.
 
-**Architecture:** The catch-up engine synthesizes `GATEWAY_MESSAGE_CREATE` events from REST-fetched messages. REST message objects lack the thread context (`data.thread` / `channel_type`) that live gateway events carry, so the vendored `@chat-adapter/discord` adapter cannot resolve a thread message's parent channel: it encodes the identity as `discord:<guild>:<threadId>` (two-part), the router's messaging-group lookup keys on the THREAD id, finds no wiring, and silently returns — while the choke point's acceptance bookkeeping marks the row terminal 'routed' (the 2026-09-16 00:21 incident: message lost, no trace, no retry). The fix injects the thread context the engine already knows (thread targets are enumerated from `/guilds/{id}/threads/active` with `parent_id` in hand; the sweep already GETs `/channels/{id}` for guild resolution, which returns `parent_id` for threads) into both synthesis sites, so synthesized payloads resolve to the same three-part identity `discord:<guild>:<parent>:<thread>` that live in-thread traffic produces. No router, wrapper, or vendored-dependency changes.
+**Architecture:** The catch-up engine synthesizes `GATEWAY_MESSAGE_CREATE` events from REST-fetched messages. Live in-thread gateway traffic demonstrably resolves the three-part identity `discord:<guild>:<parent>:<thread>` in production (journal 2026-09-16 00:18:27 and 00:49:53; the vendored gateway listener forwards raw `packet.d` unmodified, so live payloads carry thread-resolving context the adapter consumes — whether the embedded thread data or the `channel_type` fallback, the identity outcome is the same). REST-fetched message objects carry no such context, so the vendored `@chat-adapter/discord` adapter cannot resolve a thread message's parent channel: it encodes the identity as `discord:<guild>:<threadId>` (two-part), the router's messaging-group lookup keys on the THREAD id, finds no wiring, and silently returns — while the choke point's acceptance bookkeeping marks the row terminal 'routed' (the 2026-09-16 00:21 incident: message lost, no trace, no retry). The fix injects the thread context the engine already knows (thread targets are enumerated from `/guilds/{id}/threads/active` with `parent_id` in hand; the sweep already GETs `/channels/{id}` for guild resolution, which returns `parent_id` for threads) into both synthesis sites as `thread: { id, parent_id }` — the adapter's first resolution branch — so synthesized payloads resolve to the same three-part identity live traffic produces. No router, wrapper, or vendored-dependency changes.
 
 **Tech Stack:** TypeScript (strict, NodeNext ESM with `.js` relative import extensions), vitest (in-memory SQLite per test via `initTestDb()` + `runMigrations(db)`), pnpm. No new dependencies.
 
@@ -102,6 +102,21 @@ describe('vendored adapter thread-context contract (catch-up payload parity)', (
     return { adapter, handleIncomingMessage };
   }
 
+  // The vendored adapter's .d.ts declares handleForwardedMessage private, but
+  // the runtime method is exactly what the bridge's webhook dispatches to.
+  // Cast structurally — the same pattern the integration tests already use on
+  // the wrapped adapter — so the host typecheck (tsc compiles src/**, tests
+  // included) stays green.
+  function vendoredForward(
+    adapter: ReturnType<typeof createDiscordAdapter>,
+  ): (data: unknown, options: unknown) => Promise<void> {
+    return (
+      adapter as unknown as {
+        handleForwardedMessage: (data: unknown, options: unknown) => Promise<void>;
+      }
+    ).handleForwardedMessage.bind(adapter);
+  }
+
   const basePayload = {
     id: 'm1',
     channel_id: 'thread-1',
@@ -116,10 +131,7 @@ describe('vendored adapter thread-context contract (catch-up payload parity)', (
   it('resolves a three-part identity from data.thread, like live in-thread events', async () => {
     const { adapter, handleIncomingMessage } = vendoredAdapter();
     await adapter.initialize({ handleIncomingMessage } as never);
-    await adapter.handleForwardedMessage(
-      { ...basePayload, thread: { id: 'thread-1', parent_id: 'chan-1' } },
-      {},
-    );
+    await vendoredForward(adapter)({ ...basePayload, thread: { id: 'thread-1', parent_id: 'chan-1' } }, {});
     expect(handleIncomingMessage).toHaveBeenCalledTimes(1);
     expect(handleIncomingMessage.mock.calls[0]?.[1]).toBe('discord:guild-1:chan-1:thread-1');
   });
@@ -132,7 +144,7 @@ describe('vendored adapter thread-context contract (catch-up payload parity)', (
     // failure mode the catch-up thread-context injection exists to prevent.
     const { adapter, handleIncomingMessage } = vendoredAdapter();
     await adapter.initialize({ handleIncomingMessage } as never);
-    await adapter.handleForwardedMessage({ ...basePayload }, {});
+    await vendoredForward(adapter)({ ...basePayload }, {});
     const threadId = handleIncomingMessage.mock.calls[0]?.[1] as string;
     expect(threadId).toBe('discord:guild-1:thread-1');
     expect(yenteDiscordPlatformIdFromThreadId(threadId)).toBe('thread-1');
@@ -184,9 +196,9 @@ In `catchUpTarget`, replace the synthesis (lines 245–249):
 
 - [ ] **Step 4: Run the focused test**
 
-Run: `pnpm exec vitest run src/channels/discord-catchup.test.ts src/channels/discord.test.ts`
+Run: `pnpm run typecheck && pnpm exec vitest run src/channels/discord-catchup.test.ts src/channels/discord.test.ts`
 
-Expected: PASS (all tests in both files).
+Expected: typecheck PASS (the vendored adapter's `.d.ts` declares `handleForwardedMessage` private — the structural `vendoredForward` cast exists precisely so this gate stays green) and all tests in both files PASS.
 
 - [ ] **Step 5: Refactor while green**
 
@@ -568,7 +580,7 @@ Not applicable (no test).
 In `docs/plans/2026-07-30-discord-catchup.md`, immediately after the line-69 bullet (`Do NOT enrich synthesized payloads with `channel_type` or a fabricated `thread` field. …`), append this correction paragraph (do not rewrite the original text — the plan is a historical record):
 
 ```markdown
-> **Correction (2026-09-16):** The equivalence claim above was wrong for threads. Live in-thread MESSAGE_CREATE events DO self-describe their thread to the vendored adapter (production evidence: live thread traffic routes with the three-part identity `discord:<guild>:<parent>:<thread>`, e.g. journal 2026-09-16 00:49:53), while REST-fetched message objects do not — so synthesized payloads took the two-part fall-through and the router silently dropped them as unwired-channel chatter with the row terminal `routed` (the 2026-09-16 00:21 incident). Catch-up now injects `thread: { id, parent_id }` (known from the active-threads listing / sweep channel lookup) into synthesized payloads for thread rows; see `docs/plans/2026-09-16-catchup-thread-context.md`. The `guild_id` injection requirement and the no-`channel_type` rule stand unchanged.
+> **Correction (2026-09-16):** The equivalence claim above was wrong for threads. Live in-thread MESSAGE_CREATE traffic resolves the three-part identity `discord:<guild>:<parent>:<thread>` in production (journal 2026-09-16 00:18:27/00:49:53; the gateway listener forwards raw `packet.d` unmodified, so live payloads carry thread-resolving context the vendored adapter consumes), while REST-fetched message objects do not — so synthesized payloads took the two-part fall-through and the router silently dropped them as unwired-channel chatter with the row terminal `routed` (the 2026-09-16 00:21 incident). Catch-up now injects `thread: { id, parent_id }` (known from the active-threads listing / sweep channel lookup) into synthesized payloads for thread rows; see `docs/plans/2026-09-16-catchup-thread-context.md`. The `guild_id` injection requirement and the no-`channel_type` rule stand unchanged.
 ```
 
 - [ ] **Step 4: Run the focused test**
@@ -604,8 +616,18 @@ This is the documented **coordinated GWS / NanoClaw / Ringdown release** (docs/n
 - Modify (branch `deploy/nanoclaw`, generated publication): squashed sync from `main`
 
 **Interfaces:**
-- Consumes: the full-suite gate result on final HEAD (all tests green except the recorded baseline exception); the delta-review PASSED marker.
+- Consumes: the full-suite gate result on final HEAD (Step 0 produces it; the executing stage's end-of-execution gate is the same evidence), plus the delta-review PASSED marker.
 - Produces: a deployed, smoke-verified production release pinned by `source.conf` and published on `origin/deploy/nanoclaw`.
+
+- [ ] **Step 0: Full-suite gate on the final HEAD (the deploy precondition)**
+
+Run, in the worktree, on the exact commit to be landed:
+
+```bash
+pnpm run typecheck && pnpm run lint && pnpm test
+```
+
+Expected: typecheck PASS, lint PASS, full vitest suite green excluding the ledger-recorded baseline exception (`src/gws-finalization.test.ts > sealAndDrainGwsCorrelation > accepts systemd credential mode 0440…`, WSL file-mode sensitivity, reproduction receipt in `reports/baseline-gws-failure-receipt.md`). The container/Bun suite (`container/agent-runner`, `bun test` in CI) is out of scope for this gate: this change touches no file under `container/` (reasoning recorded here; CI covers it independently). Any NEW red blocks the deploy.
 
 - [ ] **Step 1: Land on `overlay/shapiroserver2` and push**
 
