@@ -610,7 +610,7 @@ git commit -m "docs: correct the superseded catch-up payload-equivalence note �
 
 This is the documented **coordinated GWS / NanoClaw / Ringdown release** (docs/nanoclaw/Deployment.md "Coordinated GWS, NanoClaw, and Ringdown release"). A new runtime pin makes the deploy a new release; the strict new-release gate requires a fresh GWS source-sync receipt at the same reviewed wrapper SHA, and the owning runbook — `docs/nanoclaw/how-to-add-gws-google-account.md`, which is explicitly "also the required coordinated-release procedure when a NanoClaw/Yente deployment needs a GWS proxy receipt at the same reviewed wrapper SHA" — is executed COMPLETE: source selection and freeze, the pre-outage contract gate, the idle-gated three-service stop, the stopped-state GWS/skills installation and proof, the Ringdown-last consumer start with receipt proof, and the full acceptance section (Ringdown offline suite and real-Twilio live-call harness are hard gates). Use one coordinated outage; Dan sends no requests during the window; stop on the first failed command; the `BACKUP_RECEIPT`-named backup is the recovery boundary.
 
-The plan does NOT duplicate the runbook's command blocks: run the blocks with these markers, verbatim, in the runbook's documented order — `CUTOVER_SOURCE_SELECTION`, `CUTOVER_FREEZE`, `CUTOVER_PRE_OUTAGE_NANO_GATE`, `CUTOVER_QUIESCE_AND_STOP`, `CUTOVER_STOPPED_INSTALL`, `CUTOVER_START_CONSUMERS`, `CUTOVER_RINGDOWN_ACCEPTANCE`, `CUTOVER_ACCEPTANCE` — resolving the nine inputs plus the backup receipt as this task's steps specify. Do not use a partial or alternate sequence, and do not declare success with any mandatory block unrun.
+The plan does NOT duplicate the runbook's command blocks: run the blocks with these markers, verbatim (with the single explicit substitution Step 2 prescribes for the freeze block), in the runbook's documented order — `CUTOVER_SOURCE_SELECTION`, `CUTOVER_FREEZE`, `CUTOVER_PRE_OUTAGE_NANO_GATE`, `CUTOVER_QUIESCE_AND_STOP`, `CUTOVER_STOPPED_INSTALL`, `CUTOVER_START_CONSUMERS`, `CUTOVER_RINGDOWN_ACCEPTANCE`, `CUTOVER_ACCEPTANCE` — resolving the nine inputs plus the backup receipt as this task's steps specify. Do not use a partial or alternate sequence, and do not declare success with any mandatory block unrun.
 
 **Files:**
 - Modify (repo `danshapiro/nanoclaw`, branch `overlay/shapiroserver2`): merge of `the-usual/catchup-thread-context`
@@ -680,14 +680,22 @@ SHAPIRO_SHA="$(git rev-parse HEAD)"
 
 # 3. Publish deploy/nanoclaw from this same worktree: one squashed commit on
 #    the origin tip, tree = main, message carrying the full main SHA (the
-#    observed one-commit-per-publish shape, verified byte-identical to main).
+#    canonical publication shape used by the last two production deploys and
+#    AGENTS.md's squash-sync rule; fast-forward — never force-pushed).
 git fetch origin deploy/nanoclaw
 PUBLISH_SHA="$(git commit-tree "HEAD^{tree}" -p origin/deploy/nanoclaw -m "publish deploy/nanoclaw from main ${SHAPIRO_SHA}")"
 git push origin "$PUBLISH_SHA:refs/heads/deploy/nanoclaw"
 diff <(git show origin/main:srv/nanoclaw/source.conf) <(git show origin/deploy/nanoclaw:srv/nanoclaw/source.conf)
 ```
 
-Documented deviation, recorded not compressed: the runbook §0 freeze block also tests `rev-parse origin/deploy/nanoclaw = SHAPIRO_SHA` (publication tip == wrapper commit). That literal equality contradicts the repo's actual publication shape (squash commit with a different SHA, message carrying the wrapper SHA — the shape `origin/deploy/nanoclaw` itself has today, and the shape the 2026-09-16 deploy used). Follow the observed canonical shape and the deploy guard's byte-identity invariant; record this deviation in the changes.md entry.
+One EXPLICIT substitution is required when running the runbook's `CUTOVER_FREEZE` block in Step 3 — state it, do not paper over it: the block's line `test "$(git -C "$SHAPIRO_LOCAL_REPO" rev-parse origin/deploy/nanoclaw)" = "$SHAPIRO_SHA"` (publication tip == wrapper commit) is unsatisfiable under the repo's canonical publication shape above (the publication tip is the squashed publish commit carrying the wrapper SHA in its message; making the tips literally equal would require force-pushing the shared publication branch). Replace that single line with the byte-identity invariant the deploy lane itself enforces (`deploy-host.sh` `require_prod_publication_state`):
+
+```bash
+diff <(git -C "$SHAPIRO_LOCAL_REPO" show origin/main:srv/nanoclaw/source.conf) \
+     <(git -C "$SHAPIRO_LOCAL_REPO" show origin/deploy/nanoclaw:srv/nanoclaw/source.conf)
+```
+
+Every other line of the freeze block runs verbatim. Record the substitution in the changes.md deploy entry, and flag the runbook's equality line (docs/nanoclaw/how-to-add-gws-google-account.md, §2) as a follow-up correction for the config repo — it contradicts both AGENTS.md's squash-sync rule and the last two production deploys' recorded publication shape.
 
 Before any lane runs, fast-forward the shared root checkout so the lanes see the synchronized `main`. The sync is explicitly guarded — it refuses to run unless the root is clean and on `main`, then fast-forwards only (fail closed if another agent's in-flight work blocks it — wait and retry, never force):
 
@@ -714,7 +722,7 @@ Resolve the nine inputs exactly as the runbook's `CUTOVER_SOURCE_SELECTION` and 
 - `LOCAL_SKILLS_SHA`, `YENTE_CONTEXT_SHA`, `FAMILIAR_SHA`, `NYNE_SHA`, `SUMMARIZE_DND_SHA` from the live receipts they must match (read the managed status `/srv/nanoclaw/shared/repos/projects/.managed/status.json` and the runtime manifest on the host read-only, matching what the runbook's `VERIFY_STOPPED`/`VERIFY_RECEIPTS` blocks assert, so the freeze inputs are the deployed-unchanged values);
 - `BACKUP_RECEIPT` = the newest complete backup set on the host (newest `daily/*/.backup-complete` set; a partial set never qualifies). All ten values must be nonempty; the nine SHAs must each match `^[0-9a-f]{40}$`.
 
-Run the runbook's `CUTOVER_FREEZE` block (the `prove_main`/`prove_overlay` clean-tree/upstream/remote-tip proofs over all repos, with the Step 2 publication deviation noted above). Record the input TSV as the runbook directs. If personal GWS OAuth consent has expired (runbook §1 verifier), stop and report — Dan must complete a Google consent page before the outage can proceed.
+Run the runbook's `CUTOVER_FREEZE` block (the `prove_main`/`prove_overlay` clean-tree/upstream/remote-tip proofs over all repos, with the ONE explicit line substitution Step 2 prescribes for the publication-tip equality). Record the input TSV as the runbook directs. If personal GWS OAuth consent has expired (runbook §1 verifier), stop and report — Dan must complete a Google consent page before the outage can proceed.
 
 - [ ] **Step 4: Pre-outage NanoClaw contract gate (runbook §3)**
 
@@ -749,7 +757,7 @@ Run the `CUTOVER_RINGDOWN_ACCEPTANCE` and `CUTOVER_ACCEPTANCE` blocks verbatim. 
 
 Two kinds of shapiroserver2 output exist, with two commit paths — deliberate, not compressed:
 
-1. **Acceptance artifacts + the completed deploy record — committed FROM THE ROOT.** The acceptance block (Step 8) runs in the synchronized root checkout (the lanes and suites must run there), and its suites write tracked evidence under `tests/artifacts/nanoclaw-live/` (the capture publishes its coherent receipt under the runbook's `GWS_PROOF_LABEL` directory, and the runbook's block stages `current/deployed-release.json`). These machine-generated outputs can exist only in the root's tree; committing them from the root is the documented evidence-publication flow (the 2026-09-16 deploy record: "Artifacts for the three passing e2e suites are committed, each bound to <release> (releaseSha headers)"). In the root, update the `changes.md` entry with the actual results (smoke, Ringdown acceptance, standing-red triage, the Step 2 publication deviation, wrapper/GWS/ringdown receipts, previous release retained for rollback). Stage EXACTLY what this run's acceptance wrote — let `git status` enumerate the evidence, do not guess the path inventory:
+1. **Acceptance artifacts + the completed deploy record — committed FROM THE ROOT.** The acceptance block (Step 8) runs in the synchronized root checkout (the lanes and suites must run there), and its suites write tracked evidence under `tests/artifacts/nanoclaw-live/` (the capture publishes its coherent receipt under the runbook's `GWS_PROOF_LABEL` directory, and the runbook's block stages `current/deployed-release.json`). These machine-generated outputs can exist only in the root's tree; committing them from the root is the documented evidence-publication flow (the 2026-09-16 deploy record: "Artifacts for the three passing e2e suites are committed, each bound to <release> (releaseSha headers)"). In the root, update the `changes.md` entry with the actual results (smoke, Ringdown acceptance, standing-red triage, the Step 2 freeze-line substitution, wrapper/GWS/ringdown receipts, previous release retained for rollback). Stage EXACTLY what this run's acceptance wrote — let `git status` enumerate the evidence, do not guess the path inventory:
 
 ```bash
 cd /home/dan/code/shapiroserver2   # synchronized, on main, HEAD == SHAPIRO_SHA (Step 2's guarded sync)
