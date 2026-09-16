@@ -655,11 +655,16 @@ git -C .worktrees/landing-overlay rev-parse HEAD   # record this SHA as NANO_SHA
 All shapiroserver2 edits, commits, and pushes happen in a DEDICATED detached config worktree — the shared root checkout at /home/dan/code/shapiroserver2 is never edited or committed in; it is only fast-forwarded before the deploy lanes run (the lanes require a real `main`-branch checkout at the synchronized tip: deploy-host.sh's `require_exact_wrapper_handoff` refuses detached HEADs and requires HEAD == upstream == origin/main tip).
 
 ```bash
-# 1. Dedicated config worktree at the current pushed main tip (detached; never touches the root).
-git -C /home/dan/code/shapiroserver2 fetch origin
-git -C /home/dan/code/shapiroserver2 worktree add --detach \
-  /home/dan/code/shapiroserver2/.worktrees/catchup-deploy-config origin/main
-cd /home/dan/code/shapiroserver2/.worktrees/catchup-deploy-config
+# 1. Dedicated config worktree at the current pushed main tip (detached; never
+#    touches the root). Idempotent: the path is a deploy-scratch worktree owned
+#    by this run, so a re-run (the divergence recovery below) removes and
+#    recreates it rather than failing on the registered path.
+ROOT=/home/dan/code/shapiroserver2
+CFG=/home/dan/code/shapiroserver2/.worktrees/catchup-deploy-config
+git -C "$ROOT" fetch origin
+git -C "$ROOT" worktree remove --force "$CFG" 2>/dev/null || true
+git -C "$ROOT" worktree add --detach "$CFG" origin/main
+cd "$CFG"
 
 # 2. Edit srv/nanoclaw/source.conf (ref=NANO_SHA) and add the changes.md entry here,
 #    then commit detached and push to main.
@@ -679,10 +684,18 @@ diff <(git show origin/main:srv/nanoclaw/source.conf) <(git show origin/deploy/n
 
 Documented deviation, recorded not compressed: the runbook §0 freeze block also tests `rev-parse origin/deploy/nanoclaw = SHAPIRO_SHA` (publication tip == wrapper commit). That literal equality contradicts the repo's actual publication shape (squash commit with a different SHA, message carrying the wrapper SHA — the shape `origin/deploy/nanoclaw` itself has today, and the shape the 2026-09-16 deploy used). Follow the observed canonical shape and the deploy guard's byte-identity invariant; record this deviation in the changes.md entry.
 
-Before any lane runs, fast-forward the shared root checkout so the lanes see the synchronized `main` (fail closed if another agent's in-flight work blocks it — wait and retry, never force):
+Before any lane runs, fast-forward the shared root checkout so the lanes see the synchronized `main`. The sync is explicitly guarded — it refuses to run unless the root is clean and on `main`, then fast-forwards only (fail closed if another agent's in-flight work blocks it — wait and retry, never force):
 
 ```bash
-git -C /home/dan/code/shapiroserver2 pull --ff-only origin main   # root stays a convenience checkout on main, never edited
+ROOT=/home/dan/code/shapiroserver2
+test "$(git -C "$ROOT" symbolic-ref --quiet --short HEAD)" = main \
+  || { echo "root checkout is not on main — abort"; exit 1; }
+test -z "$(git -C "$ROOT" status --porcelain --untracked-files=all)" \
+  || { echo "root checkout is dirty (another agent's in-flight work) — wait and retry"; exit 1; }
+git -C "$ROOT" fetch origin
+git -C "$ROOT" merge --ff-only origin/main
+test "$(git -C "$ROOT" rev-parse HEAD)" = "$SHAPIRO_SHA" \
+  || { echo "origin/main moved past the published wrapper — re-run Step 2 at the new tip"; exit 1; }
 ```
 
 - [ ] **Step 3: Source selection and freeze (runbook §0 + §1 + §2)**
@@ -744,7 +757,7 @@ The never-edit-the-root rule guards human task work against racing other agents;
 
 2. **Human config edits (the Step 2 pin + placeholder entry) — already committed and pushed from the detached config worktree in Step 2.** If Step 9 needs any FURTHER hand-edited config (it should not), use that same detached-worktree flow, not the root.
 
-A deploy must not leave local-only commits behind: after Step 9's push, re-fetch and confirm `origin/main` equals the pushed SHA; `deploy/nanoclaw` is pushed (Step 2); the fork is pushed (Step 1); the root and all worktrees are clean. If another agent pushed to `main` between Step 2's push and the lanes, `origin/main` will have diverged past `SHAPIRO_SHA` and the lanes refuse (fail-closed by design) — re-run Step 2's pin+publication at the new main tip and re-verify the freeze before proceeding.
+A deploy must not leave local-only commits behind: after Step 9's push, re-fetch and confirm `origin/main` equals the pushed SHA; `deploy/nanoclaw` is pushed (Step 2); the fork is pushed (Step 1); the root and all worktrees are clean. If another agent pushed to `main` between Step 2's push and the lanes, `origin/main` will have diverged past `SHAPIRO_SHA` and the lanes refuse (fail-closed by design) — re-run Step 2's pin+publication at the new main tip (Step 2 recreates its scratch worktree, so the re-run is executable) and re-verify the freeze before proceeding.
 
 - [ ] **Step 10: Run impacted-test verification**
 
