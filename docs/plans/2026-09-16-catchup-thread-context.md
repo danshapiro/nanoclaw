@@ -656,13 +656,18 @@ All shapiroserver2 HAND-EDITED config (the source.conf pin and the placeholder c
 
 ```bash
 # 1. Dedicated config worktree at the current pushed main tip (detached; never
-#    touches the root). Idempotent: the path is a deploy-scratch worktree owned
-#    by this run, so a re-run (the divergence recovery below) removes and
-#    recreates it rather than failing on the registered path.
+#    touches the root). Re-usable for the divergence recovery: if the scratch
+#    path already exists it must be CLEAN before removal — an interrupted
+#    attempt's uncommitted edits (or any other worker's state at that path)
+#    are preserved and reported, never force-discarded.
 ROOT=/home/dan/code/shapiroserver2
 CFG=/home/dan/code/shapiroserver2/.worktrees/catchup-deploy-config
 git -C "$ROOT" fetch origin
-git -C "$ROOT" worktree remove --force "$CFG" 2>/dev/null || true
+if [ -e "$CFG" ]; then
+  test -z "$(git -C "$CFG" status --porcelain --untracked-files=all)" \
+    || { echo "scratch worktree $CFG is dirty — inspect and resolve manually; abort"; exit 1; }
+  git -C "$ROOT" worktree remove "$CFG"
+fi
 git -C "$ROOT" worktree add --detach "$CFG" origin/main
 cd "$CFG"
 
@@ -688,6 +693,7 @@ Before any lane runs, fast-forward the shared root checkout so the lanes see the
 
 ```bash
 ROOT=/home/dan/code/shapiroserver2
+: "${SHAPIRO_SHA:?assign SHAPIRO_SHA from Step 2 before running this block}"
 test "$(git -C "$ROOT" symbolic-ref --quiet --short HEAD)" = main \
   || { echo "root checkout is not on main — abort"; exit 1; }
 test -z "$(git -C "$ROOT" status --porcelain --untracked-files=all)" \
@@ -695,7 +701,7 @@ test -z "$(git -C "$ROOT" status --porcelain --untracked-files=all)" \
 git -C "$ROOT" fetch origin
 git -C "$ROOT" merge --ff-only origin/main
 test "$(git -C "$ROOT" rev-parse HEAD)" = "$SHAPIRO_SHA" \
-  || { echo "origin/main moved past the published wrapper — re-run Step 2 at the new tip"; exit 1; }
+  || { echo "origin/main moved past the published wrapper — apply the divergence recovery (Step 9's re-publish note)"; exit 1; }
 ```
 
 - [ ] **Step 3: Source selection and freeze (runbook §0 + §1 + §2)**
@@ -743,14 +749,20 @@ Run the `CUTOVER_RINGDOWN_ACCEPTANCE` and `CUTOVER_ACCEPTANCE` blocks verbatim. 
 
 Two kinds of shapiroserver2 output exist, with two commit paths — deliberate, not compressed:
 
-1. **Acceptance artifacts + the completed deploy record — committed FROM THE ROOT.** The acceptance block (Step 8) runs in the synchronized root checkout (the lanes and suites must run there), and its suites write tracked evidence under `tests/artifacts/nanoclaw-live/current/` (plus the runbook's `capture` path staging `current/deployed-release.json`). These machine-generated outputs can exist only in the root's tree; committing them from the root is the documented evidence-publication flow (the 2026-09-16 deploy record: "Artifacts for the three passing e2e suites are committed, each bound to <release> (releaseSha headers)"). In the root, update the `changes.md` entry with the actual results (smoke, Ringdown acceptance, standing-red triage, the Step 2 publication deviation, wrapper/GWS/ringdown receipts, previous release retained for rollback), commit the artifacts + record together, and push:
+1. **Acceptance artifacts + the completed deploy record — committed FROM THE ROOT.** The acceptance block (Step 8) runs in the synchronized root checkout (the lanes and suites must run there), and its suites write tracked evidence under `tests/artifacts/nanoclaw-live/` (the capture publishes its coherent receipt under the runbook's `GWS_PROOF_LABEL` directory, and the runbook's block stages `current/deployed-release.json`). These machine-generated outputs can exist only in the root's tree; committing them from the root is the documented evidence-publication flow (the 2026-09-16 deploy record: "Artifacts for the three passing e2e suites are committed, each bound to <release> (releaseSha headers)"). In the root, update the `changes.md` entry with the actual results (smoke, Ringdown acceptance, standing-red triage, the Step 2 publication deviation, wrapper/GWS/ringdown receipts, previous release retained for rollback). Stage EXACTLY what this run's acceptance wrote — let `git status` enumerate the evidence, do not guess the path inventory:
 
 ```bash
 cd /home/dan/code/shapiroserver2   # synchronized, on main, HEAD == SHAPIRO_SHA (Step 2's guarded sync)
 # edit changes.md (complete the placeholder entry with actual results)
-git add tests/artifacts/nanoclaw-live/current changes.md
+git status --porcelain -- tests/artifacts/nanoclaw-live/   # enumerate this run's evidence (GWS_PROOF_LABEL dir + current/)
+git add tests/artifacts/nanoclaw-live/ changes.md
 git commit -m "nanoclaw: catch-up thread-context deploy record (<release short sha>) — smoke + acceptance evidence"
-git push origin main
+# Another agent may have advanced main during the deploy/acceptance: integrate and retry, never force.
+git push origin main || {
+  git fetch origin
+  git pull --rebase origin main   # replay the evidence commit onto the new tip
+  git push origin main            # on rebase conflict (another deploy record touched the same lines): stop and report
+}
 ```
 
 The never-edit-the-root rule guards human task work against racing other agents; the post-acceptance record is the deploy ceremony's own evidence publication from its mandated checkout — the same flow the last two production deploys used.
