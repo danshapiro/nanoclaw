@@ -527,6 +527,40 @@ describe('createDiscordCatchup runOnce', () => {
     expect(getDiscordChannelCursor('chan-1')).toBe('500'); // the sweep NEVER moves the cursor
   });
 
+  it('sweep re-presents a stranded THREAD row with thread context from the channel lookup', async () => {
+    // Incident shape: a thread message whose first presentation predates the
+    // thread-context fix — its row sits behind the thread cursor forever, so
+    // only the sweep can recover it.
+    claimDiscordMessage(
+      'thread-1',
+      '698',
+      { guildId: 'guild-1', authorId: 'user-1', source: 'gateway' },
+      '2026-07-30T00:00:00.000Z',
+      '2026-07-30T00:02:00.000Z',
+    );
+    markDiscordMessageFailed('thread-1', '698', '2026-07-30T00:00:01.000Z', 'transient dispatch error');
+    advanceDiscordChannelCursor('chan-1', '500', '2026-07-30T00:00:02.000Z');
+    advanceDiscordChannelCursor('thread-1', '700', '2026-07-30T00:00:02.000Z');
+    const { fetchImpl, webhookPosts } = fakeTransport({
+      '/channels/chan-1?': [json(CHANNEL_INFO)],
+      '/guilds/guild-1/threads/active': [json({ threads: [] })],
+      '/channels/chan-1/messages': [json([])],
+      // Insertion order matters: message-by-id and the thread channel-info
+      // needles must precede any catch-all.
+      '/channels/thread-1/messages/698': [json(restMessage('698', { channel_id: 'thread-1' }))],
+      '/channels/thread-1': [json({ id: 'thread-1', guild_id: 'guild-1', parent_id: 'chan-1' })],
+      '/channels/chan-1': [json(CHANNEL_INFO)],
+    });
+    const engine = makeEngine(fetchImpl, {}, () => Date.parse('2026-07-30T01:00:00.000Z'));
+    const summary = await engine.runOnce('periodic');
+    expect(webhookPosts.map((p) => p.data.id)).toEqual(['698']);
+    expect(webhookPosts[0]?.data.guild_id).toBe('guild-1');
+    expect(webhookPosts[0]?.data.thread).toEqual({ id: 'thread-1', parent_id: 'chan-1' });
+    expect(summary?.routed).toBe(1);
+    expect(getDiscordMessageRouteStatus('thread-1', '698')).toBe('routed');
+    expect(getDiscordChannelCursor('thread-1')).toBe('700'); // the sweep NEVER moves the cursor
+  });
+
   it("skips the bot's own messages in the walk (advance cursor, no POST, no stall)", async () => {
     advanceDiscordChannelCursor('chan-1', '500', '2026-07-30T00:00:00.000Z');
     const page = [

@@ -131,6 +131,9 @@ export function createDiscordCatchup(deps: DiscordCatchupDeps): DiscordCatchup {
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const now = deps.now ?? (() => Date.now());
   const guildCache = new Map<string, string | null>();
+  // channelId -> parent channel id for threads (null = plain channel). Lets
+  // the sweep inject thread context into re-presented stranded rows.
+  const threadParentCache = new Map<string, string | null>();
   let running: Promise<DiscordCatchupRunSummary | null> | null = null;
   let readyDebounceTimer: NodeJS.Timeout | null = null;
   let periodicTimer: NodeJS.Timeout | null = null;
@@ -322,11 +325,21 @@ export function createDiscordCatchup(deps: DiscordCatchupDeps): DiscordCatchup {
       summary.failed += 1;
     };
     let guildId = guildCache.get(row.channel_id);
+    let parentId = threadParentCache.get(row.channel_id);
     if (guildId === undefined) {
-      const info = await discordGetJson<{ guild_id?: string }>(`/channels/${encodeURIComponent(row.channel_id)}`);
+      const info = await discordGetJson<{ guild_id?: string; parent_id?: string }>(
+        `/channels/${encodeURIComponent(row.channel_id)}`,
+      );
       if (!info) return; // channel unreadable THIS run (transient); the SQL horizon bounds how long such rows can hold a budget slot
       guildId = typeof info.guild_id === 'string' && info.guild_id.length > 0 ? info.guild_id : null;
       guildCache.set(row.channel_id, guildId);
+      parentId = typeof info.parent_id === 'string' && info.parent_id.length > 0 ? info.parent_id : null;
+      threadParentCache.set(row.channel_id, parentId);
+    } else if (parentId === undefined) {
+      // A cached guild implies a monitored (non-thread) channel or a prior
+      // sweep that captured the parent — no thread context applies here.
+      parentId = null;
+      threadParentCache.set(row.channel_id, parentId);
     }
     if (guildId === null) {
       // Non-guild (DM) rows are PERMANENTLY out of scope v1 (matches the walk):
@@ -364,7 +377,11 @@ export function createDiscordCatchup(deps: DiscordCatchupDeps): DiscordCatchup {
     const event = {
       type: 'GATEWAY_MESSAGE_CREATE',
       timestamp: now(),
-      data: { ...message, guild_id: guildId }, // same hard-required injection as the walk
+      data: {
+        ...message,
+        guild_id: guildId, // same hard-required injection as the walk
+        ...(parentId ? { thread: { id: row.channel_id, parent_id: parentId } } : {}),
+      },
     };
     const delivered = await forwardDiscordGatewayEventWithRetry(deps.webhookUrl, event, deps.botToken, {
       fetchImpl,
