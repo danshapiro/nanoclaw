@@ -20,7 +20,7 @@ Fix the NanoClaw Discord catch-up bug that silently drops thread messages arrivi
 
 **Goal:** A user message sent in an active thread of a monitored channel while the gateway is down (or the service is restarting) is recovered by catch-up and routed into the correct per-thread session — with the same platform identity live traffic produces — instead of being silently swallowed with a terminal 'routed' row. Threads archived between the message and the catch-up run remain outside walk coverage (no row exists for the sweep either) — an accepted residual carried over from the original 2026-07-30 design (spec §7), restated in Known residuals below.
 
-**Architecture:** The catch-up engine synthesizes `GATEWAY_MESSAGE_CREATE` events from REST-fetched messages. Live in-thread gateway traffic demonstrably resolves the three-part identity `discord:<guild>:<parent>:<thread>` in production (journal 2026-09-16 00:18:27 and 00:49:53; the vendored gateway listener forwards raw `packet.d` unmodified, so live payloads carry thread-resolving context the adapter consumes — whether the embedded thread data or the `channel_type` fallback, the identity outcome is the same). REST-fetched message objects carry no such context, so the vendored `@chat-adapter/discord` adapter cannot resolve a thread message's parent channel: it encodes the identity as `discord:<guild>:<threadId>` (two-part), the router's messaging-group lookup keys on the THREAD id, finds no wiring, and silently returns — while the choke point's acceptance bookkeeping marks the row terminal 'routed' (the 2026-09-16 00:21 incident: message lost, no trace, no retry). The fix injects the thread context the engine already knows (thread targets are enumerated from `/guilds/{id}/threads/active` with `parent_id` in hand; the sweep already GETs `/channels/{id}` for guild resolution, which returns `parent_id` for threads) into both synthesis sites as `thread: { id, parent_id }` — the adapter's first resolution branch — so synthesized payloads resolve to the same three-part identity live traffic produces. No router, wrapper, or vendored-dependency changes.
+**Architecture:** The catch-up engine synthesizes `GATEWAY_MESSAGE_CREATE` events from REST-fetched messages. Live in-thread gateway traffic demonstrably resolves the three-part identity `discord:<guild>:<parent>:<thread>` in production (journal 2026-09-16 00:18:27 and 00:49:53), while the same adapter, fed a REST-fetched message, produced the two-part identity `discord:<guild>:<threadId>` and the router silently dropped the message (the 2026-09-16 00:21 incident: no `Message routed` log, message absent from the session DB, route row terminal `routed`, no trace, no retry). The fix restores the observed live identity outcome for recovered messages: injecting `thread: { id, parent_id }` — the parent is already known to the engine (thread targets are enumerated from `/guilds/{id}/threads/active` with `parent_id` in hand; the sweep already GETs `/channels/{id}` for guild resolution, which returns `parent_id` for threads) into both synthesis sites feeds the vendored adapter's documented first resolution branch and yields the same three-part identity. This plan claims only that identity outcome, which production journals prove; it does not assert WHICH field live gateway payloads carry (the installed discord-api-types describe neither `thread` for ordinary thread replies nor a `channel_type` gateway extra, so any mechanism claim beyond the observed outcome would be unproven). No router, wrapper, or vendored-dependency changes.
 
 **Tech Stack:** TypeScript (strict, NodeNext ESM with `.js` relative import extensions), vitest (in-memory SQLite per test via `initTestDb()` + `runMigrations(db)`), pnpm. No new dependencies.
 
@@ -580,7 +580,7 @@ Not applicable (no test).
 In `docs/plans/2026-07-30-discord-catchup.md`, immediately after the line-69 bullet (`Do NOT enrich synthesized payloads with `channel_type` or a fabricated `thread` field. …`), append this correction paragraph (do not rewrite the original text — the plan is a historical record):
 
 ```markdown
-> **Correction (2026-09-16):** The equivalence claim above was wrong for threads. Live in-thread MESSAGE_CREATE traffic resolves the three-part identity `discord:<guild>:<parent>:<thread>` in production (journal 2026-09-16 00:18:27/00:49:53; the gateway listener forwards raw `packet.d` unmodified, so live payloads carry thread-resolving context the vendored adapter consumes), while REST-fetched message objects do not — so synthesized payloads took the two-part fall-through and the router silently dropped them as unwired-channel chatter with the row terminal `routed` (the 2026-09-16 00:21 incident). Catch-up now injects `thread: { id, parent_id }` (known from the active-threads listing / sweep channel lookup) into synthesized payloads for thread rows; see `docs/plans/2026-09-16-catchup-thread-context.md`. The `guild_id` injection requirement and the no-`channel_type` rule stand unchanged.
+> **Correction (2026-09-16):** The equivalence claim above was wrong for threads. Live in-thread MESSAGE_CREATE traffic resolves the three-part identity `discord:<guild>:<parent>:<thread>` in production (journal 2026-09-16 00:18:27/00:49:53), while REST-fetched message objects take the two-part fall-through and the router silently drops them as unwired-channel chatter with the row terminal `routed` (the 2026-09-16 00:21 incident). Catch-up now injects `thread: { id, parent_id }` (known from the active-threads listing / sweep channel lookup) into synthesized payloads for thread rows, yielding the same identity live traffic is observed to resolve; see `docs/plans/2026-09-16-catchup-thread-context.md`. This correction claims only the observed identity outcome, not the live payload's mechanism (the installed discord-api-types describe neither `thread` for ordinary thread replies nor a `channel_type` gateway extra). The `guild_id` injection requirement and the no-`channel_type` rule stand unchanged.
 ```
 
 - [ ] **Step 4: Run the focused test**
@@ -652,33 +652,38 @@ git -C .worktrees/landing-overlay rev-parse HEAD   # record this SHA as NANO_SHA
 
 - [ ] **Step 2: Pin the release on shapiroserver2 `main`, push, and publish `deploy/nanoclaw`**
 
-In `/home/dan/code/shapiroserver2` — FIRST verify the root checkout is clean and on `main` (another agent's in-flight uncommitted work aborts this step; retry when clean):
+All shapiroserver2 edits, commits, and pushes happen in a DEDICATED detached config worktree — the shared root checkout at /home/dan/code/shapiroserver2 is never edited or committed in; it is only fast-forwarded before the deploy lanes run (the lanes require a real `main`-branch checkout at the synchronized tip: deploy-host.sh's `require_exact_wrapper_handoff` refuses detached HEADs and requires HEAD == upstream == origin/main tip).
 
 ```bash
-git -C /home/dan/code/shapiroserver2 status --porcelain --untracked-files=all   # must be empty
-git -C /home/dan/code/shapiroserver2 symbolic-ref --quiet --short HEAD          # must be main
-git -C /home/dan/code/shapiroserver2 fetch origin && git status --branch --short
-```
+# 1. Dedicated config worktree at the current pushed main tip (detached; never touches the root).
+git -C /home/dan/code/shapiroserver2 fetch origin
+git -C /home/dan/code/shapiroserver2 worktree add --detach \
+  /home/dan/code/shapiroserver2/.worktrees/catchup-deploy-config origin/main
+cd /home/dan/code/shapiroserver2/.worktrees/catchup-deploy-config
 
-Then set `ref=` in `srv/nanoclaw/source.conf` to NANO_SHA, add a `changes.md` entry (top dated-entry format) describing the fix, the incident, the release SHA, and a smoke-result placeholder, and commit/push/publish:
-
-```bash
+# 2. Edit srv/nanoclaw/source.conf (ref=NANO_SHA) and add the changes.md entry here,
+#    then commit detached and push to main.
 git add srv/nanoclaw/source.conf changes.md
 git commit -m "nanoclaw: pin catch-up thread-context fix (<short sha>)"
-git push origin main
+git push origin HEAD:refs/heads/main
 SHAPIRO_SHA="$(git rev-parse HEAD)"
-# Publish deploy/nanoclaw: one squashed commit on the origin tip, tree = main,
-# message carrying the full main SHA (the observed one-commit-per-publish
-# shape; verified byte-identical to main — origin/main and origin/deploy/nanoclaw
-# currently diff empty). The deploy guard enforces source.conf byte-identity
-# across worktree, main, origin/main, and origin/deploy/nanoclaw.
+
+# 3. Publish deploy/nanoclaw from this same worktree: one squashed commit on
+#    the origin tip, tree = main, message carrying the full main SHA (the
+#    observed one-commit-per-publish shape, verified byte-identical to main).
 git fetch origin deploy/nanoclaw
-PUBLISH_SHA="$(git commit-tree "main^{tree}" -p origin/deploy/nanoclaw -m "publish deploy/nanoclaw from main ${SHAPIRO_SHA}")"
+PUBLISH_SHA="$(git commit-tree "HEAD^{tree}" -p origin/deploy/nanoclaw -m "publish deploy/nanoclaw from main ${SHAPIRO_SHA}")"
 git push origin "$PUBLISH_SHA:refs/heads/deploy/nanoclaw"
 diff <(git show origin/main:srv/nanoclaw/source.conf) <(git show origin/deploy/nanoclaw:srv/nanoclaw/source.conf)
 ```
 
 Documented deviation, recorded not compressed: the runbook §0 freeze block also tests `rev-parse origin/deploy/nanoclaw = SHAPIRO_SHA` (publication tip == wrapper commit). That literal equality contradicts the repo's actual publication shape (squash commit with a different SHA, message carrying the wrapper SHA — the shape `origin/deploy/nanoclaw` itself has today, and the shape the 2026-09-16 deploy used). Follow the observed canonical shape and the deploy guard's byte-identity invariant; record this deviation in the changes.md entry.
+
+Before any lane runs, fast-forward the shared root checkout so the lanes see the synchronized `main` (fail closed if another agent's in-flight work blocks it — wait and retry, never force):
+
+```bash
+git -C /home/dan/code/shapiroserver2 pull --ff-only origin main   # root stays a convenience checkout on main, never edited
+```
 
 - [ ] **Step 3: Source selection and freeze (runbook §0 + §1 + §2)**
 
@@ -723,7 +728,7 @@ Run the `CUTOVER_RINGDOWN_ACCEPTANCE` and `CUTOVER_ACCEPTANCE` blocks verbatim. 
 
 - [ ] **Step 9: Record the deploy and push everything**
 
-Update the `changes.md` entry with the actual results (smoke, Ringdown acceptance, standing-red triage, the Step 2 publication deviation, wrapper/GWS/ringdown receipts, previous release retained for rollback), commit, and push main. A deploy must not leave local-only commits behind: verify `git log origin/main..main` is empty, `deploy/nanoclaw` is pushed, the fork is pushed, and all checkouts are clean.
+Update the `changes.md` entry with the actual results (smoke, Ringdown acceptance, standing-red triage, the Step 2 publication deviation, wrapper/GWS/ringdown receipts, previous release retained for rollback) using the SAME dedicated config-worktree flow as Step 2 (detached worktree at the current `origin/main` tip, edit, commit, `git push origin HEAD:refs/heads/main`, then fast-forward the shared root with `git pull --ff-only`). A deploy must not leave local-only commits behind: after pushing, re-fetch and confirm `origin/main` equals the pushed SHA; `deploy/nanoclaw` is pushed; the fork is pushed; all checkouts are clean.
 
 - [ ] **Step 10: Run impacted-test verification**
 
