@@ -30,7 +30,7 @@ Fix the formatting defect from the 2026-09-27 Yente incident (kata rdj6) in the 
 
 ## Global Constraints
 
-- All commands run from `container/agent-runner/` with `PATH="$HOME/.bun/bin:$PATH"` (bun 1.4.2 is not on the default PATH).
+- All commands run from `container/agent-runner/` in a shell that has first run `export PATH="$HOME/.bun/bin:$PATH"` (bun 1.4.2 is not on the default PATH). Every `bun` command in this plan carries that PATH prefix; never chain an unprefixed `bun` after a `&&`.
 - The two `prepareCodexInputText` tests at src/providers/codex.factory.test.ts:91-112 pin the inbound restore exactly — they must stay green unchanged.
 - Whole-body-only strip: text that merely CONTAINS CDATA mid-body (e.g. a code sample quoting CDATA syntax) must pass through unchanged.
 - Do not touch the `MESSAGE_RE` destination contract, routing, recovery, or any provider other than codex's input preparation.
@@ -152,7 +152,7 @@ Add to `src/poll-loop.test.ts` after the `accepts single-quoted destination name
 
 - [ ] **Step 2: Run the tests and verify the intended failures**
 
-Run: `PATH="$HOME/.bun/bin:$PATH" bun test src/formatter.test.ts src/poll-loop.test.ts -t "stripCdataWrapper"` then `bun test src/poll-loop.test.ts -t "CDATA"`
+Run: `PATH="$HOME/.bun/bin:$PATH" bun test src/formatter.test.ts src/poll-loop.test.ts -t "stripCdataWrapper"` then `PATH="$HOME/.bun/bin:$PATH" bun test src/poll-loop.test.ts -t "CDATA"`
 
 Expected: FAIL — the formatter tests fail because `stripCdataWrapper` does not exist (import error — acceptable as the red for a new export; confirm it is the missing-export failure, not a syntax accident). The two poll-loop tests fail because the delivered `text` is the body verbatim with the `<![CDATA[`/`]]>` markers (and the split form intact) — assert the actual delivered text in the failure output shows the markers.
 
@@ -162,7 +162,9 @@ In `src/formatter.ts`, after `stripInternalTags`:
 
 ```ts
 const CDATA_WRAPPER_RE = /^<!\[CDATA\[([\s\S]*)\]\]>$/;
-const CDATA_SPLIT_BOUNDARY_RE = /\]\]\]\><!\[CDATA\[>/g;
+// The inverse of the codex provider's ]]> split (which rewrites ]]> to
+// ]]]]><![CDATA[>): note FOUR closing brackets before the >.
+const CDATA_SPLIT_BOUNDARY_RE = /\]\]\]\]\><!\[CDATA\[>/g;
 
 /**
  * Remove a whole-body `<![CDATA[...]]>` wrapper from agent-authored text
@@ -199,7 +201,7 @@ In `src/poll-loop.ts`:
 
 - [ ] **Step 4: Run the focused tests**
 
-Run: `PATH="$HOME/.bun/bin:$PATH" bun test src/formatter.test.ts src/poll-loop.test.ts -t "CDATA"` and `bun test src/formatter.test.ts -t "stripCdataWrapper"`
+Run: `PATH="$HOME/.bun/bin:$PATH" bun test src/formatter.test.ts src/poll-loop.test.ts -t "CDATA"` and `PATH="$HOME/.bun/bin:$PATH" bun test src/formatter.test.ts -t "stripCdataWrapper"`
 
 Expected: PASS
 
@@ -263,7 +265,7 @@ Add to `src/mcp-tools/core.test.ts` (imitate the `stamps same-route send_message
   });
 ```
 
-Create `src/mcp-tools/send-file.test.ts` (new file — send_file copies the file through fs against `/workspace/outbox`, so `fs` is mocked before importing the handler). The mock form below is load-bearing-verified on bun 1.4.2: a naive `{ ...fs }` spread WITHOUT a `default` key silently keeps the real module for `import fs from 'fs'` consumers; the `default:` shim is required. The `destinations` table lives in the INBOUND test db (insert via `getInboundDb()`, mirroring core.test.ts's `insertDestination`), and `getUndeliveredMessages` comes from `../db/messages-out.js`:
+Create `src/mcp-tools/send-file.test.ts` (new file — send_file copies the file through fs against `/workspace/outbox`, which does not exist on a workstation, so `fs` is mocked before importing the handler). Two harness facts are load-bearing-verified on bun 1.4.2: (a) a naive `{ ...fs }` spread WITHOUT a `default` key silently keeps the real module for `import fs from 'fs'` consumers — the `default:` shim is required; (b) `mock.module` overrides are process-global for the whole `bun test` run and cannot be restored, so the mock must be PATH-SCOPED: it delegates to the real fs for everything outside `/workspace` (the test file's own statically-imported `fs` binding captured BEFORE the mock registration IS the real module — that is the delegation target). This keeps every other test file, whatever its load order, on real filesystem behavior. The `destinations` table lives in the INBOUND test db (insert via `getInboundDb()`, mirroring core.test.ts's `insertDestination`), and `getUndeliveredMessages` comes from `../db/messages-out.js`:
 
 ```ts
 import { mock, describe, it, expect, beforeEach, afterEach } from 'bun:test';
@@ -272,11 +274,19 @@ import fs from 'fs';
 import { initTestSessionDb, closeSessionDb, getInboundDb } from '../db/connection.js';
 import { getUndeliveredMessages } from '../db/messages-out.js';
 
+// Captured BEFORE the mock registration, so this binding is the real fs.
+const realFs = fs;
+
+// Path-scoped virtualization: only /workspace paths are virtual; every other
+// caller in the test process keeps real fs behavior (bun's mock.module is
+// process-global and not restorable).
 const fsMock = {
-  ...fs,
-  existsSync: () => true,
-  mkdirSync: () => {},
-  copyFileSync: () => {},
+  ...realFs,
+  existsSync: (p: string) => (typeof p === 'string' && p.startsWith('/workspace') ? true : realFs.existsSync(p)),
+  mkdirSync: (p: string, ...rest: Parameters<typeof realFs.mkdirSync>) =>
+    typeof p === 'string' && p.startsWith('/workspace') ? undefined : realFs.mkdirSync(p, ...rest),
+  copyFileSync: (src: string, dst: string, ...rest: Parameters<typeof realFs.copyFileSync>) =>
+    typeof dst === 'string' && dst.startsWith('/workspace') ? undefined : realFs.copyFileSync(src, dst, ...rest),
 };
 mock.module('fs', () => ({ ...fsMock, default: fsMock }));
 
@@ -450,7 +460,7 @@ None expected. Confirm the only `prepareCodexInputText` call site (codex.ts:537)
 
 Affected groups: the codex provider tests and any poll-loop test that drives the codex path end to end.
 
-Run: `PATH="$HOME/.bun/bin:$PATH" bun test src/providers/ && bun test src/poll-loop.test.ts -t "nudge"`
+Run: `PATH="$HOME/.bun/bin:$PATH" bun test src/providers/` then `PATH="$HOME/.bun/bin:$PATH" bun test src/poll-loop.test.ts -t "nudge"`
 
 Expected: PASS
 
