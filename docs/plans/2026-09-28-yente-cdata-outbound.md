@@ -263,28 +263,34 @@ Add to `src/mcp-tools/core.test.ts` (imitate the `stamps same-route send_message
   });
 ```
 
-Create `src/mcp-tools/send-file.test.ts` (new file — send_file copies the file through fs against `/workspace/outbox`, which does not exist on a workstation, so `fs` is mocked before importing the handler). Two harness facts are load-bearing-verified on bun 1.4.2: (a) a naive `{ ...fs }` spread WITHOUT a `default` key silently keeps the real module for `import fs from 'fs'` consumers — the `default:` shim is required; (b) `mock.module` overrides are process-global for the whole `bun test` run and cannot be restored, so the mock must be PATH-SCOPED: it delegates to the real fs for everything outside `/workspace` (the test file's own statically-imported `fs` binding captured BEFORE the mock registration IS the real module — that is the delegation target). This keeps every other test file, whatever its load order, on real filesystem behavior. The `destinations` table lives in the INBOUND test db (insert via `getInboundDb()`, mirroring core.test.ts's `insertDestination`), and `getUndeliveredMessages` comes from `../db/messages-out.js`:
+Create `src/mcp-tools/send-file.test.ts` (new file). bun's `mock.module` is process-global for the whole `bun test` run, non-restorable, and updates already-imported ESM bindings — so the mock must be as narrow as physically possible. Design constraints, verified against the reviewer's contamination finding:
+
+- Do NOT mock `existsSync` at all: the test creates a REAL source file (in a real temp dir, via the real fs) and passes its path, so the handler's existence check is genuine.
+- Mock ONLY `mkdirSync` and `copyFileSync`, and only for the exact `/workspace/outbox` prefix (the one directory that cannot exist on a workstation); delegate to the real fs for every other path. `codex.ts` and other tests that probe `/workspace/agent/...` with `existsSync`/`readFileSync` are untouched because `existsSync` is not mocked.
+- The test file's own statically-imported `fs` binding is captured BEFORE the mock registration and is the real module — it is the delegation target.
+- Before relying on the prefix scoping, confirm no other test writes under `/workspace/outbox`: run `grep -rn "workspace/outbox" container/agent-runner/src --include="*.test.ts"` and verify the only match is this new test (production code's own outbox constant aside).
 
 ```ts
 import { mock, describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
 import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import { initTestSessionDb, closeSessionDb, getInboundDb } from '../db/connection.js';
 import { getUndeliveredMessages } from '../db/messages-out.js';
 
 // Captured BEFORE the mock registration, so this binding is the real fs.
 const realFs = fs;
 
-// Path-scoped virtualization: only /workspace paths are virtual; every other
-// caller in the test process keeps real fs behavior (bun's mock.module is
-// process-global and not restorable).
+// Only the /workspace/outbox prefix is virtual (that directory cannot exist
+// on a workstation); every other caller in the test process keeps real fs
+// behavior, including existsSync, which is not mocked at all.
 const fsMock = {
   ...realFs,
-  existsSync: (p: string) => (typeof p === 'string' && p.startsWith('/workspace') ? true : realFs.existsSync(p)),
   mkdirSync: (p: string, ...rest: Parameters<typeof realFs.mkdirSync>) =>
-    typeof p === 'string' && p.startsWith('/workspace') ? undefined : realFs.mkdirSync(p, ...rest),
+    typeof p === 'string' && p.startsWith('/workspace/outbox') ? undefined : realFs.mkdirSync(p, ...rest),
   copyFileSync: (src: string, dst: string, ...rest: Parameters<typeof realFs.copyFileSync>) =>
-    typeof dst === 'string' && dst.startsWith('/workspace') ? undefined : realFs.copyFileSync(src, dst, ...rest),
+    typeof dst === 'string' && dst.startsWith('/workspace/outbox') ? undefined : realFs.copyFileSync(src, dst, ...rest),
 };
 mock.module('fs', () => ({ ...fsMock, default: fsMock }));
 
@@ -307,9 +313,13 @@ afterEach(() => {
 
 describe('send_file', () => {
   it('unwraps whole-body CDATA text in the accompanying message', async () => {
+    const sourceDir = realFs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-sendfile-'));
+    const sourcePath = path.join(sourceDir, 'report.pptx');
+    realFs.writeFileSync(sourcePath, 'real bytes');
+
     const result = await sendFile.handler({
       to: 'discord-current',
-      path: '/workspace/agent/report.pptx',
+      path: sourcePath,
       filename: 'report.pptx',
       text: '<![CDATA[Found the originals — unchanged.]]>',
     });
@@ -320,8 +330,11 @@ describe('send_file', () => {
     const content = JSON.parse(out[0].content);
     expect(content.text).toBe('Found the originals — unchanged.');
     expect(content.files).toEqual(['report.pptx']);
+
+    realFs.rmSync(sourceDir, { recursive: true, force: true });
   });
 });
+```
 ```
 
 - [ ] **Step 2: Run the tests and verify the intended failures**
