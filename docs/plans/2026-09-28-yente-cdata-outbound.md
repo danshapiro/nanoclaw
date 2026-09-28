@@ -263,28 +263,29 @@ Add to `src/mcp-tools/core.test.ts` (imitate the `stamps same-route send_message
   });
 ```
 
-Create `src/mcp-tools/send-file.test.ts` (new file — send_file copies the file through fs against `/workspace/outbox`, so `fs` is mocked before importing the handler; the mock spreads the real module and overrides only the three calls send_file makes, per the `mock.module` precedent in `self-mod.test.ts`):
+Create `src/mcp-tools/send-file.test.ts` (new file — send_file copies the file through fs against `/workspace/outbox`, so `fs` is mocked before importing the handler). The mock form below is load-bearing-verified on bun 1.4.2: a naive `{ ...fs }` spread WITHOUT a `default` key silently keeps the real module for `import fs from 'fs'` consumers; the `default:` shim is required. The `destinations` table lives in the INBOUND test db (insert via `getInboundDb()`, mirroring core.test.ts's `insertDestination`), and `getUndeliveredMessages` comes from `../db/messages-out.js`:
 
 ```ts
 import { mock, describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
 import fs from 'fs';
-import { initTestSessionDb, closeSessionDb } from '../db/connection.js';
-import { getOutboundDb, getUndeliveredMessages } from '../db/messages-out.js';
+import { initTestSessionDb, closeSessionDb, getInboundDb } from '../db/connection.js';
+import { getUndeliveredMessages } from '../db/messages-out.js';
 
-mock.module('fs', () => ({
+const fsMock = {
   ...fs,
   existsSync: () => true,
   mkdirSync: () => {},
   copyFileSync: () => {},
-}));
+};
+mock.module('fs', () => ({ ...fsMock, default: fsMock }));
 
 // Imported after the fs mock is registered.
 const { sendFile } = await import('./core.js');
 
 beforeEach(() => {
   initTestSessionDb();
-  getOutboundDb()
+  getInboundDb()
     .prepare(
       `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
        VALUES ('discord-current', 'Discord Current', 'channel', 'discord', 'chan-1', NULL)`,
@@ -314,8 +315,6 @@ describe('send_file', () => {
   });
 });
 ```
-
-Note for the implementer: check the real `destinations` table schema in `src/db/` (or the INSERT shape used in core.test.ts) and use the exact columns it has; check the exact mock-module registration form that works under bun 1.4.2 (the goal is only that the send_file handler reaches writeMessageOut without touching the real filesystem); if `getUndeliveredMessages` needs an active-input/routing setup, copy the minimal harness lines from core.test.ts. If the destinations INSERT in this draft does not match the schema, fix the INSERT — do not change the production handler's contract.
 
 - [ ] **Step 2: Run the tests and verify the intended failures**
 
