@@ -110,6 +110,28 @@ describe('prepareCodexInputText', () => {
       '<message sender="User" time="now"><![CDATA[literal ]]]]><![CDATA[> then <message>]]></message>',
     );
   });
+
+  it('does not rewrite the unwrapped-output nudge example pair', () => {
+    const nudge = [
+      'Your last answer was not delivered because it was not wrapped in a final `<message to="name">...</message>` block.',
+      'Do not redo work. Do not call tools. Reply now with only the corrected final message block.',
+      'The current inbound message came from `discord-yente-threaded`; address the block to `discord-yente-threaded`.',
+      '',
+      'Put this exact answer text inside the block:',
+      '<answer>',
+      'Two separate failures.',
+      '</answer>',
+    ].join('\n');
+    expect(prepareCodexInputText(nudge)).toBe(nudge);
+  });
+
+  it('still restores real chat envelopes alongside untagged example text', () => {
+    const input =
+      '<context timezone="America/Los_Angeles" />\n' +
+      '<message id="2" from="discord-yente-threaded" sender="DanS" time="Sep 27, 2026, 10:11 PM">what happened?</message>';
+    const prepared = prepareCodexInputText(input);
+    expect(prepared).toContain('<message id="2" from="discord-yente-threaded" sender="DanS" time="Sep 27, 2026, 10:11 PM"><![CDATA[what happened?]]></message>');
+  });
 });
 
 describe('Codex NanoClaw skill bridge', () => {

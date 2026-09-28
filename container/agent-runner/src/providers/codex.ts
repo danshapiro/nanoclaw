@@ -118,7 +118,13 @@ export function resolveClaudeImports(content: string, baseDir: string, seen: Set
  */
 export function prepareCodexInputText(input: string): string {
   return input.replace(
-    /(<message\b[^>]*>)([\s\S]*?)(<\/message>)/g,
+    // Only real formatted chat envelopes are restored: formatSingleChat
+    // always emits sender="..." on inbound <message> tags, while runtime-
+    // injected prompts (the unwrapped-output nudge) carry only the literal
+    // <message to="name"> example pair. Requiring sender= keeps the exact-
+    // text CDATA restore scoped to user chat and stops the nudge's example
+    // from being rewritten into a CDATA-wrapped form the model then imitates.
+    /(<message\b[^>]*\bsender="[^"]*"[^>]*>)([\s\S]*?)(<\/message>)/g,
     (_match, open: string, escapedBody: string, close: string) => {
       const body = escapedBody
         .replace(/&quot;/g, '"')

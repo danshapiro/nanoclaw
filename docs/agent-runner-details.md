@@ -612,6 +612,8 @@ The agent-runner transforms messages_in rows into a prompt string. The provider 
 
 Mixed kinds (e.g., a chat message + a system response) are combined with clear delimiters. Each section is labeled by kind.
 
+The exact-text CDATA restore in the codex provider applies only to formatted inbound chat envelopes (`<message>` tags carrying `sender="`); runtime-injected prompts such as the unwrapped-output nudge are never rewritten.
+
 **Command detection:** Messages starting with `/` are checked against a command list. Recognized commands bypass formatting and are passed raw to the provider (for Claude's slash command handling) or intercepted by the agent-runner (for NanoClaw-level commands like session reset).
 
 ### Routing
@@ -632,7 +634,7 @@ interface RoutingContext {
 
 The agent never sees raw routing fields in the prompt. The runner keeps them as delivery metadata and fills `routeKey`/`messagingGroupId`/`isGroup` from the normalized active route when a provider turn starts.
 
-Provider final text is explicitly routed, not implicitly delivered. The runner sends only `<message to="destination-name">...</message>` blocks from the final provider result. Text outside those blocks, including `<internal>...</internal>`, is scratchpad: it is logged and not sent. Unknown destinations are dropped with a warning and added to scratchpad.
+Provider final text is explicitly routed, not implicitly delivered. The runner sends only `<message to="destination-name">...</message>` blocks from the final provider result. Text outside those blocks, including `<internal>...</internal>`, is scratchpad: it is logged and not sent. Unknown destinations are dropped with a warning and added to scratchpad. Delivered text never carries the CDATA boundary: a whole-body `<![CDATA[...]]>` wrapper (including the split `]]]]><![CDATA[>` form) is stripped from final-message bodies and from MCP send_message/send_file text before delivery.
 
 For a final `<message>` addressed to the active route, the runner writes a `messages_out` row with the active reply/thread metadata and the active route stamp so recovery can harvest it as prior progress. For a final `<message>` addressed to another destination, the runner writes to that destination but leaves the active `in_reply_to`, `thread_id`, `route_key`, `messaging_group_id`, and `is_group` fields unset so a cross-destination message cannot be recovered as progress for the triggering conversation.
 
