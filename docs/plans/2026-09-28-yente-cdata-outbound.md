@@ -268,7 +268,7 @@ Create `src/mcp-tools/send-file.test.ts` (new file). bun's `mock.module` is proc
 - Do NOT mock `existsSync` at all: the test creates a REAL source file (in a real temp dir, via the real fs) and passes its path, so the handler's existence check is genuine.
 - Mock ONLY `mkdirSync` and `copyFileSync`, and only for the exact `/workspace/outbox` prefix (the one directory that cannot exist on a workstation); delegate to the real fs for every other path. `codex.ts` and other tests that probe `/workspace/agent/...` with `existsSync`/`readFileSync` are untouched because `existsSync` is not mocked.
 - The test file's own statically-imported `fs` binding is captured BEFORE the mock registration and is the real module — it is the delegation target.
-- Before relying on the prefix scoping, confirm no other test writes under `/workspace/outbox`: run `grep -rn "workspace/outbox" container/agent-runner/src --include="*.test.ts"` and verify the only match is this new test (production code's own outbox constant aside).
+- Before relying on the prefix scoping, confirm no other test CALLS mkdirSync/copyFileSync with a `/workspace/outbox` argument: run `grep -rn "workspace/outbox" container/agent-runner/src --include="*.test.ts"` and check each match. Known result at plan time: the matches in `attachments.test.ts` (lines ~52/59/196) are string data for path-parsing tests (extractExplicitPaths/collectQueryAttachments with a mocked inspectFile seam) — they perform no fs writes on the prefix. This new test must be the only test that invokes the mocked functions with that prefix.
 
 ```ts
 import { mock, describe, it, expect, beforeEach, afterEach } from 'bun:test';
