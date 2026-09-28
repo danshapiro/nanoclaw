@@ -10,6 +10,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { findByName, getAllDestinations, isBlockedChannelName, SUBAGENT_CHANNEL_BLOCKED_MESSAGE } from '../destinations.js';
+import { stripCdataWrapper } from '../formatter.js';
 import { getMessageTargetBySeq, getRoutingBySeq, writeMessageOut } from '../db/messages-out.js';
 import { getSessionRouting } from '../db/session-routing.js';
 import { registerTools } from './server.js';
@@ -165,7 +166,7 @@ export const sendMessage: McpToolDefinition = {
     },
   },
   async handler(args) {
-    const text = args.text as string;
+    const text = stripCdataWrapper(args.text as string);
     if (!text) return err('text is required');
 
     const routing = resolveRouting(args.to as string | undefined);
@@ -233,7 +234,7 @@ export const sendFile: McpToolDefinition = {
         route_key: routeStamp?.route_key ?? null,
         messaging_group_id: routeStamp?.messaging_group_id ?? null,
         is_group: routeStamp?.is_group ?? null,
-        content: JSON.stringify({ text: (args.text as string) || '', files: [filename] }),
+        content: JSON.stringify({ text: stripCdataWrapper((args.text as string) || ''), files: [filename] }),
       });
     } catch (writeErr) {
       fs.rmSync(outboxDir, { recursive: true, force: true });

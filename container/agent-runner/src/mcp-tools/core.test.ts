@@ -141,6 +141,26 @@ describe('core message action tools', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  it('unwraps whole-body CDATA text in send_message deliveries', async () => {
+    const dir = writeActiveInput('opencode|discord|chan-1|dm:mg-1');
+    createSessionRouting({
+      channelType: 'discord',
+      platformId: 'chan-1',
+      threadId: null,
+      messagingGroupId: 'mg-1',
+      isGroup: 0,
+    });
+
+    const result = await sendMessage.handler({ text: '<![CDATA[Done — clean text.]]>' });
+    expect(result.isError).toBeUndefined();
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(JSON.parse(out[0].content).text).toBe('Done — clean text.');
+
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
   it('does not route-stamp cross-destination send_message rows', async () => {
     const dir = writeActiveInput('opencode|discord|chan-1|dm:mg-1');
     createSessionRouting({
