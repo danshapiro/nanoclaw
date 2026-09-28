@@ -17,7 +17,7 @@ import path from 'path';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb } from './db/connection.js';
 import { getPendingMessages } from './db/messages-in.js';
-import { formatMessages, formatRecoveryContext, sanitizeDeliveredText, stripInternalTags } from './formatter.js';
+import { formatMessages, formatRecoveryContext, sanitizeDeliveredText, stripCdataWrapper, stripInternalTags } from './formatter.js';
 import { TIMEZONE } from './timezone.js';
 
 let originalLocalSkillsWorkspace: string | undefined;
@@ -339,5 +339,33 @@ describe('sanitizeDeliveredText', () => {
     });
     expect(result.text).toBe('Reply text.');
     expect(result.droppedDestinations).toEqual([]);
+  });
+});
+
+describe('stripCdataWrapper', () => {
+  it('returns plain text unchanged', () => {
+    expect(stripCdataWrapper('Working on it.')).toBe('Working on it.');
+  });
+
+  it('leaves mid-body CDATA (a code sample) untouched', () => {
+    const text = 'Use `<![CDATA[x]]>` syntax like this.';
+    expect(stripCdataWrapper(text)).toBe(text);
+  });
+
+  it('unwraps a whole-body CDATA wrapper', () => {
+    expect(stripCdataWrapper('<![CDATA[Two separate failures.]]>')).toBe('Two separate failures.');
+  });
+
+  it('trims whitespace inside and around a whole-body wrapper', () => {
+    expect(stripCdataWrapper('  <![CDATA[\nDone.\n]]>  ')).toBe('Done.');
+  });
+
+  it('collapses the split CDATA boundary back to the original text', () => {
+    expect(stripCdataWrapper('<![CDATA[a ]]]]><![CDATA[> b]]>')).toBe('a ]]> b');
+  });
+
+  it('does not unwrap when the body only starts with the marker', () => {
+    const text = '<![CDATA[open but never closed';
+    expect(stripCdataWrapper(text)).toBe(text);
   });
 });

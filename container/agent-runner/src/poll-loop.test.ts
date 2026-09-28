@@ -1159,6 +1159,64 @@ describe('poll-loop conversational reply accounting', () => {
     await loopPromise.catch(() => {});
   });
 
+  it('delivers CDATA-wrapped final message bodies without the markers', async () => {
+    insertChannelDestination('discord-current', 'chan-2');
+    insertMessage(
+      'cdata-final-chat',
+      'chat',
+      { sender: 'User', text: 'finish this' },
+      { platformId: 'chan-2', channelType: 'discord', threadId: 'thread-2' },
+    );
+
+    const provider = new ScriptedProvider(async function* () {
+      yield { type: 'init', continuation: 'cdata-final-session' };
+      yield {
+        type: 'result',
+        text: '<message to="discord-current"><![CDATA[Two separate failures — not a permission problem.]]></message>',
+      };
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal);
+
+    await waitFor(() => getAckStatus('cdata-final-chat') === 'completed', 1500);
+    controller.abort();
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(JSON.parse(out[0].content).text).toBe('Two separate failures — not a permission problem.');
+
+    await loopPromise.catch(() => {});
+  });
+
+  it('delivers the split CDATA boundary form as the original text', async () => {
+    insertChannelDestination('discord-current', 'chan-2');
+    insertMessage(
+      'cdata-split-final-chat',
+      'chat',
+      { sender: 'User', text: 'finish this' },
+      { platformId: 'chan-2', channelType: 'discord', threadId: 'thread-2' },
+    );
+
+    const provider = new ScriptedProvider(async function* () {
+      yield { type: 'init', continuation: 'cdata-split-final-session' };
+      yield {
+        type: 'result',
+        text: '<message to="discord-current"><![CDATA[kept ]]]]><![CDATA[> sequence]]></message>',
+      };
+    });
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal);
+
+    await waitFor(() => getAckStatus('cdata-split-final-chat') === 'completed', 1500);
+    controller.abort();
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(JSON.parse(out[0].content).text).toBe('kept ]]> sequence');
+
+    await loopPromise.catch(() => {});
+  });
+
   it('does not route-stamp or thread cross-destination final message rows', async () => {
     insertChannelDestination('discord-current', 'chan-1');
     insertChannelDestination('other-channel', 'chan-2');

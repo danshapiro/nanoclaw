@@ -292,6 +292,27 @@ export function stripInternalTags(text: string): string {
   return text.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
 }
 
+const CDATA_WRAPPER_RE = /^<!\[CDATA\[([\s\S]*)\]\]>$/;
+// The inverse of the codex provider's ]]> split (which rewrites ]]> to
+// ]]]]><![CDATA[>): note FOUR closing brackets before the >.
+const CDATA_SPLIT_BOUNDARY_RE = /\]\]\]\]\><!\[CDATA\[>/g;
+
+/**
+ * Remove a whole-body `<![CDATA[...]]>` wrapper from agent-authored text
+ * before delivery. The codex provider rewraps inbound chat bodies in a CDATA
+ * boundary (and splits any literal `]]>` inside them); models imitating that
+ * envelope can echo the markers into their replies, so delivery strips the
+ * wrapper again — collapsing the split boundary back to the original text.
+ * Text that merely contains CDATA mid-body (for example a code sample) is
+ * delivered unchanged: only a single wrapper around the whole body is removed.
+ */
+export function stripCdataWrapper(text: string): string {
+  if (!text || !text.includes('<![CDATA[')) return text;
+  const match = CDATA_WRAPPER_RE.exec(text.trim());
+  if (!match) return text;
+  return match[1].replace(CDATA_SPLIT_BOUNDARY_RE, ']]>').trim();
+}
+
 /** Fast check: does delivered text still contain wrapper/routing tags? */
 const DELIVERY_WRAPPER_MARKER_RE = /<\/?answer>|<message\b|<\/message>/i;
 /** Well-formed routed block: `<message to="name">body</message>`. */

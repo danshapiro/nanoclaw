@@ -46,6 +46,7 @@ import {
   categorizeMessage,
   normalizeRoute,
   sanitizeDeliveredText,
+  stripCdataWrapper,
   stripInternalTags,
   type RoutingContext,
 } from './formatter.js';
@@ -190,7 +191,7 @@ function writeRoutedMessage(routing: RoutingContext, text: string): void {
   // `<answer>`/`<message to=…>` wrapper tags or blocks addressed to
   // unresolvable destinations. Strip the tags (preserving inner content) and
   // drop unresolvable-destination blocks instead of delivering them verbatim.
-  const sanitized = sanitizeDeliveredText(text, (name) => Boolean(findByName(name)));
+  const sanitized = sanitizeDeliveredText(stripCdataWrapper(text), (name) => Boolean(findByName(name)));
   for (const dest of sanitized.droppedDestinations) {
     log(
       JSON.stringify({
@@ -2166,7 +2167,7 @@ function dispatchResultText(text: string, routing: RoutingContext): { sent: numb
       scratchpadParts.push(text.slice(lastIndex, match.index));
     }
     const toName = match[2];
-    const body = match[3].trim();
+    const body = stripCdataWrapper(match[3].trim());
     messageBlocks++;
     lastIndex = MESSAGE_RE.lastIndex;
 
