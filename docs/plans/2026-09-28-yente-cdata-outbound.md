@@ -30,7 +30,7 @@ Fix the formatting defect from the 2026-09-27 Yente incident (kata rdj6) in the 
 
 ## Global Constraints
 
-- All commands run from `container/agent-runner/` in a shell that has first run `export PATH="$HOME/.bun/bin:$PATH"` (bun 1.4.2 is not on the default PATH). Every `bun` command in this plan carries that PATH prefix; never chain an unprefixed `bun` after a `&&`.
+- All `bun`/`tsc` test commands run from `container/agent-runner/`; all `git` commands run from the worktree root, using repository-root-relative paths (`container/agent-runner/src/...`). Run `export PATH="$HOME/.bun/bin:$PATH"` once per shell (bun 1.4.2 is not on the default PATH); every `bun` command in this plan carries that PATH prefix — never chain an unprefixed `bun` after a `&&`.
 - The two `prepareCodexInputText` tests at src/providers/codex.factory.test.ts:91-112 pin the inbound restore exactly — they must stay green unchanged.
 - Whole-body-only strip: text that merely CONTAINS CDATA mid-body (e.g. a code sample quoting CDATA syntax) must pass through unchanged.
 - Do not touch the `MESSAGE_RE` destination contract, routing, recovery, or any provider other than codex's input preparation.
@@ -218,8 +218,6 @@ Run: `PATH="$HOME/.bun/bin:$PATH" bun test src/formatter.test.ts src/poll-loop.t
 Expected: PASS
 
 - [ ] **Step 7: Commit the task**
-
-From the worktree root (run git there, using repo-root-relative paths):
 
 ```bash
 git add container/agent-runner/src/formatter.ts container/agent-runner/src/formatter.test.ts container/agent-runner/src/poll-loop.ts container/agent-runner/src/poll-loop.test.ts
