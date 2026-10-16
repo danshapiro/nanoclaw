@@ -11,7 +11,7 @@ describe('createProvider', () => {
   });
 
   it('returns CodexProvider for codex', () => {
-    expect(createProvider('codex')).toBeInstanceOf(CodexProvider);
+    expect(createProvider('codex', { env: { CODEX_MODEL: 'gpt-6.1-sol' } })).toBeInstanceOf(CodexProvider);
   });
 
   it('returns MockProvider for mock', () => {

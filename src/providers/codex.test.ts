@@ -610,4 +610,39 @@ describe('codex host provider container config', () => {
       await broker.close();
     }
   });
+
+  it('throws with a clear config error when no model is configured anywhere (no silent default)', async () => {
+    const root = tempDir('yente-codex-missing-model-');
+    const sessionDir = path.join(root, 'session');
+    fs.mkdirSync(sessionDir, { recursive: true });
+    const { configPath } = writeNativeConfig(root);
+    const broker = await startFakeBroker({
+      auth_mode: 'chatgpt',
+      tokens: {
+        access_token: 'access-token',
+        id_token: 'identity-token',
+        refresh_token: '',
+        account_id: 'acct_1',
+      },
+    });
+    try {
+      expect(() =>
+        codexHostContainerFactory({
+          sessionDir,
+          agentGroupId: 'ag-main',
+          agentGroupFolder: 'main',
+          hostEnv: {},
+          containerConfig: {
+            mcpServers: {},
+            packages: { apt: [], npm: [] },
+            additionalMounts: [],
+            skills: 'all',
+            codex: { onecliConfigPath: configPath, brokerSocket: broker.sock },
+          },
+        }),
+      ).toThrow(/codex group 'main' has no model configured/);
+    } finally {
+      await broker.close();
+    }
+  });
 });

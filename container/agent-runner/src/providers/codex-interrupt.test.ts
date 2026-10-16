@@ -355,7 +355,7 @@ describe('CodexProvider query setup abort handling', () => {
     let spawnCalls = 0;
     let terminationCalls = 0;
     const provider = new CodexProvider(
-      {},
+      { env: { CODEX_MODEL: 'gpt-6.1-sol' } },
       {
         syncManagedSkillLinks: () => {
           throw new Error('skill setup failed before spawn');
@@ -385,7 +385,7 @@ describe('CodexProvider query setup abort handling', () => {
     let initializeCancelled = false;
     let terminationCalls = 0;
     const provider = new CodexProvider(
-      {},
+      { env: { CODEX_MODEL: 'gpt-6.1-sol' } },
       {
         syncManagedSkillLinks: () => [],
         writeMcpConfig: () => {},
@@ -433,7 +433,7 @@ describe('CodexProvider query setup abort handling', () => {
     let threadStartCancelled = false;
     let terminationCalls = 0;
     const provider = new CodexProvider(
-      {},
+      { env: { CODEX_MODEL: 'gpt-6.1-sol' } },
       {
         syncManagedSkillLinks: () => [],
         writeMcpConfig: () => {},

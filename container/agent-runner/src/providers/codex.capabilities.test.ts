@@ -9,7 +9,7 @@ describe('Codex provider capabilities', () => {
       supportsSeparateRelayRuntime: true,
       relayToolPolicy: 'status_only',
     });
-    expect(new CodexProvider().capabilities).toEqual(codexCapabilities());
+    expect(new CodexProvider({ env: { CODEX_MODEL: 'gpt-6.1-sol' } }).capabilities).toEqual(codexCapabilities());
   });
 
   it('uses read-only sandboxing for relay turns only', () => {

@@ -250,7 +250,7 @@ describe('poll loop integration', () => {
     // path instead of exiting fatally through the quiescence rethrow.
     let bindAttempts = 0;
     const provider = new CodexProvider(
-      {},
+      { env: { CODEX_MODEL: 'gpt-6.1-sol' } },
       {
         syncManagedSkillLinks: () => [],
         writeMcpConfig: () => {},

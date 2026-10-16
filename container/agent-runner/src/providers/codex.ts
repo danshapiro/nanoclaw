@@ -357,9 +357,18 @@ export class CodexProvider implements AgentProvider {
   constructor(options: ProviderOptions = {}, queryDependencies: CodexQueryDependencies = {}) {
     this.mcpServers = options.mcpServers ?? {};
     this.queryDependencies = queryDependencies;
-    // Yente default. Per-group override via CODEX_MODEL in the runtime env
-    // supplied by the host-side provider config.
-    this.model = (options.env?.CODEX_MODEL as string | undefined) ?? 'gpt-5.5';
+    // No silent default model: the host-side provider config always forwards
+    // CODEX_MODEL, and a missing model is a configuration error, not something
+    // to paper over with a default that rots when the provider retires the
+    // model (the 2026-10-15 gpt-5.5 retirement broke every model-less group
+    // with a confusing provider 400).
+    const model = options.env?.CODEX_MODEL as string | undefined;
+    if (!model) {
+      throw new Error(
+        'CodexProvider requires CODEX_MODEL in its provider env; refusing to fall back to a default model',
+      );
+    }
+    this.model = model;
   }
 
   isSessionInvalid(err: unknown): boolean {
@@ -900,7 +909,7 @@ export async function* runOneTurn(
         break;
       }
       // NOTE: `turn/failed` is NOT part of the codex app-server v2 protocol
-      // (verified against openai/codex@rust-v0.153.4 — the deployed pin; the
+      // (verified against openai/codex@rust-v0.162.1 — the deployed pin; the
       // ServerNotification enum has no `turn/failed`). A terminal failure arrives
       // as an `error` notification (willRetry:false) plus `turn/completed` with
       // status:"failed" and turn.error.message — both handled below. Retained as a

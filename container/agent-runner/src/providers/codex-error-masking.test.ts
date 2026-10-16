@@ -16,7 +16,7 @@ function queryServer(): AppServer {
 
 function makeProvider(): CodexProvider {
   return new CodexProvider(
-    {},
+    { env: { CODEX_MODEL: 'gpt-6.1-sol' } },
     {
       syncManagedSkillLinks: () => [],
       writeMcpConfig: () => {},

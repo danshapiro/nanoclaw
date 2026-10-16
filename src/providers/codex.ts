@@ -628,7 +628,19 @@ export const codexHostContainerFactory = (ctx: ProviderContainerContext) => {
   // "no raw model-provider keys in team containers" and (b) actively flip Codex
   // out of ChatGPT-OAuth mode into API-key billing — both wrong. Only non-secret
   // *config* (model id, base URL, reasoning effort, timeouts) is passed through.
-  const model = ctx.containerConfig?.model ?? ctx.groupModel ?? ctx.hostEnv.CODEX_MODEL ?? 'gpt-5.5';
+  //
+  // No silent default model: a missing model is a configuration error. The old
+  // gpt-5.5 fallback rotted invisibly — when OpenAI retired gpt-5.5 for
+  // ChatGPT-account Codex (2026-10-15), the one model-less group (yente-dev)
+  // broke on every turn with a confusing provider 400 instead of a clear
+  // config error at spawn.
+  const model = ctx.containerConfig?.model ?? ctx.groupModel ?? ctx.hostEnv.CODEX_MODEL;
+  if (!model) {
+    throw new Error(
+      `codex group '${ctx.agentGroupFolder ?? ctx.agentGroupId ?? 'unknown'}' has no model configured: ` +
+        'set "model" in its container.json (set-yente-provider.sh --model) or CODEX_MODEL in the host env',
+    );
+  }
   const reasoningEffort =
     ctx.containerConfig?.reasoningEffort ?? ctx.groupReasoningEffort ?? ctx.hostEnv.CODEX_REASONING_EFFORT ?? 'high';
   const env: Record<string, string> = {

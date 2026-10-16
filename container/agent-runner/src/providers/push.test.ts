@@ -534,7 +534,7 @@ describe('provider push attachment compatibility', () => {
   });
 
   it('codex provider accepts structured follow-up turns before its event stream starts', () => {
-    const provider = new CodexProvider();
+    const provider = new CodexProvider({ env: { CODEX_MODEL: 'gpt-6.1-sol' } });
     const query = provider.query({ inputId: 'codex-first', acceptInput: async () => {}, prompt: 'first', cwd: '/tmp' });
 
     expect(() =>
