@@ -10,6 +10,7 @@ import { Message, parseMarkdown, type Adapter } from 'chat';
 import type { ChannelSetup } from './adapter.js';
 import { closeDb, initTestDb } from '../db/connection.js';
 import { createAgentGroup, createMessagingGroup, createMessagingGroupAgent } from '../db/index.js';
+import { setMessagingGroupDeniedAt } from '../db/messaging-groups.js';
 import { runMigrations } from '../db/migrations/index.js';
 import { log } from '../log.js';
 import { attachmentStagingDir, cleanupAttachmentStaging, MAX_INBOUND_ATTACHMENT_BYTES } from '../yente/attachments.js';
@@ -312,7 +313,10 @@ describe('Chat SDK attachment preflight', () => {
     expect(shouldDownloadChatSdkAttachments(null)).toBe(true);
     expect(shouldDownloadChatSdkAttachments(0)).toBe(false);
     expect(shouldDownloadChatSdkAttachments(0, true)).toBe(true);
+    expect(shouldDownloadChatSdkAttachments(0, true, true)).toBe(false);
+    expect(shouldDownloadChatSdkAttachments(0, false, true)).toBe(false);
     expect(shouldDownloadChatSdkAttachments(1)).toBe(true);
+    expect(shouldDownloadChatSdkAttachments(1, true, true)).toBe(true);
   });
 });
 
@@ -946,6 +950,44 @@ describe('plain-message catch-all dispatch', () => {
     }
   });
 
+  it('skips attachment download for denied zero-wired mentions', async () => {
+    const stagingDir = attachmentStagingDir();
+    await cleanupAttachmentStaging(stagingDir);
+    const fetchData = vi.fn().mockResolvedValue(Buffer.from('denied attachment'));
+    const { bridge, driver, fakeAdapter } = await makeDispatchHarness();
+
+    try {
+      createMessagingGroup({
+        id: 'mg-denied-mention',
+        channel_type: 'discord',
+        platform_id: 'thread-denied-mention',
+        name: 'Denied channel',
+        is_group: 1,
+        unknown_sender_policy: 'request_approval',
+        created_at: new Date().toISOString(),
+      });
+      setMessagingGroupDeniedAt('mg-denied-mention', new Date().toISOString());
+
+      await driver.handleIncomingMessage(
+        fakeAdapter,
+        'thread-denied-mention',
+        makeMessage({
+          id: 'm-denied-mention',
+          text: '@yente-test please review this file',
+          formatted: parseMarkdown('@yente-test please review this file'),
+          attachments: [{ id: 'denied-file', type: 'file', name: 'denied.docx', fetchData }],
+        }),
+      );
+
+      expect(fetchData).not.toHaveBeenCalled();
+      expect(fs.readdirSync(stagingDir)).toEqual([]);
+    } finally {
+      await bridge.teardown();
+      await cleanupAttachmentStaging(stagingDir);
+      closeDb();
+    }
+  });
+
   it('sanitizes attachment download failures from signed URLs and removes partial staging files', async () => {
     const stagingDir = attachmentStagingDir();
     await cleanupAttachmentStaging(stagingDir);
@@ -1013,6 +1055,14 @@ describe('plain-message catch-all dispatch', () => {
         content: { attachments: Array<{ error?: string }> };
       };
       expect(inbound.content.attachments[0]?.error).toBe('Attachment download failed');
+      expect(warning).toHaveBeenCalledWith('Failed to download attachment', {
+        channel: 'discord',
+        messageId: 'm-interrupted-file',
+        attachmentId: 'att-interrupted',
+        name: 'private.docx',
+        type: 'file',
+        error: 'Attachment download failed',
+      });
       expect(JSON.stringify(warning.mock.calls)).not.toContain(signedUrl);
       expect(fs.readdirSync(stagingDir)).toEqual([]);
     } finally {

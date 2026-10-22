@@ -6,8 +6,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Readable } from 'stream';
 
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../db/index.js';
+import { log } from '../log.js';
 import { inboundDbPath, resolveSession, writeSessionMessage } from '../session-manager.js';
-import { shouldSkipWhatsAppMediaDownload, stageWhatsAppMedia } from './whatsapp.js';
+import { logWhatsAppMediaDownloadFailure, shouldSkipWhatsAppMediaDownload, stageWhatsAppMedia } from './whatsapp.js';
 
 vi.mock('../config.js', async () => {
   const actual = await vi.importActual('../config.js');
@@ -120,6 +121,32 @@ describe('WhatsApp streamed media download', () => {
       cancelled = true;
       await pending.catch(() => undefined);
       await fs.promises.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('logs safe metadata and a sanitized error when a media download fails', () => {
+    const signedUrl = 'https://cdn.whatsapp.example/private-file?token=secret';
+    const warning = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
+    try {
+      logWhatsAppMediaDownloadFailure({
+        messageId: 'wa-failed-message',
+        attachmentId: 'document-wa-failed-message',
+        name: 'private.docx',
+        type: 'document',
+        error: new Error(`socket reset at ${signedUrl}`),
+      });
+
+      expect(warning).toHaveBeenCalledWith('Failed to download media', {
+        channel: 'whatsapp',
+        messageId: 'wa-failed-message',
+        attachmentId: 'document-wa-failed-message',
+        name: 'private.docx',
+        type: 'document',
+        error: 'WhatsApp attachment download failed',
+      });
+      expect(JSON.stringify(warning.mock.calls)).not.toContain(signedUrl);
+    } finally {
+      warning.mockRestore();
     }
   });
 });

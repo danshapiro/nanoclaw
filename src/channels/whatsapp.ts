@@ -145,6 +145,37 @@ export async function stageWhatsAppMedia(
   }
 }
 
+function safeWhatsAppMediaDownloadError(error: unknown): string {
+  const message = error instanceof Error ? error.message : '';
+  if (
+    message === 'WhatsApp attachment download timed out' ||
+    message === 'WhatsApp attachment download failed' ||
+    /^Inbound attachment exceeds the (?:1 GiB|\d+-byte) limit$/.test(message)
+  ) {
+    return message;
+  }
+  return 'WhatsApp attachment download failed';
+}
+
+export function logWhatsAppMediaDownloadFailure(args: {
+  messageId?: string;
+  attachmentId: string;
+  name: string;
+  type: string;
+  error: unknown;
+}): string {
+  const error = safeWhatsAppMediaDownloadError(args.error);
+  log.warn('Failed to download media', {
+    channel: 'whatsapp',
+    messageId: args.messageId,
+    attachmentId: args.attachmentId,
+    name: args.name,
+    type: args.type,
+    error,
+  });
+  return error;
+}
+
 export function shouldSkipWhatsAppMediaDownload(input: {
   fromMe: boolean;
   content: string;
@@ -449,10 +480,16 @@ registerChannelAdapter('whatsapp', {
             durationMs: Date.now() - transferStartedAt,
           });
         } catch (err) {
-          const error = err instanceof Error ? err.message : 'WhatsApp attachment download failed';
-          log.warn('Failed to download media', { type, error });
+          const attachmentId = `${type}-${msg.key.id || Date.now()}`;
+          const error = logWhatsAppMediaDownloadFailure({
+            messageId: msg.key.id ?? undefined,
+            attachmentId,
+            name: filename,
+            type,
+            error: err,
+          });
           results.push({
-            id: `${type}-${msg.key.id || Date.now()}`,
+            id: attachmentId,
             type,
             name: filename,
             mimeType,

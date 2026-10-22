@@ -300,8 +300,12 @@ export function safeAttachmentDownloadError(error: unknown): string {
   return 'Attachment download failed';
 }
 
-export function shouldDownloadChatSdkAttachments(wiredAgentCount: number | null, isApprovalCandidate = false): boolean {
-  return isApprovalCandidate || wiredAgentCount === null || wiredAgentCount > 0;
+export function shouldDownloadChatSdkAttachments(
+  wiredAgentCount: number | null,
+  isApprovalCandidate = false,
+  isDeniedChannel = false,
+): boolean {
+  return wiredAgentCount === null || wiredAgentCount > 0 || (isApprovalCandidate && !isDeniedChannel);
 }
 
 async function awaitWithTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
@@ -474,14 +478,14 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     const serialized = message.toJSON() as Record<string, any>;
 
     // Download attachment data before serialization loses fetchData()
-    const wiredAgentCount = channelId
-      ? (getMessagingGroupWithAgentCount(adapter.name, channelId)?.agentCount ?? 0)
-      : null;
+    const messagingGroup = channelId ? getMessagingGroupWithAgentCount(adapter.name, channelId) : null;
+    const wiredAgentCount = channelId ? (messagingGroup?.agentCount ?? 0) : null;
     const isApprovalCandidate = isMention || isGroup === false;
+    const isDeniedChannel = !!messagingGroup?.mg.denied_at;
     if (
       message.attachments &&
       message.attachments.length > 0 &&
-      shouldDownloadChatSdkAttachments(wiredAgentCount, isApprovalCandidate)
+      shouldDownloadChatSdkAttachments(wiredAgentCount, isApprovalCandidate, isDeniedChannel)
     ) {
       const enriched = [];
       const serializedAttachments = Array.isArray(serialized.attachments) ? serialized.attachments : [];
@@ -494,7 +498,14 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           });
         } catch (err) {
           const safeError = safeAttachmentDownloadError(err);
-          log.warn('Failed to download attachment', { type: attachment.type, error: safeError });
+          log.warn('Failed to download attachment', {
+            channel: adapter.name,
+            messageId: message.id,
+            attachmentId: attachment.id,
+            name: attachment.name,
+            type: attachment.type,
+            error: safeError,
+          });
           entry = {
             id: attachment.id,
             type: attachment.type,
