@@ -1,7 +1,26 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import fs from 'fs/promises';
+import os from 'os';
+import path from 'path';
+
+const agentMailTestState = vi.hoisted(() => ({ getAttachment: vi.fn() }));
+vi.mock('agentmail', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('agentmail')>();
+  return {
+    ...actual,
+    AgentMailClient: class {
+      inboxes = { messages: { getAttachment: agentMailTestState.getAttachment } };
+    },
+  };
+});
 
 import { log } from '../log.js';
-import { AGENTMAIL_ONECLI_PLACEHOLDER, createAgentMailOneCliWebSocket } from './agentmail-api.js';
+import {
+  AGENTMAIL_ONECLI_PLACEHOLDER,
+  createAgentMailApi,
+  createAgentMailOneCliWebSocket,
+  downloadAgentMailAttachmentResponse,
+} from './agentmail-api.js';
 
 type FakeWebSocketEvent = 'open' | 'message' | 'close' | 'error' | 'pong';
 type FakeWebSocketStoredHandler = (...args: unknown[]) => void;
@@ -261,5 +280,173 @@ describe('AgentMail API WebSocket boundary', () => {
     vi.advanceTimersByTime(1000);
     expect(FakeWebSocket.instances).toHaveLength(37);
     socket.close();
+  });
+});
+
+describe('AgentMail attachment downloads', () => {
+  it('fetches the attachment URL and streams its response into a staged file without base64 data', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmail-attachments-'));
+    try {
+      const chunks = [Buffer.from('large '), Buffer.from('word '), Buffer.from('document')];
+      const downloadUrl = 'https://files.agentmail.test/attachment?signature=secret';
+      agentMailTestState.getAttachment.mockResolvedValueOnce({
+        download_url: downloadUrl,
+        filename: 'report.docx',
+        content_type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      });
+      const fetchImpl = vi.fn(
+        async () =>
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                for (const chunk of chunks) controller.enqueue(chunk);
+                controller.close();
+              },
+            }),
+            { headers: { 'content-length': '19' } },
+          ),
+      );
+      const api = createAgentMailApi(
+        { mode: 'api-key', apiKey: 'test-key' },
+        { fetchImpl: fetchImpl as unknown as typeof fetch, stagingDir: dir },
+      );
+      const result = await api.downloadAttachment({ inboxId: 'inbox', messageId: 'message', attachmentId: 'file-1' });
+      expect(fetchImpl).toHaveBeenCalledWith(downloadUrl, { signal: expect.any(AbortSignal) });
+      expect(result).toMatchObject({ filename: 'report.docx', sizeBytes: 19 });
+      expect('data' in result).toBe(false);
+      expect(await fs.readFile(result.stagedHostPath, 'utf8')).toBe('large word document');
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a declared attachment larger than the fixed 1 GiB inbound cap', async () => {
+    let bodyCancelled = false;
+    const body = {
+      cancel: vi.fn(async () => {
+        bodyCancelled = true;
+      }),
+    };
+    await expect(
+      downloadAgentMailAttachmentResponse(
+        {
+          ok: true,
+          status: 200,
+          headers: new Headers({ 'content-length': String(1024 ** 3 + 1) }),
+          body,
+        } as unknown as Response,
+        { filename: 'large.docx' },
+      ),
+    ).rejects.toThrow('Inbound attachment exceeds the 1 GiB limit');
+    expect(body.cancel).toHaveBeenCalledOnce();
+    expect(bodyCancelled).toBe(true);
+  });
+
+  it('reports a safe HTTP status and cancels a rejected response body', async () => {
+    let cancelled = false;
+    const response = new Response(
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(Buffer.from('error body'));
+        },
+        cancel() {
+          cancelled = true;
+        },
+      }),
+      { status: 503 },
+    );
+    await expect(downloadAgentMailAttachmentResponse(response, { filename: 'report.docx' })).rejects.toThrow(
+      'AgentMail attachment download failed with HTTP 503',
+    );
+    expect(cancelled).toBe(true);
+  });
+
+  it('rejects declared AgentMail size metadata before fetching the signed URL', async () => {
+    agentMailTestState.getAttachment.mockResolvedValueOnce({
+      download_url: 'https://files.agentmail.test/attachment?signature=private',
+      filename: 'large.docx',
+      size_bytes: 1024 ** 3 + 1,
+    });
+    const fetchImpl = vi.fn();
+    const api = createAgentMailApi(
+      { mode: 'api-key', apiKey: 'test-key' },
+      { fetchImpl: fetchImpl as unknown as typeof fetch },
+    );
+    await expect(
+      api.downloadAttachment({ inboxId: 'inbox', messageId: 'message', attachmentId: 'file-large' }),
+    ).rejects.toThrow('Inbound attachment exceeds the 1 GiB limit');
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('enforces the byte limit while streaming and removes partial files after overflow', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmail-attachments-'));
+    try {
+      await expect(
+        downloadAgentMailAttachmentResponse(
+          new Response(
+            new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(Buffer.from('123456'));
+                controller.enqueue(Buffer.from('7890'));
+                controller.close();
+              },
+            }),
+          ),
+          { filename: 'report.docx' },
+          { stagingDir: dir, maxBytes: 8 },
+        ),
+      ).rejects.toThrow('Inbound attachment exceeds the 8-byte limit');
+      expect(await fs.readdir(dir)).toEqual([]);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('sanitizes interrupted streams and removes partial staging files', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmail-attachments-'));
+    try {
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          controller.enqueue(Buffer.from('partial'));
+          controller.error(new Error('signed URL token=secret'));
+        },
+      });
+      await expect(
+        downloadAgentMailAttachmentResponse(new Response(body), { filename: 'report.docx' }, { stagingDir: dir }),
+      ).rejects.toThrow('AgentMail attachment download failed');
+      expect(await fs.readdir(dir)).toEqual([]);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('aborts a stalled response after the fixed timeout and removes partial staging bytes', async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmail-attachments-'));
+    let cancelled = false;
+    const response = new Response(
+      new ReadableStream<Uint8Array>({
+        start(streamController) {
+          streamController.enqueue(Buffer.from('partial'));
+        },
+        cancel() {
+          cancelled = true;
+        },
+      }),
+    );
+    const pending = downloadAgentMailAttachmentResponse(
+      response,
+      { filename: 'stalled.docx' },
+      { stagingDir: dir, timeoutMs: 20 },
+    );
+    const timeoutAssertion = expect(pending).rejects.toThrow(/timed out/i);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      await timeoutAssertion;
+      expect(cancelled).toBe(true);
+      expect(await fs.readdir(dir)).toEqual([]);
+    } finally {
+      await pending.catch(() => undefined);
+      await fs.rm(dir, { recursive: true, force: true });
+    }
   });
 });

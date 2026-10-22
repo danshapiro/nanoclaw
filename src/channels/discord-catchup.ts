@@ -108,6 +108,8 @@ export type DiscordCatchupDeps = {
   monitoredChannelIds: () => Set<string>;
   env?: NodeJS.ProcessEnv;
   fetchImpl?: typeof fetch;
+  /** Test seam for the local webhook. Production uses the shared Node HTTP transport. */
+  webhookFetchImpl?: typeof fetch;
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
 };
@@ -267,7 +269,7 @@ export function createDiscordCatchup(deps: DiscordCatchupDeps): DiscordCatchup {
         // and can exhaust the 3-attempt budget in ~1.3 s; the LIVE forwarder
         // keeps its own 3 network-level attempts unchanged.
         const delivered = await forwardDiscordGatewayEventWithRetry(deps.webhookUrl, event, deps.botToken, {
-          fetchImpl,
+          ...(deps.webhookFetchImpl ? { fetchImpl: deps.webhookFetchImpl } : {}),
           sleep,
           retryDelaysMs: [],
         });
@@ -384,7 +386,7 @@ export function createDiscordCatchup(deps: DiscordCatchupDeps): DiscordCatchup {
       },
     };
     const delivered = await forwardDiscordGatewayEventWithRetry(deps.webhookUrl, event, deps.botToken, {
-      fetchImpl,
+      ...(deps.webhookFetchImpl ? { fetchImpl: deps.webhookFetchImpl } : {}),
       sleep,
       retryDelaysMs: [],
     });

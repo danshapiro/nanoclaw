@@ -12,13 +12,17 @@
  *  - Deny path: pending row deleted, no member added
  */
 import fs from 'fs';
+import path from 'path';
+import Database from 'better-sqlite3';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 
-import { initTestDb, closeDb, runMigrations } from '../../db/index.js';
+import { initDb, closeDb, runMigrations } from '../../db/index.js';
 import { createAgentGroup } from '../../db/agent-groups.js';
 import { createMessagingGroup, createMessagingGroupAgent } from '../../db/messaging-groups.js';
 import { upsertUser } from './db/users.js';
 import { grantRole } from './db/user-roles.js';
+import { attachmentStagingDir } from '../../yente/attachments.js';
+import { inboundDbPath } from '../../session-manager.js';
 
 // Mock container runner — prevent actual docker spawn.
 vi.mock('../../container-runner.js', () => ({
@@ -54,10 +58,15 @@ vi.mock('./user-dm.js', () => ({
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-sender-approval' };
+  return {
+    ...actual,
+    DATA_DIR: '/tmp/nanoclaw-test-sender-approval',
+    GROUPS_DIR: '/tmp/nanoclaw-test-sender-approval/groups',
+  };
 });
 
 const TEST_DIR = '/tmp/nanoclaw-test-sender-approval';
+const TEST_DB_PATH = path.join(TEST_DIR, 'central.db');
 
 function now() {
   return new Date().toISOString();
@@ -66,7 +75,7 @@ function now() {
 beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
-  const db = initTestDb();
+  const db = initDb(TEST_DB_PATH);
   runMigrations(db);
 
   // Side-effect imports: register hooks (permissions module) AFTER the
@@ -152,7 +161,273 @@ function stranger(text: string) {
   };
 }
 
+function strangerWithAttachment(text: string, sourceName: string) {
+  const sourceDir = attachmentStagingDir();
+  fs.mkdirSync(sourceDir, { recursive: true });
+  const sourcePath = path.join(sourceDir, sourceName);
+  fs.writeFileSync(sourcePath, Buffer.from('approved attachment bytes'));
+  const message = stranger(text);
+  const content = JSON.parse(message.message.content) as Record<string, unknown>;
+  message.message.content = JSON.stringify({
+    ...content,
+    attachments: [
+      {
+        id: 'approval-file',
+        name: 'approval.docx',
+        mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        stagedHostPath: sourcePath,
+      },
+    ],
+  });
+  return { event: message, sourcePath };
+}
+
 describe('unknown-sender request_approval flow', () => {
+  it('awaits pending attachment spooling while allowing the question card to finish asynchronously', async () => {
+    const { routeInbound } = await import('../../router.js');
+    let finishCard!: () => void;
+    deliverMock.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishCard = () => resolve('plat-msg-id');
+        }),
+    );
+    const { event, sourcePath } = strangerWithAttachment('please let me in', 'pending.attachment');
+
+    await routeInbound(event);
+
+    const { getDb } = await import('../../db/connection.js');
+    const row = getDb().prepare('SELECT original_message FROM pending_sender_approvals').get() as {
+      original_message: string;
+    };
+    const pendingEvent = JSON.parse(row.original_message) as {
+      message: { content: string };
+    };
+    const pendingContent = JSON.parse(pendingEvent.message.content) as {
+      attachments: Array<{ stagedHostPath?: string; approvalSpoolPath?: string }>;
+    };
+    expect(pendingContent.attachments[0]?.stagedHostPath).toBeUndefined();
+    expect(pendingContent.attachments[0]?.approvalSpoolPath).toBeTruthy();
+    expect(fs.existsSync(pendingContent.attachments[0]!.approvalSpoolPath!)).toBe(true);
+    expect(fs.existsSync(sourcePath)).toBe(false);
+    expect(deliverMock).toHaveBeenCalledTimes(1);
+
+    finishCard();
+  });
+
+  it('replays an approved staged attachment after reopening the database', async () => {
+    const { routeInbound } = await import('../../router.js');
+    const { getResponseHandlers } = await import('../../response-registry.js');
+    createMessagingGroup({
+      id: 'mg-discord-approval',
+      channel_type: 'discord',
+      platform_id: 'discord-chat',
+      name: 'Discord Chat',
+      is_group: 1,
+      unknown_sender_policy: 'request_approval',
+      created_at: now(),
+    });
+    createMessagingGroupAgent({
+      id: 'mga-discord-approval',
+      messaging_group_id: 'mg-discord-approval',
+      agent_group_id: 'ag-1',
+      engage_mode: 'pattern',
+      engage_pattern: '.',
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'shared',
+      priority: 0,
+      created_at: now(),
+    });
+    const sourceDir = attachmentStagingDir();
+    fs.mkdirSync(sourceDir, { recursive: true });
+    const sourcePath = path.join(sourceDir, 'reopen-approval.attachment');
+    const expectedBytes = Buffer.from('approved Discord attachment bytes');
+    fs.writeFileSync(sourcePath, expectedBytes);
+    const event = {
+      channelType: 'discord',
+      platformId: 'discord-chat',
+      threadId: 'thread-approval',
+      message: {
+        id: 'discord-approval-message',
+        kind: 'chat' as const,
+        content: JSON.stringify({
+          senderId: 'discord:outsider',
+          senderName: 'Outsider',
+          text: 'please approve this document',
+          attachments: [
+            {
+              id: 'approval-file',
+              name: 'approval.docx',
+              mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+              stagedHostPath: sourcePath,
+            },
+          ],
+        }),
+        timestamp: now(),
+      },
+    };
+
+    await routeInbound(event);
+    const { getDb } = await import('../../db/connection.js');
+    const pending = getDb().prepare('SELECT id, original_message FROM pending_sender_approvals').get() as {
+      id: string;
+      original_message: string;
+    };
+    const pendingContent = JSON.parse(
+      (JSON.parse(pending.original_message) as { message: { content: string } }).message.content,
+    ) as { attachments: Array<{ approvalSpoolPath: string }> };
+    const spoolPath = pendingContent.attachments[0]!.approvalSpoolPath;
+    expect(fs.existsSync(sourcePath)).toBe(false);
+    expect(fs.existsSync(spoolPath)).toBe(true);
+
+    closeDb();
+    runMigrations(initDb(TEST_DB_PATH));
+
+    for (const handler of getResponseHandlers()) {
+      const claimed = await handler({
+        questionId: pending.id,
+        value: 'approve',
+        userId: 'owner',
+        channelType: 'telegram',
+        platformId: 'dm-owner',
+        threadId: null,
+      });
+      if (claimed) break;
+    }
+
+    const workspaceFile = path.join(
+      TEST_DIR,
+      'groups',
+      'agent',
+      'attachments',
+      'discord',
+      'discord-approval-message',
+      'approval-file-approval.docx',
+    );
+    expect(fs.readFileSync(workspaceFile)).toEqual(expectedBytes);
+    expect(fs.existsSync(spoolPath)).toBe(false);
+    const session = getDb().prepare('SELECT id FROM sessions WHERE agent_group_id = ?').get('ag-1') as { id: string };
+    const inbound = new Database(inboundDbPath('ag-1', session.id));
+    const stored = inbound
+      .prepare('SELECT content FROM messages_in WHERE platform_message_id = ?')
+      .get('discord-approval-message') as { content: string };
+    inbound.close();
+    const storedContent = JSON.parse(stored.content) as { attachments: Array<Record<string, unknown>> };
+    expect(storedContent.attachments[0]).toHaveProperty('workspacePath');
+    expect(storedContent.attachments[0]).not.toHaveProperty('data');
+    expect(storedContent.attachments[0]).not.toHaveProperty('stagedHostPath');
+    expect(storedContent.attachments[0]).not.toHaveProperty('approvalSpoolPath');
+  }, 20000);
+
+  it('denying an attachment approval removes its spool without creating a workspace file', async () => {
+    const { routeInbound } = await import('../../router.js');
+    const { getResponseHandlers } = await import('../../response-registry.js');
+    const sourceDir = attachmentStagingDir();
+    fs.mkdirSync(sourceDir, { recursive: true });
+    const sourcePath = path.join(sourceDir, 'denied.attachment');
+    fs.writeFileSync(sourcePath, Buffer.from('denied attachment'));
+    const event = stranger('please review this');
+    event.message.content = JSON.stringify({
+      senderId: 'tg:stranger',
+      senderName: 'Stranger',
+      text: 'please review this',
+      attachments: [{ id: 'denied-file', name: 'denied.docx', stagedHostPath: sourcePath }],
+    });
+    await routeInbound(event);
+
+    const { getDb } = await import('../../db/connection.js');
+    const pending = getDb().prepare('SELECT id, original_message FROM pending_sender_approvals').get() as {
+      id: string;
+      original_message: string;
+    };
+    const content = JSON.parse(
+      (JSON.parse(pending.original_message) as { message: { content: string } }).message.content,
+    ) as { attachments: Array<{ approvalSpoolPath: string }> };
+    const spoolPath = content.attachments[0]!.approvalSpoolPath;
+    for (const handler of getResponseHandlers()) {
+      const claimed = await handler({
+        questionId: pending.id,
+        value: 'reject',
+        userId: 'owner',
+        channelType: 'telegram',
+        platformId: 'dm-owner',
+        threadId: null,
+      });
+      if (claimed) break;
+    }
+    expect(fs.existsSync(sourcePath)).toBe(false);
+    expect(fs.existsSync(spoolPath)).toBe(false);
+    expect(fs.existsSync(path.join(TEST_DIR, 'groups', 'agent', 'attachments', 'telegram'))).toBe(false);
+  });
+
+  it('removes pending attachment bytes when an approved message cannot be replayed', async () => {
+    const { routeInbound } = await import('../../router.js');
+    const { getResponseHandlers } = await import('../../response-registry.js');
+    const { wakeContainer } = await import('../../container-runner.js');
+    const { event } = strangerWithAttachment('please review', 'failed-replay.attachment');
+    await routeInbound(event);
+
+    const { getDb } = await import('../../db/connection.js');
+    const pending = getDb().prepare('SELECT id, original_message FROM pending_sender_approvals').get() as {
+      id: string;
+      original_message: string;
+    };
+    const pendingEvent = JSON.parse(pending.original_message) as { message: { content: string } };
+    const pendingContent = JSON.parse(pendingEvent.message.content) as {
+      attachments: Array<{ approvalSpoolPath: string }>;
+    };
+    const spoolPath = pendingContent.attachments[0]!.approvalSpoolPath;
+    vi.mocked(wakeContainer).mockRejectedValueOnce(new Error('simulated wake failure'));
+
+    for (const handler of getResponseHandlers()) {
+      const claimed = await handler({
+        questionId: pending.id,
+        value: 'approve',
+        userId: 'owner',
+        channelType: 'telegram',
+        platformId: 'dm-owner',
+        threadId: null,
+      });
+      if (claimed) break;
+    }
+
+    expect(fs.existsSync(spoolPath)).toBe(false);
+  });
+
+  it('removes pending attachment bytes when the stored approval event is malformed', async () => {
+    const { routeInbound } = await import('../../router.js');
+    const { getResponseHandlers } = await import('../../response-registry.js');
+    const { event } = strangerWithAttachment('please review', 'malformed-replay.attachment');
+    await routeInbound(event);
+
+    const { getDb } = await import('../../db/connection.js');
+    const pending = getDb().prepare('SELECT id, original_message FROM pending_sender_approvals').get() as {
+      id: string;
+      original_message: string;
+    };
+    const pendingEvent = JSON.parse(pending.original_message) as { message: { content: string } };
+    const pendingContent = JSON.parse(pendingEvent.message.content) as {
+      attachments: Array<{ approvalSpoolPath: string }>;
+    };
+    const spoolPath = pendingContent.attachments[0]!.approvalSpoolPath;
+    getDb().prepare('UPDATE pending_sender_approvals SET original_message = ? WHERE id = ?').run('{', pending.id);
+
+    for (const handler of getResponseHandlers()) {
+      const claimed = await handler({
+        questionId: pending.id,
+        value: 'approve',
+        userId: 'owner',
+        channelType: 'telegram',
+        platformId: 'dm-owner',
+        threadId: null,
+      });
+      if (claimed) break;
+    }
+
+    expect(fs.existsSync(spoolPath)).toBe(false);
+  });
+
   it('delivers an approval card on first unknown message', async () => {
     const { routeInbound } = await import('../../router.js');
     await routeInbound(stranger('hi'));

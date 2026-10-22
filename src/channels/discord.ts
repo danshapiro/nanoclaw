@@ -3,6 +3,8 @@
  * Self-registers on import.
  */
 import { createDiscordAdapter } from '@chat-adapter/discord';
+import http from 'node:http';
+import https from 'node:https';
 
 import { getDb, hasTable, isDbInitialized } from '../db/connection.js';
 import { readEnvFile } from '../env.js';
@@ -399,6 +401,53 @@ function isTransientGatewayForwardError(error: unknown): boolean {
   return false;
 }
 
+type GatewayForwardResponse = Pick<Response, 'ok' | 'status' | 'text'>;
+
+function postDiscordGatewayEvent(
+  webhookUrl: string,
+  event: { type: string },
+  botToken: string,
+): Promise<GatewayForwardResponse> {
+  return new Promise((resolve, reject) => {
+    const url = new URL(webhookUrl);
+    const transport = url.protocol === 'https:' ? https : url.protocol === 'http:' ? http : null;
+    if (!transport) {
+      reject(new Error('Discord webhook URL must use HTTP or HTTPS'));
+      return;
+    }
+    const body = Buffer.from(JSON.stringify(event));
+    const request = transport.request(
+      url,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': body.byteLength,
+          'x-discord-gateway-token': botToken,
+        },
+      },
+      (response) => {
+        const chunks: Buffer[] = [];
+        response.on('data', (chunk: Buffer | Uint8Array | string) => {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        });
+        response.once('error', reject);
+        response.once('close', () => {
+          if (!response.complete) reject(new Error('Discord webhook response closed before completing'));
+        });
+        response.once('end', () => {
+          const status = response.statusCode ?? 0;
+          const text = Buffer.concat(chunks).toString('utf8');
+          resolve({ ok: status >= 200 && status < 300, status, text: async () => text });
+        });
+      },
+    );
+    request.once('error', reject);
+    // Deliberately no request timeout: the route may need the full supported lease.
+    request.end(body);
+  });
+}
+
 /**
  * Forward a Discord Gateway event to the local webhook server with a small
  * bounded retry (3 attempts total, 250ms then 1000ms backoff).
@@ -420,22 +469,23 @@ export async function forwardDiscordGatewayEventWithRetry(
     retryDelaysMs?: readonly number[];
   } = {},
 ): Promise<boolean> {
-  const fetchImpl = deps.fetchImpl ?? fetch;
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const retryDelays = deps?.retryDelaysMs ?? GATEWAY_FORWARD_RETRY_DELAYS_MS;
   const maxAttempts = retryDelays.length + 1;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    let response: Response;
+    let response: GatewayForwardResponse;
     try {
-      response = await fetchImpl(webhookUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-discord-gateway-token': botToken,
-        },
-        body: JSON.stringify(event),
-      });
+      response = deps.fetchImpl
+        ? await deps.fetchImpl(webhookUrl, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-discord-gateway-token': botToken,
+            },
+            body: JSON.stringify(event),
+          })
+        : await postDiscordGatewayEvent(webhookUrl, event, botToken);
     } catch (error) {
       if (attempt < maxAttempts && isTransientGatewayForwardError(error)) {
         log.warn('Transient error forwarding Gateway event, retrying', {
@@ -537,6 +587,7 @@ export function wrapYenteDiscordChannelIds(
   const routeLeaseMs = options.routeLeaseMs ?? DEFAULT_DISCORD_CATCHUP_ROUTE_LEASE_MS;
   const nowIso = options.now ?? ((): string => new Date().toISOString());
   const wasMessageHandled = options.wasMessageHandled;
+  const inFlightMessages = new Set<string>();
   // Replace the vendored adapter's single-shot Gateway event forwarder with
   // the bounded-retry version. The adapter awaits forwardGatewayEvent per
   // event, so sequencing is unchanged — a retry only delays that one event.
@@ -607,99 +658,110 @@ export function wrapYenteDiscordChannelIds(
       return undefined;
     }
 
-    // 1. Idempotency gate: claim before forwarding. Live and catch-up
-    //    messages traverse this same choke point, so one claim covers both.
-    //    FAIL-OPEN on DB errors: a state bug must never silence live messages.
-    try {
-      const claimedAt = nowIso();
-      const leaseExpiresAt = new Date(Date.parse(claimedAt) + routeLeaseMs).toISOString();
-      const claim = claimDiscordMessage(
-        channelId,
-        messageId,
-        {
-          guildId: (data?.guild_id as string | undefined) ?? null,
-          authorId: (data?.author?.id as string | undefined) ?? null,
-          source: 'gateway',
-        },
-        claimedAt,
-        leaseExpiresAt,
-      );
-      if (!claim.claimed) {
-        // INFO, not debug: the deployed default log level is info, and the
-        // host smoke greps logs/nanoclaw.log for this exact bare token.
-        log.info('discord_message_duplicate_dropped', { channelId, messageId, status: claim.status });
-        return undefined;
-      }
-    } catch (error) {
-      log.error('Discord message claim failed, routing anyway', { channelId, messageId, error: String(error) });
+    const inFlightKey = `${channelId}\0${messageId}`;
+    if (inFlightMessages.has(inFlightKey)) {
+      log.info('discord_message_duplicate_dropped', { channelId, messageId, status: 'in_flight' });
+      return undefined;
     }
+    inFlightMessages.add(inFlightKey);
 
-    // 2. Auto-thread creation (existing behavior), after the claim.
-    const alreadyInThread = data?.thread != null || data?.channel_type === 11 || data?.channel_type === 12;
-    if (!alreadyInThread && autoCreateThreadChannelIds.has(channelId)) {
+    try {
+      // 1. Idempotency gate: claim before forwarding. Live and catch-up
+      //    messages traverse this same choke point, so one claim covers both.
+      //    FAIL-OPEN on DB errors: a state bug must never silence live messages.
       try {
-        const newThread = await rawAdapter.createDiscordThread(channelId, messageId);
-        if (newThread?.id) {
-          dataArg = {
-            ...data,
-            thread: { id: newThread.id, parent_id: channelId },
-          };
-          log.info('Created Discord thread for auto-thread channel', {
-            channelId,
-            messageId,
-            threadId: newThread.id,
-          });
-        }
-      } catch (error) {
-        log.warn('Failed to create Discord thread for auto-thread channel', {
+        const claimedAt = nowIso();
+        const leaseExpiresAt = new Date(Date.parse(claimedAt) + routeLeaseMs).toISOString();
+        const claim = claimDiscordMessage(
           channelId,
           messageId,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-    }
-
-    // 3. Forward, then record the outcome (fail-open on state errors). The
-    //    bridge dispatches with concurrency 'concurrent', so the acceptance
-    //    hook written during dispatch is synchronously visible by the time the
-    //    vendored forward resolves.
-    try {
-      const result = await originalHandleForwardedMessage(dataArg, opts, ...rest);
-      try {
-        const routedAt = nowIso();
-        if (wasMessageHandled(messageId)) {
-          markDiscordMessageRouted(channelId, messageId, routedAt);
-          const monitored = monitoredChannelIds();
-          const parentId = (dataArg as Record<string, any>)?.thread?.parent_id as string | undefined;
-          if (monitored.has(channelId) || (parentId !== undefined && monitored.has(parentId))) {
-            advanceDiscordChannelCursor(channelId, messageId, routedAt);
-          }
-        } else {
-          // No dispatch handler accepted this message. Record it failed (not
-          // routed) and leave the cursor behind so catch-up keeps
-          // re-presenting it; the attempts cap still bounds a poison message.
-          log.warn('Discord message accepted by no dispatch handler; marked failed for catch-up', {
-            channelId,
-            messageId,
-          });
-          markDiscordMessageFailed(channelId, messageId, routedAt, 'no dispatch handler accepted the message');
-        }
-      } catch (error) {
-        log.error('Discord route bookkeeping failed', { channelId, messageId, error: String(error) });
-      }
-      return result;
-    } catch (error) {
-      try {
-        markDiscordMessageFailed(
-          channelId,
-          messageId,
-          nowIso(),
-          error instanceof Error ? error.message : String(error),
+          {
+            guildId: (data?.guild_id as string | undefined) ?? null,
+            authorId: (data?.author?.id as string | undefined) ?? null,
+            source: 'gateway',
+          },
+          claimedAt,
+          leaseExpiresAt,
         );
-      } catch (stateError) {
-        log.error('Discord route failure bookkeeping failed', { channelId, messageId, error: String(stateError) });
+        if (!claim.claimed) {
+          // INFO, not debug: the deployed default log level is info, and the
+          // host smoke greps logs/nanoclaw.log for this exact bare token.
+          log.info('discord_message_duplicate_dropped', { channelId, messageId, status: claim.status });
+          return undefined;
+        }
+      } catch (error) {
+        log.error('Discord message claim failed, routing anyway', { channelId, messageId, error: String(error) });
       }
-      throw error;
+
+      // 2. Auto-thread creation (existing behavior), after the claim.
+      const alreadyInThread = data?.thread != null || data?.channel_type === 11 || data?.channel_type === 12;
+      if (!alreadyInThread && autoCreateThreadChannelIds.has(channelId)) {
+        try {
+          const newThread = await rawAdapter.createDiscordThread(channelId, messageId);
+          if (newThread?.id) {
+            dataArg = {
+              ...data,
+              thread: { id: newThread.id, parent_id: channelId },
+            };
+            log.info('Created Discord thread for auto-thread channel', {
+              channelId,
+              messageId,
+              threadId: newThread.id,
+            });
+          }
+        } catch (error) {
+          log.warn('Failed to create Discord thread for auto-thread channel', {
+            channelId,
+            messageId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+
+      // 3. Forward, then record the outcome (fail-open on state errors). The
+      //    bridge dispatches with concurrency 'concurrent', so the acceptance
+      //    hook written during dispatch is synchronously visible by the time the
+      //    vendored forward resolves.
+      try {
+        const result = await originalHandleForwardedMessage(dataArg, opts, ...rest);
+        try {
+          const routedAt = nowIso();
+          if (wasMessageHandled(messageId)) {
+            markDiscordMessageRouted(channelId, messageId, routedAt);
+            const monitored = monitoredChannelIds();
+            const parentId = (dataArg as Record<string, any>)?.thread?.parent_id as string | undefined;
+            if (monitored.has(channelId) || (parentId !== undefined && monitored.has(parentId))) {
+              advanceDiscordChannelCursor(channelId, messageId, routedAt);
+            }
+          } else {
+            // No dispatch handler accepted this message. Record it failed (not
+            // routed) and leave the cursor behind so catch-up keeps
+            // re-presenting it; the attempts cap still bounds a poison message.
+            log.warn('Discord message accepted by no dispatch handler; marked failed for catch-up', {
+              channelId,
+              messageId,
+            });
+            markDiscordMessageFailed(channelId, messageId, routedAt, 'no dispatch handler accepted the message');
+          }
+        } catch (error) {
+          log.error('Discord route bookkeeping failed', { channelId, messageId, error: String(error) });
+        }
+        return result;
+      } catch (error) {
+        try {
+          markDiscordMessageFailed(
+            channelId,
+            messageId,
+            nowIso(),
+            error instanceof Error ? error.message : String(error),
+          );
+        } catch (stateError) {
+          log.error('Discord route failure bookkeeping failed', { channelId, messageId, error: String(stateError) });
+        }
+        throw error;
+      }
+    } finally {
+      inFlightMessages.delete(inFlightKey);
     }
   };
 

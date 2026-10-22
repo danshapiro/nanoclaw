@@ -1,10 +1,13 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { Readable } from 'stream';
 
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../db/index.js';
 import { inboundDbPath, resolveSession, writeSessionMessage } from '../session-manager.js';
+import { shouldSkipWhatsAppMediaDownload, stageWhatsAppMedia } from './whatsapp.js';
 
 vi.mock('../config.js', async () => {
   const actual = await vi.importActual('../config.js');
@@ -17,6 +20,109 @@ vi.mock('../config.js', async () => {
 
 const TEST_DATA_DIR = '/tmp/nanoclaw-test-whatsapp-data';
 const TEST_GROUPS_DIR = '/tmp/nanoclaw-test-whatsapp-groups';
+
+describe('WhatsApp streamed media download', () => {
+  it('skips media downloads for bot echoes and matching pending-question answers', () => {
+    expect(shouldSkipWhatsAppMediaDownload({ fromMe: true, content: '', pendingOptionLabels: [] })).toBe(true);
+    expect(
+      shouldSkipWhatsAppMediaDownload({
+        fromMe: false,
+        content: '/approve',
+        pendingOptionLabels: ['Approve', 'Reject'],
+      }),
+    ).toBe(true);
+    expect(
+      shouldSkipWhatsAppMediaDownload({
+        fromMe: false,
+        content: '/unrelated',
+        pendingOptionLabels: ['Approve', 'Reject'],
+      }),
+    ).toBe(false);
+  });
+
+  it('requests a Baileys stream, stages its bytes, and enforces the byte limit', async () => {
+    const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'whatsapp-stream-'));
+    const message = { key: { id: 'wa-stream-1' } } as never;
+    const stream = vi.fn(async (_message: unknown, mode: string, _options: object) => {
+      expect(mode).toBe('stream');
+      return Readable.from([Buffer.from('document '), Buffer.from('bytes')]);
+    });
+    try {
+      const result = await stageWhatsAppMedia(
+        message,
+        { fileLength: 14 },
+        { download: stream as never, stagingDir: dir },
+      );
+      expect(stream).toHaveBeenCalledOnce();
+      expect(result.sizeBytes).toBe(14);
+      expect(await fs.promises.readFile(result.stagedHostPath, 'utf8')).toBe('document bytes');
+    } finally {
+      await fs.promises.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects over-limit streamed bytes and removes the partial staging file', async () => {
+    const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'whatsapp-stream-'));
+    try {
+      await expect(
+        stageWhatsAppMedia(
+          { key: { id: 'wa-stream-2' } } as never,
+          { fileLength: 0 },
+          {
+            download: (async () => Readable.from([Buffer.from('123456'), Buffer.from('789')])) as never,
+            stagingDir: dir,
+            maxBytes: 8,
+          },
+        ),
+      ).rejects.toThrow('Inbound attachment exceeds the 8-byte limit');
+      expect(await fs.promises.readdir(dir)).toEqual([]);
+    } finally {
+      await fs.promises.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('aborts a stalled Baileys stream after the fixed timeout and removes partial staging bytes', async () => {
+    const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'whatsapp-stream-'));
+    let cancelled = false;
+    let receivedSignal: AbortSignal | undefined;
+    const stream = vi.fn(
+      async (_message: unknown, _mode: string, { options }: { options: { signal: AbortSignal } }) => {
+        const { signal } = options;
+        receivedSignal = signal;
+        signal.addEventListener('abort', () => {
+          cancelled = true;
+        });
+        return Readable.from(
+          (async function* () {
+            yield Buffer.from('partial');
+            await new Promise<void>((resolve) => {
+              const timer = setTimeout(resolve, 80);
+              timer.unref?.();
+            });
+            if (!cancelled) yield Buffer.from('complete');
+          })(),
+        );
+      },
+    );
+    const pending = stageWhatsAppMedia(
+      { key: { id: 'wa-stream-timeout' } } as never,
+      { fileLength: 0 },
+      { download: stream as never, stagingDir: dir, timeoutMs: 20 },
+    );
+    const timeoutAssertion = expect(pending).rejects.toThrow(/timed out/i);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      await timeoutAssertion;
+      expect(cancelled).toBe(true);
+      expect(receivedSignal?.aborted).toBe(true);
+      expect(await fs.promises.readdir(dir)).toEqual([]);
+    } finally {
+      cancelled = true;
+      await pending.catch(() => undefined);
+      await fs.promises.rm(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 function now(): string {
   return new Date().toISOString();

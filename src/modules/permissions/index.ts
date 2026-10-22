@@ -37,6 +37,7 @@ import { deletePendingSenderApproval, getPendingSenderApproval } from './db/pend
 import { hasAdminPrivilege } from './db/user-roles.js';
 import { getUser, upsertUser } from './db/users.js';
 import { requestSenderApproval } from './sender-approval.js';
+import { removePendingApprovalAttachmentSpool, restorePendingApprovalAttachments } from './pending-attachments.js';
 
 function extractAndUpsertUser(event: InboundEvent): string | null {
   let content: Record<string, unknown>;
@@ -84,13 +85,13 @@ function safeParseContent(raw: string): { text?: string; sender?: string; sender
   }
 }
 
-function handleUnknownSender(
+async function handleUnknownSender(
   mg: MessagingGroup,
   userId: string | null,
   agentGroupId: string,
   accessReason: string,
   event: InboundEvent,
-): void {
+): Promise<void> {
   const parsed = safeParseContent(event.message.content);
   const senderName = parsed.sender ?? null;
   const dropRecord = {
@@ -122,13 +123,12 @@ function handleUnknownSender(
       accessReason,
     });
     recordDroppedMessage(dropRecord);
-    // Fire-and-forget; pick-approver + delivery + row-insert are all async.
-    // If it fails it logs internally — the user's message still stays dropped
-    // either way. Requires a resolved userId (senderResolver populates users
-    // row before the gate fires); if we got here without one, there's nothing
-    // to identify for approval and we just stay in the "silent strict" branch.
+    // Persist the approval row and owned attachment copies before routing
+    // cleans temporary source files. Card delivery runs asynchronously from
+    // requestSenderApproval. Requires a resolved userId so the request can be
+    // tied to a specific sender.
     if (userId) {
-      requestSenderApproval({
+      await requestSenderApproval({
         messagingGroupId: mg.id,
         agentGroupId,
         senderIdentity: userId,
@@ -140,18 +140,19 @@ function handleUnknownSender(
   }
 
   // 'public' should have been handled before the gate; fall through silently.
+  return;
 }
 
 setSenderResolver(extractAndUpsertUser);
 
-setAccessGate((event, userId, mg, agentGroupId): AccessGateResult => {
+setAccessGate(async (event, userId, mg, agentGroupId): Promise<AccessGateResult> => {
   // Public channels skip the access check entirely.
   if (mg.unknown_sender_policy === 'public') {
     return { allowed: true };
   }
 
   if (!userId) {
-    handleUnknownSender(mg, null, agentGroupId, 'unknown_user', event);
+    await handleUnknownSender(mg, null, agentGroupId, 'unknown_user', event);
     return { allowed: false, reason: 'unknown_user' };
   }
 
@@ -160,7 +161,7 @@ setAccessGate((event, userId, mg, agentGroupId): AccessGateResult => {
     return { allowed: true };
   }
 
-  handleUnknownSender(mg, userId, agentGroupId, decision.reason, event);
+  await handleUnknownSender(mg, userId, agentGroupId, decision.reason, event);
   return { allowed: false, reason: decision.reason };
 });
 
@@ -238,10 +239,17 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
     deletePendingSenderApproval(row.id);
 
     try {
-      const event = JSON.parse(row.original_message) as InboundEvent;
+      const event = restorePendingApprovalAttachments(JSON.parse(row.original_message) as InboundEvent);
       await routeInbound(event);
     } catch (err) {
       log.error('Failed to replay message after sender approval', { approvalId: row.id, err });
+    } finally {
+      await removePendingApprovalAttachmentSpool(row.original_message, { pendingId: row.id }).catch((err) => {
+        log.warn('Failed to remove sender-approval attachment spool', {
+          approvalId: row.id,
+          error: err instanceof Error ? err.name : 'unknown',
+        });
+      });
     }
     return true;
   }
@@ -253,6 +261,12 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
     approverId,
   });
   deletePendingSenderApproval(row.id);
+  await removePendingApprovalAttachmentSpool(row.original_message, { pendingId: row.id }).catch((err) => {
+    log.warn('Failed to remove sender-approval attachment spool', {
+      approvalId: row.id,
+      error: err instanceof Error ? err.name : 'unknown',
+    });
+  });
   return true;
 }
 
@@ -304,6 +318,14 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
   if (!approved) {
     setMessagingGroupDeniedAt(row.messaging_group_id, new Date().toISOString());
     deletePendingChannelApproval(row.messaging_group_id);
+    await removePendingApprovalAttachmentSpool(row.original_message, { pendingId: row.messaging_group_id }).catch(
+      (err) => {
+        log.warn('Failed to remove channel-approval attachment spool', {
+          messagingGroupId: row.messaging_group_id,
+          error: err instanceof Error ? err.name : 'unknown',
+        });
+      },
+    );
     log.info('Channel registration denied', {
       messagingGroupId: row.messaging_group_id,
       agentGroupId: row.agent_group_id,
@@ -317,13 +339,16 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
   // (auto-member-add so sender_scope='known' doesn't bounce the replay).
   let event: InboundEvent;
   try {
-    event = JSON.parse(row.original_message) as InboundEvent;
+    event = restorePendingApprovalAttachments(JSON.parse(row.original_message) as InboundEvent);
   } catch (err) {
     log.error('Channel registration: failed to parse stored event', {
       messagingGroupId: row.messaging_group_id,
       err,
     });
     deletePendingChannelApproval(row.messaging_group_id);
+    await removePendingApprovalAttachmentSpool(row.original_message, { pendingId: row.messaging_group_id }).catch(
+      () => undefined,
+    );
     return true;
   }
 
@@ -386,6 +411,15 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
       messagingGroupId: row.messaging_group_id,
       err,
     });
+  } finally {
+    await removePendingApprovalAttachmentSpool(row.original_message, { pendingId: row.messaging_group_id }).catch(
+      (err) => {
+        log.warn('Failed to remove channel-approval attachment spool', {
+          messagingGroupId: row.messaging_group_id,
+          error: err instanceof Error ? err.name : 'unknown',
+        });
+      },
+    );
   }
   return true;
 }

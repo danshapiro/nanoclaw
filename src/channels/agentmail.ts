@@ -1,4 +1,5 @@
 import { NANOCLAW_ROOT } from '../config.js';
+import { getMessagingGroupWithAgentCount } from '../db/messaging-groups.js';
 import { log } from '../log.js';
 import type { ChannelAdapter, ChannelSetup, OutboundMessage } from './adapter.js';
 import {
@@ -39,6 +40,7 @@ import {
 } from './agentmail-state.js';
 import { ensureAgentMailOneCliEnv } from './agentmail-onecli.js';
 import { registerChannelAdapter } from './channel-registry.js';
+import { cleanupInboundAttachmentSources } from '../yente/attachments.js';
 
 type AgentMailAdapterDeps = {
   api?: AgentMailApi;
@@ -242,8 +244,20 @@ export function createAgentMailAdapter(deps: AgentMailAdapterDeps = {}): Channel
     }
 
     const nanoThreadId = nanoThreadIdForAgentMailMessage(route, message);
+    let routedMessage: AgentMailMessageLike | undefined;
     try {
-      const routedMessage = await withDownloadedAttachments(message);
+      const wiredAgentCount = getMessagingGroupWithAgentCount('agentmail', message.inboxId)?.agentCount ?? 0;
+      const messageForRouting =
+        wiredAgentCount > 0 || !Array.isArray(message.attachments) || message.attachments.length === 0
+          ? message
+          : { ...message, attachments: [] };
+      if (messageForRouting !== message) {
+        log.debug('Skipping AgentMail attachment downloads for an unwired inbox', {
+          inboxId: message.inboxId,
+          messageId: message.messageId,
+        });
+      }
+      routedMessage = await withDownloadedAttachments(messageForRouting);
       recordAgentMailMessageRoute({
         inboxId: routedMessage.inboxId,
         messageId: routedMessage.messageId,
@@ -267,6 +281,11 @@ export function createAgentMailAdapter(deps: AgentMailAdapterDeps = {}): Channel
 
       markAgentMailMessageRouted(message.inboxId, message.messageId, now());
     } catch (err) {
+      if (routedMessage) {
+        await cleanupInboundAttachmentSources(JSON.stringify({ attachments: routedMessage.attachments })).catch(
+          () => undefined,
+        );
+      }
       markAgentMailMessageFailed(message.inboxId, message.messageId, now(), errorMessage(err));
       throw err;
     }
@@ -285,28 +304,42 @@ export function createAgentMailAdapter(deps: AgentMailAdapterDeps = {}): Channel
   async function withDownloadedAttachments(message: AgentMailMessageLike): Promise<AgentMailMessageLike> {
     if (!Array.isArray(message.attachments) || message.attachments.length === 0) return message;
     const attachments = [];
-    for (const item of message.attachments) {
-      if (!item || typeof item !== 'object') continue;
-      const record = item as Record<string, unknown>;
-      const attachmentId =
-        typeof record.id === 'string'
-          ? record.id
-          : typeof record.attachmentId === 'string'
-            ? record.attachmentId
-            : null;
-      if (!attachmentId) continue;
-      const downloaded = await api.downloadAttachment({
-        inboxId: message.inboxId,
-        messageId: message.messageId,
-        attachmentId,
-        maxBytes: attachmentMaxBytes,
-      });
-      attachments.push({
-        id: downloaded.attachmentId,
-        filename: downloaded.filename,
-        contentType: downloaded.contentType,
-        data: downloaded.data.toString('base64'),
-      });
+    try {
+      for (const item of message.attachments) {
+        if (!item || typeof item !== 'object') continue;
+        const record = item as Record<string, unknown>;
+        const attachmentId =
+          typeof record.id === 'string'
+            ? record.id
+            : typeof record.attachmentId === 'string'
+              ? record.attachmentId
+              : null;
+        if (!attachmentId) continue;
+        const startedAt = Date.now();
+        const downloaded = await api.downloadAttachment({
+          inboxId: message.inboxId,
+          messageId: message.messageId,
+          attachmentId,
+        });
+        attachments.push({
+          id: downloaded.attachmentId,
+          filename: downloaded.filename,
+          contentType: downloaded.contentType,
+          size: downloaded.sizeBytes,
+          stagedHostPath: downloaded.stagedHostPath,
+        });
+        log.info('Inbound attachment staged', {
+          channel: 'agentmail',
+          id: attachmentId,
+          name: downloaded.filename,
+          type: downloaded.contentType ?? 'unknown',
+          bytes: downloaded.sizeBytes,
+          durationMs: Date.now() - startedAt,
+        });
+      }
+    } catch (error) {
+      await cleanupInboundAttachmentSources(JSON.stringify({ attachments })).catch(() => undefined);
+      throw error;
     }
     return attachments.length ? { ...message, attachments } : message;
   }

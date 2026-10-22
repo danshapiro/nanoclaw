@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import path from 'path';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { normalizeDiscordApplicationCommandInteraction } from './channels/discord-commands.js';
 import type { InboundEvent } from './channels/adapter.js';
@@ -17,6 +18,7 @@ import { findSessionForAgent, getSession, getSessionsByAgentGroup } from './db/s
 import { setDeliveryAdapter } from './delivery.js';
 import { inboundDbPath, outboundDbPath, sessionDir, writeOutboundDirect } from './session-manager.js';
 import { getScheduledTask } from './modules/scheduling/ledger.js';
+import { attachmentStagingDir } from './yente/attachments.js';
 
 const cleanupContainerForSessionMock = vi.hoisted(() => vi.fn().mockResolvedValue(true));
 
@@ -47,6 +49,11 @@ const DISCORD_CANONICAL_CONVERSATION_THREAD_ID = `discord:guild:${DISCORD_PLATFO
 const SHARED_PLATFORM_ID = 'shared-platform';
 const SHARED_THREAD_ID = 'discord:guild:shared';
 let currentUserId: string | null = 'discord:admin';
+
+beforeAll(async () => {
+  // Load the router outside the per-test timeout; its module graph is shared by this file's tests.
+  await import('./router.js');
+});
 
 beforeEach(async () => {
   fs.rmSync(TEST_DIR, { recursive: true, force: true });
@@ -258,6 +265,108 @@ describe('Yente host command routing', () => {
     expect(wakeContainer).toHaveBeenCalled();
   });
 
+  it('copies a staged attachment into the workspace, stores prompt metadata, and removes its source', async () => {
+    const { routeInbound } = await import('./router.js');
+    const sourceDir = attachmentStagingDir();
+    fs.mkdirSync(sourceDir, { recursive: true });
+    const sourcePath = path.join(sourceDir, 'staged-router-test.attachment');
+    const bytes = Buffer.from('streamed Word document bytes');
+    fs.writeFileSync(sourcePath, bytes);
+
+    await routeInbound(
+      event(
+        JSON.stringify({
+          senderId: 'discord:admin',
+          senderName: 'Admin',
+          text: 'Please read this document',
+          attachments: [
+            {
+              id: 'file-1',
+              name: 'report.docx',
+              mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+              size: bytes.byteLength,
+              stagedHostPath: sourcePath,
+            },
+          ],
+        }),
+        'msg-staged-attachment',
+      ),
+    );
+
+    const session = getSessionsByAgentGroup('ag-yente')[0];
+    expect(session).toBeDefined();
+    const db = new Database(inboundDbPath('ag-yente', session!.id));
+    const row = db
+      .prepare('SELECT content FROM messages_in WHERE platform_message_id = ?')
+      .get('msg-staged-attachment') as { content: string };
+    db.close();
+    const parsed = JSON.parse(row.content) as {
+      text: string;
+      attachments: Array<Record<string, unknown>>;
+    };
+    expect(parsed.attachments[0]?.workspacePath).toBe(
+      '/workspace/agent/attachments/discord/msg-staged-attachment/file-1-report.docx',
+    );
+    expect(parsed.text).toContain('/workspace/agent/attachments/discord/msg-staged-attachment/file-1-report.docx');
+    expect(parsed.attachments[0]).not.toHaveProperty('stagedHostPath');
+    expect(parsed.attachments[0]).not.toHaveProperty('approvalSpoolPath');
+    const workspaceHostPath = path.join(
+      TEST_DIR,
+      'groups',
+      'yente',
+      'attachments',
+      'discord',
+      'msg-staged-attachment',
+      'file-1-report.docx',
+    );
+    expect(fs.readFileSync(workspaceHostPath)).toEqual(bytes);
+    expect(fs.existsSync(sourcePath)).toBe(false);
+  });
+
+  it('removes a staged attachment when the strict sender gate drops the message', async () => {
+    const { routeInbound, setAccessGate } = await import('./router.js');
+    const sourceDir = attachmentStagingDir();
+    fs.mkdirSync(sourceDir, { recursive: true });
+    const sourcePath = path.join(sourceDir, 'strict-drop.attachment');
+    fs.writeFileSync(sourcePath, 'must be removed on drop');
+    setAccessGate(() => ({ allowed: false, reason: 'unknown_sender_strict' }));
+
+    try {
+      await routeInbound(
+        event(
+          JSON.stringify({
+            senderId: 'discord:unknown',
+            senderName: 'Unknown',
+            text: 'do not route',
+            attachments: [{ id: 'strict-file', name: 'private.docx', stagedHostPath: sourcePath }],
+          }),
+          'msg-strict-attachment-drop',
+        ),
+      );
+      expect(fs.existsSync(sourcePath)).toBe(false);
+      expect(getSessionsByAgentGroup('ag-yente')).toHaveLength(0);
+    } finally {
+      setAccessGate(() => ({ allowed: true }));
+    }
+  });
+
+  it('preserves agent-to-agent localPath attachment references', async () => {
+    const { routeInbound } = await import('./router.js');
+    const content = JSON.stringify({
+      text: 'forward this file',
+      attachments: [{ localPath: 'attachments/previous-agent/report.docx', originalName: 'report.docx' }],
+    });
+    await routeInbound(event(content, 'msg-agent-local-path'));
+
+    const session = getSessionsByAgentGroup('ag-yente')[0];
+    const db = new Database(inboundDbPath('ag-yente', session!.id));
+    const row = db
+      .prepare('SELECT content FROM messages_in WHERE platform_message_id = ?')
+      .get('msg-agent-local-path') as { content: string };
+    db.close();
+    expect(JSON.parse(row.content).attachments[0].localPath).toBe('attachments/previous-agent/report.docx');
+  });
+
   it('writes /help and bare help as host-authored responses without waking a container', async () => {
     const { routeInbound } = await import('./router.js');
     const { wakeContainer } = await import('./container-runner.js');
@@ -287,7 +396,7 @@ describe('Yente host command routing', () => {
     const session = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID);
     expect(inboundTexts(session!.id)).toEqual(['status please', 'new session', 'clear history']);
     expect(wakeMock).toHaveBeenCalledTimes(3);
-  });
+  }, 15_000);
 
   it('archives and rolls the addressed session for admin /new and /clear', async () => {
     const { routeInbound } = await import('./router.js');

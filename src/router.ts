@@ -41,9 +41,11 @@ import {
 import { deliverSessionMessages, getDeliveryAdapter, suppressSessionOutbound } from './delivery.js';
 import { startTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
+import { cleanupInboundAttachmentSources } from './yente/attachments.js';
 import {
   getSessionMessageRouteIdentity,
   inboundDbPath,
+  materializeStagedAttachments,
   resolveSession,
   writeSessionMessage,
   writeOutboundDirect,
@@ -104,7 +106,7 @@ export type AccessGateFn = (
   userId: string | null,
   mg: MessagingGroup,
   agentGroupId: string,
-) => AccessGateResult;
+) => AccessGateResult | Promise<AccessGateResult>;
 
 let accessGate: AccessGateFn | null = null;
 
@@ -142,8 +144,8 @@ export function setSenderScopeGate(fn: SenderScopeGateFn): void {
  * Channel-registration hook. Runs when the router sees a mention/DM on a
  * messaging group that has no wirings AND hasn't been denied. The hook is
  * expected to escalate to an owner (card, etc.) and arrange for future
- * replay via routeInbound after approval. Fire-and-forget from the
- * router's perspective.
+ * replay via routeInbound after approval. The router awaits the hook so it
+ * can finish recording approval state before cleaning staged attachments.
  *
  * Registered by the permissions module. Without the module the router
  * silently records the drop with reason='no_agent_wired' and moves on.
@@ -172,6 +174,22 @@ function safeParseContent(raw: string): { text?: string; sender?: string; sender
  * Creates messaging group + session if they don't exist yet.
  */
 export async function routeInbound(event: InboundEvent): Promise<void> {
+  try {
+    await routeInboundInner(event);
+  } finally {
+    try {
+      await cleanupInboundAttachmentSources(event.message.content);
+    } catch (error) {
+      log.warn('Failed to clean staged inbound attachments', {
+        channelType: event.channelType,
+        messageId: event.message.id,
+        error: error instanceof Error ? error.name : 'unknown',
+      });
+    }
+  }
+}
+
+async function routeInboundInner(event: InboundEvent): Promise<void> {
   // 0. Apply the adapter's thread policy. Non-threaded adapters (Telegram,
   //    WhatsApp, iMessage, email) collapse threads to the channel.
   const adapter = getChannelAdapter(event.channelType);
@@ -241,13 +259,11 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
     });
 
     if (channelRequestGate) {
-      // Fire-and-forget escalation. The gate is expected to build a card,
-      // persist pending_channel_approvals, and replay the event via
-      // routeInbound after approval. Errors are logged internally — the
-      // user's message still stays dropped here either way.
-      void channelRequestGate(mg, event).catch((err) =>
-        log.error('Channel-request gate threw', { messagingGroupId: mg.id, err }),
-      );
+      // Wait until the gate has stored its pending event and any owned
+      // attachment copies. The approval card itself remains asynchronous.
+      await channelRequestGate(mg, event).catch((err) => {
+        log.error('Channel-request gate threw', { messagingGroupId: mg.id, err });
+      });
     } else {
       log.warn('MESSAGE DROPPED — no agent groups wired and no channel-request gate registered', {
         messagingGroupId: mg.id,
@@ -293,7 +309,11 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
 
     const engages = evaluateEngage(agent, messageText, isMention, mg, agentEvent.threadId);
 
-    const accessOk = engages && (!accessGate || accessGate(agentEvent, userId, mg, agent.agent_group_id).allowed);
+    const accessDecision =
+      engages && accessGate
+        ? await accessGate(agentEvent, userId, mg, agent.agent_group_id)
+        : { allowed: true as const };
+    const accessOk = engages && accessDecision.allowed;
     const scopeOk = engages && (!senderScopeGate || senderScopeGate(agentEvent, userId, mg, agent).allowed);
 
     if (engages && accessOk && scopeOk) {
@@ -616,13 +636,7 @@ async function deliverToAgent(
   const routedMessageId = messageIdForAgent(agentEvent.message.id, agent.agent_group_id);
   const storedRoute = getSessionMessageRouteIdentity(session.agent_group_id, session.id, routedMessageId);
   if (storedRoute) {
-    const sameDelivery =
-      storedRoute.platformMessageId === (agentEvent.message.id || null) &&
-      storedRoute.platformId === deliveryAddr.platformId &&
-      storedRoute.channelType === deliveryAddr.channelType &&
-      storedRoute.threadId === deliveryAddr.threadId &&
-      storedRoute.messagingGroupId === mg.id &&
-      storedRoute.timestamp === agentEvent.message.timestamp;
+    const sameDelivery = sessionRouteMatches(storedRoute, agentEvent, deliveryAddr, mg.id);
     if (!sameDelivery) {
       // A distinct message reusing this id: do NOT silently skip (delta
       // review round 8). Throwing keeps the collision loud — on the strict
@@ -684,13 +698,7 @@ async function deliverToAgent(
           continue;
         }
         if (!priorRoute) continue;
-        const sameDelivery =
-          priorRoute.platformMessageId === (agentEvent.message.id || null) &&
-          priorRoute.platformId === deliveryAddr.platformId &&
-          priorRoute.channelType === deliveryAddr.channelType &&
-          priorRoute.threadId === deliveryAddr.threadId &&
-          priorRoute.messagingGroupId === mg.id &&
-          priorRoute.timestamp === agentEvent.message.timestamp;
+        const sameDelivery = sessionRouteMatches(priorRoute, agentEvent, deliveryAddr, mg.id);
         if (!sameDelivery) {
           // Sibling rows are not write-target candidates: a colliding id
           // with a different route identity belongs to unrelated history
@@ -712,22 +720,51 @@ async function deliverToAgent(
         return;
       }
     }
-    writeSessionMessage(session.agent_group_id, session.id, {
-      id: routedMessageId,
-      kind: agentEvent.message.kind,
-      timestamp: agentEvent.message.timestamp,
-      platformId: deliveryAddr.platformId,
-      platformMessageId: agentEvent.message.id || null,
-      channelType: deliveryAddr.channelType,
-      threadId: deliveryAddr.threadId,
-      content: agentEvent.message.content,
-      trigger: wake ? 1 : 0,
-      // Host-stamped route identity from the resolved messaging group. Lets the
-      // container normalizer collapse DM aliases safely and isolate distinct
-      // group threads, without inferring from nullable thread ids.
-      messagingGroupId: mg.id,
-      isGroup: mg.is_group === 1 ? 1 : 0,
-    });
+    const content = await materializeStagedAttachments(
+      session.agent_group_id,
+      agentEvent.message.id,
+      agentEvent.channelType,
+      agentEvent.message.content,
+    );
+    const currentSession = getSession(session.id);
+    if (!currentSession || currentSession.status !== 'active') {
+      throw new Error(`Session ${session.id} changed while inbound attachments were materialized`);
+    }
+    const routeAfterMaterialization = getSessionMessageRouteIdentity(
+      session.agent_group_id,
+      session.id,
+      routedMessageId,
+    );
+    if (routeAfterMaterialization) {
+      const sameDelivery = sessionRouteMatches(routeAfterMaterialization, agentEvent, deliveryAddr, mg.id);
+      if (!sameDelivery) {
+        throw new Error(
+          `Refusing to write distinct message with colliding route id ${routedMessageId}: route changed during attachment materialization`,
+        );
+      }
+      log.info('Message recorded while attachments were materialized — skipping duplicate session write', {
+        sessionId: session.id,
+        agentGroup: agent.agent_group_id,
+        messageId: routedMessageId,
+      });
+    } else {
+      writeSessionMessage(session.agent_group_id, session.id, {
+        id: routedMessageId,
+        kind: agentEvent.message.kind,
+        timestamp: agentEvent.message.timestamp,
+        platformId: deliveryAddr.platformId,
+        platformMessageId: agentEvent.message.id || null,
+        channelType: deliveryAddr.channelType,
+        threadId: deliveryAddr.threadId,
+        content,
+        trigger: wake ? 1 : 0,
+        // Host-stamped route identity from the resolved messaging group. Lets the
+        // container normalizer collapse DM aliases safely and isolate distinct
+        // group threads, without inferring from nullable thread ids.
+        messagingGroupId: mg.id,
+        isGroup: mg.is_group === 1 ? 1 : 0,
+      });
+    }
   }
 
   log.info('Message routed', {
@@ -756,6 +793,22 @@ async function deliverToAgent(
       await wakeContainer(freshSession);
     }
   }
+}
+
+function sessionRouteMatches(
+  route: NonNullable<ReturnType<typeof getSessionMessageRouteIdentity>>,
+  event: InboundEvent,
+  deliveryAddr: { channelType: string; platformId: string; threadId: string | null },
+  messagingGroupId: string,
+): boolean {
+  return (
+    route.platformMessageId === (event.message.id || null) &&
+    route.platformId === deliveryAddr.platformId &&
+    route.channelType === deliveryAddr.channelType &&
+    route.threadId === deliveryAddr.threadId &&
+    route.messagingGroupId === messagingGroupId &&
+    route.timestamp === event.message.timestamp
+  );
 }
 
 type DiscordNullThreadResetResolution =

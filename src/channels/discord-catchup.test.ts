@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { createServer } from 'node:http';
 
 import { closeDb, getDb, initTestDb } from '../db/connection.js';
 import { runMigrations } from '../db/migrations/index.js';
@@ -150,7 +151,12 @@ function fakeTransport(rest: Record<string, Response[]>, webhookStatus: () => nu
 
 const CHANNEL_INFO = { id: 'chan-1', guild_id: 'guild-1', last_message_id: '500' };
 
-function makeEngine(fetchImpl: typeof fetch, env: NodeJS.ProcessEnv = {}, nowMs = () => 1753900000000) {
+function makeEngine(
+  fetchImpl: typeof fetch,
+  env: NodeJS.ProcessEnv = {},
+  nowMs = () => 1753900000000,
+  webhookFetchImpl: typeof fetch | null = fetchImpl,
+) {
   return createDiscordCatchup({
     botToken: 'test-token',
     botUserId: 'bot-1',
@@ -158,6 +164,7 @@ function makeEngine(fetchImpl: typeof fetch, env: NodeJS.ProcessEnv = {}, nowMs 
     monitoredChannelIds: () => new Set(['chan-1']),
     env,
     fetchImpl,
+    ...(webhookFetchImpl ? { webhookFetchImpl } : {}),
     sleep: async () => {},
     now: nowMs,
   });
@@ -170,6 +177,81 @@ describe('createDiscordCatchup runOnce', () => {
   });
 
   afterEach(() => closeDb());
+
+  it('waits for the completed Node HTTP webhook response instead of using the REST fetch stub', async () => {
+    advanceDiscordChannelCursor('chan-1', '500', '2026-07-30T00:00:00.000Z');
+    let received = false;
+    let runDone = false;
+    let releaseResponse: (() => void) | undefined;
+    const server = createServer((request, response) => {
+      received = true;
+      const chunks: Buffer[] = [];
+      request.on('data', (chunk: Buffer) => chunks.push(chunk));
+      request.on('end', () => {
+        const event = JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
+          data: { channel_id: string; id: string; guild_id: string; author: { id: string } };
+        };
+        const nowIso = new Date().toISOString();
+        claimDiscordMessage(
+          event.data.channel_id,
+          event.data.id,
+          { guildId: event.data.guild_id, authorId: event.data.author.id, source: 'gateway' },
+          nowIso,
+          new Date(Date.parse(nowIso) + 120000).toISOString(),
+        );
+        markDiscordMessageRouted(event.data.channel_id, event.data.id, nowIso);
+        releaseResponse = () => {
+          response.statusCode = 200;
+          response.end('{"ok":true}');
+        };
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('Test server did not bind a TCP port');
+    let webhookFetchCalls = 0;
+    let messagePageCalls = 0;
+    const restFetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.includes('/webhook')) {
+        webhookFetchCalls += 1;
+        throw new Error('short webhook fetch timeout');
+      }
+      if (url.includes('/messages?after=')) {
+        messagePageCalls += 1;
+        return json(messagePageCalls === 1 ? [restMessage('501')] : []);
+      }
+      if (url.includes('/guilds/guild-1/threads/active')) return json({ threads: [] });
+      if (url.includes('/channels/chan-1')) return json(CHANNEL_INFO);
+      throw new Error(`Unexpected REST fetch: ${url}`);
+    }) as typeof fetch;
+    const engine = createDiscordCatchup({
+      botToken: 'test-token',
+      botUserId: 'bot-1',
+      webhookUrl: `http://127.0.0.1:${address.port}/webhook`,
+      monitoredChannelIds: () => new Set(['chan-1']),
+      fetchImpl: restFetch,
+      sleep: async () => {},
+      now: () => 1753900000000,
+    });
+    try {
+      const run = engine.runOnce('periodic').then((summary) => {
+        runDone = true;
+        return summary;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(received).toBe(true);
+      expect(runDone).toBe(false);
+      expect(webhookFetchCalls).toBe(0);
+      releaseResponse?.();
+      const summary = await run;
+      expect(summary?.routed).toBe(1);
+      expect(getDiscordChannelCursor('chan-1')).toBe('501');
+    } finally {
+      engine.stop();
+      await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    }
+  });
 
   it('initializes a missing cursor at the channel head and routes nothing (first deploy)', async () => {
     const { fetchImpl, webhookPosts } = fakeTransport({
@@ -411,6 +493,7 @@ describe('createDiscordCatchup runOnce', () => {
       monitoredChannelIds: () => new Set(['chan-1']),
       env: {},
       fetchImpl,
+      webhookFetchImpl: fetchImpl,
       sleep: async (ms) => {
         sleeps.push(ms);
       },

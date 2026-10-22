@@ -17,7 +17,7 @@ vi.mock('./log.js', () => ({
 }));
 vi.mock('./config.js', () => ({ DATA_DIR: '/tmp/nanoclaw-shutdown-test' }));
 vi.mock('./claude-md-compose.js', () => ({ migrateGroupsToClaudeLocal: vi.fn() }));
-vi.mock('./db/connection.js', () => ({ initDb: vi.fn() }));
+vi.mock('./db/connection.js', () => ({ initDb: vi.fn(), hasTable: vi.fn(() => false) }));
 vi.mock('./db/migrations/index.js', () => ({ runMigrations: vi.fn() }));
 vi.mock('./db/runtime-locks.js', () => ({ clearStaleRuntimeLocks: vi.fn() }));
 vi.mock('./process-singleton.js', () => ({
@@ -58,6 +58,9 @@ vi.mock('./container-runner.js', () => ({
     h.calls.push(`drainAllContainers(${graceSeconds})`);
     return h.drainImpl ? h.drainImpl() : Promise.resolve();
   }),
+}));
+vi.mock('./modules/permissions/pending-attachments.js', () => ({
+  cleanupOrphanedPendingApprovalAttachments: vi.fn(async () => 0),
 }));
 vi.mock('./channels/index.js', () => ({}));
 vi.mock('./modules/index.js', () => ({}));

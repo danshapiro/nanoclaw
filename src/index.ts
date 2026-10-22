@@ -8,7 +8,7 @@ import path from 'path';
 
 import { DATA_DIR } from './config.js';
 import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
-import { initDb } from './db/connection.js';
+import { hasTable, initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
 import { clearStaleRuntimeLocks } from './db/runtime-locks.js';
 import { acquireProcessSingletonLock } from './process-singleton.js';
@@ -21,6 +21,8 @@ import {
   resetRecoveryDrainShutdownForDaemonStart,
 } from './container-runner.js';
 import { routeInbound } from './router.js';
+import { cleanupAttachmentStaging } from './yente/attachments.js';
+import { cleanupOrphanedPendingApprovalAttachments } from './modules/permissions/pending-attachments.js';
 import { reconcileLegacyTaskImportsOnStartup } from './modules/scheduling/startup-import.js';
 import { log } from './log.js';
 import {
@@ -100,6 +102,20 @@ async function main(): Promise<void> {
   // Sweep per-container --env-file leftovers from a previous crash — they hold
   // secret-bearing env values and must not accumulate.
   cleanupStaleContainerEnvFiles();
+  const staleAttachmentCount = await cleanupAttachmentStaging();
+  if (staleAttachmentCount > 0) {
+    log.info('Removed leftover staged inbound attachments', { count: staleAttachmentCount });
+  }
+  const pendingApprovalEvents: string[] = [];
+  for (const table of ['pending_sender_approvals', 'pending_channel_approvals']) {
+    if (!hasTable(db, table)) continue;
+    const rows = db.prepare(`SELECT original_message FROM ${table}`).all() as Array<{ original_message: string }>;
+    pendingApprovalEvents.push(...rows.map((row) => row.original_message));
+  }
+  const orphanedApprovalAttachmentCount = await cleanupOrphanedPendingApprovalAttachments(pendingApprovalEvents);
+  if (orphanedApprovalAttachmentCount > 0) {
+    log.info('Removed orphaned pending approval attachments', { count: orphanedApprovalAttachmentCount });
+  }
 
   // 3. Channel adapters
   await initChannelAdapters((adapter: ChannelAdapter): ChannelSetup => {

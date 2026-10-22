@@ -1,19 +1,33 @@
 import http from 'http';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import { createHash } from 'crypto';
 
 import { describe, expect, it, vi } from 'vitest';
 import { Message, parseMarkdown, type Adapter } from 'chat';
 
 import type { ChannelSetup } from './adapter.js';
 import { closeDb, initTestDb } from '../db/connection.js';
+import { createAgentGroup, createMessagingGroup, createMessagingGroupAgent } from '../db/index.js';
 import { runMigrations } from '../db/migrations/index.js';
+import { log } from '../log.js';
+import { attachmentStagingDir, cleanupAttachmentStaging, MAX_INBOUND_ATTACHMENT_BYTES } from '../yente/attachments.js';
 import {
   createChatSdkBridge,
   disableWebhookServerKeepAlive,
   forwardChatSdkInboundMessage,
   handleForwardedEvent,
   isOwnChatSdkMessageForTest,
+  safeAttachmentDownloadError,
   serializeChatSdkAttachmentForInbound,
+  shouldDownloadChatSdkAttachments,
 } from './chat-sdk-bridge.js';
+
+vi.mock('../config.js', async () => {
+  const actual = await vi.importActual('../config.js');
+  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-chat-sdk-data' };
+});
 
 describe('local webhook server keep-alive', () => {
   it('disables keepAliveTimeout so undici cannot race a server-side idle close', () => {
@@ -27,8 +41,62 @@ describe('local webhook server keep-alive', () => {
 });
 
 describe('Chat SDK bridge attachments', () => {
-  it('downloads attachment data from serialized URLs when fetchData is unavailable', async () => {
+  function stagingDir(): string {
+    return fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-chat-sdk-staging-'));
+  }
+
+  it.each([undefined, 17 * 1024 * 1024])(
+    'streams URL attachments to disk when Content-Length is %s',
+    async (contentLength) => {
+      const dir = stagingDir();
+      const originalFetch = globalThis.fetch;
+      const bytes = Buffer.alloc(17 * 1024 * 1024, 0x61);
+      const responseHeaders: Record<string, string> =
+        contentLength === undefined ? {} : { 'content-length': String(contentLength) };
+      globalThis.fetch = vi.fn().mockResolvedValue(
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(bytes.subarray(0, 5 * 1024 * 1024));
+              controller.enqueue(bytes.subarray(5 * 1024 * 1024));
+              controller.close();
+            },
+          }),
+          { status: 200, headers: responseHeaders },
+        ),
+      );
+
+      try {
+        const entry = await serializeChatSdkAttachmentForInbound(
+          {
+            id: 'att-1',
+            type: 'file',
+            name: 'large.docx',
+            mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            size: bytes.byteLength,
+          },
+          {
+            url: 'https://cdn.discordapp.com/attachments/channel/message/large.docx',
+          },
+          { stagingDir: dir },
+        );
+
+        expect(entry).not.toHaveProperty('data');
+        expect(typeof entry.stagedHostPath).toBe('string');
+        const saved = fs.readFileSync(String(entry.stagedHostPath));
+        expect(saved.byteLength).toBe(bytes.byteLength);
+        expect(createHash('sha256').update(saved).digest('hex')).toBe(createHash('sha256').update(bytes).digest('hex'));
+      } finally {
+        globalThis.fetch = originalFetch;
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it('prefers a URL over fetchData and never puts attachment bytes in inbound JSON', async () => {
+    const dir = stagingDir();
     const originalFetch = globalThis.fetch;
+    const fetchData = vi.fn().mockResolvedValue(Buffer.from('memory-path-must-not-win'));
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(Buffer.from('discord-file'), {
         status: 200,
@@ -45,24 +113,205 @@ describe('Chat SDK bridge attachments', () => {
           name: 'vision-fixture.png',
           mimeType: 'image/png',
           size: 12,
+          fetchData,
         },
         {
           url: 'https://cdn.discordapp.com/attachments/channel/message/vision-fixture.png',
         },
+        { stagingDir: dir },
       );
 
       expect(fetchMock).toHaveBeenCalledWith(
         'https://cdn.discordapp.com/attachments/channel/message/vision-fixture.png',
         expect.objectContaining({ method: 'GET' }),
       );
-      expect(entry).toMatchObject({
-        id: 'att-1',
-        name: 'vision-fixture.png',
-        data: Buffer.from('discord-file').toString('base64'),
-      });
+      expect(fetchData).not.toHaveBeenCalled();
+      expect(entry).toMatchObject({ id: 'att-1', name: 'vision-fixture.png' });
+      expect(entry).not.toHaveProperty('data');
+      expect(fs.readFileSync(String(entry.stagedHostPath))).toEqual(Buffer.from('discord-file'));
+    } finally {
+      globalThis.fetch = originalFetch;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a declared attachment larger than the fixed 1 GiB inbound limit', async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn();
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    try {
+      await expect(
+        serializeChatSdkAttachmentForInbound(
+          { id: 'too-big', type: 'file', name: 'huge.docx', size: 1024 ** 3 + 1 },
+          { url: 'https://cdn.discordapp.com/signed?token=private-value' },
+        ),
+      ).rejects.toThrow(/1 GiB|1073741824|too large/i);
+      expect(fetchMock).not.toHaveBeenCalled();
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
+
+  it('enforces actual streamed bytes at and above a small test limit', async () => {
+    const dir = stagingDir();
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(Buffer.from('abc'), { status: 200 }))
+      .mockResolvedValueOnce(new Response(Buffer.from('abcd'), { status: 200 })) as unknown as typeof fetch;
+    try {
+      const accepted = await serializeChatSdkAttachmentForInbound(
+        { id: 'at-limit', type: 'file', name: 'three.bin' },
+        { url: 'https://cdn.discordapp.com/attachments/at-limit' },
+        { stagingDir: dir, maxBytes: 3 },
+      );
+      expect(fs.readFileSync(String(accepted.stagedHostPath))).toEqual(Buffer.from('abc'));
+
+      await expect(
+        serializeChatSdkAttachmentForInbound(
+          { id: 'over-limit', type: 'file', name: 'four.bin' },
+          { url: 'https://cdn.discordapp.com/attachments/over-limit' },
+          { stagingDir: dir, maxBytes: 3 },
+        ),
+      ).rejects.toThrow(/size|limit|large/i);
+      expect(fs.readdirSync(dir)).toHaveLength(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves the size-limit message when a streamed attachment exceeds its limit', async () => {
+    const dir = stagingDir();
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response(Buffer.from('abcd'))) as unknown as typeof fetch;
+    try {
+      await expect(
+        serializeChatSdkAttachmentForInbound(
+          { id: 'overflow', type: 'file', name: 'overflow.bin' },
+          { url: 'https://cdn.discordapp.com/attachments/overflow' },
+          { stagingDir: dir, maxBytes: 3 },
+        ),
+      ).rejects.toThrow('Attachment exceeds the 3-byte limit');
+      expect(safeAttachmentDownloadError(new Error('Attachment exceeds the 3-byte limit'))).toBe(
+        'Attachment exceeds the 3-byte limit',
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('aborts a stalled URL transfer after the fixed timeout and removes partial staging bytes', async () => {
+    const dir = stagingDir();
+    const originalFetch = globalThis.fetch;
+    let cancelled = false;
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(streamController) {
+            streamController.enqueue(Buffer.from('partial'));
+          },
+          cancel() {
+            cancelled = true;
+          },
+        }),
+        { status: 200 },
+      ),
+    ) as unknown as typeof fetch;
+    const pending = serializeChatSdkAttachmentForInbound(
+      { id: 'stalled', type: 'file', name: 'stalled.docx' },
+      { url: 'https://cdn.discordapp.com/attachments/stalled' },
+      { stagingDir: dir, timeoutMs: 20 },
+    );
+    const timeoutAssertion = expect(pending).rejects.toThrow(/timed out/i);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      await timeoutAssertion;
+      expect(cancelled).toBe(true);
+      expect(fs.readdirSync(dir)).toEqual([]);
+    } finally {
+      await pending.catch(() => undefined);
+      globalThis.fetch = originalFetch;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('streams the no-URL fetchData fallback to disk and enforces the same byte cap', async () => {
+    const dir = stagingDir();
+    const attachment = {
+      id: 'fallback',
+      type: 'file',
+      name: 'fallback.bin',
+      fetchData: vi.fn().mockResolvedValue(Buffer.from('abc')),
+    };
+    try {
+      const entry = await serializeChatSdkAttachmentForInbound(attachment, undefined, {
+        stagingDir: dir,
+        maxBytes: 3,
+      });
+      expect(entry).not.toHaveProperty('data');
+      expect(fs.readFileSync(String(entry.stagedHostPath))).toEqual(Buffer.from('abc'));
+
+      const oversized = {
+        ...attachment,
+        fetchData: vi.fn().mockResolvedValue(Buffer.from('abcd')),
+      };
+      await expect(
+        serializeChatSdkAttachmentForInbound(oversized, undefined, { stagingDir: dir, maxBytes: 3 }),
+      ).rejects.toThrow(/too large|limit/i);
+      expect(MAX_INBOUND_ATTACHMENT_BYTES).toBe(1024 ** 3);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('writes streamed bytes to staging before the response finishes', async () => {
+    const dir = stagingDir();
+    const originalFetch = globalThis.fetch;
+    let releaseFinalChunk!: () => void;
+    const finalChunk = new Promise<void>((resolve) => {
+      releaseFinalChunk = resolve;
+    });
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(Buffer.from('first-chunk'));
+          },
+          async pull(controller) {
+            await finalChunk;
+            controller.enqueue(Buffer.from('last-chunk'));
+            controller.close();
+          },
+        }),
+        { status: 200 },
+      ),
+    ) as unknown as typeof fetch;
+    const pending = serializeChatSdkAttachmentForInbound(
+      { id: 'streaming', type: 'file', name: 'large.docx' },
+      { url: 'https://cdn.discordapp.com/attachments/streaming' },
+      { stagingDir: dir },
+    );
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const stagedFiles = fs.readdirSync(dir);
+      expect(stagedFiles).toHaveLength(1);
+      expect(fs.statSync(path.join(dir, stagedFiles[0]!)).size).toBeGreaterThan(0);
+    } finally {
+      releaseFinalChunk();
+      await pending.catch(() => undefined);
+      globalThis.fetch = originalFetch;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('Chat SDK attachment preflight', () => {
+  it('keeps mentioned approval events but skips deterministic unwired drops', () => {
+    expect(shouldDownloadChatSdkAttachments(null)).toBe(true);
+    expect(shouldDownloadChatSdkAttachments(0)).toBe(false);
+    expect(shouldDownloadChatSdkAttachments(1)).toBe(true);
   });
 });
 
@@ -573,6 +822,84 @@ describe('plain-message catch-all dispatch', () => {
       expect(inbound.content.attachments?.[0]?.name).toBe('report.pdf');
     } finally {
       await bridge.teardown();
+      closeDb();
+    }
+  });
+
+  it('sanitizes attachment download failures from signed URLs and removes partial staging files', async () => {
+    const stagingDir = attachmentStagingDir();
+    await cleanupAttachmentStaging(stagingDir);
+    const signedUrl = 'https://cdn.discordapp.com/private-file?ex=secret-value';
+    const originalFetch = globalThis.fetch;
+    const warning = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
+    globalThis.fetch = vi.fn().mockResolvedValue(
+      new Response(
+        new ReadableStream<Uint8Array>({
+          pull(controller) {
+            controller.enqueue(Buffer.from('partial bytes'));
+            controller.error(new Error(`connection reset for ${signedUrl}`));
+          },
+        }),
+        { status: 200 },
+      ),
+    ) as unknown as typeof fetch;
+    const harness = await makeDispatchHarness();
+    try {
+      createAgentGroup({
+        id: 'ag-attachments',
+        name: 'Attachment Test',
+        folder: 'attachment-test',
+        agent_provider: null,
+        created_at: new Date().toISOString(),
+      });
+      createMessagingGroup({
+        id: 'mg-attachments',
+        channel_type: 'discord',
+        platform_id: 'thread-1',
+        name: 'Attachment Test',
+        is_group: 0,
+        unknown_sender_policy: 'public',
+        created_at: new Date().toISOString(),
+      });
+      createMessagingGroupAgent({
+        id: 'mga-attachments',
+        messaging_group_id: 'mg-attachments',
+        agent_group_id: 'ag-attachments',
+        engage_mode: 'pattern',
+        engage_pattern: '.',
+        sender_scope: 'all',
+        ignored_message_policy: 'drop',
+        session_mode: 'per-thread',
+        priority: 0,
+        created_at: new Date().toISOString(),
+      });
+      await harness.driver.handleIncomingMessage(
+        harness.fakeAdapter,
+        'thread-1',
+        makeMessage({
+          id: 'm-interrupted-file',
+          attachments: [
+            {
+              id: 'att-interrupted',
+              type: 'file',
+              name: 'private.docx',
+              url: signedUrl,
+            },
+          ],
+        }),
+      );
+
+      const inbound = harness.onInbound.mock.calls[0]?.[2] as {
+        content: { attachments: Array<{ error?: string }> };
+      };
+      expect(inbound.content.attachments[0]?.error).toBe('Attachment download failed');
+      expect(JSON.stringify(warning.mock.calls)).not.toContain(signedUrl);
+      expect(fs.readdirSync(stagingDir)).toEqual([]);
+    } finally {
+      globalThis.fetch = originalFetch;
+      warning.mockRestore();
+      await harness.bridge.teardown();
+      await cleanupAttachmentStaging(stagingDir);
       closeDb();
     }
   });

@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import fs from 'fs';
+import { createServer } from 'node:http';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Message, parseMarkdown } from 'chat';
@@ -487,6 +488,47 @@ describe('forwardDiscordGatewayEventWithRetry', () => {
     ).resolves.toBe(false);
     expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
+
+  it('uses Node HTTP and waits for the complete webhook response', async () => {
+    let received = false;
+    let requestDone = false;
+    let releaseResponse: (() => void) | undefined;
+    const server = createServer((request, response) => {
+      received = true;
+      request.resume();
+      request.on('end', () => {
+        releaseResponse = () => {
+          response.statusCode = 200;
+          response.end('{"ok":true}');
+        };
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('Test server did not bind a TCP port');
+    const shortTimeoutFetch = vi.fn<typeof fetch>().mockRejectedValue(new Error('short fetch timeout'));
+    vi.stubGlobal('fetch', shortTimeoutFetch);
+    try {
+      const result = forwardDiscordGatewayEventWithRetry(
+        `http://127.0.0.1:${address.port}/webhook`,
+        EVENT,
+        'bot-token',
+        { retryDelaysMs: [], sleep: noSleep },
+      ).then((accepted) => {
+        requestDone = true;
+        return accepted;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(received).toBe(true);
+      expect(requestDone).toBe(false);
+      expect(shortTimeoutFetch).not.toHaveBeenCalled();
+      releaseResponse?.();
+      await expect(result).resolves.toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+      await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
+    }
+  });
 });
 
 describe('wrapYenteDiscordChannelIds ingress claim', () => {
@@ -609,6 +651,51 @@ describe('wrapYenteDiscordChannelIds ingress claim', () => {
     nowMs += 120001;
     await wrapped.handleForwardedMessage(message('m3'), {});
     expect(isDiscordMessageTerminal('chan-1', 'm3')).toBe(true);
+  });
+
+  it('drops a lease-expired duplicate while dispatch is pending, then allows a retry after rejection', async () => {
+    const fake = fakeAdapter();
+    const forwardSpy = fake.handleForwardedMessage;
+    let rejectFirst!: (error: Error) => void;
+    let markFirstStarted!: () => void;
+    const firstStarted = new Promise<void>((resolve) => {
+      markFirstStarted = resolve;
+    });
+    forwardSpy
+      .mockImplementationOnce(
+        () =>
+          new Promise((_resolve, reject) => {
+            rejectFirst = reject;
+            markFirstStarted();
+          }),
+      )
+      .mockResolvedValue('handled');
+    let nowMs = Date.parse('2026-07-30T00:00:00.000Z');
+    const wrapped = wrapYenteDiscordChannelIds(
+      fake as unknown as Parameters<typeof wrapYenteDiscordChannelIds>[0],
+      'test-token',
+      new Set(),
+      {
+        monitoredChannelIds: () => new Set(),
+        routeLeaseMs: 100,
+        now: () => new Date(nowMs).toISOString(),
+        wasMessageHandled: () => true,
+      },
+    ) as unknown as { handleForwardedMessage: (data: unknown, options: unknown) => Promise<unknown> };
+
+    const first = wrapped.handleForwardedMessage(message('m-inflight'), {});
+    await firstStarted;
+    nowMs += 101;
+    await wrapped.handleForwardedMessage(message('m-inflight'), {});
+    expect(forwardSpy).toHaveBeenCalledTimes(1);
+
+    rejectFirst(new Error('dispatch rejected'));
+    await expect(first).rejects.toThrow('dispatch rejected');
+    expect(getDiscordMessageRouteStatus('chan-1', 'm-inflight')).toBe('failed');
+
+    await wrapped.handleForwardedMessage(message('m-inflight'), {});
+    expect(forwardSpy).toHaveBeenCalledTimes(2);
+    expect(getDiscordMessageRouteStatus('chan-1', 'm-inflight')).toBe('routed');
   });
 
   it('fails open: routes the message even when the claim state is unavailable', async () => {

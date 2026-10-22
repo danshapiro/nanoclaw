@@ -21,9 +21,16 @@ import { extractHttpStatusFromError } from '../delivery-errors.js';
 import { SqliteStateAdapter } from '../state-sqlite.js';
 import { registerWebhookAdapter } from '../webhook-server.js';
 import { getAskQuestionRender } from '../db/sessions.js';
+import { getMessagingGroupWithAgentCount } from '../db/messaging-groups.js';
 import { normalizeOptions, type NormalizedOption } from './ask-question.js';
 import { normalizeDiscordApplicationCommandInteraction } from './discord-commands.js';
 import type { ChannelAdapter, ChannelSetup, InboundMessage } from './adapter.js';
+import {
+  MAX_INBOUND_ATTACHMENT_BYTES,
+  INBOUND_ATTACHMENT_TIMEOUT_MS,
+  stageInboundAttachment,
+  stageInboundAttachmentBuffer,
+} from '../yente/attachments.js';
 
 /** Adapter with optional gateway support (e.g., Discord). */
 interface GatewayAdapter extends Adapter {
@@ -41,9 +48,6 @@ type FetchLike = (
   url: string,
   init: { method: 'POST'; headers: Record<string, string>; body: string },
 ) => Promise<{ ok: boolean; status: number; text(): Promise<string> }>;
-
-const MAX_ATTACHMENT_DOWNLOAD_BYTES = 10 * 1024 * 1024;
-const ATTACHMENT_DOWNLOAD_TIMEOUT_MS = 15_000;
 
 /**
  * Minimal shortcode -> unicode map for reaction emoji. Agents routinely pass
@@ -179,7 +183,9 @@ type ChatSdkAttachment = SerializableAttachment & {
 export async function serializeChatSdkAttachmentForInbound(
   att: ChatSdkAttachment,
   serializedAttachment?: SerializableAttachment,
+  options: { stagingDir?: string; maxBytes?: number; timeoutMs?: number; channel?: string } = {},
 ): Promise<SerializableAttachment> {
+  const startedAt = Date.now();
   const entry: SerializableAttachment = {
     id: att.id,
     type: att.type,
@@ -190,48 +196,130 @@ export async function serializeChatSdkAttachmentForInbound(
     height: att.height,
   };
 
-  const data = await readChatSdkAttachmentData(att, serializedAttachment);
-  if (data) {
-    entry.data = data.toString('base64');
+  const maxBytes = options.maxBytes ?? MAX_INBOUND_ATTACHMENT_BYTES;
+  const url = attachmentDownloadUrl(att, serializedAttachment);
+  const declaredSize = typeof att.size === 'number' ? att.size : sizeFromSerializedAttachment(serializedAttachment);
+  if (declaredSize != null && declaredSize > maxBytes) {
+    throw new Error(`Attachment is too large to download: ${declaredSize} bytes (limit ${maxBytes})`);
   }
+
+  if (url) {
+    const controller = new AbortController();
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, options.timeoutMs ?? INBOUND_ATTACHMENT_TIMEOUT_MS);
+    try {
+      const response = await fetch(url, { method: 'GET', signal: controller.signal });
+      if (!response.ok) {
+        await cancelResponseBody(response);
+        throw new Error(`Attachment download failed with HTTP ${response.status}`);
+      }
+      const contentLength = Number(response.headers.get('content-length'));
+      if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+        await cancelResponseBody(response);
+        throw new Error(`Attachment is too large to download: ${contentLength} bytes (limit ${maxBytes})`);
+      }
+      const source = response.body ?? new ReadableStream<Uint8Array>({ start: (stream) => stream.close() });
+      const staged = await stageInboundAttachment(source, {
+        ...(options.stagingDir ? { stagingDir: options.stagingDir } : {}),
+        maxBytes,
+        signal: controller.signal,
+      });
+      entry.stagedHostPath = staged.stagedHostPath;
+      entry.size = staged.sizeBytes;
+      log.info('Inbound attachment staged', {
+        channel: options.channel ?? 'chat-sdk',
+        id: att.id,
+        name: att.name,
+        type: att.type,
+        bytes: staged.sizeBytes,
+        durationMs: Date.now() - startedAt,
+      });
+      return entry;
+    } catch (error) {
+      if (timedOut) {
+        // eslint-disable-next-line preserve-caught-error -- Avoid retaining upstream details that can include signed URLs.
+        throw new Error('Attachment download timed out');
+      }
+      if (error instanceof Error && error.message.startsWith('Attachment exceeds')) throw error;
+      if (
+        error instanceof Error &&
+        (error.message.startsWith('Attachment is too large to download:') ||
+          /^Attachment download failed with HTTP \d{3}$/.test(error.message))
+      ) {
+        throw error;
+      }
+      // eslint-disable-next-line preserve-caught-error -- Never retain an upstream error that may contain a signed URL.
+      throw new Error('Attachment download failed');
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  if (!att.fetchData) return entry;
+  let data: Buffer;
+  try {
+    data = bufferFromAttachmentData(
+      await awaitWithTimeout(att.fetchData(), options.timeoutMs ?? INBOUND_ATTACHMENT_TIMEOUT_MS),
+    );
+  } catch (_error) {
+    // eslint-disable-next-line preserve-caught-error -- Provider errors can contain signed attachment URLs.
+    throw new Error('Attachment download failed');
+  }
+  if (data.byteLength > maxBytes) {
+    throw new Error(`Attachment is too large to download: ${data.byteLength} bytes (limit ${maxBytes})`);
+  }
+  const staged = await stageInboundAttachmentBuffer(data, {
+    ...(options.stagingDir ? { stagingDir: options.stagingDir } : {}),
+    maxBytes,
+  });
+  entry.stagedHostPath = staged.stagedHostPath;
+  entry.size = staged.sizeBytes;
+  log.info('Inbound attachment staged', {
+    channel: options.channel ?? 'chat-sdk',
+    id: att.id,
+    name: att.name,
+    type: att.type,
+    bytes: staged.sizeBytes,
+    durationMs: Date.now() - startedAt,
+  });
   return entry;
 }
 
-async function readChatSdkAttachmentData(
-  att: ChatSdkAttachment,
-  serializedAttachment?: SerializableAttachment,
-): Promise<Buffer | null> {
-  if (att.fetchData) {
-    return bufferFromAttachmentData(await att.fetchData());
+export function safeAttachmentDownloadError(error: unknown): string {
+  if (error instanceof Error && error.message.startsWith('Attachment exceeds the ')) return error.message;
+  if (error instanceof Error && error.message.startsWith('Attachment is too large to download:')) {
+    return error.message;
   }
-
-  const url = attachmentDownloadUrl(att, serializedAttachment);
-  if (!url) return null;
-
-  const declaredSize = typeof att.size === 'number' ? att.size : sizeFromSerializedAttachment(serializedAttachment);
-  if (declaredSize != null && declaredSize > MAX_ATTACHMENT_DOWNLOAD_BYTES) {
-    throw new Error(`Attachment is too large to download: ${declaredSize} bytes`);
+  if (error instanceof Error) {
+    const status = /\bHTTP (\d{3})\b/.exec(error.message)?.[1];
+    if (status) return `Attachment download failed with HTTP ${status}`;
   }
+  return 'Attachment download failed';
+}
 
-  const response = await fetch(url, {
-    method: 'GET',
-    signal: AbortSignal.timeout(ATTACHMENT_DOWNLOAD_TIMEOUT_MS),
-  });
-  if (!response.ok) {
-    throw new Error(`Attachment download failed with HTTP ${response.status}`);
-  }
+export function shouldDownloadChatSdkAttachments(wiredAgentCount: number | null): boolean {
+  return wiredAgentCount === null || wiredAgentCount > 0;
+}
 
-  const lengthHeader = response.headers.get('content-length');
-  const contentLength = lengthHeader ? Number.parseInt(lengthHeader, 10) : null;
-  if (contentLength != null && Number.isFinite(contentLength) && contentLength > MAX_ATTACHMENT_DOWNLOAD_BYTES) {
-    throw new Error(`Attachment is too large to download: ${contentLength} bytes`);
+async function awaitWithTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error('Attachment download timed out')), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
   }
+}
 
-  const buffer = Buffer.from(await response.arrayBuffer());
-  if (buffer.length > MAX_ATTACHMENT_DOWNLOAD_BYTES) {
-    throw new Error(`Attachment is too large to download: ${buffer.length} bytes`);
-  }
-  return buffer;
+async function cancelResponseBody(response: Response): Promise<void> {
+  await response.body?.cancel().catch(() => undefined);
 }
 
 function bufferFromAttachmentData(data: AttachmentData): Buffer {
@@ -380,21 +468,28 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     message: ChatMessage,
     isMention: boolean,
     isGroup?: boolean,
+    channelId?: string,
   ): Promise<InboundMessage> {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const serialized = message.toJSON() as Record<string, any>;
 
     // Download attachment data before serialization loses fetchData()
-    if (message.attachments && message.attachments.length > 0) {
+    const wiredAgentCount = channelId
+      ? (getMessagingGroupWithAgentCount(adapter.name, channelId)?.agentCount ?? 0)
+      : null;
+    if (message.attachments && message.attachments.length > 0 && shouldDownloadChatSdkAttachments(wiredAgentCount)) {
       const enriched = [];
       const serializedAttachments = Array.isArray(serialized.attachments) ? serialized.attachments : [];
       for (const [index, att] of message.attachments.entries()) {
         const attachment = att as unknown as ChatSdkAttachment;
         let entry: SerializableAttachment;
         try {
-          entry = await serializeChatSdkAttachmentForInbound(attachment, serializedAttachments[index]);
+          entry = await serializeChatSdkAttachmentForInbound(attachment, serializedAttachments[index], {
+            channel: adapter.name,
+          });
         } catch (err) {
-          log.warn('Failed to download attachment', { type: attachment.type, err });
+          const safeError = safeAttachmentDownloadError(err);
+          log.warn('Failed to download attachment', { type: attachment.type, error: safeError });
           entry = {
             id: attachment.id,
             type: attachment.type,
@@ -403,7 +498,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
             size: attachment.size,
             width: attachment.width,
             height: attachment.height,
-            error: err instanceof Error ? err.message : String(err),
+            error: safeError,
           };
         }
         enriched.push(entry);
@@ -463,7 +558,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // acceptance hook stays silent on failure and the message remains
       // catch-up eligible instead of being falsely marked routed.
       onInbound: setupConfig.onInboundStrict ?? setupConfig.onInbound,
-      toInbound: messageToInbound,
+      toInbound: (message, isMention, isGroup) => messageToInbound(message, isMention, isGroup, channelId),
       onForwarded: config.onInboundForwarded,
     });
   }
@@ -532,10 +627,9 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // lets the router see every plain message on every unsubscribed thread
       // the bot can see, including attachment-only posts: Discord sends those
       // with empty content, and the previous `/./` silently dropped them
-      // (2026-08-15 incident). The router short-circuits via
-      // getMessagingGroupWithAgentCount (~1 DB read) for unwired channels,
-      // so forwarding every one is cheap enough to not need a bridge-side
-      // flood gate.
+      // (2026-08-15 incident). messageToInbound checks
+      // getMessagingGroupWithAgentCount (~1 DB read) before downloading any
+      // attachments, so unwired channels are dropped without a file transfer.
       chat.onNewMessage(/[\s\S]*/, async (thread, message) => {
         const channelId = adapter.channelIdFromThreadId(thread.id);
         await forwardInboundMessage(channelId, thread.id, message, false, true, 'plain');

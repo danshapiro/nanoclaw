@@ -33,11 +33,19 @@ import {
 import type { GroupMetadata, WAMessageKey, WAMessage, WASocket } from '@whiskeysockets/baileys';
 
 import { ASSISTANT_HAS_OWN_NUMBER, ASSISTANT_NAME } from '../config.js';
+import { getMessagingGroupWithAgentCount } from '../db/messaging-groups.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import { normalizeOptions, type NormalizedOption } from './ask-question.js';
 import type { ChannelAdapter, ChannelSetup, ConversationInfo, InboundMessage, OutboundMessage } from './adapter.js';
+import {
+  INBOUND_ATTACHMENT_TIMEOUT_MS,
+  MAX_INBOUND_ATTACHMENT_BYTES,
+  cleanupInboundAttachmentSources,
+  stageInboundAttachment,
+  type StagedAttachmentFile,
+} from '../yente/attachments.js';
 
 // Baileys v6 bug: getPlatformId sends charCode (49) instead of enum value (1).
 // Fixed in Baileys 7.x but not backported. Without this, pairing codes fail with
@@ -68,6 +76,100 @@ const GROUP_METADATA_CACHE_TTL_MS = 60_000; // 1 min for outbound sends
 const SENT_MESSAGE_CACHE_MAX = 256;
 const RECONNECT_DELAY_MS = 5000;
 const PENDING_QUESTIONS_MAX = 64;
+
+interface LongLike {
+  toNumber?: () => number;
+}
+
+type WhatsAppMediaInfo = { fileLength?: number | LongLike };
+
+export async function stageWhatsAppMedia(
+  message: WAMessage,
+  media: WhatsAppMediaInfo,
+  options: {
+    download?: typeof downloadMediaMessage;
+    stagingDir?: string;
+    maxBytes?: number;
+    timeoutMs?: number;
+  } = {},
+): Promise<StagedAttachmentFile> {
+  const maxBytes = options.maxBytes ?? MAX_INBOUND_ATTACHMENT_BYTES;
+  if (coerceMediaSize(media.fileLength) > maxBytes) {
+    throw new Error(
+      maxBytes === MAX_INBOUND_ATTACHMENT_BYTES
+        ? 'Inbound attachment exceeds the 1 GiB limit'
+        : `Inbound attachment exceeds the ${maxBytes}-byte limit`,
+    );
+  }
+  const controller = new AbortController();
+  let timedOut = false;
+  let rejectTimeout!: (error: Error) => void;
+  const timeoutMs = options.timeoutMs ?? INBOUND_ATTACHMENT_TIMEOUT_MS;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    rejectTimeout = reject;
+  });
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+    rejectTimeout(new Error('WhatsApp attachment download timed out'));
+  }, timeoutMs);
+  try {
+    const streamPromise = Promise.resolve(
+      (options.download ?? downloadMediaMessage)(message, 'stream', {
+        options: { signal: controller.signal },
+      }),
+    );
+    const stream = await Promise.race([streamPromise, timeoutPromise]);
+    return await stageInboundAttachment(stream as AsyncIterable<Uint8Array>, {
+      stagingDir: options.stagingDir,
+      maxBytes,
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (timedOut) {
+      // eslint-disable-next-line preserve-caught-error -- Provider errors can include private media transport details.
+      throw new Error('WhatsApp attachment download timed out');
+    }
+    if (error instanceof Error && error.message.startsWith('Attachment exceeds the ')) {
+      // eslint-disable-next-line preserve-caught-error -- Return a stable limit error without exposing stream details.
+      throw new Error(
+        maxBytes === MAX_INBOUND_ATTACHMENT_BYTES
+          ? 'Inbound attachment exceeds the 1 GiB limit'
+          : `Inbound attachment exceeds the ${maxBytes}-byte limit`,
+      );
+    }
+    // eslint-disable-next-line preserve-caught-error -- Provider errors can include private media transport details.
+    throw new Error('WhatsApp attachment download failed');
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+export function shouldSkipWhatsAppMediaDownload(input: {
+  fromMe: boolean;
+  content: string;
+  pendingOptionLabels: string[];
+}): boolean {
+  if (input.fromMe) return true;
+  if (!input.content.startsWith('/')) return false;
+  const command = input.content.trim().toLowerCase();
+  return input.pendingOptionLabels.some((label) => optionToCommand(label) === command);
+}
+
+export function shouldDownloadWhatsAppMedia(input: {
+  fromMe: boolean;
+  content: string;
+  pendingOptionLabels: string[];
+  wiredAgentCount: number;
+}): boolean {
+  return input.wiredAgentCount > 0 && !shouldSkipWhatsAppMediaDownload(input);
+}
+
+function coerceMediaSize(value: number | LongLike | undefined): number {
+  if (typeof value === 'number') return value;
+  if (typeof value?.toNumber === 'function') return value.toNumber();
+  return 0;
+}
 
 /** Normalize an option label to a slash command: "Approve" → "/approve" */
 function optionToCommand(option: string): string {
@@ -302,7 +404,7 @@ registerChannelAdapter('whatsapp', {
         name: string;
         mimeType: string | null;
         size: number;
-        data?: string;
+        stagedHostPath?: string;
         error?: string;
       }>
     > {
@@ -318,7 +420,7 @@ registerChannelAdapter('whatsapp', {
         name: string;
         mimeType: string | null;
         size: number;
-        data?: string;
+        stagedHostPath?: string;
         error?: string;
       }> = [];
       for (const { key, type, ext } of mediaTypes) {
@@ -327,40 +429,39 @@ registerChannelAdapter('whatsapp', {
         const docFilename = media.fileName;
         const filename = docFilename || `${type}-${Date.now()}${ext}`;
         const mimeType = media.mimetype ?? null;
+        const transferStartedAt = Date.now();
         try {
-          const buffer = await downloadMediaMessage(msg, 'buffer', {});
+          const staged = await stageWhatsAppMedia(msg, media);
           results.push({
             id: `${type}-${msg.key.id || Date.now()}`,
             type,
             name: filename,
             mimeType,
-            size: buffer.byteLength,
-            data: buffer.toString('base64'),
+            size: staged.sizeBytes,
+            stagedHostPath: staged.stagedHostPath,
           });
-          log.info('Media downloaded', { type, filename });
+          log.info('Inbound attachment staged', {
+            channel: 'whatsapp',
+            id: `${type}-${msg.key.id || 'unknown'}`,
+            name: filename,
+            type,
+            bytes: staged.sizeBytes,
+            durationMs: Date.now() - transferStartedAt,
+          });
         } catch (err) {
-          log.warn('Failed to download media', { type, err });
+          const error = err instanceof Error ? err.message : 'WhatsApp attachment download failed';
+          log.warn('Failed to download media', { type, error });
           results.push({
             id: `${type}-${msg.key.id || Date.now()}`,
             type,
             name: filename,
             mimeType,
             size: coerceMediaSize(media.fileLength),
-            error: err instanceof Error ? err.message : String(err),
+            error,
           });
         }
       }
       return results;
-    }
-
-    interface LongLike {
-      toNumber?: () => number;
-    }
-
-    function coerceMediaSize(value: number | LongLike | undefined): number {
-      if (typeof value === 'number') return value;
-      if (typeof value?.toNumber === 'function') return value.toNumber();
-      return 0;
     }
 
     async function sendRawMessage(jid: string, text: string): Promise<string | undefined> {
@@ -529,6 +630,7 @@ registerChannelAdapter('whatsapp', {
       // Inbound messages
       sock.ev.on('messages.upsert', async ({ messages }) => {
         for (const msg of messages) {
+          let stagedAttachments: Array<{ stagedHostPath?: string }> = [];
           try {
             if (!msg.message) continue;
             const normalized = normalizeMessageContent(msg.message);
@@ -565,12 +667,6 @@ registerChannelAdapter('whatsapp', {
               content = content.replace(`@${botLidUser}`, `@${ASSISTANT_NAME}`);
             }
 
-            // Download media attachments (images, video, audio, documents)
-            const attachments = await downloadInboundMedia(msg, normalized);
-
-            // Skip empty protocol messages (no text and no attachments)
-            if (!content && attachments.length === 0) continue;
-
             const sender = msg.key.participant || msg.key.remoteJid || '';
             const senderName = msg.pushName || sender.split('@')[0];
             const fromMe = msg.key.fromMe || false;
@@ -583,7 +679,12 @@ registerChannelAdapter('whatsapp', {
 
             // Check if this reply answers a pending question via slash command
             const pending = pendingQuestions.get(chatJid);
-            if (pending && content.startsWith('/')) {
+            const skipMediaDownload = shouldSkipWhatsAppMediaDownload({
+              fromMe,
+              content,
+              pendingOptionLabels: pending?.options.map((option) => option.label) ?? [],
+            });
+            if (pending && skipMediaDownload) {
               const cmd = content.trim().toLowerCase();
               const matched = pending.options.find((o) => optionToCommand(o.label) === cmd);
               if (matched) {
@@ -599,6 +700,20 @@ registerChannelAdapter('whatsapp', {
                 continue; // Don't forward this reply to the agent
               }
             }
+
+            // Download media only after self-echo and pending-answer drops.
+            const wiredAgentCount = getMessagingGroupWithAgentCount('whatsapp', chatJid)?.agentCount ?? 0;
+            const shouldDownloadMedia = shouldDownloadWhatsAppMedia({
+              fromMe,
+              content,
+              pendingOptionLabels: pending?.options.map((option) => option.label) ?? [],
+              wiredAgentCount,
+            });
+            const attachments = shouldDownloadMedia ? await downloadInboundMedia(msg, normalized) : [];
+            stagedAttachments = attachments;
+
+            // Skip empty protocol messages (no text and no attachments)
+            if (!content && attachments.length === 0) continue;
 
             const inbound: InboundMessage = {
               id: msg.key.id || `wa-${Date.now()}`,
@@ -619,6 +734,9 @@ registerChannelAdapter('whatsapp', {
             // WhatsApp doesn't use threads — threadId is null
             setupConfig.onInbound(chatJid, null, inbound);
           } catch (err) {
+            await cleanupInboundAttachmentSources(JSON.stringify({ attachments: stagedAttachments })).catch(
+              () => undefined,
+            );
             log.error('Error processing incoming WhatsApp message', {
               err,
               remoteJid: msg.key?.remoteJid,

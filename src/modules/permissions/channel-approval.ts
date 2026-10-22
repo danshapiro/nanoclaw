@@ -44,6 +44,7 @@ import { log } from '../../log.js';
 import type { InboundEvent } from '../../channels/adapter.js';
 import { pickApprovalDelivery, pickApprover } from '../approvals/primitive.js';
 import { createPendingChannelApproval, hasInFlightChannelApproval } from './db/pending-channel-approvals.js';
+import { removePendingApprovalAttachmentSpool, spoolPendingApprovalAttachments } from './pending-attachments.js';
 
 const APPROVAL_OPTIONS: RawOption[] = [
   { label: 'Approve', selectedLabel: '✅ Wired', value: 'approve' },
@@ -122,15 +123,21 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
       : `Someone DM'd your agent on ${originChannelType}. Wire it to ${target.name} and let it respond?`;
   const options = normalizeOptions(APPROVAL_OPTIONS);
 
-  createPendingChannelApproval({
-    messaging_group_id: messagingGroupId,
-    agent_group_id: target.id,
-    original_message: JSON.stringify(event),
-    approver_user_id: delivery.userId,
-    created_at: new Date().toISOString(),
-    title,
-    options_json: JSON.stringify(options),
-  });
+  const pendingEvent = await spoolPendingApprovalAttachments(event, messagingGroupId);
+  try {
+    createPendingChannelApproval({
+      messaging_group_id: messagingGroupId,
+      agent_group_id: target.id,
+      original_message: JSON.stringify(pendingEvent),
+      approver_user_id: delivery.userId,
+      created_at: new Date().toISOString(),
+      title,
+      options_json: JSON.stringify(options),
+    });
+  } catch (error) {
+    await removePendingApprovalAttachmentSpool(pendingEvent).catch(() => undefined);
+    throw error;
+  }
 
   const adapter = getDeliveryAdapter();
   if (!adapter) {
@@ -140,8 +147,8 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
     return;
   }
 
-  try {
-    await adapter.deliver(
+  void adapter
+    .deliver(
       delivery.messagingGroup.channel_type,
       delivery.messagingGroup.platform_id,
       null,
@@ -156,18 +163,17 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
         question,
         options,
       }),
-    );
-    log.info('Channel registration card delivered', {
-      messagingGroupId,
-      targetAgentGroupId: target.id,
-      approver: delivery.userId,
+    )
+    .then(() => {
+      log.info('Channel registration card delivered', {
+        messagingGroupId,
+        targetAgentGroupId: target.id,
+        approver: delivery.userId,
+      });
+    })
+    .catch((err) => {
+      log.error('Channel registration card delivery failed', { messagingGroupId, err });
     });
-  } catch (err) {
-    log.error('Channel registration card delivery failed', {
-      messagingGroupId,
-      err,
-    });
-  }
 }
 
 export const APPROVE_VALUE = 'approve';

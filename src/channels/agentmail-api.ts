@@ -3,6 +3,11 @@ import { AgentMailClient, AgentMailEnvironment, type AgentMail } from 'agentmail
 import WebSocket from 'ws';
 
 import { log } from '../log.js';
+import {
+  INBOUND_ATTACHMENT_TIMEOUT_MS,
+  MAX_INBOUND_ATTACHMENT_BYTES,
+  stageInboundAttachment,
+} from '../yente/attachments.js';
 import type { AgentMailMessageLike } from './agentmail-config.js';
 
 export const AGENTMAIL_ONECLI_PLACEHOLDER = 'onecli-managed';
@@ -51,7 +56,6 @@ export type AgentMailApi = {
     inboxId: string;
     messageId: string;
     attachmentId: string;
-    maxBytes: number;
   }): Promise<AgentMailDownloadedAttachment>;
 };
 
@@ -65,10 +69,24 @@ export type AgentMailDownloadedAttachment = {
   attachmentId: string;
   filename: string;
   contentType: string | null;
-  data: Buffer;
+  stagedHostPath: string;
+  sizeBytes: number;
+};
+
+export type AgentMailAttachmentMetadata = {
+  attachmentId?: string;
+  filename: string;
+  contentType?: string | null;
+  sizeBytes?: number;
 };
 
 export type AgentMailApiAuthOptions = { mode: 'onecli' } | { mode: 'api-key'; apiKey: string };
+export type AgentMailApiDeps = {
+  fetchImpl?: typeof fetch;
+  stagingDir?: string;
+  maxBytes?: number;
+  timeoutMs?: number;
+};
 
 type WebSocketOptions = { headers?: Record<string, string>; agent?: unknown };
 type WebSocketConstructor = new (
@@ -111,8 +129,9 @@ export function agentMailClientOptions(options: AgentMailApiAuthOptions): AgentM
   } as AgentMailClient.Options;
 }
 
-export function createAgentMailApi(options: AgentMailApiAuthOptions): AgentMailApi {
+export function createAgentMailApi(options: AgentMailApiAuthOptions, deps: AgentMailApiDeps = {}): AgentMailApi {
   const client = new AgentMailClient(agentMailClientOptions(options));
+  const fetchImpl = deps.fetchImpl ?? fetch;
 
   return {
     connectWebSocket:
@@ -150,20 +169,115 @@ export function createAgentMailApi(options: AgentMailApiAuthOptions): AgentMailA
         await client.inboxes.messages.getAttachment(args.inboxId, args.messageId, args.attachmentId),
         args.attachmentId,
       );
-      const response = await fetch(meta.downloadUrl);
-      if (!response.ok) throw new Error(`AgentMail attachment download failed: HTTP ${response.status}`);
-      const length = Number(response.headers.get('content-length') ?? '0');
-      if (length > args.maxBytes) throw new Error(`AgentMail attachment exceeds ${args.maxBytes} bytes`);
-      const data = Buffer.from(await response.arrayBuffer());
-      if (data.byteLength > args.maxBytes) throw new Error(`AgentMail attachment exceeds ${args.maxBytes} bytes`);
-      return {
-        attachmentId: args.attachmentId,
-        filename: meta.filename ?? args.attachmentId,
-        contentType: meta.contentType ?? response.headers.get('content-type'),
-        data,
-      };
+      const maxBytes = deps.maxBytes ?? MAX_INBOUND_ATTACHMENT_BYTES;
+      if (meta.sizeBytes != null && meta.sizeBytes > maxBytes) {
+        throw attachmentSizeLimitError(maxBytes);
+      }
+      const controller = new AbortController();
+      let timedOut = false;
+      const timeout = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, deps.timeoutMs ?? INBOUND_ATTACHMENT_TIMEOUT_MS);
+      try {
+        const response = await fetchImpl(meta.downloadUrl, { signal: controller.signal });
+        return await downloadAgentMailAttachmentResponse(
+          response,
+          {
+            attachmentId: args.attachmentId,
+            filename: meta.filename ?? args.attachmentId,
+            contentType: meta.contentType,
+          },
+          { stagingDir: deps.stagingDir, maxBytes, signal: controller.signal },
+        );
+      } catch (_error) {
+        // eslint-disable-next-line preserve-caught-error -- Network errors can contain the signed attachment URL.
+        if (timedOut) throw new Error('AgentMail attachment download timed out');
+        if (
+          _error instanceof Error &&
+          (_error.message.startsWith('Inbound attachment exceeds the ') ||
+            /^AgentMail attachment download failed with HTTP \d{3}$/.test(_error.message))
+        ) {
+          throw _error;
+        }
+        // eslint-disable-next-line preserve-caught-error -- Do not expose signed attachment URLs from network failures.
+        throw new Error('AgentMail attachment download failed');
+      } finally {
+        clearTimeout(timeout);
+      }
     },
   };
+}
+
+export async function downloadAgentMailAttachmentResponse(
+  response: Response,
+  metadata: AgentMailAttachmentMetadata,
+  options: { stagingDir?: string; maxBytes?: number; signal?: AbortSignal; timeoutMs?: number } = {},
+): Promise<AgentMailDownloadedAttachment> {
+  const maxBytes = options.maxBytes ?? MAX_INBOUND_ATTACHMENT_BYTES;
+  if (!response.ok) {
+    await cancelResponseBody(response);
+    throw new Error(`AgentMail attachment download failed with HTTP ${response.status}`);
+  }
+  const contentLength = Number(response.headers.get('content-length') ?? '0');
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    await cancelResponseBody(response);
+    throw attachmentSizeLimitError(maxBytes);
+  }
+  const controller = options.signal ? null : new AbortController();
+  const signal = options.signal ?? controller!.signal;
+  let timedOut = false;
+  const timeout = controller
+    ? setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, options.timeoutMs ?? INBOUND_ATTACHMENT_TIMEOUT_MS)
+    : null;
+  try {
+    const source = response.body ?? new ReadableStream<Uint8Array>({ start: (stream) => stream.close() });
+    const staged = await stageInboundAttachment(source, {
+      stagingDir: options.stagingDir,
+      maxBytes,
+      signal,
+    });
+    return {
+      attachmentId: metadata.attachmentId ?? 'attachment',
+      filename: metadata.filename,
+      contentType: metadata.contentType ?? response.headers.get('content-type'),
+      stagedHostPath: staged.stagedHostPath,
+      sizeBytes: staged.sizeBytes,
+    };
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : '';
+    if (timedOut) {
+      // eslint-disable-next-line preserve-caught-error -- Avoid retaining provider errors that can include signed URLs.
+      throw new Error('AgentMail attachment download timed out');
+    }
+    if (detail.startsWith('Attachment exceeds the ')) {
+      // eslint-disable-next-line preserve-caught-error -- Convert the internal stream-limit error into a stable provider-neutral message.
+      throw new Error(
+        maxBytes === MAX_INBOUND_ATTACHMENT_BYTES
+          ? 'Inbound attachment exceeds the 1 GiB limit'
+          : `Inbound attachment exceeds the ${maxBytes}-byte limit`,
+      );
+    }
+    // eslint-disable-next-line preserve-caught-error -- Discard upstream details because they may contain signed download URLs.
+    throw new Error('AgentMail attachment download failed');
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+function attachmentSizeLimitError(maxBytes: number): Error {
+  return new Error(
+    maxBytes === MAX_INBOUND_ATTACHMENT_BYTES
+      ? 'Inbound attachment exceeds the 1 GiB limit'
+      : `Inbound attachment exceeds the ${maxBytes}-byte limit`,
+  );
+}
+
+async function cancelResponseBody(response: Response): Promise<void> {
+  await response.body?.cancel().catch(() => undefined);
 }
 
 export async function createAgentMailOneCliWebSocket(
@@ -420,17 +534,20 @@ function normalizeMessageList(response: unknown): { messages: AgentMailMessageLi
 function normalizeAttachmentMetadata(
   response: unknown,
   attachmentId: string,
-): { filename?: string; contentType?: string; downloadUrl: string } {
+): { filename?: string; contentType?: string; downloadUrl: string; sizeBytes?: number } {
   if (!response || typeof response !== 'object') {
     throw new Error(`AgentMail attachment ${attachmentId} metadata missing`);
   }
   const record = response as Record<string, unknown>;
   const downloadUrl = stringValue(record.downloadUrl) ?? stringValue(record.download_url);
   if (!downloadUrl) throw new Error(`AgentMail attachment ${attachmentId} missing downloadUrl`);
+  const size = record.sizeBytes ?? record.size_bytes ?? record.size;
+  const sizeBytes = typeof size === 'number' ? size : typeof size === 'string' ? Number(size) : undefined;
   return {
     filename: stringValue(record.filename) ?? stringValue(record.name),
     contentType: stringValue(record.contentType) ?? stringValue(record.content_type),
     downloadUrl,
+    ...(sizeBytes != null && Number.isFinite(sizeBytes) && sizeBytes >= 0 ? { sizeBytes } : {}),
   };
 }
 

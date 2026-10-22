@@ -11,6 +11,8 @@ vi.mock('../../config.js', async () => {
   return { ...actual, DATA_DIR: mocks.testDir };
 });
 
+vi.mock('../../container-runner.js', () => ({ wakeContainer: vi.fn().mockResolvedValue(undefined) }));
+
 import {
   closeDb,
   createAgentGroup,
@@ -19,8 +21,9 @@ import {
   initTestDb,
   runMigrations,
 } from '../../db/index.js';
-import { inboundDbPath, resolveSession } from '../../session-manager.js';
+import { inboundDbPath, resolveSession, sessionDir } from '../../session-manager.js';
 import { createDestination } from './db/agent-destinations.js';
+import { routeAgentMessage } from './agent-route.js';
 import { writeDestinations } from './write-destinations.js';
 
 function now(): string {
@@ -203,5 +206,51 @@ describe('writeDestinations channel projection policy', () => {
       { name: 'parent', type: 'agent', channel_type: null },
       { name: 'user-channel', type: 'blocked_channel', channel_type: 'discord' },
     ]);
+  });
+});
+
+describe('agent-to-agent attachment forwarding', () => {
+  it('preserves the forwarded localPath when writeSessionMessage stores an agent message', async () => {
+    createDestination({
+      agent_group_id: 'ag-primary',
+      local_name: 'child',
+      target_type: 'agent',
+      target_id: 'ag-child',
+      created_at: now(),
+    });
+    const { session: sourceSession } = resolveSession('ag-primary', 'mg-user', null, 'shared');
+    const sourceOutbox = `${sessionDir('ag-primary', sourceSession.id)}/outbox/agent-out-1`;
+    fs.mkdirSync(sourceOutbox, { recursive: true });
+    fs.writeFileSync(`${sourceOutbox}/report.docx`, 'forwarded file bytes');
+    const { session: targetSession } = resolveSession('ag-child', null, null, 'agent-shared');
+
+    await routeAgentMessage(
+      {
+        id: 'agent-out-1',
+        platform_id: 'ag-child',
+        content: JSON.stringify({ text: 'Review this report.', files: ['report.docx'] }),
+      },
+      sourceSession,
+    );
+
+    const inbound = new Database(inboundDbPath('ag-child', targetSession.id));
+    try {
+      const row = inbound.prepare("SELECT content FROM messages_in WHERE channel_type = 'agent'").get() as {
+        content: string;
+      };
+      const content = JSON.parse(row.content) as {
+        attachments: Array<{ localPath: string; name: string }>;
+      };
+      expect(content.attachments).toEqual([
+        {
+          name: 'report.docx',
+          filename: 'report.docx',
+          type: 'file',
+          localPath: expect.stringMatching(/^inbox\/a2a-/),
+        },
+      ]);
+    } finally {
+      inbound.close();
+    }
   });
 });

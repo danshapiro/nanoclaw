@@ -33,6 +33,7 @@ import { log } from '../../log.js';
 import type { InboundEvent } from '../../channels/adapter.js';
 import { pickApprovalDelivery, pickApprover } from '../approvals/primitive.js';
 import { createPendingSenderApproval, hasInFlightSenderApproval } from './db/pending-sender-approvals.js';
+import { removePendingApprovalAttachmentSpool, spoolPendingApprovalAttachments } from './pending-attachments.js';
 
 const APPROVAL_OPTIONS: RawOption[] = [
   { label: 'Allow', selectedLabel: '✅ Allowed', value: 'approve' },
@@ -93,19 +94,25 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
   const title = '👤 New sender';
   const question = `${senderDisplay} wants to talk to your agent in ${originName}. Allow?`;
   const options = normalizeOptions(APPROVAL_OPTIONS);
+  const pendingEvent = await spoolPendingApprovalAttachments(event, approvalId);
 
-  createPendingSenderApproval({
-    id: approvalId,
-    messaging_group_id: messagingGroupId,
-    agent_group_id: agentGroupId,
-    sender_identity: senderIdentity,
-    sender_name: senderName,
-    original_message: JSON.stringify(event),
-    approver_user_id: target.userId,
-    created_at: new Date().toISOString(),
-    title,
-    options_json: JSON.stringify(options),
-  });
+  try {
+    createPendingSenderApproval({
+      id: approvalId,
+      messaging_group_id: messagingGroupId,
+      agent_group_id: agentGroupId,
+      sender_identity: senderIdentity,
+      sender_name: senderName,
+      original_message: JSON.stringify(pendingEvent),
+      approver_user_id: target.userId,
+      created_at: new Date().toISOString(),
+      title,
+      options_json: JSON.stringify(options),
+    });
+  } catch (error) {
+    await removePendingApprovalAttachmentSpool(pendingEvent).catch(() => undefined);
+    throw error;
+  }
 
   const adapter = getDeliveryAdapter();
   if (!adapter) {
@@ -118,8 +125,8 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
     return;
   }
 
-  try {
-    await adapter.deliver(
+  void adapter
+    .deliver(
       target.messagingGroup.channel_type,
       target.messagingGroup.platform_id,
       null,
@@ -131,20 +138,19 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
         question,
         options,
       }),
-    );
-    log.info('Unknown-sender approval card delivered', {
-      approvalId,
-      senderIdentity,
-      approver: target.userId,
-      messagingGroupId,
-      agentGroupId,
+    )
+    .then(() => {
+      log.info('Unknown-sender approval card delivered', {
+        approvalId,
+        senderIdentity,
+        approver: target.userId,
+        messagingGroupId,
+        agentGroupId,
+      });
+    })
+    .catch((err) => {
+      log.error('Unknown-sender approval card delivery failed', { approvalId, err });
     });
-  } catch (err) {
-    log.error('Unknown-sender approval card delivery failed', {
-      approvalId,
-      err,
-    });
-  }
 }
 
 /**

@@ -1,4 +1,5 @@
 import { EventEmitter } from 'events';
+import fs from 'fs';
 import type { AgentMail } from 'agentmail';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -10,6 +11,7 @@ import type { ChannelSetup, OutboundMessage } from './adapter.js';
 import { agentMailClientOptions } from './agentmail-api.js';
 import type { AgentMailApi, AgentMailSocketLike } from './agentmail-api.js';
 import { agentMailChannelFactory, createAgentMailAdapter } from './agentmail.js';
+import { stageInboundAttachmentBuffer } from '../yente/attachments.js';
 
 class FakeSocket extends EventEmitter implements AgentMailSocketLike {
   subscriptions: unknown[] = [];
@@ -210,6 +212,95 @@ describe('AgentMail adapter', () => {
     expect(inbound[0]![0]).toBe('yente-threads@agentmail.to');
     expect(inbound[0]![1]).toBe('agentmail:yente-threads:thread-1');
     expect(JSON.stringify(inbound[0]![2].content)).toContain('"senderId":"agentmail:ci@example.com"');
+  });
+
+  it('maps staged AgentMail attachment paths and byte sizes into inbound content', async () => {
+    const socket = new FakeSocket();
+    fake = fakeApi(socket);
+    const staged = await stageInboundAttachmentBuffer(Buffer.from('agentmail attachment'));
+    vi.mocked(fake.downloadAttachment).mockResolvedValue({
+      attachmentId: 'file-1',
+      filename: 'brief.docx',
+      contentType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      stagedHostPath: staged.stagedHostPath,
+      sizeBytes: staged.sizeBytes,
+    });
+    const inbound: Parameters<ChannelSetup['onInbound']>[] = [];
+    const adapter = createAgentMailAdapter({ api: fake, env: BASE_AGENTMAIL_ENV })!;
+    await adapter.setup(setupCollector(inbound));
+    socket.emit('message', agentMailEvent('m-map', [{ id: 'file-1' }]));
+
+    await vi.waitFor(() => expect(inbound).toHaveLength(1));
+    const content = inbound[0]![2].content as { attachments: Array<Record<string, unknown>> };
+    expect(content.attachments[0]).toMatchObject({
+      id: 'file-1',
+      filename: 'brief.docx',
+      contentType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      size: staged.sizeBytes,
+      stagedHostPath: staged.stagedHostPath,
+    });
+    await adapter.teardown?.();
+    await fs.promises.rm(staged.stagedHostPath, { force: true });
+  });
+
+  it('skips AgentMail attachment downloads when the inbox has no wired agent', async () => {
+    const socket = new FakeSocket();
+    fake = fakeApi(socket);
+    const inbound: Parameters<ChannelSetup['onInbound']>[] = [];
+    const adapter = createAgentMailAdapter({ api: fake, env: BASE_AGENTMAIL_ENV })!;
+    await adapter.setup(setupCollector(inbound));
+    getDb()
+      .prepare('DELETE FROM messaging_group_agents WHERE messaging_group_id = ?')
+      .run('mg-agentmail-yente-threads');
+    socket.emit('message', agentMailEvent('m-unwired', [{ id: 'file-1' }]));
+
+    await vi.waitFor(() => expect(inbound).toHaveLength(1));
+    expect(fake.downloadAttachment).not.toHaveBeenCalled();
+    const content = inbound[0]![2].content as { attachments: unknown[] };
+    expect(content.attachments).toEqual([]);
+    await adapter.teardown?.();
+  });
+
+  it('removes earlier AgentMail staged files when a later attachment download fails', async () => {
+    const socket = new FakeSocket();
+    fake = fakeApi(socket);
+    const staged = await stageInboundAttachmentBuffer(Buffer.from('first attachment'));
+    vi.mocked(fake.downloadAttachment)
+      .mockResolvedValueOnce({
+        attachmentId: 'file-1',
+        filename: 'first.docx',
+        contentType: null,
+        stagedHostPath: staged.stagedHostPath,
+        sizeBytes: staged.sizeBytes,
+      })
+      .mockRejectedValueOnce(new Error('second download failed'));
+    const adapter = createAgentMailAdapter({ api: fake, env: BASE_AGENTMAIL_ENV })!;
+    await adapter.setup(setupCollector());
+    socket.emit('message', agentMailEvent('m-partial', [{ id: 'file-1' }, { id: 'file-2' }]));
+
+    await vi.waitFor(() => expect(fs.existsSync(staged.stagedHostPath)).toBe(false));
+    await adapter.teardown?.();
+  });
+
+  it('removes AgentMail staged files when route bookkeeping fails', async () => {
+    const socket = new FakeSocket();
+    fake = fakeApi(socket);
+    const staged = await stageInboundAttachmentBuffer(Buffer.from('route bookkeeping attachment'));
+    vi.mocked(fake.downloadAttachment).mockResolvedValue({
+      attachmentId: 'file-1',
+      filename: 'brief.docx',
+      contentType: null,
+      stagedHostPath: staged.stagedHostPath,
+      sizeBytes: staged.sizeBytes,
+    });
+    getDb().exec(`CREATE TRIGGER fail_agentmail_route_record BEFORE UPDATE ON agentmail_message_routes
+      WHEN NEW.nano_thread_id IS NOT NULL BEGIN SELECT RAISE(FAIL, 'route record failed'); END;`);
+    const adapter = createAgentMailAdapter({ api: fake, env: BASE_AGENTMAIL_ENV })!;
+    await adapter.setup(setupCollector());
+    socket.emit('message', agentMailEvent('m-route-record-failure', [{ id: 'file-1' }]));
+
+    await vi.waitFor(() => expect(fs.existsSync(staged.stagedHostPath)).toBe(false));
+    await adapter.teardown?.();
   });
 
   it('blocks non-greenlisted senders before routing to NanoClaw', async () => {
@@ -682,6 +773,23 @@ function setupCollector(inbound: Parameters<ChannelSetup['onInbound']>[] = []): 
     onInboundEvent: vi.fn(),
     onMetadata: vi.fn(),
     onAction: vi.fn(),
+  };
+}
+
+function agentMailEvent(messageId: string, attachments: unknown[]): Record<string, unknown> {
+  return {
+    type: 'event',
+    eventType: 'message.received',
+    eventId: `event-${messageId}`,
+    message: {
+      inboxId: 'yente-threads@agentmail.to',
+      messageId,
+      threadId: `thread-${messageId}`,
+      from_: 'ci@example.com',
+      subject: 'Attachment test',
+      text: 'Please read the attached document.',
+      attachments,
+    },
   };
 }
 

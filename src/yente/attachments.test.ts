@@ -5,10 +5,15 @@ import path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import {
+  attachmentStagingDir,
+  cleanupAttachmentStaging,
   formatAttachmentErrorPromptMetadata,
   formatAttachmentPromptMetadata,
+  materializeAttachmentFile,
   materializeAttachmentData,
   materializedAttachmentDir,
+  stageInboundAttachment,
+  stageInboundAttachmentBuffer,
   safeAttachmentName,
 } from './attachments.js';
 
@@ -158,5 +163,106 @@ describe('Yente attachment materialization', () => {
         error: 'download failed',
       }),
     ).toBe('Attachment error for photo.jpg on platform message message-2: download failed');
+  });
+
+  it('cleans leftovers from the dedicated staging directory', async () => {
+    const dataDir = makeTmpRoot();
+    const stagingDir = attachmentStagingDir(dataDir);
+    expect(path.basename(stagingDir)).toBe('inbound-attachment-staging');
+    fs.mkdirSync(stagingDir, { recursive: true });
+    fs.writeFileSync(path.join(stagingDir, 'partial.attachment'), 'incomplete');
+    fs.writeFileSync(path.join(stagingDir, 'interrupted.attachment.tmp'), 'unfinished');
+
+    await expect(cleanupAttachmentStaging(stagingDir)).resolves.toBe(2);
+    expect(fs.readdirSync(stagingDir)).toEqual([]);
+  });
+
+  it('materializes an asynchronously staged file atomically and preserves its source for fan-out', async () => {
+    const groupsDir = makeTmpRoot();
+    const stagingDir = path.join(makeTmpRoot(), 'staging');
+    const { stagedHostPath, sizeBytes } = await stageInboundAttachmentBuffer(Buffer.from('document payload'), {
+      stagingDir,
+    });
+    const expected = fs.readFileSync(stagedHostPath);
+    expect(sizeBytes).toBe(expected.byteLength);
+
+    const first = await materializeAttachmentFile({
+      groupsDir,
+      groupFolder: 'first-agent',
+      channel: 'discord',
+      messageId: 'message-1',
+      attachmentId: 'file-1',
+      originalName: 'report.docx',
+      contentType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      sourceHostPath: stagedHostPath,
+    });
+    const second = await materializeAttachmentFile({
+      groupsDir,
+      groupFolder: 'second-agent',
+      channel: 'discord',
+      messageId: 'message-1',
+      attachmentId: 'file-1',
+      originalName: 'report.docx',
+      contentType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      sourceHostPath: stagedHostPath,
+    });
+
+    expect(fs.readFileSync(first.hostPath)).toEqual(expected);
+    expect(fs.readFileSync(second.hostPath)).toEqual(expected);
+    expect(fs.readFileSync(stagedHostPath)).toEqual(expected);
+    expect(fs.statSync(first.hostPath).mode & 0o777).toBe(0o644);
+    expect(fs.readdirSync(path.dirname(first.hostPath))).toEqual(['file-1-report.docx']);
+    expect(first.workspacePath).toBe('/workspace/agent/attachments/discord/message-1/file-1-report.docx');
+  });
+
+  it('removes a temporary sibling when file materialization fails', async () => {
+    const groupsDir = makeTmpRoot();
+    await expect(
+      materializeAttachmentFile({
+        groupsDir,
+        groupFolder: 'main',
+        channel: 'whatsapp',
+        messageId: 'message-2',
+        attachmentId: 'file-2',
+        originalName: 'missing.docx',
+        contentType: null,
+        sourceHostPath: path.join(groupsDir, 'missing-source'),
+      }),
+    ).rejects.toThrow();
+    expect(fs.readdirSync(path.join(groupsDir, 'main', 'attachments', 'whatsapp', 'message-2'))).toEqual([]);
+  });
+
+  it('keeps the event loop responsive while copying a large staged file', async () => {
+    const groupsDir = makeTmpRoot();
+    const stagingDir = path.join(makeTmpRoot(), 'staging');
+    const { stagedHostPath } = await stageInboundAttachment(
+      (async function* () {
+        yield Buffer.alloc(32 * 1024 * 1024, 0x61);
+      })(),
+      { stagingDir },
+    );
+    let eventLoopRanBeforeCopySettled = false;
+    let copySettled = false;
+    const copy = materializeAttachmentFile({
+      groupsDir,
+      groupFolder: 'main',
+      channel: 'discord',
+      messageId: 'responsive-copy',
+      attachmentId: 'large-file',
+      originalName: 'large.docx',
+      contentType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      sourceHostPath: stagedHostPath,
+    }).then((result) => {
+      copySettled = true;
+      return result;
+    });
+    await new Promise<void>((resolve) =>
+      setImmediate(() => {
+        eventLoopRanBeforeCopySettled = !copySettled;
+        resolve();
+      }),
+    );
+    await copy;
+    expect(eventLoopRanBeforeCopySettled).toBe(true);
   });
 });
