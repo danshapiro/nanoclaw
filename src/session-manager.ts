@@ -505,7 +505,17 @@ export function writeSessionMessage(
     db.close();
   }
 
-  updateSession(sessionId, { last_active: new Date().toISOString() });
+  // The message row is durable now; failure to update its activity timestamp
+  // must not make the router treat a committed message as an unwritten row.
+  try {
+    updateSession(sessionId, { last_active: new Date().toISOString() });
+    // eslint-disable-next-line no-catch-all/no-catch-all -- the inbound row is already durable; metadata failure must not invalidate its attachment.
+  } catch (error) {
+    log.warn('Failed to update session activity after persisting inbound message', {
+      sessionId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
 }
 
 export interface StagedAttachmentMaterialization {

@@ -533,6 +533,52 @@ describe('Yente host command routing', () => {
     }
   });
 
+  it('keeps a durable attachment when the last_active update fails after the inbound row insert', async () => {
+    const { routeInbound } = await import('./router.js');
+    const sessionDb = await import('./db/sessions.js');
+    const stagingDir = attachmentStagingDir();
+    fs.mkdirSync(stagingDir, { recursive: true });
+    const sourcePath = path.join(stagingDir, 'metadata-update-failure.attachment');
+    const bytes = Buffer.from('attachment survives metadata update failure');
+    fs.writeFileSync(sourcePath, bytes);
+    const incoming = stagedAttachmentEvent('metadata update failure', 'msg-attachment-metadata-failure', sourcePath);
+    const originalUpdateSession = sessionDb.updateSession;
+    let failedLastActiveUpdate = false;
+    const updateSpy = vi.spyOn(sessionDb, 'updateSession').mockImplementation((sessionId, updates) => {
+      if (updates.last_active) {
+        failedLastActiveUpdate = true;
+        throw new Error('simulated last_active update failure');
+      }
+      originalUpdateSession(sessionId, updates);
+    });
+
+    try {
+      const routeError = await routeInbound(incoming).then(
+        () => null,
+        (error: unknown) => error,
+      );
+
+      expect(failedLastActiveUpdate).toBe(true);
+      const session = getSessionsByAgentGroup('ag-yente')[0]!;
+      const db = new Database(inboundDbPath('ag-yente', session.id));
+      const row = db
+        .prepare('SELECT content FROM messages_in WHERE platform_message_id = ?')
+        .get('msg-attachment-metadata-failure') as { content: string };
+      db.close();
+      const parsed = JSON.parse(row.content) as { attachments: Array<{ workspacePath: string }> };
+      const workspacePath = parsed.attachments[0]!.workspacePath;
+      expect(workspacePath).toMatch(
+        /^\/workspace\/agent\/attachments\/discord\/msg-attachment-metadata-failure\/file-1-report-[0-9a-f-]{36}\.docx$/,
+      );
+      const hostPath = workspacePath.replace('/workspace/agent', path.join(TEST_DIR, 'groups', 'yente'));
+      expect(fs.existsSync(hostPath)).toBe(true);
+      expect(fs.readFileSync(hostPath)).toEqual(bytes);
+      expect(routeError).toBeNull();
+    } finally {
+      updateSpy.mockRestore();
+    }
+  });
+
   it('removes a staged attachment when the strict sender gate drops the message', async () => {
     const { routeInbound, setAccessGate } = await import('./router.js');
     const sourceDir = attachmentStagingDir();
