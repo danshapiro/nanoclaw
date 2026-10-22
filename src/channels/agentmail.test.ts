@@ -265,6 +265,9 @@ describe('AgentMail adapter', () => {
     const socket = new FakeSocket();
     fake = fakeApi(socket);
     const staged = await stageInboundAttachmentBuffer(Buffer.from('first attachment'));
+    const signedUrl = 'https://files.agentmail.test/private?signature=secret';
+    const warning = vi.spyOn(log, 'warn').mockImplementation(() => undefined);
+    const errorLog = vi.spyOn(log, 'error').mockImplementation(() => undefined);
     vi.mocked(fake.downloadAttachment)
       .mockResolvedValueOnce({
         attachmentId: 'file-1',
@@ -273,12 +276,32 @@ describe('AgentMail adapter', () => {
         stagedHostPath: staged.stagedHostPath,
         sizeBytes: staged.sizeBytes,
       })
-      .mockRejectedValueOnce(new Error('second download failed'));
+      .mockRejectedValueOnce(new Error(`download failed for ${signedUrl}`));
     const adapter = createAgentMailAdapter({ api: fake, env: BASE_AGENTMAIL_ENV })!;
     await adapter.setup(setupCollector());
-    socket.emit('message', agentMailEvent('m-partial', [{ id: 'file-1' }, { id: 'file-2' }]));
+    socket.emit(
+      'message',
+      agentMailEvent('m-partial', [
+        { id: 'file-1', filename: 'first.docx' },
+        {
+          id: 'file-2',
+          filename: 'second.docx',
+          contentType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        },
+      ]),
+    );
 
     await vi.waitFor(() => expect(fs.existsSync(staged.stagedHostPath)).toBe(false));
+    expect(warning).toHaveBeenCalledWith('AgentMail attachment download failed', {
+      inboxId: 'yente-threads@agentmail.to',
+      messageId: 'm-partial',
+      attachmentId: 'file-2',
+      name: 'second.docx',
+      type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      error: 'AgentMail attachment download failed',
+    });
+    expect(JSON.stringify(warning.mock.calls)).not.toContain(signedUrl);
+    expect(JSON.stringify([...warning.mock.calls, ...errorLog.mock.calls])).not.toContain(signedUrl);
     await adapter.teardown?.();
   });
 

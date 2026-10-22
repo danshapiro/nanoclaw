@@ -315,12 +315,37 @@ export function createAgentMailAdapter(deps: AgentMailAdapterDeps = {}): Channel
               ? record.attachmentId
               : null;
         if (!attachmentId) continue;
+        const name =
+          typeof record.filename === 'string' ? record.filename : typeof record.name === 'string' ? record.name : null;
+        const type =
+          typeof record.contentType === 'string'
+            ? record.contentType
+            : typeof record.mimeType === 'string'
+              ? record.mimeType
+              : typeof record.type === 'string'
+                ? record.type
+                : null;
         const startedAt = Date.now();
-        const downloaded = await api.downloadAttachment({
-          inboxId: message.inboxId,
-          messageId: message.messageId,
-          attachmentId,
-        });
+        let downloaded: Awaited<ReturnType<AgentMailApi['downloadAttachment']>>;
+        try {
+          downloaded = await api.downloadAttachment({
+            inboxId: message.inboxId,
+            messageId: message.messageId,
+            attachmentId,
+          });
+        } catch (error) {
+          const safeError = safeAgentMailAttachmentDownloadError(error);
+          log.warn('AgentMail attachment download failed', {
+            inboxId: message.inboxId,
+            messageId: message.messageId,
+            attachmentId,
+            name,
+            type,
+            error: safeError,
+          });
+          // eslint-disable-next-line preserve-caught-error -- The provider error can contain a signed URL; only the safe summary is rethrown.
+          throw new Error(safeError);
+        }
         attachments.push({
           id: downloaded.attachmentId,
           filename: downloaded.filename,
@@ -541,6 +566,19 @@ export function createAgentMailAdapter(deps: AgentMailAdapterDeps = {}): Channel
       }
     },
   };
+}
+
+function safeAgentMailAttachmentDownloadError(error: unknown): string {
+  const message = error instanceof Error ? error.message : '';
+  if (
+    message === 'AgentMail attachment download failed' ||
+    message === 'AgentMail attachment download timed out' ||
+    /^AgentMail attachment download failed with HTTP \d{3}$/.test(message) ||
+    /^Inbound attachment exceeds the (?:1 GiB|\d+-byte) limit$/.test(message)
+  ) {
+    return message;
+  }
+  return 'AgentMail attachment download failed';
 }
 
 /**
