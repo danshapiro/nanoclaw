@@ -211,8 +211,10 @@ describe('Yente attachment materialization', () => {
     expect(fs.readFileSync(second.hostPath)).toEqual(expected);
     expect(fs.readFileSync(stagedHostPath)).toEqual(expected);
     expect(fs.statSync(first.hostPath).mode & 0o777).toBe(0o644);
-    expect(fs.readdirSync(path.dirname(first.hostPath))).toEqual(['file-1-report.docx']);
-    expect(first.workspacePath).toBe('/workspace/agent/attachments/discord/message-1/file-1-report.docx');
+    expect(path.basename(first.hostPath)).toMatch(/^file-1-report-[0-9a-f-]{36}\.docx$/);
+    expect(first.workspacePath).toMatch(
+      /^\/workspace\/agent\/attachments\/discord\/message-1\/file-1-report-[0-9a-f-]{36}\.docx$/,
+    );
   });
 
   it('removes a temporary sibling when file materialization fails', async () => {

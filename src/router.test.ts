@@ -155,6 +155,18 @@ function sharedEvent(content: string, id: string): InboundEvent {
   };
 }
 
+function stagedAttachmentEvent(text: string, id: string, sourcePath: string, timestamp = now()): InboundEvent {
+  const staged = event(
+    JSON.stringify({
+      text,
+      attachments: [{ id: 'file-1', name: 'report.docx', stagedHostPath: sourcePath }],
+    }),
+    id,
+  );
+  staged.message.timestamp = timestamp;
+  return staged;
+}
+
 function outboundTexts(sessionId: string): string[] {
   const db = new Database(outboundDbPath('ag-yente', sessionId));
   try {
@@ -302,25 +314,223 @@ describe('Yente host command routing', () => {
     db.close();
     const parsed = JSON.parse(row.content) as {
       text: string;
-      attachments: Array<Record<string, unknown>>;
+      attachments: Array<Record<string, unknown> & { workspacePath: string }>;
     };
-    expect(parsed.attachments[0]?.workspacePath).toBe(
-      '/workspace/agent/attachments/discord/msg-staged-attachment/file-1-report.docx',
+    expect(parsed.attachments[0]?.workspacePath).toMatch(
+      /^\/workspace\/agent\/attachments\/discord\/msg-staged-attachment\/file-1-report-[0-9a-f-]{36}\.docx$/,
     );
-    expect(parsed.text).toContain('/workspace/agent/attachments/discord/msg-staged-attachment/file-1-report.docx');
+    expect(parsed.text).toContain(parsed.attachments[0]?.workspacePath as string);
     expect(parsed.attachments[0]).not.toHaveProperty('stagedHostPath');
     expect(parsed.attachments[0]).not.toHaveProperty('approvalSpoolPath');
-    const workspaceHostPath = path.join(
-      TEST_DIR,
-      'groups',
-      'yente',
-      'attachments',
-      'discord',
-      'msg-staged-attachment',
-      'file-1-report.docx',
+    const workspaceHostPath = parsed.attachments[0]?.workspacePath.replace(
+      '/workspace/agent',
+      path.join(TEST_DIR, 'groups', 'yente'),
     );
+    expect(workspaceHostPath).toBeDefined();
     expect(fs.readFileSync(workspaceHostPath)).toEqual(bytes);
     expect(fs.existsSync(sourcePath)).toBe(false);
+  });
+
+  it('keeps an accepted attachment intact when a concurrent colliding delivery materializes later', async () => {
+    const { routeInbound } = await import('./router.js');
+    const sessionManager = await import('./session-manager.js');
+    const stagingDir = attachmentStagingDir();
+    fs.mkdirSync(stagingDir, { recursive: true });
+    const rejectedSource = path.join(stagingDir, 'rejected-race.attachment');
+    const acceptedSource = path.join(stagingDir, 'accepted-race.attachment');
+    fs.writeFileSync(rejectedSource, 'rejected delivery bytes');
+    fs.writeFileSync(acceptedSource, 'accepted delivery bytes');
+
+    const rejected = event(
+      JSON.stringify({
+        text: 'rejected collision',
+        attachments: [{ id: 'file-1', name: 'report.docx', stagedHostPath: rejectedSource }],
+      }),
+      'msg-attachment-race',
+    );
+    rejected.message.timestamp = '2026-10-22T12:00:00.000Z';
+    const accepted = event(
+      JSON.stringify({
+        text: 'accepted delivery',
+        attachments: [{ id: 'file-1', name: 'report.docx', stagedHostPath: acceptedSource }],
+      }),
+      'msg-attachment-race',
+    );
+    accepted.message.timestamp = '2026-10-22T12:01:00.000Z';
+
+    let releaseRejectedCopy!: () => void;
+    let signalRejectedCopyStarted!: () => void;
+    const rejectedCopyStarted = new Promise<void>((resolve) => {
+      signalRejectedCopyStarted = resolve;
+    });
+    const rejectedCopyGate = new Promise<void>((resolve) => {
+      releaseRejectedCopy = resolve;
+    });
+    const materialize = sessionManager.materializeStagedAttachments;
+    const materializeSpy = vi
+      .spyOn(sessionManager, 'materializeStagedAttachments')
+      .mockImplementation(async (agentGroupId, messageId, channelType, content) => {
+        if (JSON.parse(content).text === 'rejected collision') {
+          signalRejectedCopyStarted();
+          await rejectedCopyGate;
+        }
+        return materialize(agentGroupId, messageId, channelType, content);
+      });
+
+    try {
+      const rejectedRoute = routeInbound(rejected);
+      await rejectedCopyStarted;
+      await routeInbound(accepted);
+      releaseRejectedCopy();
+      await expect(rejectedRoute).rejects.toThrow(/colliding route id/);
+
+      const session = getSessionsByAgentGroup('ag-yente')[0];
+      const db = new Database(inboundDbPath('ag-yente', session!.id));
+      const row = db
+        .prepare('SELECT content FROM messages_in WHERE platform_message_id = ?')
+        .get('msg-attachment-race') as { content: string };
+      db.close();
+      const parsed = JSON.parse(row.content) as { attachments: Array<{ workspacePath: string }> };
+      const workspacePath = parsed.attachments[0]!.workspacePath;
+      expect(workspacePath).toMatch(/^\/workspace\/agent\/attachments\/discord\/msg-attachment-race\/[^/]+\.docx$/);
+      const hostPath = workspacePath.replace('/workspace/agent', path.join(TEST_DIR, 'groups', 'yente'));
+      expect(fs.readFileSync(hostPath, 'utf8')).toBe('accepted delivery bytes');
+      expect(fs.readdirSync(path.dirname(hostPath))).toEqual([path.basename(hostPath)]);
+    } finally {
+      releaseRejectedCopy();
+      materializeSpy.mockRestore();
+    }
+  });
+
+  it('removes a concurrent duplicate copy that is not written to the session', async () => {
+    const { routeInbound } = await import('./router.js');
+    const sessionManager = await import('./session-manager.js');
+    const stagingDir = attachmentStagingDir();
+    fs.mkdirSync(stagingDir, { recursive: true });
+    const duplicateSource = path.join(stagingDir, 'duplicate-race.attachment');
+    const acceptedSource = path.join(stagingDir, 'duplicate-accepted.attachment');
+    fs.writeFileSync(duplicateSource, 'duplicate delivery bytes');
+    fs.writeFileSync(acceptedSource, 'accepted duplicate bytes');
+    const timestamp = '2026-10-22T12:02:00.000Z';
+    const duplicate = stagedAttachmentEvent('held duplicate', 'msg-duplicate-race', duplicateSource, timestamp);
+    const accepted = stagedAttachmentEvent('accepted duplicate', 'msg-duplicate-race', acceptedSource, timestamp);
+
+    let releaseDuplicate!: () => void;
+    let signalDuplicateStarted!: () => void;
+    const duplicateStarted = new Promise<void>((resolve) => {
+      signalDuplicateStarted = resolve;
+    });
+    const duplicateGate = new Promise<void>((resolve) => {
+      releaseDuplicate = resolve;
+    });
+    const materialize = sessionManager.materializeStagedAttachments;
+    const materializeSpy = vi
+      .spyOn(sessionManager, 'materializeStagedAttachments')
+      .mockImplementation(async (agentGroupId, messageId, channelType, content) => {
+        if (JSON.parse(content).text === 'held duplicate') {
+          signalDuplicateStarted();
+          await duplicateGate;
+        }
+        return materialize(agentGroupId, messageId, channelType, content);
+      });
+
+    try {
+      const duplicateRoute = routeInbound(duplicate);
+      await duplicateStarted;
+      await routeInbound(accepted);
+      releaseDuplicate();
+      await duplicateRoute;
+
+      const session = getSessionsByAgentGroup('ag-yente')[0];
+      const db = new Database(inboundDbPath('ag-yente', session!.id));
+      const row = db
+        .prepare('SELECT content FROM messages_in WHERE platform_message_id = ?')
+        .get('msg-duplicate-race') as { content: string };
+      db.close();
+      const parsed = JSON.parse(row.content) as { attachments: Array<{ workspacePath: string }> };
+      const hostPath = parsed.attachments[0]!.workspacePath.replace(
+        '/workspace/agent',
+        path.join(TEST_DIR, 'groups', 'yente'),
+      );
+      expect(fs.readFileSync(hostPath, 'utf8')).toBe('accepted duplicate bytes');
+      expect(fs.readdirSync(path.dirname(hostPath))).toEqual([path.basename(hostPath)]);
+    } finally {
+      releaseDuplicate();
+      materializeSpy.mockRestore();
+    }
+  });
+
+  it('removes a materialized copy when its session becomes inactive before the write', async () => {
+    const { routeInbound } = await import('./router.js');
+    const sessionManager = await import('./session-manager.js');
+    const stagingDir = attachmentStagingDir();
+    fs.mkdirSync(stagingDir, { recursive: true });
+    const sourcePath = path.join(stagingDir, 'inactive-session.attachment');
+    fs.writeFileSync(sourcePath, 'must not remain after session rollover');
+    const incoming = stagedAttachmentEvent('pending stale attachment', 'msg-inactive-attachment', sourcePath);
+
+    let releaseMaterialization!: () => void;
+    let signalMaterializationStarted!: () => void;
+    const materializationStarted = new Promise<void>((resolve) => {
+      signalMaterializationStarted = resolve;
+    });
+    const materializationGate = new Promise<void>((resolve) => {
+      releaseMaterialization = resolve;
+    });
+    const materialize = sessionManager.materializeStagedAttachments;
+    const materializeSpy = vi
+      .spyOn(sessionManager, 'materializeStagedAttachments')
+      .mockImplementation(async (agentGroupId, messageId, channelType, content) => {
+        if (JSON.parse(content).text === 'pending stale attachment') {
+          signalMaterializationStarted();
+          await materializationGate;
+        }
+        return materialize(agentGroupId, messageId, channelType, content);
+      });
+
+    try {
+      const staleRoute = routeInbound(incoming);
+      await materializationStarted;
+      const originalSession = getSessionsByAgentGroup('ag-yente')[0]!;
+      await routeInbound(event('/new', 'msg-inactive-reset'));
+      expect(getSession(originalSession.id)?.status).toBe('archived');
+      releaseMaterialization();
+      await expect(staleRoute).rejects.toThrow(/changed while inbound attachments were materialized/);
+
+      const attachmentDir = path.join(TEST_DIR, 'groups', 'yente', 'attachments', 'discord', 'msg-inactive-attachment');
+      expect(fs.readdirSync(attachmentDir)).toEqual([]);
+    } finally {
+      releaseMaterialization();
+      materializeSpy.mockRestore();
+    }
+  }, 15_000);
+
+  it('removes a materialized copy when writing the session row fails', async () => {
+    const { routeInbound } = await import('./router.js');
+    const sessionManager = await import('./session-manager.js');
+    const stagingDir = attachmentStagingDir();
+    fs.mkdirSync(stagingDir, { recursive: true });
+    const sourcePath = path.join(stagingDir, 'write-failure.attachment');
+    fs.writeFileSync(sourcePath, 'must not remain after write failure');
+    const incoming = stagedAttachmentEvent('write failure', 'msg-attachment-write-failure', sourcePath);
+    const writeSpy = vi.spyOn(sessionManager, 'writeSessionMessage').mockImplementation(() => {
+      throw new Error('simulated session write failure');
+    });
+
+    try {
+      await expect(routeInbound(incoming)).rejects.toThrow('simulated session write failure');
+      const attachmentDir = path.join(
+        TEST_DIR,
+        'groups',
+        'yente',
+        'attachments',
+        'discord',
+        'msg-attachment-write-failure',
+      );
+      expect(fs.readdirSync(attachmentDir)).toEqual([]);
+    } finally {
+      writeSpy.mockRestore();
+    }
   });
 
   it('removes a staged attachment when the strict sender gate drops the message', async () => {

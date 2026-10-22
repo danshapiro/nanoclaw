@@ -111,21 +111,16 @@ describe('ensureDurableSideEffectLedger', () => {
       content,
     );
 
-    const parsed = JSON.parse(materialized) as {
+    const parsed = JSON.parse(materialized.content) as {
       attachments: Array<{ workspacePath: string; sizeBytes: number; stagedHostPath?: string }>;
     };
-    expect(parsed.attachments[0]?.workspacePath).toBe(
-      '/workspace/agent/attachments/discord/msg-session-materialize/file-1-brief.docx',
+    expect(parsed.attachments[0]?.workspacePath).toMatch(
+      /^\/workspace\/agent\/attachments\/discord\/msg-session-materialize\/file-1-brief-[0-9a-f-]{36}\.docx$/,
     );
     expect(parsed.attachments[0]?.stagedHostPath).toBeUndefined();
-    const hostPath = path.join(
-      TEST_DATA_DIR,
-      'groups',
-      'agent',
-      'attachments',
-      'discord',
-      'msg-session-materialize',
-      'file-1-brief.docx',
+    const hostPath = parsed.attachments[0]!.workspacePath.replace(
+      '/workspace/agent',
+      path.join(TEST_DATA_DIR, 'groups', 'agent'),
     );
     expect(fs.readFileSync(hostPath, 'utf8')).toBe('direct session-manager materialization');
     expect(fs.statSync(hostPath).mode & 0o777).toBe(0o644);

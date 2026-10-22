@@ -139,7 +139,9 @@ export async function materializeAttachmentFile(args: {
   const safeName = safeAttachmentName(args.originalName);
   const safeAttachmentId = safeAttachmentName(args.attachmentId);
   const safeMessageId = safeAttachmentName(args.messageId);
-  const filename = `${safeAttachmentId}-${safeName}`;
+  const extension = path.extname(safeName);
+  const nameWithoutExtension = extension ? safeName.slice(0, -extension.length) : safeName;
+  const filename = `${safeAttachmentId}-${nameWithoutExtension}-${randomUUID()}${extension}`;
   const hostPath = path.join(dir, filename);
   const tmpPath = path.join(dir, `.${filename}.${process.pid}.${randomUUID()}.tmp`);
 

@@ -720,50 +720,65 @@ async function deliverToAgent(
         return;
       }
     }
-    const content = await materializeStagedAttachments(
+    const materialized = await materializeStagedAttachments(
       session.agent_group_id,
       agentEvent.message.id,
       agentEvent.channelType,
       agentEvent.message.content,
     );
-    const currentSession = getSession(session.id);
-    if (!currentSession || currentSession.status !== 'active') {
-      throw new Error(`Session ${session.id} changed while inbound attachments were materialized`);
-    }
-    const routeAfterMaterialization = getSessionMessageRouteIdentity(
-      session.agent_group_id,
-      session.id,
-      routedMessageId,
-    );
-    if (routeAfterMaterialization) {
-      const sameDelivery = sessionRouteMatches(routeAfterMaterialization, agentEvent, deliveryAddr, mg.id);
-      if (!sameDelivery) {
-        throw new Error(
-          `Refusing to write distinct message with colliding route id ${routedMessageId}: route changed during attachment materialization`,
-        );
+    let sessionWriteCommitted = false;
+    try {
+      const currentSession = getSession(session.id);
+      if (!currentSession || currentSession.status !== 'active') {
+        throw new Error(`Session ${session.id} changed while inbound attachments were materialized`);
       }
-      log.info('Message recorded while attachments were materialized — skipping duplicate session write', {
-        sessionId: session.id,
-        agentGroup: agent.agent_group_id,
-        messageId: routedMessageId,
-      });
-    } else {
-      writeSessionMessage(session.agent_group_id, session.id, {
-        id: routedMessageId,
-        kind: agentEvent.message.kind,
-        timestamp: agentEvent.message.timestamp,
-        platformId: deliveryAddr.platformId,
-        platformMessageId: agentEvent.message.id || null,
-        channelType: deliveryAddr.channelType,
-        threadId: deliveryAddr.threadId,
-        content,
-        trigger: wake ? 1 : 0,
-        // Host-stamped route identity from the resolved messaging group. Lets the
-        // container normalizer collapse DM aliases safely and isolate distinct
-        // group threads, without inferring from nullable thread ids.
-        messagingGroupId: mg.id,
-        isGroup: mg.is_group === 1 ? 1 : 0,
-      });
+      const routeAfterMaterialization = getSessionMessageRouteIdentity(
+        session.agent_group_id,
+        session.id,
+        routedMessageId,
+      );
+      if (routeAfterMaterialization) {
+        const sameDelivery = sessionRouteMatches(routeAfterMaterialization, agentEvent, deliveryAddr, mg.id);
+        if (!sameDelivery) {
+          throw new Error(
+            `Refusing to write distinct message with colliding route id ${routedMessageId}: route changed during attachment materialization`,
+          );
+        }
+        log.info('Message recorded while attachments were materialized — skipping duplicate session write', {
+          sessionId: session.id,
+          agentGroup: agent.agent_group_id,
+          messageId: routedMessageId,
+        });
+      } else {
+        writeSessionMessage(session.agent_group_id, session.id, {
+          id: routedMessageId,
+          kind: agentEvent.message.kind,
+          timestamp: agentEvent.message.timestamp,
+          platformId: deliveryAddr.platformId,
+          platformMessageId: agentEvent.message.id || null,
+          channelType: deliveryAddr.channelType,
+          threadId: deliveryAddr.threadId,
+          content: materialized.content,
+          trigger: wake ? 1 : 0,
+          // Host-stamped route identity from the resolved messaging group. Lets the
+          // container normalizer collapse DM aliases safely and isolate distinct
+          // group threads, without inferring from nullable thread ids.
+          messagingGroupId: mg.id,
+          isGroup: mg.is_group === 1 ? 1 : 0,
+        });
+        sessionWriteCommitted = true;
+      }
+    } finally {
+      if (!sessionWriteCommitted) {
+        await materialized.cleanup().catch((error: unknown) => {
+          log.warn('Failed to clean uncommitted inbound attachment copies', {
+            sessionId: session.id,
+            agentGroup: agent.agent_group_id,
+            messageId: routedMessageId,
+            error: error instanceof Error ? error.name : 'unknown',
+          });
+        });
+      }
     }
   }
 

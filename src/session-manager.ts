@@ -508,89 +508,106 @@ export function writeSessionMessage(
   updateSession(sessionId, { last_active: new Date().toISOString() });
 }
 
+export interface StagedAttachmentMaterialization {
+  content: string;
+  /** Remove newly copied files when the message is not committed to a session. */
+  cleanup(): Promise<void>;
+}
+
 /** Copy channel-staged files into the agent workspace before the sync DB write. */
 export async function materializeStagedAttachments(
   agentGroupId: string,
   messageId: string,
   channelType: string | null | undefined,
   contentStr: string,
-): Promise<string> {
-  let parsed: Record<string, unknown>;
+): Promise<StagedAttachmentMaterialization> {
+  const materializedHostPaths: string[] = [];
+  const cleanup = async (): Promise<void> => {
+    await Promise.all(materializedHostPaths.map((hostPath) => fs.promises.rm(hostPath, { force: true })));
+  };
+
   try {
-    parsed = JSON.parse(contentStr) as Record<string, unknown>;
-  } catch {
-    return contentStr;
-  }
-
-  const attachments = parsed.attachments;
-  if (!Array.isArray(attachments)) return contentStr;
-  const hasStagedFile = attachments.some(
-    (attachment) =>
-      attachment &&
-      typeof attachment === 'object' &&
-      typeof (attachment as Record<string, unknown>).stagedHostPath === 'string',
-  );
-  if (!hasStagedFile) return contentStr;
-
-  const channel =
-    channelType === 'discord' || channelType === 'whatsapp' || channelType === 'agentmail' ? channelType : null;
-  const agentGroup = getAgentGroup(agentGroupId);
-  if (!agentGroup) throw new Error(`Cannot materialize attachments: unknown agent group ${agentGroupId}`);
-
-  let changed = false;
-  const promptMetadata: string[] = [];
-  for (const [idx, rawAttachment] of attachments.entries()) {
-    if (!rawAttachment || typeof rawAttachment !== 'object') continue;
-    const attachment = rawAttachment as Record<string, unknown>;
-    if (typeof attachment.stagedHostPath !== 'string') continue;
-    if (!isInboundAttachmentSource(attachment.stagedHostPath)) {
-      throw new Error(
-        'Cannot materialize attachment: staged source is outside inbound staging and approval spool roots',
-      );
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(contentStr) as Record<string, unknown>;
+    } catch {
+      return { content: contentStr, cleanup };
     }
-    if (!channel)
-      throw new Error(`Cannot materialize attachments for unsupported channel ${channelType ?? '(missing)'}`);
 
-    const originalName =
-      (typeof attachment.name === 'string' && attachment.name) ||
-      (typeof attachment.filename === 'string' && attachment.filename) ||
-      `attachment-${idx + 1}`;
-    const materialized = await materializeAttachmentFile({
-      groupsDir: GROUPS_DIR,
-      groupFolder: agentGroup.folder,
-      channel,
-      messageId,
-      attachmentId:
-        (typeof attachment.id === 'string' && attachment.id) ||
-        (typeof attachment.attachmentId === 'string' && attachment.attachmentId) ||
-        `attachment-${idx + 1}`,
-      originalName,
-      contentType:
-        (typeof attachment.mimeType === 'string' && attachment.mimeType) ||
-        (typeof attachment.contentType === 'string' && attachment.contentType) ||
-        null,
-      sourceHostPath: attachment.stagedHostPath,
-    });
-    Object.assign(attachment, attachmentForPrompt(materialized));
-    delete attachment.stagedHostPath;
-    delete attachment.approvalSpoolPath;
-    delete attachment.data;
-    promptMetadata.push(formatAttachmentPromptMetadata(materialized));
-    changed = true;
-    log.debug('Copied staged attachment to group workspace', {
-      messageId,
-      workspacePath: materialized.workspacePath,
-      size: materialized.sizeBytes,
-    });
+    const attachments = parsed.attachments;
+    if (!Array.isArray(attachments)) return { content: contentStr, cleanup };
+    const hasStagedFile = attachments.some(
+      (attachment) =>
+        attachment &&
+        typeof attachment === 'object' &&
+        typeof (attachment as Record<string, unknown>).stagedHostPath === 'string',
+    );
+    if (!hasStagedFile) return { content: contentStr, cleanup };
+
+    const channel =
+      channelType === 'discord' || channelType === 'whatsapp' || channelType === 'agentmail' ? channelType : null;
+    const agentGroup = getAgentGroup(agentGroupId);
+    if (!agentGroup) throw new Error(`Cannot materialize attachments: unknown agent group ${agentGroupId}`);
+
+    let changed = false;
+    const promptMetadata: string[] = [];
+    for (const [idx, rawAttachment] of attachments.entries()) {
+      if (!rawAttachment || typeof rawAttachment !== 'object') continue;
+      const attachment = rawAttachment as Record<string, unknown>;
+      if (typeof attachment.stagedHostPath !== 'string') continue;
+      if (!isInboundAttachmentSource(attachment.stagedHostPath)) {
+        throw new Error(
+          'Cannot materialize attachment: staged source is outside inbound staging and approval spool roots',
+        );
+      }
+      if (!channel)
+        throw new Error(`Cannot materialize attachments for unsupported channel ${channelType ?? '(missing)'}`);
+
+      const originalName =
+        (typeof attachment.name === 'string' && attachment.name) ||
+        (typeof attachment.filename === 'string' && attachment.filename) ||
+        `attachment-${idx + 1}`;
+      const materialized = await materializeAttachmentFile({
+        groupsDir: GROUPS_DIR,
+        groupFolder: agentGroup.folder,
+        channel,
+        messageId,
+        attachmentId:
+          (typeof attachment.id === 'string' && attachment.id) ||
+          (typeof attachment.attachmentId === 'string' && attachment.attachmentId) ||
+          `attachment-${idx + 1}`,
+        originalName,
+        contentType:
+          (typeof attachment.mimeType === 'string' && attachment.mimeType) ||
+          (typeof attachment.contentType === 'string' && attachment.contentType) ||
+          null,
+        sourceHostPath: attachment.stagedHostPath,
+      });
+      materializedHostPaths.push(materialized.hostPath);
+      Object.assign(attachment, attachmentForPrompt(materialized));
+      delete attachment.stagedHostPath;
+      delete attachment.approvalSpoolPath;
+      delete attachment.data;
+      promptMetadata.push(formatAttachmentPromptMetadata(materialized));
+      changed = true;
+      log.debug('Copied staged attachment to group workspace', {
+        messageId,
+        workspacePath: materialized.workspacePath,
+        size: materialized.sizeBytes,
+      });
+    }
+
+    if (promptMetadata.length > 0) {
+      const existingText = typeof parsed.text === 'string' ? parsed.text : '';
+      parsed.text = existingText ? `${existingText}\n\n${promptMetadata.join('\n\n')}` : promptMetadata.join('\n\n');
+      changed = true;
+    }
+
+    return { content: changed ? JSON.stringify(parsed) : contentStr, cleanup };
+  } catch (error) {
+    await cleanup().catch(() => undefined);
+    throw error;
   }
-
-  if (promptMetadata.length > 0) {
-    const existingText = typeof parsed.text === 'string' ? parsed.text : '';
-    parsed.text = existingText ? `${existingText}\n\n${promptMetadata.join('\n\n')}` : promptMetadata.join('\n\n');
-    changed = true;
-  }
-
-  return changed ? JSON.stringify(parsed) : contentStr;
 }
 
 /** Route identity of a stored session inbound row, as stamped at write time. */
