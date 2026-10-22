@@ -30,7 +30,7 @@ The supported download can outlive the Discord route lease and Node's default lo
 - Never buffer or base64-encode a URL-backed attachment. Keep the no-URL SDK fallback at 10 MiB and check its declared and returned sizes.
 - Keep incomplete download and spool files cleaned up on errors. Temporary download paths must never enter durable session rows; only the approval-owned spool path may be stored with a pending approval.
 - Preserve the existing /workspace/agent/attachments/... path, per-attachment error behavior, other channels' base64 handling, and provider-native image behavior.
-- Do not log attachment bytes or signed attachment URLs.
+- In download failure logs, include safe attachment metadata and a sanitized error summary; do not log raw fetch errors, attachment bytes, or signed attachment URLs.
 - Runtime changes stay on this task branch. The canonical overlay has since advanced to a25b686; the-usual work must not merge or rebase it. No publish, deployment pin change, or production deployment in this run.
 
 ## Task 1: Implement and verify the complete path
@@ -57,7 +57,7 @@ The supported download can outlive the Discord route lease and Node's default lo
 - src/modules/permissions/channel-approval.test.ts
 - src/channels/discord.test.ts
 
-1. Add failing tests first. Cover a chunked 17 MiB URL response without Content-Length, URL preference when fetchData is also present, exact bytes/hash, no data field, declared oversize rejection, actual-byte acceptance at and overflow above a small test-only limit, interrupted-stream cleanup, and the no-URL fallback's 10 MiB cap. For each behavior, run its focused test before implementing and confirm it fails because the behavior is missing.
+1. Add failing tests first. Cover a chunked 17 MiB URL response without Content-Length, URL preference when fetchData is also present, exact bytes/hash, no data field, declared oversize rejection, actual-byte acceptance at and overflow above a small test-only limit, interrupted-stream cleanup, a sanitized log entry when the fetch error contains a signed URL, and the no-URL fallback's 10 MiB cap. For each behavior, run its focused test before implementing and confirm it fails because the behavior is missing.
 2. Add file-path materialization into a temporary sibling followed by atomic rename. Confirm exact bytes, source preservation for fan-out, cleanup on failure, and that session rows retain only the existing workspace metadata and prompt path.
 3. Make the router await access and channel approval hooks until their pending event and approval-owned attachment spool are stored. Keep question-card delivery asynchronous. Approval replay reads the durable spool; denial and completed replay remove it. Preserve existing approval-row behavior if replay fails. Test both approval routes, source cleanup after strict routing, approval delivering exact bytes, denial creating no workspace file, and replay after reopening the test database.
 4. Wrap Discord message forwarding with an in-flight set keyed by channel and message ID. Hold it through dispatch and route bookkeeping and release it in finally. Test a second presentation after an injected lease expiry while the first dispatch is pending, then confirm a later attempt is allowed after rejection.
