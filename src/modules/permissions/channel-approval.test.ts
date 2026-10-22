@@ -15,6 +15,7 @@
  */
 import fs from 'fs';
 import path from 'path';
+import Database from 'better-sqlite3';
 import { beforeAll, beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 
 import { initDb, closeDb, runMigrations } from '../../db/index.js';
@@ -23,6 +24,7 @@ import { createMessagingGroup, getMessagingGroupByPlatform } from '../../db/mess
 import { upsertUser } from './db/users.js';
 import { grantRole } from './db/user-roles.js';
 import { attachmentStagingDir } from '../../yente/attachments.js';
+import { inboundDbPath } from '../../session-manager.js';
 
 // Mock container runner — prevent actual docker spawn.
 vi.mock('../../container-runner.js', () => ({
@@ -249,15 +251,18 @@ describe('unknown-channel registration flow', () => {
       if (claimed) break;
     }
 
-    const workspaceFile = path.join(
-      TEST_DIR,
-      'groups',
-      'andy',
-      'attachments',
-      'discord',
-      event.message.id,
-      'channel-file-channel.docx',
+    const session = getDb().prepare('SELECT id FROM sessions WHERE agent_group_id = ?').get('ag-1') as { id: string };
+    const inbound = new Database(inboundDbPath('ag-1', session.id));
+    const stored = inbound
+      .prepare('SELECT content FROM messages_in WHERE platform_message_id = ?')
+      .get(event.message.id) as { content: string };
+    inbound.close();
+    const storedContent = JSON.parse(stored.content) as { attachments: Array<{ workspacePath: string }> };
+    const workspacePath = storedContent.attachments[0]!.workspacePath;
+    expect(workspacePath).toMatch(
+      /^\/workspace\/agent\/attachments\/discord\/[^/]+\/channel-file-channel-[0-9a-f-]{36}\.docx$/,
     );
+    const workspaceFile = workspacePath.replace('/workspace/agent', path.join(TEST_DIR, 'groups', 'andy'));
     expect(fs.readFileSync(workspaceFile)).toEqual(expectedBytes);
     expect(fs.existsSync(spoolPath)).toBe(false);
   }, 15_000);

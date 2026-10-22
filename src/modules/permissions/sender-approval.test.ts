@@ -296,24 +296,22 @@ describe('unknown-sender request_approval flow', () => {
       if (claimed) break;
     }
 
-    const workspaceFile = path.join(
-      TEST_DIR,
-      'groups',
-      'agent',
-      'attachments',
-      'discord',
-      'discord-approval-message',
-      'approval-file-approval.docx',
-    );
-    expect(fs.readFileSync(workspaceFile)).toEqual(expectedBytes);
-    expect(fs.existsSync(spoolPath)).toBe(false);
     const session = getDb().prepare('SELECT id FROM sessions WHERE agent_group_id = ?').get('ag-1') as { id: string };
     const inbound = new Database(inboundDbPath('ag-1', session.id));
     const stored = inbound
       .prepare('SELECT content FROM messages_in WHERE platform_message_id = ?')
       .get('discord-approval-message') as { content: string };
     inbound.close();
-    const storedContent = JSON.parse(stored.content) as { attachments: Array<Record<string, unknown>> };
+    const storedContent = JSON.parse(stored.content) as {
+      attachments: Array<Record<string, unknown> & { workspacePath: string }>;
+    };
+    const workspacePath = storedContent.attachments[0]!.workspacePath;
+    expect(workspacePath).toMatch(
+      /^\/workspace\/agent\/attachments\/discord\/discord-approval-message\/approval-file-approval-[0-9a-f-]{36}\.docx$/,
+    );
+    const workspaceFile = workspacePath.replace('/workspace/agent', path.join(TEST_DIR, 'groups', 'agent'));
+    expect(fs.readFileSync(workspaceFile)).toEqual(expectedBytes);
+    expect(fs.existsSync(spoolPath)).toBe(false);
     expect(storedContent.attachments[0]).toHaveProperty('workspacePath');
     expect(storedContent.attachments[0]).not.toHaveProperty('data');
     expect(storedContent.attachments[0]).not.toHaveProperty('stagedHostPath');
