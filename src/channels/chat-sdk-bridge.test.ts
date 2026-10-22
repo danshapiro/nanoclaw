@@ -311,6 +311,7 @@ describe('Chat SDK attachment preflight', () => {
   it('keeps mentioned approval events but skips deterministic unwired drops', () => {
     expect(shouldDownloadChatSdkAttachments(null)).toBe(true);
     expect(shouldDownloadChatSdkAttachments(0)).toBe(false);
+    expect(shouldDownloadChatSdkAttachments(0, true)).toBe(true);
     expect(shouldDownloadChatSdkAttachments(1)).toBe(true);
   });
 });
@@ -760,6 +761,7 @@ describe('plain-message catch-all dispatch', () => {
       onInbound?: ChannelSetup['onInbound'];
       onInboundStrict?: ChannelSetup['onInboundStrict'];
     } = {},
+    adapterOverrides: { isDM?: (threadId: string) => boolean } = {},
   ) {
     const db = initTestDb();
     runMigrations(db);
@@ -779,6 +781,7 @@ describe('plain-message catch-all dispatch', () => {
         captured = chat as DispatchDriver;
       },
       channelIdFromThreadId: (threadId: string) => threadId,
+      isDM: adapterOverrides.isDM,
     };
     const bridge = createChatSdkBridge({
       adapter: fakeAdapter as never,
@@ -822,6 +825,123 @@ describe('plain-message catch-all dispatch', () => {
       expect(inbound.content.attachments?.[0]?.name).toBe('report.pdf');
     } finally {
       await bridge.teardown();
+      closeDb();
+    }
+  });
+
+  it.each([
+    {
+      label: 'a mention',
+      channelId: 'thread-approval-mention',
+      isDM: false,
+      isGroup: true,
+      text: '@yente-test please review this file',
+    },
+    {
+      label: 'a DM',
+      channelId: 'thread-approval-dm',
+      isDM: true,
+      isGroup: false,
+      text: 'please review this file',
+    },
+  ])(
+    'stages attachments for $label events with zero wired agents',
+    async ({ label, channelId, isDM, isGroup, text }) => {
+      const stagingDir = attachmentStagingDir();
+      await cleanupAttachmentStaging(stagingDir);
+      const bytes = Buffer.from(`${label} attachment bytes`);
+      const fetchData = vi.fn().mockResolvedValue(bytes);
+      const { bridge, driver, fakeAdapter, onInbound } = await makeDispatchHarness(
+        {},
+        {},
+        { isDM: (threadId) => threadId === channelId && isDM },
+      );
+
+      try {
+        createMessagingGroup({
+          id: `mg-${channelId}`,
+          channel_type: 'discord',
+          platform_id: channelId,
+          name: `Unwired ${label}`,
+          is_group: isGroup ? 1 : 0,
+          unknown_sender_policy: 'request_approval',
+          created_at: new Date().toISOString(),
+        });
+
+        await driver.handleIncomingMessage(
+          fakeAdapter,
+          channelId,
+          makeMessage({
+            id: `m-${label.replaceAll(' ', '-')}`,
+            text,
+            formatted: parseMarkdown(text),
+            attachments: [
+              {
+                id: 'approval-document',
+                type: 'file',
+                name: 'approval.docx',
+                mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                fetchData,
+              },
+            ],
+          }),
+        );
+
+        expect(onInbound).toHaveBeenCalledTimes(1);
+        const inbound = onInbound.mock.calls[0]?.[2] as {
+          isMention?: boolean;
+          isGroup?: boolean;
+          content: { attachments: Array<{ stagedHostPath?: string }> };
+        };
+        const stagedHostPath = inbound.content.attachments[0]?.stagedHostPath;
+        expect(inbound.isMention).toBe(true);
+        expect(inbound.isGroup).toBe(isGroup);
+        expect(stagedHostPath).toBeTruthy();
+        expect(fs.readFileSync(stagedHostPath!)).toEqual(bytes);
+        expect(fetchData).toHaveBeenCalledOnce();
+      } finally {
+        await bridge.teardown();
+        await cleanupAttachmentStaging(stagingDir);
+        closeDb();
+      }
+    },
+  );
+
+  it('skips attachment download for non-mention messages on zero-wired channels', async () => {
+    const stagingDir = attachmentStagingDir();
+    await cleanupAttachmentStaging(stagingDir);
+    const fetchData = vi.fn().mockResolvedValue(Buffer.from('drop this attachment'));
+    const { bridge, driver, fakeAdapter, onInbound } = await makeDispatchHarness();
+
+    try {
+      createMessagingGroup({
+        id: 'mg-unwired-plain',
+        channel_type: 'discord',
+        platform_id: 'thread-unwired-plain',
+        name: 'Unwired plain channel',
+        is_group: 1,
+        unknown_sender_policy: 'request_approval',
+        created_at: new Date().toISOString(),
+      });
+
+      await driver.handleIncomingMessage(
+        fakeAdapter,
+        'thread-unwired-plain',
+        makeMessage({
+          id: 'm-unwired-plain',
+          text: 'regular channel update',
+          formatted: parseMarkdown('regular channel update'),
+          attachments: [{ id: 'dropped-file', type: 'file', name: 'drop.pdf', fetchData }],
+        }),
+      );
+
+      expect(onInbound).toHaveBeenCalledTimes(1);
+      expect((onInbound.mock.calls[0]?.[2] as { isMention?: boolean }).isMention).toBe(false);
+      expect(fetchData).not.toHaveBeenCalled();
+      expect(fs.readdirSync(stagingDir)).toEqual([]);
+    } finally {
+      await bridge.teardown();
+      await cleanupAttachmentStaging(stagingDir);
       closeDb();
     }
   });

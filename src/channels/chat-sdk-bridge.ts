@@ -300,8 +300,8 @@ export function safeAttachmentDownloadError(error: unknown): string {
   return 'Attachment download failed';
 }
 
-export function shouldDownloadChatSdkAttachments(wiredAgentCount: number | null): boolean {
-  return wiredAgentCount === null || wiredAgentCount > 0;
+export function shouldDownloadChatSdkAttachments(wiredAgentCount: number | null, isApprovalCandidate = false): boolean {
+  return isApprovalCandidate || wiredAgentCount === null || wiredAgentCount > 0;
 }
 
 async function awaitWithTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
@@ -477,7 +477,12 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     const wiredAgentCount = channelId
       ? (getMessagingGroupWithAgentCount(adapter.name, channelId)?.agentCount ?? 0)
       : null;
-    if (message.attachments && message.attachments.length > 0 && shouldDownloadChatSdkAttachments(wiredAgentCount)) {
+    const isApprovalCandidate = isMention || isGroup === false;
+    if (
+      message.attachments &&
+      message.attachments.length > 0 &&
+      shouldDownloadChatSdkAttachments(wiredAgentCount, isApprovalCandidate)
+    ) {
       const enriched = [];
       const serializedAttachments = Array.isArray(serialized.attachments) ? serialized.attachments : [];
       for (const [index, att] of message.attachments.entries()) {
@@ -628,8 +633,9 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // the bot can see, including attachment-only posts: Discord sends those
       // with empty content, and the previous `/./` silently dropped them
       // (2026-08-15 incident). messageToInbound checks
-      // getMessagingGroupWithAgentCount (~1 DB read) before downloading any
-      // attachments, so unwired channels are dropped without a file transfer.
+      // getMessagingGroupWithAgentCount (~1 DB read) before downloading
+      // attachments, skipping deterministic non-mention drops on unwired
+      // channels while retaining files for mentions and DMs that may need approval.
       chat.onNewMessage(/[\s\S]*/, async (thread, message) => {
         const channelId = adapter.channelIdFromThreadId(thread.id);
         await forwardInboundMessage(channelId, thread.id, message, false, true, 'plain');
