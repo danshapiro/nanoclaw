@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 /**
  * Host-side container config for the `codex` provider.
  *
@@ -667,6 +668,15 @@ export const codexHostContainerFactory = (ctx: ProviderContainerContext) => {
     // copy), not by a read-only mount: the shared master + real refresh token never
     // leave the host. See the auth.json write above for the full rationale.
     { hostPath: codexDir, containerPath: '/home/node/.codex', readonly: false },
+    {
+      hostPath: path.join(
+        path.dirname(codexBrokerSocket(ctx)),
+        'review',
+        createHash('sha256').update(ctx.agentGroupId).digest('hex').slice(0, 16),
+      ),
+      containerPath: '/run/nanoclaw-review',
+      readonly: true,
+    },
   ];
 
   // AUTH-GATED ONECLI EGRESS: a Codex container cannot spawn without an

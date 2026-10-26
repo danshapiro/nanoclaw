@@ -432,14 +432,8 @@ const STALE_SESSION_RE = /no conversation found|ENOENT.*\.jsonl|session.*not fou
 
 // ── Claude Code executable resolution ──
 
-/**
- * Where the base image's `pnpm install -g @anthropic-ai/claude-code` places the
- * global bin shim (PNPM_HOME=/pnpm; container/Dockerfile). Per-agent-group
- * images (buildAgentGroupImage in src/container-runner.ts) run a further
- * `pnpm install -g <pkgs>` layer, which re-links pnpm's global bin dir and can
- * drop this shim — so dynamically-created groups may boot without it.
- */
-export const DEFAULT_CLAUDE_EXECUTABLE_PATH = '/pnpm/claude';
+/** Stable launcher selecting the SDK-owned native CLI, independent of pnpm globals. */
+export const DEFAULT_CLAUDE_EXECUTABLE_PATH = '/usr/local/bin/claude';
 
 export interface ClaudeExecutableResolution {
   /** Resolved executable path, or undefined to let the SDK use its bundled default. */

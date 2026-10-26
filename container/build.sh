@@ -37,6 +37,15 @@ echo "Image: ${IMAGE_NAME}:${TAG}"
 
 ${CONTAINER_RUNTIME} build "${BUILD_ARGS[@]}" -t "${IMAGE_NAME}:${TAG}" .
 
+echo "Verifying SDK-owned Claude CLI and subscription review entrypoints offline..."
+${CONTAINER_RUNTIME} run --rm --network none --user 12345:12345 -e HOME=/home/node \
+    --entrypoint sh "${IMAGE_NAME}:${TAG}" -c 'set -eu
+claude --version | grep -F "2.1.310 (Claude Code)"
+test -x /usr/local/bin/nanoclaw-subscription-review
+test -x /usr/local/libexec/nanoclaw-subscription/claude
+claude --help | grep -F -- "--safe-mode"
+PYTHONPYCACHEPREFIX=/tmp/claude-review-pycache python3 -m py_compile /usr/local/bin/nanoclaw-subscription-review /usr/local/libexec/nanoclaw-subscription/claude'
+
 echo "Verifying yt-dlp and ffmpeg in the built image..."
 # shellcheck disable=SC2016 # The quoted script expands inside the container.
 ${CONTAINER_RUNTIME} run --rm \

@@ -1,0 +1,14 @@
+#!/bin/sh
+# One SDK installation owns both library and native CLI. No global pnpm shim.
+set -eu
+case "$(uname -m)" in
+  x86_64) arch=x64 ;;
+  aarch64|arm64) arch=arm64 ;;
+  *) echo 'Unsupported architecture for the SDK Claude CLI' >&2; exit 1 ;;
+esac
+binary="/app/node_modules/@anthropic-ai/claude-agent-sdk-linux-${arch}/claude"
+if [ ! -x "$binary" ]; then
+  echo "SDK Claude CLI missing: ${binary}; rebuild the pinned agent image" >&2
+  exit 1
+fi
+exec "$binary" "$@"

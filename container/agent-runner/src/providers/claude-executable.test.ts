@@ -1,12 +1,6 @@
 /**
- * FIX 2: Claude Code executable resolution.
- *
- * The hardcoded /pnpm/claude bin shim exists in the base image (created at
- * image-build time by `pnpm install -g @anthropic-ai/claude-code`) but can be
- * missing in per-agent-group images whose extra `pnpm install -g <pkgs>` layer
- * re-links pnpm's global bin dir (buildAgentGroupImage). Resolution must fall
- * back to a PATH lookup and then to the SDK's bundled default, with one loud
- * structured error (not per-turn noise) when nothing is found.
+ * The SDK-owned launcher is stable across per-group pnpm rebuilds. Prefer it;
+ * retain PATH and SDK-default fallback for nonstandard/missing-launcher images.
  */
 import { describe, it, expect, beforeEach, spyOn } from 'bun:test';
 
@@ -22,7 +16,7 @@ describe('resolveClaudeCodeExecutable', () => {
     resetClaudeExecutableResolutionLogForTests();
   });
 
-  it('prefers the configured /pnpm/claude path when it exists', () => {
+  it('prefers the configured /usr/local/bin/claude path when it exists', () => {
     const resolution = resolveClaudeCodeExecutable({
       existsSync: (p) => p === DEFAULT_CLAUDE_EXECUTABLE_PATH,
       env: { PATH: '/usr/local/bin:/usr/bin' },
@@ -33,10 +27,10 @@ describe('resolveClaudeCodeExecutable', () => {
 
   it('falls back to a PATH lookup when the configured path is missing', () => {
     const resolution = resolveClaudeCodeExecutable({
-      existsSync: (p) => p === '/usr/local/bin/claude',
-      env: { PATH: '/pnpm/bin:/usr/local/bin:/usr/bin' },
+      existsSync: (p) => p === '/opt/bin/claude',
+      env: { PATH: '/pnpm/bin:/opt/bin:/usr/bin' },
     });
-    expect(resolution.path).toBe('/usr/local/bin/claude');
+    expect(resolution.path).toBe('/opt/bin/claude');
     expect(resolution.source).toBe('path-lookup');
     expect(resolution.tried[0]).toBe(DEFAULT_CLAUDE_EXECUTABLE_PATH);
   });
@@ -81,10 +75,10 @@ describe('resolveClaudeCodeExecutable', () => {
   it('logs a warn (not error) when resolved via PATH lookup', () => {
     const errSpy = spyOn(console, 'error').mockImplementation(() => {});
     const resolved = resolveClaudeExecutableWithLogging({
-      existsSync: (p) => p === '/usr/local/bin/claude',
-      env: { PATH: '/usr/local/bin' },
+      existsSync: (p) => p === '/opt/bin/claude',
+      env: { PATH: '/opt/bin' },
     });
-    expect(resolved).toBe('/usr/local/bin/claude');
+    expect(resolved).toBe('/opt/bin/claude');
     const pathLogs = errSpy.mock.calls.filter((call) =>
       String(call[0]).includes('claude_executable_resolved_from_path'),
     );

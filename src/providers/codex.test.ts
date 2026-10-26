@@ -512,6 +512,15 @@ describe('codex host provider container config', () => {
         containerPath: '/home/node/.codex',
         readonly: false,
       });
+      expect(contribution.mounts).toContainEqual({
+        hostPath: path.join(
+          path.dirname(broker.sock),
+          'review',
+          crypto.createHash('sha256').update('ag-main').digest('hex').slice(0, 16),
+        ),
+        containerPath: '/run/nanoclaw-review',
+        readonly: true,
+      });
       expect(contribution.mounts?.some((mount) => mount.containerPath === '/tmp/onecli-gateway-ca.pem')).toBe(false);
       expect(contribution.env?.OPENAI_API_KEY).toBeUndefined();
       expect(contribution.env?.CODEX_MODEL).toBe('gpt-5.5');

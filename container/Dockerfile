@@ -4,7 +4,8 @@
 #
 # Runtime split:
 #   - agent-runner (our TypeScript code): Bun, mounted RO at /app/src by host
-#   - globally-installed Node CLIs (claude-code, agent-browser, vercel): pnpm + Node
+#   - Claude CLI: native executable bundled with the pinned agent SDK
+#   - other globally-installed Node CLIs (agent-browser, vercel): pnpm + Node
 #
 # Source is never baked in — /app/src is provided by a shared read-only
 # bind mount at runtime (see src/container-runner.ts). Source-only changes
@@ -26,7 +27,7 @@ ARG INSTALL_CJK_FONTS=false
 # Pin CLI versions for reproducibility. Bump deliberately — unpinned installs
 # mean every rebuild silently picks up the latest and can break in lockstep
 # across all users.
-ARG CLAUDE_CODE_VERSION=2.1.116
+ARG CLAUDE_CODE_VERSION=2.1.310
 ARG OPENCODE_VERSION=1.15.10
 ARG CODEX_VERSION=0.162.1
 ARG AGENT_BROWSER_VERSION=0.27.2
@@ -92,7 +93,7 @@ RUN curl -fsSL https://bun.sh/install | bash -s "bun-v${BUN_VERSION}" && \
     rm -rf /root/.bun
 
 # ---- agent-runner deps -------------------------------------------------------
-# Deps are cached independently of CLI versions. Source is NOT baked in —
+# The SDK and its native CLI are pinned together. Source is NOT baked in —
 # it's provided by the shared RO mount at runtime.
 WORKDIR /app
 
@@ -101,16 +102,19 @@ COPY agent-runner/package.json agent-runner/bun.lock ./
 RUN --mount=type=cache,target=/root/.bun/install/cache \
     bun install --frozen-lockfile
 
+# Fresh Eyes uses subscription-only Claude auth through the scoped host broker.
+COPY claude-subscription-review.py /usr/local/libexec/nanoclaw-subscription/claude
+COPY subscription-review-transport.py /usr/local/bin/nanoclaw-subscription-review
+RUN chmod 0755 /usr/local/libexec/nanoclaw-subscription/claude /usr/local/bin/nanoclaw-subscription-review
+ENV USUAL_FRESHEYES_TRANSPORT=/usr/local/bin/nanoclaw-subscription-review
+ENV USUAL_FRESHEYES_INDEPENDENCE_LABEL="Fresh-context different-family CLI; Claude subscription-only"
+
 # ---- pnpm + global Node CLIs -------------------------------------------------
-# Most stable first, most frequently bumped last. Bumping claude-code
-# (the most common change) only invalidates one layer.
+# Other CLIs use pnpm. Claude below deliberately bypasses global shims.
 #
 # only-built-dependencies gates pnpm's supply-chain policy:
 #   - agent-browser has a postinstall build step.
 #   - esbuild installs its runtime binary during postinstall.
-#   - @anthropic-ai/claude-code's postinstall downloads the native Claude
-#     binary (linux-arm64 variant on our image). Without the allowlist
-#     the SDK fails at spawn time with "native binary not found".
 #   - opencode-ai's postinstall installs the OpenCode runtime wrapper; pnpm
 #     global install leaves the placeholder shim in place unless we run it
 #     explicitly in the OpenCode layer below.
@@ -144,9 +148,11 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
     export PATH="/pnpm/bin:/pnpm:$PATH" && \
     pnpm install -g "agent-browser@${AGENT_BROWSER_VERSION}"
 
-RUN --mount=type=cache,target=/root/.cache/pnpm \
-    export PATH="/pnpm/bin:/pnpm:$PATH" && \
-    pnpm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+# Use the SDK-owned native CLI, so SDK and CLI cannot drift and pnpm's
+# optional-dependency/postinstall behavior cannot leave a broken launcher.
+COPY claude-sdk-cli /usr/local/bin/claude
+RUN chmod 0755 /usr/local/bin/claude && \
+    /usr/local/bin/claude --version | grep -F "${CLAUDE_CODE_VERSION} (Claude Code)"
 
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     export PATH="/pnpm/bin:/pnpm:$PATH" && \
