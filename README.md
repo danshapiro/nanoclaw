@@ -81,7 +81,8 @@ the current turn. To save a request for the next turn instead, start it with an
 unmatched `*`. For example, `*do this next` queues `do this next`; `**do this next*`
 queues `*do this next*`. Matched emphasis such as `*change this now*` or
 `**change this now**` steers normally. Both forms start immediately when the
-assistant is idle. `/stop` interrupts the active turn.
+assistant is idle. `/stop` interrupts the active turn. Prefixing a slash command
+with the queue marker sends it as message text; use `/compact` directly to compact.
 
 ## Customizing
 

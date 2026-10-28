@@ -669,7 +669,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // Format messages: passthrough commands get raw text (only if the
       // provider natively handles slash commands), others get XML.
       const modelMessages = keep.map((message) => prepareMessageDelivery(message).message);
-      prompt = formatMessagesWithCommands(modelMessages, config.provider.supportsNativeSlashCommands);
+      prompt = formatMessagesWithCommands(keep, config.provider.supportsNativeSlashCommands);
 
       // Prepend route-scoped recovery context (XML-escaped) so an interrupted
       // prior turn resumes as a normal top-level prompt (plan line 86).
@@ -705,7 +705,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         acceptInput: initialClaim.acceptInput,
         prompt,
         attachments,
-        messages: modelMessages,
+        // Native controls must inspect the original text that passed the host gate.
+        messages: keep,
         visibleDestinationName,
         continuation,
         cwd: config.cwd,
@@ -983,7 +984,7 @@ function formatMessagesWithCommands(messages: MessageInRow[], nativeSlashCommand
         continue;
       }
     }
-    normalBatch.push(msg);
+    normalBatch.push(prepareMessageDelivery(msg).message);
   }
 
   if (normalBatch.length > 0) {
@@ -1446,9 +1447,10 @@ async function processQuery(
       label: 'countOutboundVisibleReplyMessages',
     });
 
-    const prompt = formatMessages(newMessages);
+    const modelMessages = newMessages.map((message) => prepareMessageDelivery(message).message);
+    const prompt = formatMessages(modelMessages);
     const attachments = await collectQueryAttachments({
-      messages: newMessages,
+      messages: modelMessages,
       pathReferenceMessages: newMessages,
       inspectFile: inspectAttachmentFile,
       log: logAttachmentEvent,

@@ -66,6 +66,7 @@ function harness(
     steerError?: { code: number; message: string };
     followupGate?: Promise<void>;
     holdSteerResponse?: boolean;
+    initialText?: string;
   } = {},
 ) {
   const requests: Request[] = [];
@@ -89,6 +90,9 @@ function harness(
                 request,
                 options.steerError ? { error: options.steerError } : { result: { turnId: `turn-${turnNumber}` } },
               );
+            } else if (request.method === 'thread/compact/start') {
+              respond(request, { result: {} });
+              notify('thread/compacted', { threadId: 'thread-steering', turnId: 'compact-turn' });
             } else if (request.method === 'turn/interrupt') {
               respond(request, { result: {} });
               notify('turn/completed', {
@@ -145,7 +149,7 @@ function harness(
       };
     },
   };
-  insertMessage('initial', 'Long task', 1);
+  insertMessage('initial', options.initialText ?? 'Long task', 1);
   const controller = new AbortController();
   const loop = runPollLoop({
     provider,
@@ -196,6 +200,39 @@ beforeEach(() => {
 afterEach(() => closeSessionDb());
 
 describe('Codex steering with accumulate-only host claims', () => {
+  it('delivers an idle queued slash command as text without invoking native compaction', async () => {
+    const h = harness({ initialText: '*/compact' });
+    try {
+      await waitFor(() => h.requests.length > 0);
+      expect(h.requests.map((request) => request.method)).toEqual(['turn/start']);
+      expect(JSON.stringify(h.requests[0].params.input)).toContain('/compact');
+      expect(JSON.stringify(h.requests[0].params.input)).not.toContain('*/compact');
+      h.complete();
+      await waitFor(() => ackStatus('initial') === 'completed');
+    } finally {
+      await h.stop();
+    }
+  });
+
+  it('keeps an active queued slash command as text after the current turn completes', async () => {
+    const h = harness();
+    try {
+      await waitFor(() => h.requests.some((request) => request.method === 'turn/start'));
+      insertMessage('queued-compact', '*/compact', 1);
+      await waitFor(() => ackStatus('queued-compact') === 'processing');
+      expect(h.requests.map((request) => request.method)).toEqual(['turn/start']);
+      h.complete();
+      await waitFor(() => h.requests.length > 1);
+      expect(h.requests.map((request) => request.method)).toEqual(['turn/start', 'turn/start']);
+      expect(JSON.stringify(h.requests[1].params.input)).toContain('/compact');
+      expect(JSON.stringify(h.requests[1].params.input)).not.toContain('*/compact');
+      h.complete();
+      await waitFor(() => ackStatus('queued-compact') === 'completed');
+    } finally {
+      await h.stop();
+    }
+  });
+
   it('waits for native steer acknowledgement before completing either shared-input claim', async () => {
     const h = harness({ holdSteerResponse: true });
     try {

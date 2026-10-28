@@ -40,17 +40,17 @@ export function prepareMessageDelivery(message: MessageInRow): { message: Messag
   return { message: { ...message, content: JSON.stringify({ ...content, text: text.slice(1) }) }, mode: 'queue' };
 }
 
-/** Keep each contiguous delivery group distinct so a queue marker cannot capture a correction. */
+/** Group delivery policies while retaining the original, host-gated command metadata. */
 export function groupMessageDeliveries(
   messages: MessageInRow[],
 ): Array<{ messages: MessageInRow[]; mode: MessageDeliveryMode }> {
   const groups: Array<{ messages: MessageInRow[]; mode: MessageDeliveryMode }> = [];
   for (const message of messages) {
-    const delivery = prepareMessageDelivery(message);
+    const { mode } = prepareMessageDelivery(message);
     const last = groups.at(-1);
-    if (last?.mode === delivery.mode && !isCompactControl(delivery.message) && !last.messages.some(isCompactControl))
-      last.messages.push(delivery.message);
-    else groups.push({ messages: [delivery.message], mode: delivery.mode });
+    if (last?.mode === mode && !isCompactControl(message) && !last.messages.some(isCompactControl))
+      last.messages.push(message);
+    else groups.push({ messages: [message], mode });
   }
   return groups;
 }

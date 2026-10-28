@@ -492,6 +492,30 @@ describe('end-to-end with mock provider', () => {
 });
 
 describe('poll-loop conversational reply accounting', () => {
+  it.each(['*/compact', '*/help', '* /compact'])(
+    'keeps normalized %s inside message formatting for native slash providers',
+    async (text) => {
+      insertChannelDestination('discord-current', 'chan-1');
+      insertMessage('queued-command', 'chat', { sender: 'User', text }, { channelType: 'discord' });
+      let delivered: QueryInput | undefined;
+      const provider = new NativeScriptedProvider(async function* (input) {
+        delivered = input;
+        yield { type: 'result', text: '<message to="discord-current">received</message>' };
+      });
+      const controller = new AbortController();
+      const loop = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+      try {
+        await waitFor(() => getAckStatus('queued-command') === 'completed', 1500);
+        expect(delivered?.prompt).toContain('<message ');
+        expect(delivered?.prompt).toContain(`${text.slice(1)}</message>`);
+        expect(JSON.parse(delivered!.messages![0].content).text).toBe(text);
+      } finally {
+        controller.abort();
+        await loop;
+      }
+    },
+  );
+
   it('strips one queue marker on idle human messages while preserving inbound content', async () => {
     insertChannelDestination('discord-current', 'chan-1');
     const examples = ['*yes', '**yes*', '*no*', 'This is *no', '**bold**', '***both***', '*hello* then unmatched *'];
@@ -512,15 +536,10 @@ describe('poll-loop conversational reply accounting', () => {
     const loop = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
     try {
       await waitFor(() => getAckStatus('delivery-6') === 'completed', 1500);
-      expect(delivered?.messages?.map((message) => JSON.parse(message.content).text)).toEqual([
-        'yes',
-        '*yes*',
-        '*no*',
-        'This is *no',
-        '**bold**',
-        '***both***',
-        '*hello* then unmatched *',
-      ]);
+      // Provider metadata retains the exact host-gated text; only the prompt is normalized.
+      expect(delivered?.messages?.map((message) => JSON.parse(message.content).text)).toEqual(examples);
+      expect(delivered?.prompt).toContain('>yes</message>');
+      expect(delivered?.prompt).toContain('>*yes*</message>');
       const stored = getInboundDb().prepare('SELECT content FROM messages_in ORDER BY seq').all() as Array<{
         content: string;
       }>;
@@ -587,13 +606,15 @@ describe('poll-loop conversational reply accounting', () => {
         'steer',
       ]);
       expect(pushes.map((push) => push.messages?.map((message) => JSON.parse(message.content).text))).toEqual([
-        ['yes'],
+        ['*yes'],
         ['*no*'],
-        ['*yes*'],
+        ['**yes*'],
         ['This is *no'],
         ['/compact'],
         ['ordinary correction'],
       ]);
+      expect(pushes[0].prompt).toContain('>yes</message>');
+      expect(pushes[2].prompt).toContain('>*yes*</message>');
       expect(pushes.map((push) => push.inputId)).toEqual([
         'in-host-delivery-follow-0',
         'in-host-delivery-follow-1',
