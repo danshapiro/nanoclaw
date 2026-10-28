@@ -781,6 +781,11 @@ export async function* runOneTurn(
   let steeringTail = Promise.resolve();
   let pumpingSteering = false;
 
+  const observeSteeringAcceptance = (followup: QueryTurnInput): void => {
+    buffer.push({ type: 'input-accepted', inputId: followup.inputId, scope: 'followup' });
+    kick();
+  };
+
   const pumpSteering = (): void => {
     if (pumpingSteering || !startAcknowledged || !activeTurnId || turnDone || abortRequested) return;
     pumpingSteering = true;
@@ -793,8 +798,9 @@ export async function* runOneTurn(
           if (!abortRequested) deps.deferSteering?.(followup);
           break;
         }
-        // Begin submission before reporting acceptance. A transport failure
-        // after this point is recovery-owned, never blindly submitted twice.
+        // The exact claim is already host-bound. Observe provider acceptance
+        // after submission settles: a proven rejection must not let an older
+        // result complete a deferred claim that reuses the same inputId.
         const submission = steerCodexTurn(
           server,
           {
@@ -805,18 +811,25 @@ export async function* runOneTurn(
           },
           runDeps.abortSignal,
         );
+        const previousInputId = inputId;
         inputId = followup.inputId;
-        buffer.push({ type: 'input-accepted', inputId: followup.inputId, scope: 'followup' });
-        kick();
         try {
           await submission;
           resolvedInputIds.add(followup.inputId);
           logStructured('codex_followup_steered', { threadId, turnId: expectedTurnId, inputId: followup.inputId });
         } catch (error) {
-          if (!(error instanceof CodexSteerRejectedError)) throw error;
+          if (!(error instanceof CodexSteerRejectedError)) {
+            // Ambiguous submission stays accepted for recovery; resubmission
+            // could duplicate work that reached the native turn.
+            observeSteeringAcceptance(followup);
+            throw error;
+          }
+          inputId = previousInputId;
           deps.deferSteering?.(followup);
           logStructured('codex_steer_deferred', { threadId, inputId: followup.inputId, reason: error.message });
+          continue;
         }
+        observeSteeringAcceptance(followup);
       }
     })()
       .catch((error) => {
