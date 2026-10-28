@@ -1,22 +1,15 @@
-import { beforeEach, describe, expect, it, mock } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 
-const writes: Array<{ id: string; kind: string; content: string }> = [];
-
-mock.module('../db/messages-out.js', () => ({
-  writeMessageOut: (msg: { id: string; kind: string; content: string }) => {
-    writes.push(msg);
-    return writes.length * 2 - 1;
-  },
-}));
-
-mock.module('./server.js', () => ({
-  registerTools: () => {},
-}));
-
-const { installPackages } = await import('./self-mod.js');
+import { closeSessionDb, initTestSessionDb } from '../db/connection.js';
+import { getUndeliveredMessages } from '../db/messages-out.js';
+import { installPackages } from './self-mod.js';
 
 beforeEach(() => {
-  writes.splice(0);
+  initTestSessionDb();
+});
+
+afterEach(() => {
+  closeSessionDb();
 });
 
 describe('install_packages policy', () => {
@@ -28,7 +21,7 @@ describe('install_packages policy', () => {
 
     expect(result.isError).toBe(true);
     expect(JSON.stringify(result.content)).toContain('installed skill dependencies');
-    expect(writes).toHaveLength(0);
+    expect(getUndeliveredMessages()).toHaveLength(0);
   });
 
   it('rejects variant Flight Goat wording before writing an outbound request', async () => {
@@ -39,7 +32,7 @@ describe('install_packages policy', () => {
 
     expect(result.isError).toBe(true);
     expect(JSON.stringify(result.content)).toContain('installed skill dependencies');
-    expect(writes).toHaveLength(0);
+    expect(getUndeliveredMessages()).toHaveLength(0);
   });
 
   it('rejects explicit deployed skill dependency purpose before writing an outbound request', async () => {
@@ -51,7 +44,7 @@ describe('install_packages policy', () => {
 
     expect(result.isError).toBe(true);
     expect(JSON.stringify(result.content)).toContain('installed skill dependencies');
-    expect(writes).toHaveLength(0);
+    expect(getUndeliveredMessages()).toHaveLength(0);
   });
 
   it('allows user-requested general capability installs', async () => {
@@ -62,7 +55,9 @@ describe('install_packages policy', () => {
     });
 
     expect(result.isError).toBeUndefined();
+    const writes = getUndeliveredMessages();
     expect(writes).toHaveLength(1);
+    expect(writes[0].kind).toBe('system');
     expect(JSON.parse(writes[0].content)).toMatchObject({
       action: 'install_packages',
       apt: ['golang-go'],
