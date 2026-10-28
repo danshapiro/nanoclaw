@@ -76,6 +76,13 @@ From a channel you own or administer, you can manage groups and tasks:
 @Andy join the Family Chat group
 ```
 
+With the Codex provider, a message sent while the assistant is working steers
+the current turn. To save a request for the next turn instead, start it with an
+unmatched `*`. For example, `*do this next` queues `do this next`; `**do this next*`
+queues `*do this next*`. Matched emphasis such as `*change this now*` or
+`**change this now**` steers normally. Both forms start immediately when the
+assistant is idle. `/stop` interrupts the active turn.
+
 ## Customizing
 
 NanoClaw doesn't use configuration files. To make changes, just tell Claude Code what you want:

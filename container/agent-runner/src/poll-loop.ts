@@ -39,6 +39,7 @@ import {
 import { markRecoveryCompleted } from './db/messages-in.js';
 import { getSessionRouting } from './db/session-routing.js';
 import { collectQueryAttachments, type InspectedFile } from './attachments.js';
+import { groupMessageDeliveries, prepareMessageDelivery, type MessageDeliveryMode } from './message-delivery.js';
 import {
   formatMessages,
   formatRecoveryContext,
@@ -667,7 +668,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
       // Format messages: passthrough commands get raw text (only if the
       // provider natively handles slash commands), others get XML.
-      prompt = formatMessagesWithCommands(keep, config.provider.supportsNativeSlashCommands);
+      const modelMessages = keep.map((message) => prepareMessageDelivery(message).message);
+      prompt = formatMessagesWithCommands(modelMessages, config.provider.supportsNativeSlashCommands);
 
       // Prepend route-scoped recovery context (XML-escaped) so an interrupted
       // prior turn resumes as a normal top-level prompt (plan line 86).
@@ -677,7 +679,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       log(`Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}`);
 
       attachments = await collectQueryAttachments({
-        messages: keep,
+        messages: modelMessages,
         pathReferenceMessages: keep,
         inspectFile: config.inspectAttachmentFile,
         log: logAttachmentEvent,
@@ -703,7 +705,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         acceptInput: initialClaim.acceptInput,
         prompt,
         attachments,
-        messages: keep,
+        messages: modelMessages,
         visibleDestinationName,
         continuation,
         cwd: config.cwd,
@@ -1384,7 +1386,12 @@ async function processQuery(
       }
       return;
     }
-    const newMessages = routeMessages;
+    for (const group of groupMessageDeliveries(routeMessages)) {
+      await pushFollowup(group.messages, group.mode);
+    }
+  }
+
+  async function pushFollowup(newMessages: MessageInRow[], deliveryMode: MessageDeliveryMode): Promise<void> {
     if (newMessages.length === 0) return;
 
     const newIds = newMessages.map((m) => m.id);
@@ -1472,6 +1479,7 @@ async function processQuery(
         prompt,
         attachments,
         messages: newMessages,
+        deliveryMode,
         visibleDestinationName: followupDestination?.name,
       });
     } catch (err) {
@@ -1641,6 +1649,20 @@ async function processQuery(
         const dispatch = event.text ? dispatchResultText(event.text, routing) : { sent: 0, hasUnwrapped: false };
         const stillMissingVisibleReply = hasMissingVisibleReply(resolved);
         if (event.text) {
+          if (dispatch.hasUnwrapped && dispatch.sent === 0 && resolved.length > 1 && stillMissingVisibleReply) {
+            // A steered native turn can resolve several input claims together.
+            // Deliver its final text directly; a nudge tied to just one input
+            // would strand the others or let a queued task overwrite the reply.
+            writeRoutedMessage(routing, event.text);
+            log(
+              JSON.stringify({
+                severity: 'warn',
+                event: 'multi_input_unwrapped_output_delivered',
+                route_key: ledgerCtx.activeRouteKey,
+                resolved_input_ids: resolved,
+              }),
+            );
+          }
           if (
             dispatch.hasUnwrapped &&
             dispatch.sent === 0 &&

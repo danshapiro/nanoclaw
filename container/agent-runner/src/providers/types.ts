@@ -53,6 +53,9 @@ export interface QueryAttachment {
 }
 
 export interface QueryTurnInput {
+  /** Follow-up delivery policy. Normal human messages may steer; explicit queue markers defer. */
+  deliveryMode?: 'steer' | 'queue';
+
   /**
    * Correlation id for this prompt. The poll loop generates one per top-level
    * prompt and per follow-up push, and treats a prompt as accepted only after

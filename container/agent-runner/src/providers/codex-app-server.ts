@@ -759,6 +759,49 @@ export async function startCodexTurn(server: AppServer, params: TurnParams): Pro
   if (resp.error) throw new Error(`turn/start failed: ${resp.error.message}`);
 }
 
+/** A protocol rejection proves this input never entered model execution. */
+export class CodexSteerRejectedError extends Error {
+  constructor(message: string) {
+    super(`turn/steer rejected: ${message}`);
+    this.name = 'CodexSteerRejectedError';
+  }
+}
+
+export async function steerCodexTurn(
+  server: AppServer,
+  params: { threadId: string; expectedTurnId: string; inputText: string; inputId: string },
+  cancellation?: CodexRequestCancellation,
+): Promise<void> {
+  const response = await sendCodexRequest(
+    server,
+    'turn/steer',
+    {
+      threadId: params.threadId,
+      expectedTurnId: params.expectedTurnId,
+      clientUserMessageId: params.inputId,
+      input: [{ type: 'text', text: params.inputText }],
+    },
+    60_000,
+    cancellation,
+  );
+  if (response.error) {
+    const { code, message } = response.error;
+    // Codex 0.162.1 rejects these preconditions before submit. Other errors
+    // (including transport failures) do not prove that submission did not happen.
+    if (
+      code === -32600 &&
+      (message === 'no active turn to steer' ||
+        /^expected active turn id `[^`]+` but found `[^`]+`$/.test(message) ||
+        /^cannot steer a (review|compact) turn$/.test(message))
+    )
+      throw new CodexSteerRejectedError(message);
+    throw new Error(`turn/steer failed: ${message}`);
+  }
+  if ((response.result as { turnId?: string } | undefined)?.turnId !== params.expectedTurnId) {
+    throw new Error('turn/steer response did not confirm the expected active turn');
+  }
+}
+
 export interface TurnInterruptParams {
   threadId: string;
   turnId: string;

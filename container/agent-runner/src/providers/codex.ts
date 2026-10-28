@@ -7,11 +7,8 @@
  * the standalone codex CLI uses, so the container and host share one
  * provider-integration story.
  *
- * Codex turns don't accept mid-turn input. Follow-up `push()` messages are
- * queued and drained after the current turn completes (same pattern as the
- * opencode provider — see poll-loop for why that's correct: the poll-loop
- * only pushes once it has new pending messages, and we only drain between
- * turns, so no message is dropped).
+ * Human follow-ups steer the active native turn. Explicitly queued inputs and
+ * control operations wait for a subsequent turn in the same conversation.
  */
 import { createHash } from 'crypto';
 import fs from 'fs';
@@ -31,6 +28,7 @@ import {
 } from './types.js';
 import {
   type AppServer,
+  CodexSteerRejectedError,
   type JsonRpcNotification,
   STALE_THREAD_RE,
   attachCodexAutoApproval,
@@ -40,6 +38,7 @@ import {
   sendCodexRequest,
   spawnCodexAppServer,
   startCodexTurn,
+  steerCodexTurn,
   startOrResumeCodexThread,
   terminateCodexAppServer,
   waitForCodexCompactionComplete,
@@ -387,6 +386,7 @@ export class CodexProvider implements AgentProvider {
     let waiting: (() => void) | null = null;
     let ended = false;
     let aborted = false;
+    let activeSteering: ((turn: QueryTurnInput) => boolean) | undefined;
     const abortSignal: CodexAbortSignal = {
       isAborted: () => aborted,
       onAbort: (handler) => {
@@ -610,6 +610,20 @@ export class CodexProvider implements AgentProvider {
               acceptInput: turn.acceptInput,
               abortGraceMs: self.queryDependencies.abortGraceMs,
               terminateServer: async () => await terminateQueryServer(),
+              registerSteering: (handler) => {
+                activeSteering = handler ?? undefined;
+                if (!handler) return;
+                for (let index = 0; index < pending.length; ) {
+                  const followup = pending[index];
+                  if (followup.deliveryMode === 'steer' && !isCompactCommand(followup.messages) && handler(followup)) {
+                    pending.splice(index, 1);
+                  } else index++;
+                }
+              },
+              deferSteering: (followup) => {
+                pending.push(followup);
+                kick();
+              },
             },
           );
           // A terminal interruption (timeout / turn failure) ENDS the whole
@@ -665,7 +679,10 @@ export class CodexProvider implements AgentProvider {
         // Mirror OpenCode (opencode-container.ts:1265): normalize so a
         // `{ prompt, inputId }` object is queued intact (preserving its
         // inputId) instead of being coerced to a string.
-        pending.push(normalizeQueryTurnInput(message));
+        const turn = normalizeQueryTurnInput(message);
+        if (turn.deliveryMode === 'steer' && !isCompactCommand(turn.messages) && activeSteering?.(turn)) return;
+        pending.push(turn);
+        logStructured('codex_followup_queued', { inputId: turn.inputId, deliveryMode: turn.deliveryMode ?? 'queue' });
         kick();
       },
       end: () => {
@@ -709,6 +726,8 @@ export async function* runOneTurn(
     acceptInput?: () => Promise<void>;
     abortGraceMs?: number;
     terminateServer?: typeof terminateCodexAppServer;
+    registerSteering?: (handler: ((turn: QueryTurnInput) => boolean) | null) => void;
+    deferSteering?: (turn: QueryTurnInput) => void;
   } = {},
 ): AsyncGenerator<ProviderEvent, boolean> {
   const runDeps = {
@@ -728,6 +747,7 @@ export async function* runOneTurn(
   let turnDone = false;
   let turnInterrupted = false;
   let activeTurnId: string | undefined;
+  let startAcknowledged = false;
   let abortRequested = runDeps.abortSignal?.isAborted() ?? false;
   let interruptRequested = false;
   let forcedTerminationHandle: ReturnType<typeof setTimeout> | null = null;
@@ -755,7 +775,67 @@ export async function* runOneTurn(
   // terminal interruption / dedupeCodexSideEffect so those carry the REAL input
   // correlation id (F1). Undefined only when the caller has no inputId; ?? '' is
   // safe for the message builders.
-  const inputId: string | undefined = turnInputId;
+  let inputId: string | undefined = turnInputId;
+  const resolvedInputIds = new Set(turnInputId ? [turnInputId] : []);
+  const steeringQueue: QueryTurnInput[] = [];
+  let steeringTail = Promise.resolve();
+  let pumpingSteering = false;
+
+  const pumpSteering = (): void => {
+    if (pumpingSteering || !startAcknowledged || !activeTurnId || turnDone || abortRequested) return;
+    pumpingSteering = true;
+    steeringTail = (async () => {
+      while (steeringQueue.length > 0 && !turnDone && !abortRequested) {
+        const followup = steeringQueue.shift()!;
+        const expectedTurnId = activeTurnId!;
+        await followup.acceptInput();
+        if (turnDone || abortRequested || runDeps.abortSignal?.isAborted()) {
+          if (!abortRequested) deps.deferSteering?.(followup);
+          break;
+        }
+        // Begin submission before reporting acceptance. A transport failure
+        // after this point is recovery-owned, never blindly submitted twice.
+        const submission = steerCodexTurn(
+          server,
+          {
+            threadId,
+            expectedTurnId,
+            inputText: prepareCodexInputText(followup.prompt),
+            inputId: followup.inputId,
+          },
+          runDeps.abortSignal,
+        );
+        inputId = followup.inputId;
+        buffer.push({ type: 'input-accepted', inputId: followup.inputId, scope: 'followup' });
+        kick();
+        try {
+          await submission;
+          resolvedInputIds.add(followup.inputId);
+          logStructured('codex_followup_steered', { threadId, turnId: expectedTurnId, inputId: followup.inputId });
+        } catch (error) {
+          if (!(error instanceof CodexSteerRejectedError)) throw error;
+          deps.deferSteering?.(followup);
+          logStructured('codex_steer_deferred', { threadId, inputId: followup.inputId, reason: error.message });
+        }
+      }
+    })()
+      .catch((error) => {
+        turnState.error = error instanceof Error ? error : new Error(String(error));
+        turnDone = true;
+        kick();
+      })
+      .finally(() => {
+        pumpingSteering = false;
+        if (steeringQueue.length > 0 && !turnDone && !abortRequested) pumpSteering();
+        kick();
+      });
+  };
+  deps.registerSteering?.((followup) => {
+    if (turnDone || abortRequested) return false;
+    steeringQueue.push(followup);
+    pumpSteering();
+    return true;
+  });
   const armForcedTermination = (): void => {
     if (forcedTerminationHandle || turnDone) return;
     forcedTerminationHandle = runDeps.setTimer(runDeps.abortGraceMs, () => {
@@ -874,6 +954,7 @@ export async function* runOneTurn(
         if (turnId) {
           activeTurnId = turnId;
           requestInterrupt();
+          pumpSteering();
         }
         break;
       }
@@ -974,6 +1055,11 @@ export async function* runOneTurn(
     } else {
       await runDeps.startTurn(server, { threadId, inputText, model, cwd });
     }
+    // turn/started can arrive before the start RPC completes. Retain incoming
+    // corrections until that handshake succeeds, so a rejected start cannot
+    // hide an already-submitted steer's acceptance from the poll loop.
+    startAcknowledged = true;
+    pumpSteering();
 
     while (true) {
       while (buffer.length > 0) {
@@ -987,6 +1073,10 @@ export async function* runOneTurn(
       waker = null;
     }
 
+    // Completion can race the steer RPC response or its trusted acceptance
+    // barrier. Settle the submission before resolving any of its input IDs.
+    await steeringTail;
+    while (steeringQueue.length > 0) deps.deferSteering?.(steeringQueue.shift()!);
     while (buffer.length > 0) yield buffer.shift()!;
 
     if (turnInterrupted) {
@@ -1039,7 +1129,7 @@ export async function* runOneTurn(
       type: 'result',
       text: resultText || null,
       inputId: turnInputId,
-      resolvedInputIds: turnInputId ? [turnInputId] : [],
+      resolvedInputIds: [...resolvedInputIds],
       // Empty turn + provider reason (e.g. usage limit): carry it verbatim so the
       // poll loop surfaces it instead of the generic empty-reply fallback.
       ...(resultText ? {} : turnErrorText ? { errorText: turnErrorText } : {}),
@@ -1047,6 +1137,9 @@ export async function* runOneTurn(
     // Non-terminal: the outer loop continues to drain the next pending input.
     return false;
   } finally {
+    deps.registerSteering?.(null);
+    turnDone = true;
+    await steeringTail;
     if (wakeHandle) clearTimeout(wakeHandle);
     if (forcedTerminationHandle) clearTimeout(forcedTerminationHandle);
     unsubscribeAbort?.();

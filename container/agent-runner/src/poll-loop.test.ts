@@ -492,6 +492,181 @@ describe('end-to-end with mock provider', () => {
 });
 
 describe('poll-loop conversational reply accounting', () => {
+  it('strips one queue marker on idle human messages while preserving inbound content', async () => {
+    insertChannelDestination('discord-current', 'chan-1');
+    const examples = ['*yes', '**yes*', '*no*', 'This is *no', '**bold**', '***both***', '*hello* then unmatched *'];
+    for (const [index, text] of examples.entries()) {
+      insertMessage(
+        `delivery-${index}`,
+        'chat',
+        { sender: 'User', text },
+        { channelType: 'discord', platformId: 'chan-1' },
+      );
+    }
+    let delivered: QueryInput | undefined;
+    const provider = new ScriptedProvider(async function* (input) {
+      delivered = input;
+      yield { type: 'result', text: '<message to="discord-current">received</message>' };
+    });
+    const controller = new AbortController();
+    const loop = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+    try {
+      await waitFor(() => getAckStatus('delivery-6') === 'completed', 1500);
+      expect(delivered?.messages?.map((message) => JSON.parse(message.content).text)).toEqual([
+        'yes',
+        '*yes*',
+        '*no*',
+        'This is *no',
+        '**bold**',
+        '***both***',
+        '*hello* then unmatched *',
+      ]);
+      const stored = getInboundDb().prepare('SELECT content FROM messages_in ORDER BY seq').all() as Array<{
+        content: string;
+      }>;
+      expect(stored.map((row) => JSON.parse(row.content).text)).toEqual(examples);
+    } finally {
+      controller.abort();
+      await loop.catch(() => {});
+    }
+  });
+
+  it('separates queued and steering human follow-ups collected in the same active poll', async () => {
+    insertMessage('delivery-initial', 'chat', { sender: 'User', text: 'first' }, { channelType: 'discord' });
+    const started = deferred();
+    const pushes: QueryTurnInput[] = [];
+    let release!: () => void;
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query(input) {
+        return {
+          push(message) {
+            if (typeof message !== 'string') pushes.push(message);
+          },
+          end() {
+            release?.();
+          },
+          abort: async () => {
+            release?.();
+          },
+          events: (async function* () {
+            yield { type: 'input-accepted', inputId: input.inputId, scope: 'initial' };
+            started.resolve();
+            await new Promise<void>((resolve) => {
+              release = resolve;
+            });
+          })(),
+        };
+      },
+    };
+    const controller = new AbortController();
+    const loop = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+    try {
+      await started.promise;
+      for (const [index, text] of [
+        '*yes',
+        '*no*',
+        '**yes*',
+        'This is *no',
+        '/compact',
+        'ordinary correction',
+      ].entries()) {
+        insertMessage(`delivery-follow-${index}`, 'chat-sdk', { sender: 'User', text }, { channelType: 'discord' });
+      }
+      await waitFor(
+        () => pushes.some((push) => push.messages?.some((message) => message.id === 'delivery-follow-5')),
+        1500,
+      );
+      expect(pushes.map((push) => (push as QueryTurnInput & { deliveryMode?: string }).deliveryMode)).toEqual([
+        'queue',
+        'steer',
+        'queue',
+        'steer',
+        'queue',
+        'steer',
+      ]);
+      expect(pushes.map((push) => push.messages?.map((message) => JSON.parse(message.content).text))).toEqual([
+        ['yes'],
+        ['*no*'],
+        ['*yes*'],
+        ['This is *no'],
+        ['/compact'],
+        ['ordinary correction'],
+      ]);
+      expect(pushes.map((push) => push.inputId)).toEqual([
+        'in-host-delivery-follow-0',
+        'in-host-delivery-follow-1',
+        'in-host-delivery-follow-2',
+        'in-host-delivery-follow-3',
+        'in-host-delivery-follow-4',
+        'in-host-delivery-follow-5',
+      ]);
+    } finally {
+      controller.abort();
+      release?.();
+      await loop.catch(() => {});
+    }
+  });
+
+  it('delivers a bare final reply that resolves the initial input and a steered follow-up', async () => {
+    insertChannelDestination('discord-current', 'chan-1');
+    const route = { channelType: 'discord', platformId: 'chan-1' };
+    insertMessage('steer-visible-initial', 'chat', { sender: 'User', text: 'first' }, route);
+    const started = deferred();
+    const pushed = deferred();
+    let followup!: QueryTurnInput;
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query(input) {
+        return {
+          push(message) {
+            if (typeof message !== 'string') followup = message;
+            pushed.resolve();
+          },
+          end() {},
+          abort: async () => {
+            pushed.resolve();
+          },
+          events: (async function* () {
+            yield { type: 'input-accepted', inputId: input.inputId, scope: 'initial' };
+            started.resolve();
+            await pushed.promise;
+            if (!followup) return;
+            await followup.acceptInput();
+            yield { type: 'input-accepted', inputId: followup.inputId, scope: 'followup' };
+            yield { type: 'result', text: 'Corrected answer.', resolvedInputIds: [input.inputId, followup.inputId] };
+          })(),
+        };
+      },
+    };
+    const controller = new AbortController();
+    const loop = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+    try {
+      await started.promise;
+      insertMessage('steer-visible-followup', 'chat', { sender: 'User', text: 'correction' }, route);
+      await waitFor(() => getAckStatus('steer-visible-followup') === 'completed', 2000);
+      expect(getAckStatus('steer-visible-initial')).toBe('completed');
+      expect(getUndeliveredMessages().map((row) => JSON.parse(row.content).text)).toEqual(['Corrected answer.']);
+      expect(
+        listRecoveryEntries({
+          providerName: 'test',
+          routeKey: 'test|discord|chan-1|nometa:discord:chan-1:null',
+          channelType: 'discord',
+          platformId: 'chan-1',
+          threadKey: null,
+          messagingGroupId: null,
+          isGroup: null,
+        }),
+      ).toHaveLength(0);
+    } finally {
+      controller.abort();
+      pushed.resolve();
+      await loop.catch(() => {});
+    }
+  });
+
   it('passes collected attachments on the initial provider turn', async () => {
     insertChannelDestination('discord-current', 'chan-1');
     const filePath = '/workspace/agent/attachments/discord/msg/photo.png';
