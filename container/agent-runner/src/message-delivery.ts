@@ -1,3 +1,5 @@
+import { Parser } from 'commonmark';
+
 import type { MessageInRow } from './db/messages-in.js';
 
 export type MessageDeliveryMode = 'steer' | 'queue';
@@ -11,66 +13,12 @@ function isCompactControl(message: MessageInRow): boolean {
   }
 }
 
-/** Match the opening emphasis delimiter, not unrelated stars later in the text. */
+const markdown = new Parser();
+
+/** Only parsed emphasis beginning at the first source character matches the marker. */
 function hasClosingEmphasis(text: string): boolean {
-  const opening = text.match(/^\*+/)?.[0].length ?? 0;
-  if (!opening || /\s/.test(text[opening] ?? ' ')) return false;
-  const delimiters = [{ count: opening, originalCount: opening, canClose: false }];
-  for (let index = opening; index < text.length; index++) {
-    if (text[index] === '\\') {
-      index++;
-      continue;
-    }
-    // Stars inside inline code cannot close Markdown emphasis.
-    if (text[index] === '`') {
-      let count = 1;
-      while (text[index + count] === '`') count++;
-      const closing = text.indexOf('`'.repeat(count), index + count);
-      if (closing >= 0) {
-        index = closing + count - 1;
-        continue;
-      }
-    }
-    if (text[index] !== '*') continue;
-    let count = 1;
-    while (text[index + count] === '*') count++;
-    const previous = text[index - 1];
-    const next = text[index + count] ?? ' ';
-    const beforeSpace = /\s/.test(previous);
-    const afterSpace = /\s/.test(next);
-    const beforePunctuation = /[\p{P}\p{S}]/u.test(previous);
-    const afterPunctuation = /[\p{P}\p{S}]/u.test(next);
-    const canClose = !beforeSpace && (!beforePunctuation || afterSpace || afterPunctuation);
-    const canOpen = !afterSpace && (!afterPunctuation || beforeSpace || beforePunctuation);
-    let remaining = count;
-    if (canClose) {
-      while (remaining > 0) {
-        let opener = delimiters.length - 1;
-        // CommonMark's rule of three prevents an intraword ** from closing
-        // the initial * in '*foo**bar**' (and the inverse for bold text).
-        while (opener >= 0) {
-          const candidate = delimiters[opener];
-          const ambiguous = canOpen || candidate.canClose;
-          const ruleOfThree =
-            ambiguous &&
-            (candidate.originalCount + count) % 3 === 0 &&
-            (candidate.originalCount % 3 !== 0 || count % 3 !== 0);
-          if (!ruleOfThree) break;
-          opener--;
-        }
-        if (opener < 0) break;
-        const matched = delimiters[opener].count >= 2 && remaining >= 2 ? 2 : 1;
-        delimiters[opener].count -= matched;
-        remaining -= matched;
-        if (opener === 0 && delimiters[opener].count === 0) return true;
-        // Unmatched delimiters inside this matched span become literal text.
-        delimiters.length = opener + (delimiters[opener].count > 0 ? 1 : 0);
-      }
-    }
-    if (canOpen && remaining > 0) delimiters.push({ count: remaining, originalCount: count, canClose });
-    index += count - 1;
-  }
-  return false;
+  const leadingInline = markdown.parse(text).firstChild?.firstChild;
+  return leadingInline?.type === 'emph' || leadingInline?.type === 'strong';
 }
 
 /** Return a model-facing copy; the durable inbound row keeps the user's text. */
