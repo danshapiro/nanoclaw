@@ -86,6 +86,25 @@ Both paths end with Bun running the same source file from `/app/src/index.ts`.
 
 Any failure fails the PR.
 
+### Container incident replay prerequisites
+
+The runner suite calls the production `summarize-dnd` writer to verify real summary artifacts and recovery records. It never calls its model or transcription services. Supply a checkout of that repository with `NANOCLAW_SUMMARIZE_DND_TEST_ROOT`; revision `a49332b95fbda0248c84daf09d633f28727d4df1` is the verified fixture. The writer needs Python 3.12 with the JSON Schema dependency listed in `container/agent-runner/test-requirements.txt`. An optional `NANOCLAW_SUMMARIZE_DND_TEST_PYTHON` selects a virtual environment's interpreter; the default is `python3` on `PATH`.
+
+`danshapiro/summarize-dnd` is private. The existing GitHub Actions workflow does not provision this fixture, and its default repository token cannot read it. That runner prerequisite must be supplied before the complete container suite can pass in CI; no new credential setup is included here.
+
+For example, after checking out that `summarize-dnd` revision under `/tmp/summarize-dnd-replay`:
+
+```bash
+python3 -m venv /tmp/nanoclaw-replay-python
+/tmp/nanoclaw-replay-python/bin/python -m pip install -r container/agent-runner/test-requirements.txt
+cd container/agent-runner
+NANOCLAW_SUMMARIZE_DND_TEST_ROOT=/tmp/summarize-dnd-replay \
+NANOCLAW_SUMMARIZE_DND_TEST_PYTHON=/tmp/nanoclaw-replay-python/bin/python \
+bun test
+```
+
+No workstation-specific worktree or virtual environment path is required. A missing writer checkout fails with the required setting, and replay cleanup stops the active test runtime before the next test starts.
+
 ## Key invariants
 
 - **Session DBs must use `journal_mode=DELETE`.** WAL's `-shm` memory-map doesn't cross VirtioFS between host and guest. See the doc comment at the top of `container/agent-runner/src/db/connection.ts` and `src/session-manager.ts`.

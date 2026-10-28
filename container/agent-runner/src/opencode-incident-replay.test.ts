@@ -118,8 +118,8 @@ const RECORDING = { recording_date: '2026-05-19', size_bytes: 2_560_000_000 };
 const SHIM_PATH = path.resolve(import.meta.dir, '../../shim/gws');
 const SHIM_REQUEST_HELPER_PATH = path.resolve(import.meta.dir, '../../shim/gws-request.mjs');
 const SHIM_WRITE_OPERATIONS_PATH = path.resolve(import.meta.dir, '../../shim/gws-v0.18.1-write-operations.json');
-const SDDND_DIR = '/home/dan/code/summarize-dnd/.worktrees/nanoclaw-side-effect-ledger';
-const SDDND_PY = path.join(SDDND_DIR, '.venv-wsl/bin/python');
+const SDDND_DIR = process.env.NANOCLAW_SUMMARIZE_DND_TEST_ROOT;
+const SDDND_PY = process.env.NANOCLAW_SUMMARIZE_DND_TEST_PYTHON ?? 'python3';
 
 // ── Temp-dir + env lifecycle ─────────────────────────────────────────────────
 
@@ -284,8 +284,9 @@ class FakeController implements OpenCodeRuntimeController {
     this.sessionExistsCalls.push(id);
     return this.sessionExistsResult;
   }
-  destroy(reason: string): void {
+  async destroy(reason: string): Promise<void> {
     this.destroyed.push(reason);
+    this.stream.end();
   }
 }
 
@@ -519,6 +520,32 @@ async function runWake(opts: {
     await loop.catch(() => {});
   }
 }
+
+describe('incident replay lifecycle', () => {
+  it('stops an active replay query before propagating a setup failure', async () => {
+    const clock = new FakeClock();
+    const controller = new FakeController(new FakeStream(), 'ses_setup_failure');
+    const { provider } = makeProvider({ clock, controllerFor: () => controller });
+    insertMessage('setup-failure-1', 'Start work before a setup failure.', {
+      platformId: 'chan-setup-failure',
+      channelType: 'discord',
+      messagingGroupId: 'mg-setup-failure',
+      isGroup: 0,
+    });
+
+    await expect(
+      runWake({
+        provider,
+        drive: async () => {
+          await waitFor(() => getContinuation('opencode') === controller.sessionId);
+          throw new Error('replay prerequisite unavailable');
+        },
+        until: () => false,
+      }),
+    ).rejects.toThrow('replay prerequisite unavailable');
+    expect(controller.destroyed).toContain('abort');
+  });
+});
 
 // ── GWS production shim → fake-proxy (real classification + real Ed25519) ─────
 //
@@ -802,6 +829,12 @@ async function runSummarizeDndWriter(opts: {
   ledgerPath: string;
   activeInputPath: string;
 }): Promise<{ status: number | null; stderr: string }> {
+  if (!SDDND_DIR || !fs.existsSync(path.join(SDDND_DIR, 'summary_writer.py'))) {
+    throw new Error(
+      'The incident replay requires NANOCLAW_SUMMARIZE_DND_TEST_ROOT to name a summarize-dnd checkout; ' +
+        'see docs/build-and-runtime.md for the pinned test fixture and Python prerequisites.',
+    );
+  }
   const longPath = path.join(opts.workDir, 'long.md');
   const shortPath = path.join(opts.workDir, 'short.md');
   fs.writeFileSync(longPath, 'long 5/19 narrative (faked model leaf)');
@@ -812,19 +845,13 @@ async function runSummarizeDndWriter(opts: {
     `res = sw._finalize_short_summary(short_text=${JSON.stringify(opts.shortText)}, output_paths={'short': Path(${JSON.stringify(shortPath)}), 'long': Path(${JSON.stringify(longPath)})}, source_path=Path(${JSON.stringify(longPath)}), stage='generate-short')`,
     'print("OK")',
   ].join('\n');
-  if (!fs.existsSync(SDDND_PY)) {
-    throw new Error(
-      `Task 6 replay requires the summarize-dnd venv at ${SDDND_PY}; ` +
-        `provision it via Task 0 Step 3 (python3 -m venv .venv-wsl; pip install pytest jsonschema httpx) ` +
-        `in the summarize-dnd worktree (${SDDND_DIR})`,
-    );
-  }
   const proc = Bun.spawn([SDDND_PY, '-c', driver], {
     cwd: opts.workDir,
     env: {
       ...process.env,
       NANOCLAW_SIDE_EFFECT_LEDGER: opts.ledgerPath,
       NANOCLAW_ACTIVE_INPUT_FILE: opts.activeInputPath,
+      PYTHONDONTWRITEBYTECODE: '1',
     },
     stdout: 'pipe',
     stderr: 'pipe',
