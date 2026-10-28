@@ -96,6 +96,7 @@ describe('sealAndDrainGwsCorrelation', () => {
     });
     const credentialDirectory = path.join(path.dirname(control.tokenPath), 'credentials');
     fs.mkdirSync(credentialDirectory, { mode: 0o750 });
+    fs.chmodSync(credentialDirectory, 0o750);
     const systemdTokenPath = path.join(credentialDirectory, 'gws-finalize-token');
     fs.renameSync(control.tokenPath, systemdTokenPath);
     fs.chmodSync(systemdTokenPath, 0o440);
