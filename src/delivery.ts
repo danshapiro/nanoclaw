@@ -451,6 +451,9 @@ async function drainSession(session: Session, options: DrainSessionOptions = {})
                 stopTypingGrace(session.id, 'discord', target.platformId, target.threadId, target.inputId);
               }
             }
+            // Cancellation may have landed after this poll's initial activity read.
+            // Re-read the current value so a newer request is preserved as well.
+            if (Array.isArray(content.stopTypingFor)) readTypingActivity(session, outDb);
           } catch {
             // Delivery already handles malformed content; this optional marker is best effort.
           }

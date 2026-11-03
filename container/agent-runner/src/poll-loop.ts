@@ -1220,6 +1220,8 @@ async function processQuery(
   // prompt is `accepted` only after the provider emits input-accepted for it,
   // and `resolved` only after a successful result resolves/supersedes it.
   const ledger = new Map<string, InputLedgerEntry>();
+  // Retain pushed rows until the turn ends so /stop can identify every
+  // unresolved follow-up, even if its acceptance raced with the stop.
   const followupTypingRows = new Map<string, MessageInRow[]>();
   const boundGwsInputs = ledgerCtx.acceptanceContext.boundGwsInputs;
   ledger.set(ledgerCtx.topLevelInputId, {
@@ -1255,8 +1257,7 @@ async function processQuery(
     claim.acceptanceObserved = true;
     entry.state = 'accepted';
     const selectedFollowup = followupTypingRows.get(inputId);
-    if (selectedFollowup) {
-      followupTypingRows.delete(inputId);
+    if (selectedFollowup && !userStopRequested) {
       typingActivity?.select(inputId, selectedFollowup);
     }
     clearProviderRetrySchedule(providerName, ledgerCtx.activeRouteKey);
@@ -1308,6 +1309,7 @@ async function processQuery(
         idsToComplete.push(...claim.messageIds);
       }
       entry.state = entry.claims.every((claim) => claim.state === 'resolved') ? 'resolved' : 'queued';
+      if (entry.state === 'resolved') followupTypingRows.delete(inputId);
       // Later context-only claims can share this input without becoming new
       // user work. Once its accepted trigger resolves, they must not hold typing.
       typingActivity?.resolve([inputId]);
@@ -1379,6 +1381,8 @@ async function processQuery(
   }, ACTIVE_POLL_INTERVAL_MS);
 
   async function pollFollowups(): Promise<void> {
+    // Leave later requests pending while the cancelled provider cleans up.
+    if (userStopRequested) return;
     // Only claim follow-ups on the ACTIVE route. Rows on other routes remain
     // pending and are excluded from this turn (route splitting also applies to
     // follow-ups, not just the initial batch). The shared park set is excluded
@@ -1401,10 +1405,18 @@ async function processQuery(
       await withSqliteRetry(() => markCompleted(sameRouteIds), { label: 'markCompleted' });
       if (!userStopRequested) {
         userStopRequested = true;
-        await withSqliteRetry(() => writeRoutedMessage(routing, STOP_ACTIVE_ACK, stopMessages), {
-          label: 'writeRoutedMessage',
+        const cancelledFollowups = [...followupTypingRows].flatMap(([inputId, rows]) => {
+          const entry = ledger.get(inputId);
+          return entry && (entry.state === 'queued' || entry.state === 'accepted') ? rows : [];
         });
+        // Publish the clear before the acknowledgement can be observed by the host.
         typingActivity?.clear();
+        await withSqliteRetry(
+          () => writeRoutedMessage(routing, STOP_ACTIVE_ACK, [...routeMessages, ...cancelledFollowups]),
+          {
+            label: 'writeRoutedMessage',
+          },
+        );
         log(
           JSON.stringify({
             severity: 'info',
@@ -1526,7 +1538,7 @@ async function processQuery(
         }),
       );
       entry.claims = entry.claims.filter((candidate) => candidate !== claim);
-      followupTypingRows.delete(followupInputId);
+      if (followupTrigger) followupTypingRows.delete(followupInputId);
       entry.messageIds = entry.messageIds.filter((id) => !newIds.includes(id));
       if (entry.claims.length === 0) ledger.delete(followupInputId);
       await withSqliteRetry(() => returnProcessingToPending(newIds, 'followup_enqueue_failed'), {
