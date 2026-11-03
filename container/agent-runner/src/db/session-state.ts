@@ -10,6 +10,7 @@
  * model/provider settings; switching either providers or scoped runtime
  * configs then starts fresh without deleting the old slot.
  */
+import type { Database } from 'bun:sqlite';
 import { getOutboundDb } from './connection.js';
 import type { ProviderContinuationPolicy, ProviderSideEffect } from '../providers/types.js';
 
@@ -39,6 +40,32 @@ function setValue(key: string, value: string): void {
   getOutboundDb()
     .prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
     .run(key, value, new Date().toISOString());
+}
+
+/** A best-effort ephemeral write must never wait behind another SQLite user. */
+export function writeTypingActivity(
+  leaseId: string,
+  destinations: Array<{ platformId: string; threadId: string | null }>,
+): void {
+  writeTypingActivityToDb(getOutboundDb(), leaseId, destinations);
+}
+
+export function writeTypingActivityToDb(
+  db: Database,
+  leaseId: string,
+  destinations: Array<{ platformId: string; threadId: string | null }>,
+): void {
+  const timeout = (db.query('PRAGMA busy_timeout').get() as { timeout: number }).timeout;
+  try {
+    db.exec('PRAGMA busy_timeout = 0');
+    db.prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)').run(
+      'discord_typing_activity',
+      JSON.stringify({ leaseId, updatedAt: Date.now(), destinations }),
+      new Date().toISOString(),
+    );
+  } finally {
+    db.exec(`PRAGMA busy_timeout = ${timeout}`);
+  }
 }
 
 function deleteValue(key: string): void {

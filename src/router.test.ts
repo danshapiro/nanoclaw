@@ -19,6 +19,7 @@ import { setDeliveryAdapter } from './delivery.js';
 import { inboundDbPath, outboundDbPath, sessionDir, writeOutboundDirect } from './session-manager.js';
 import { getScheduledTask } from './modules/scheduling/ledger.js';
 import { attachmentStagingDir } from './yente/attachments.js';
+import { stopTypingRefresh } from './modules/typing/index.js';
 
 const cleanupContainerForSessionMock = vi.hoisted(() => vi.fn().mockResolvedValue(true));
 
@@ -138,6 +139,32 @@ function event(
     },
   };
 }
+
+it('stores Discord ingress at its source and keeps a CLI override distinct while hinting the source', async () => {
+  const { routeInbound } = await import('./router.js');
+  const setTyping = vi.fn().mockResolvedValue(undefined);
+  setDeliveryAdapter({ deliver: vi.fn(), setTyping });
+  const bridge = event('from Discord', 'typing-discord');
+  bridge.message.kind = 'chat-sdk';
+  const cli = event('from CLI', 'typing-cli');
+  cli.replyTo = { channelType: 'discord', platformId: 'other-channel', threadId: 'other-thread' };
+  await routeInbound(bridge);
+  await routeInbound(cli);
+  const session = findSessionForAgent('ag-yente', 'mg-discord', DISCORD_THREAD_ID)!;
+  try {
+    const db = new Database(inboundDbPath('ag-yente', session.id));
+    const rows = db.prepare('SELECT kind, channel_type, platform_id, thread_id FROM messages_in ORDER BY seq').all();
+    db.close();
+    expect(rows).toEqual([
+      { kind: 'chat-sdk', channel_type: 'discord', platform_id: DISCORD_PLATFORM_ID, thread_id: DISCORD_THREAD_ID },
+      { kind: 'chat', channel_type: 'discord', platform_id: 'other-channel', thread_id: 'other-thread' },
+    ]);
+    expect(setTyping).toHaveBeenCalledTimes(2);
+    expect(setTyping).toHaveBeenNthCalledWith(2, 'discord', DISCORD_PLATFORM_ID, DISCORD_THREAD_ID);
+  } finally {
+    stopTypingRefresh(session.id);
+  }
+});
 
 function sharedEvent(content: string, id: string): InboundEvent {
   return {

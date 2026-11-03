@@ -39,7 +39,7 @@ import {
   getSessionsByAgentGroup,
 } from './db/sessions.js';
 import { deliverSessionMessages, getDeliveryAdapter, suppressSessionOutbound } from './delivery.js';
-import { startTypingRefresh } from './modules/typing/index.js';
+import { startTypingRefresh, stopTypingGrace } from './modules/typing/index.js';
 import { log } from './log.js';
 import { cleanupInboundAttachmentSources } from './yente/attachments.js';
 import {
@@ -805,7 +805,12 @@ async function deliverToAgent(
     );
     const freshSession = getSession(session.id);
     if (freshSession) {
-      await wakeContainer(freshSession);
+      try {
+        await wakeContainer(freshSession);
+      } catch (err) {
+        stopTypingGrace(session.id, agentEvent.channelType, agentEvent.platformId, agentEvent.threadId);
+        throw err;
+      }
     }
   }
 }

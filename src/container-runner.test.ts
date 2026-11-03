@@ -1855,6 +1855,36 @@ describe('session wake lifecycle', () => {
     }
   });
 
+  it('stops typing on verified container stop and ignores that owner afterward', async () => {
+    const harness = await loadContainerRunnerHarness();
+    const processKill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    try {
+      const wake = harness.containerRunner.wakeContainer(harness.session);
+      await harness.oneCliStarted.promise;
+      harness.oneCliRelease.resolve();
+      await wake;
+      const typing = await import('./modules/typing/index.js');
+      const setTyping = vi.fn().mockResolvedValue(undefined);
+      typing.setTypingAdapter({ setTyping });
+      const control = JSON.parse(harness.spawnedProcesses[0].stdin.end.mock.calls[0][0]);
+      const snapshot = JSON.stringify({
+        leaseId: control.leaseId,
+        updatedAt: Date.now(),
+        destinations: [{ platformId: 'channel', threadId: 'thread' }],
+      });
+      typing.applyStoredDiscordTypingActivity(harness.session.id, harness.session.agent_group_id, snapshot);
+      expect(setTyping).toHaveBeenCalledTimes(1);
+      await expect(
+        harness.containerRunner.cleanupContainerForSession(harness.session.id, 'yente-session-reset'),
+      ).resolves.toBe(true);
+      typing.applyStoredDiscordTypingActivity(harness.session.id, harness.session.agent_group_id, snapshot);
+      expect(setTyping).toHaveBeenCalledTimes(1);
+    } finally {
+      processKill.mockRestore();
+      harness.close();
+    }
+  });
+
   it('throws when stop fails and the container still appears to be running', async () => {
     const harness = await loadContainerRunnerHarness();
     const processKill = vi.spyOn(process, 'kill').mockImplementation(() => true);

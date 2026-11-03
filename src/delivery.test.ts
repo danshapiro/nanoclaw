@@ -43,6 +43,7 @@ import {
   setDeliveryAdapter,
   suppressSessionOutbound,
 } from './delivery.js';
+import { setTypingContainerOwner, stopTypingRefresh } from './modules/typing/index.js';
 
 function now(): string {
   return new Date().toISOString();
@@ -174,6 +175,72 @@ afterEach(() => {
 });
 
 describe('deliverSessionMessages — concurrent invocations', () => {
+  it('reads current runner typing activity even when there are no outgoing messages', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const db = new Database(outboundDbPath('ag-1', session.id));
+    db.prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)').run(
+      'discord_typing_activity',
+      JSON.stringify({
+        leaseId: 'current',
+        updatedAt: Date.now(),
+        destinations: [{ platformId: 'channel', threadId: 'thread' }],
+      }),
+      new Date().toISOString(),
+    );
+    db.close();
+    const setTyping = vi.fn().mockResolvedValue(undefined);
+    setDeliveryAdapter({ deliver: vi.fn(), setTyping });
+    setTypingContainerOwner(session.id, 'current');
+    try {
+      await deliverSessionMessages(session);
+      expect(setTyping).toHaveBeenCalledWith('discord', 'channel', 'thread');
+    } finally {
+      stopTypingRefresh(session.id);
+    }
+  });
+
+  it('observes the end of typing while a delivery is still waiting on its adapter', async () => {
+    vi.useFakeTimers();
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'slow-typing-delivery');
+    const write = (destinations: unknown[]) => {
+      const db = new Database(outboundDbPath('ag-1', session.id));
+      db.prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)').run(
+        'discord_typing_activity',
+        JSON.stringify({ leaseId: 'current', updatedAt: Date.now(), destinations }),
+        now(),
+      );
+      db.close();
+    };
+    write([{ platformId: 'channel', threadId: 'thread' }]);
+    let finish!: () => void;
+    const waiting = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const setTyping = vi.fn().mockResolvedValue(undefined);
+    const deliver = vi.fn(async () => {
+      await waiting;
+      return 'sent';
+    });
+    setDeliveryAdapter({ deliver, setTyping });
+    setTypingContainerOwner(session.id, 'current');
+    const first = deliverSessionMessages(session);
+    try {
+      await vi.waitFor(() => expect(deliver).toHaveBeenCalled());
+      expect(setTyping).toHaveBeenCalledTimes(1);
+      write([]);
+      await deliverSessionMessages(session);
+      await vi.advanceTimersByTimeAsync(8000);
+      expect(setTyping).toHaveBeenCalledTimes(1);
+    } finally {
+      finish();
+      await first;
+      stopTypingRefresh(session.id);
+      vi.useRealTimers();
+    }
+  });
   it('blocks non-channel-wired origin-chat channel outbound before adapter delivery', async () => {
     seedAgentAndChannel();
     createAgentGroup({

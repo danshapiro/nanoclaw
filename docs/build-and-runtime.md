@@ -1,6 +1,6 @@
 # Build & Runtime
 
-NanoClaw runs a split stack: the host is Node + pnpm, the agent container is Bun. They communicate exclusively through two SQLite files per session — there are no shared modules between them, which is what lets them use different runtimes cleanly.
+NanoClaw runs a split stack: the host is Node + pnpm, the agent container is Bun. Session messages and ephemeral Discord typing activity pass through two SQLite files per session; trusted GWS correlation uses authenticated host IPC. The runtimes have no shared modules.
 
 ## Why the split
 

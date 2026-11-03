@@ -47,7 +47,7 @@ import { getDb, hasTable, isDbInitialized } from './db/connection.js';
 import { getSession } from './db/sessions.js';
 import { initGroupFilesystem } from './group-init.js';
 import { resolveGroupIpcPath } from './group-folder.js';
-import { stopTypingRefresh } from './modules/typing/index.js';
+import { setTypingContainerOwner, stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
 import {
@@ -522,6 +522,7 @@ async function spawnContainer(session: Session): Promise<void> {
     stderrState,
   };
   activeContainers.set(session.id, activeEntry);
+  setTypingContainerOwner(session.id, launchControl.leaseId);
   if (bridges.length > 0) {
     activeMcpBridges.set(session.id, bridges);
   }

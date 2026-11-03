@@ -452,7 +452,7 @@ NanoClaw does not stream tokens to users. The Claude Agent SDK's `query()` yield
 
 Message editing is supported as an explicit operation (agent calls an `edit_message` tool), not as a streaming mechanism.
 
-Typing indicators: host sets typing when a container is active for a session, clears when the container exits or a response appears in messages_out.
+Typing indicators: Discord refreshes while selected user work remains active, including during intermediate delivery, and stops refreshing on completion or verified container stop. Other channels use the heartbeat and pause after delivery. Discord controls when its displayed indicator expires after refreshes stop.
 
 ### Message Batching
 

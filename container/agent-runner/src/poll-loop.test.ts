@@ -237,6 +237,361 @@ class NativeScriptedProvider extends ScriptedProvider {
   override readonly supportsNativeSlashCommands = true;
 }
 
+describe('selected Discord typing activity', () => {
+  it('reports the selected source during quiet work and clears it when the result arrives', async () => {
+    insertMessage(
+      'typing-1',
+      'chat-sdk',
+      { sender: 'User', text: 'work' },
+      {
+        channelType: 'discord',
+        platformId: 'channel-1',
+        threadId: 'thread-1',
+      },
+    );
+    const started = deferred();
+    const finish = deferred();
+    const provider = new ScriptedProvider(async function* () {
+      yield { type: 'init', continuation: 'typing-session' };
+      started.resolve();
+      await finish.promise;
+      yield { type: 'result', text: '<message to="discord-current">done</message>' };
+    });
+    insertChannelDestination('discord-current', 'channel-1');
+    const snapshots: Array<Array<{ platformId: string; threadId: string | null }>> = [];
+    const controller = new AbortController();
+    const loop = runPollLoop({
+      provider,
+      providerName: 'test',
+      cwd: '/tmp',
+      signal: controller.signal,
+      publishTypingActivity: (targets) => snapshots.push(targets),
+    });
+    try {
+      await started.promise;
+      expect(snapshots.at(-1)).toEqual([{ platformId: 'channel-1', threadId: 'thread-1' }]);
+      finish.resolve();
+      await waitFor(() => getAckStatus('typing-1') === 'completed', 1500);
+      expect(snapshots.at(-1)).toEqual([]);
+    } finally {
+      finish.resolve();
+      controller.abort();
+      await loop.catch(() => {});
+    }
+  });
+
+  it('does not treat a CLI reply override or accumulated Discord context as selected Discord work', async () => {
+    const route = { channelType: 'discord', platformId: 'reply-channel', threadId: 'reply-thread' };
+    insertMessage('typing-context', 'chat-sdk', { text: 'context' }, { ...route, trigger: 0 });
+    insertMessage('typing-cli', 'chat', { text: 'operator request' }, route);
+    const started = deferred();
+    const finish = deferred();
+    const provider = new ScriptedProvider(async function* () {
+      yield { type: 'init', continuation: 'typing-cli-session' };
+      started.resolve();
+      await finish.promise;
+      yield { type: 'result', text: '<message to="discord-current">done</message>' };
+    });
+    insertChannelDestination('discord-current', 'reply-channel');
+    const snapshots: unknown[] = [];
+    const controller = new AbortController();
+    const loop = runPollLoop({
+      provider,
+      providerName: 'test',
+      cwd: '/tmp',
+      signal: controller.signal,
+      publishTypingActivity: (targets) => snapshots.push(targets),
+    });
+    try {
+      await started.promise;
+      expect(snapshots).toEqual([]);
+      finish.resolve();
+      await waitFor(() => getAckStatus('typing-cli') === 'completed', 1500);
+      expect(snapshots).toEqual([]);
+    } finally {
+      finish.resolve();
+      controller.abort();
+      await loop.catch(() => {});
+    }
+  });
+
+  it('does not report a scheduled task as Discord-origin work', async () => {
+    insertMessage('typing-scheduled', 'task', { text: 'scheduled' }, {
+      channelType: 'discord', platformId: 'scheduled-channel', threadId: 'scheduled-thread',
+    });
+    const started = deferred();
+    const finish = deferred();
+    const provider = new ScriptedProvider(async function* () {
+      yield { type: 'init', continuation: 'typing-task-session' };
+      started.resolve();
+      await finish.promise;
+      yield { type: 'result', text: null };
+    });
+    const snapshots: unknown[] = [];
+    const controller = new AbortController();
+    const loop = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal,
+      publishTypingActivity: (targets) => snapshots.push(targets) });
+    try {
+      await started.promise;
+      expect(snapshots).toEqual([]);
+      finish.resolve();
+      await waitFor(() => getAckStatus('typing-scheduled') === 'completed', 1500);
+      expect(snapshots).toEqual([]);
+    } finally {
+      finish.resolve(); controller.abort();
+      await loop.catch(() => {});
+    }
+  });
+
+  it('does not report delayed or accumulated-only Discord messages as active', async () => {
+    const route = { channelType: 'discord', platformId: 'pending', threadId: 'thread' };
+    insertMessage('typing-delayed', 'chat-sdk', { text: 'later' }, {
+      ...route, processAfter: new Date(Date.now() + 3_600_000).toISOString(),
+    });
+    insertMessage('typing-context-only', 'chat-sdk', { text: 'context' }, { ...route, trigger: 0 });
+    const provider = new ScriptedProvider(async function* () { yield { type: 'result', text: null }; });
+    const snapshots: unknown[] = [];
+    const controller = new AbortController();
+    const loop = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal,
+      publishTypingActivity: (targets) => snapshots.push(targets) });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(provider.calls).toBe(0);
+      expect(snapshots).toEqual([]);
+    } finally {
+      controller.abort();
+      await loop.catch(() => {});
+    }
+  });
+
+  it('clears selected typing when the provider stream fails', async () => {
+    insertMessage('typing-provider-failure', 'chat-sdk', { text: 'work' }, {
+      channelType: 'discord', platformId: 'failure-channel', threadId: 'thread',
+    });
+    const started = deferred();
+    const fail = deferred();
+    const provider = new ScriptedProvider(async function* () {
+      yield { type: 'init', continuation: 'typing-failure-session' };
+      started.resolve();
+      await fail.promise;
+      throw new Error('test provider interruption');
+    });
+    const snapshots: unknown[][] = [];
+    const controller = new AbortController();
+    const loop = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal,
+      publishTypingActivity: (targets) => snapshots.push(targets) });
+    try {
+      await started.promise;
+      expect(snapshots.at(-1)).toEqual([{ platformId: 'failure-channel', threadId: 'thread' }]);
+      fail.resolve();
+      await waitFor(() => snapshots.length > 1 && snapshots.at(-1)?.length === 0, 1500);
+    } finally {
+      fail.resolve(); controller.abort();
+      await loop.catch(() => {});
+    }
+  });
+
+  it('keeps a destination active until both selected inputs resolve', async () => {
+    const route = { channelType: 'discord', platformId: 'overlap', threadId: 'thread' };
+    insertMessage('typing-first', 'chat-sdk', { text: 'first' }, route);
+    insertChannelDestination('discord-current', 'overlap');
+    const started = deferred();
+    const pushed = deferred();
+    const resolveFirst = deferred();
+    const firstDone = deferred();
+    const resolveSecond = deferred();
+    let followup!: QueryTurnInput;
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query(input) {
+        return {
+          push(message) { if (typeof message !== 'string') followup = message; pushed.resolve(); },
+          end() {},
+          abort: async () => { pushed.resolve(); resolveFirst.resolve(); resolveSecond.resolve(); },
+          events: (async function* () {
+            yield { type: 'input-accepted', inputId: input.inputId, scope: 'initial' };
+            started.resolve();
+            await pushed.promise;
+            if (!followup) return;
+            yield { type: 'input-accepted', inputId: followup.inputId, scope: 'followup' };
+            await resolveFirst.promise;
+            yield { type: 'result', text: '<message to="discord-current">first done</message>', resolvedInputIds: [input.inputId] };
+            firstDone.resolve();
+            await resolveSecond.promise;
+            yield { type: 'result', text: '<message to="discord-current">second done</message>', resolvedInputIds: [followup.inputId] };
+          })(),
+        };
+      },
+    };
+    const snapshots: unknown[][] = [];
+    const controller = new AbortController();
+    const loop = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal,
+      publishTypingActivity: (targets) => snapshots.push(targets) });
+    try {
+      await started.promise;
+      insertMessage('typing-second', 'chat-sdk', { text: 'second' }, route);
+      await pushed.promise;
+      resolveFirst.resolve();
+      await firstDone.promise;
+      expect(snapshots.at(-1)).toEqual([{ platformId: 'overlap', threadId: 'thread' }]);
+      resolveSecond.resolve();
+      await waitFor(() => getAckStatus('typing-second') === 'completed', 1500);
+      expect(snapshots.at(-1)).toEqual([]);
+    } finally {
+      pushed.resolve(); resolveFirst.resolve(); resolveSecond.resolve(); controller.abort();
+      await loop.catch(() => {});
+    }
+  });
+
+  it('does not keep typing for context still queued after the selected request resolves', async () => {
+    const route = { channelType: 'discord', platformId: 'context-channel', threadId: 'thread' };
+    insertMessage('typing-context-trigger', 'chat-sdk', { text: 'work' }, route);
+    insertChannelDestination('discord-current', 'context-channel');
+    const started = deferred();
+    const pushed = deferred();
+    const resultSent = deferred();
+    const finish = deferred();
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query(input) {
+        return {
+          push() { pushed.resolve(); }, end() {},
+          abort: async () => { pushed.resolve(); finish.resolve(); },
+          events: (async function* () {
+            yield { type: 'input-accepted', inputId: input.inputId, scope: 'initial' };
+            started.resolve();
+            await pushed.promise;
+            yield { type: 'result', text: '<message to="discord-current">done</message>', resolvedInputIds: [input.inputId] };
+            resultSent.resolve();
+            await finish.promise;
+          })(),
+        };
+      },
+    };
+    const snapshots: unknown[][] = [];
+    const controller = new AbortController();
+    const loop = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal,
+      publishTypingActivity: (targets) => snapshots.push(targets) });
+    try {
+      await started.promise;
+      insertMessage('typing-queued-context', 'chat-sdk', { text: 'context' }, { ...route, trigger: 0 });
+      await resultSent.promise;
+      expect(snapshots.at(-1)).toEqual([]);
+    } finally {
+      finish.resolve(); pushed.resolve(); controller.abort();
+      await loop.catch(() => {});
+    }
+  });
+
+  it('tracks distinct source threads independently when a shared route accepts a follow-up', async () => {
+    const route = { channelType: 'discord', platformId: 'shared', messagingGroupId: 'shared-dm', isGroup: 0 as const };
+    insertMessage('typing-thread-one', 'chat-sdk', { text: 'first' }, { ...route, threadId: 'one' });
+    insertChannelDestination('discord-current', 'shared');
+    const started = deferred();
+    const pushed = deferred();
+    const bothSelected = deferred();
+    const firstDone = deferred();
+    const finish = deferred();
+    let followup!: QueryTurnInput;
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query(input) {
+        return {
+          push(message) { if (typeof message !== 'string') followup = message; pushed.resolve(); },
+          end() {}, abort: async () => { pushed.resolve(); finish.resolve(); },
+          events: (async function* () {
+            yield { type: 'input-accepted', inputId: input.inputId, scope: 'initial' };
+            started.resolve();
+            await pushed.promise;
+            if (!followup) return;
+            yield { type: 'input-accepted', inputId: followup.inputId, scope: 'followup' };
+            bothSelected.resolve();
+            yield { type: 'result', text: '<message to="discord-current">one</message>', resolvedInputIds: [input.inputId] };
+            firstDone.resolve();
+            await finish.promise;
+            yield { type: 'result', text: '<message to="discord-current">two</message>', resolvedInputIds: [followup.inputId] };
+          })(),
+        };
+      },
+    };
+    const snapshots: unknown[][] = [];
+    const controller = new AbortController();
+    const loop = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal,
+      publishTypingActivity: (targets) => snapshots.push(targets) });
+    try {
+      await started.promise;
+      insertMessage('typing-thread-two', 'chat-sdk', { text: 'second' }, { ...route, threadId: 'two' });
+      await bothSelected.promise;
+      expect(snapshots.some((targets) => targets.length === 2)).toBe(true);
+      await firstDone.promise;
+      expect(snapshots.at(-1)).toEqual([{ platformId: 'shared', threadId: 'two' }]);
+      finish.resolve();
+      await waitFor(() => getAckStatus('typing-thread-two') === 'completed', 1500);
+      expect(snapshots.at(-1)).toEqual([]);
+    } finally {
+      pushed.resolve(); finish.resolve(); controller.abort();
+      await loop.catch(() => {});
+    }
+  });
+
+  it('does not report a queued follow-up until the provider selects it', async () => {
+    const route = { channelType: 'discord', platformId: 'queue', messagingGroupId: 'queue-dm', isGroup: 0 as const };
+    insertMessage('typing-queue-first', 'chat-sdk', { text: 'first' }, { ...route, threadId: 'one' });
+    insertChannelDestination('discord-current', 'queue');
+    const started = deferred();
+    const pushed = deferred();
+    const firstDone = deferred();
+    const selectQueued = deferred();
+    const queuedSelected = deferred();
+    const finish = deferred();
+    let followup!: QueryTurnInput;
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false, isSessionInvalid: () => false,
+      query(input) {
+        return {
+          push(message) { if (typeof message !== 'string') followup = message; pushed.resolve(); },
+          end() {}, abort: async () => { pushed.resolve(); selectQueued.resolve(); finish.resolve(); },
+          events: (async function* () {
+            yield { type: 'input-accepted', inputId: input.inputId, scope: 'initial' };
+            started.resolve();
+            await pushed.promise;
+            if (!followup) return;
+            yield { type: 'result', text: '<message to="discord-current">first</message>', resolvedInputIds: [input.inputId] };
+            firstDone.resolve();
+            await selectQueued.promise;
+            yield { type: 'input-accepted', inputId: followup.inputId, scope: 'followup' };
+            queuedSelected.resolve();
+            await finish.promise;
+            yield { type: 'result', text: '<message to="discord-current">second</message>', resolvedInputIds: [followup.inputId] };
+          })(),
+        };
+      },
+    };
+    const snapshots: unknown[][] = [];
+    const controller = new AbortController();
+    const loop = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal,
+      publishTypingActivity: (targets) => snapshots.push(targets) });
+    try {
+      await started.promise;
+      insertMessage('typing-queue-next', 'chat-sdk', { text: '*later' }, { ...route, threadId: 'two' });
+      await firstDone.promise;
+      expect(snapshots.at(-1)).toEqual([]);
+      selectQueued.resolve();
+      await queuedSelected.promise;
+      expect(snapshots.at(-1)).toEqual([{ platformId: 'queue', threadId: 'two' }]);
+      finish.resolve();
+      await waitFor(() => getAckStatus('typing-queue-next') === 'completed', 1500);
+      expect(snapshots.at(-1)).toEqual([]);
+    } finally {
+      pushed.resolve(); selectQueued.resolve(); finish.resolve(); controller.abort();
+      await loop.catch(() => {});
+    }
+  });
+});
+
 describe('formatter', () => {
   it('should format a single chat message', () => {
     insertMessage('m1', 'chat', { sender: 'John', text: 'Hello world' });
@@ -1763,14 +2118,23 @@ describe('poll-loop /stop control messages', () => {
     };
 
     const controller = new AbortController();
-    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+    const typingSnapshots: unknown[] = [];
+    const loopPromise = runPollLoop({
+      provider,
+      providerName: 'test',
+      cwd: '/tmp',
+      signal: controller.signal,
+      publishTypingActivity: (targets) => typingSnapshots.push(targets),
+    });
 
     await queryStarted.promise;
     await releaseReady.promise;
+    expect(typingSnapshots.at(-1)).toEqual([{ platformId: 'chan-1', threadId: null }]);
     dmMsg('stop-active-control', '  /STOP  ');
 
     await waitFor(() => abortCalls === 1 && getAckStatus('stop-active-init') === 'completed', 3000);
     expect(abortCalls).toBe(1);
+    expect(typingSnapshots.at(-1)).toEqual([]);
     expect(pushes).toHaveLength(0);
     expect(getAckStatus('stop-active-control')).toBe('completed');
     expect(getAckStatus('stop-active-init')).toBe('completed');
@@ -3830,9 +4194,12 @@ describe('poll-loop accepted-but-unresolved terminal recovery', () => {
     });
 
     const controller = new AbortController();
-    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+    const recoveryTyping: unknown[] = [];
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal,
+      publishTypingActivity: (targets) => recoveryTyping.push(targets) });
 
     await waitFor(() => getAckStatus('resume-trigger') === 'completed', 3000);
+    expect(recoveryTyping).toEqual([]);
 
     // The recovery context was injected into the top-level prompt (original task +
     // prior progress), XML-escaped.
@@ -3900,7 +4267,7 @@ describe('poll-loop accepted-but-unresolved terminal recovery', () => {
     // The released row: pending, un-acked, the ONLY due work on the route.
     insertMessage(
       'm-1',
-      'chat',
+      'chat-sdk',
       { sender: 'User', text: 'finish the interrupted request' },
       {
         platformId: 'chan-1',
@@ -3918,9 +4285,12 @@ describe('poll-loop accepted-but-unresolved terminal recovery', () => {
     });
 
     const controller = new AbortController();
-    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+    const recoveryTyping: unknown[] = [];
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal,
+      publishTypingActivity: (targets) => recoveryTyping.push(targets) });
 
     await waitFor(() => getAckStatus('m-1') === 'completed', 3000);
+    expect(recoveryTyping).toEqual([[{ platformId: 'chan-1', threadId: null }], []]);
 
     // The recovery context for the entry owning m-1 was injected into the very
     // turn that m-1 itself woke.
@@ -4076,7 +4446,7 @@ describe('poll-loop pre-query failure recovery (Step 4 lines 557-559)', () => {
   it('provider startup/session-creation failure stores recovery and does not write a raw error', async () => {
     insertMessage(
       'startup-fail',
-      'chat',
+      'chat-sdk',
       { sender: 'User', text: 'kick off' },
       {
         platformId: 'chan-1',
@@ -4103,20 +4473,25 @@ describe('poll-loop pre-query failure recovery (Step 4 lines 557-559)', () => {
       threadKey: null,
     };
 
+    let startupCalls = 0;
     const provider: AgentProvider = {
       supportsNativeSlashCommands: false,
       isSessionInvalid: () => false,
       query() {
         // Provider startup / session creation fails synchronously.
+        startupCalls++;
         throw new Error('opencode server failed to spawn');
       },
     };
 
     const controller = new AbortController();
-    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+    const startupTyping: unknown[] = [];
+    const loopPromise = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal,
+      publishTypingActivity: (targets) => startupTyping.push(targets) });
 
     try {
-      await waitFor(() => listRecoveryEntries(scope).length >= 1 || ackStatusFor('startup-fail') === null, 3000);
+      await waitFor(() => startupCalls > 0 && (listRecoveryEntries(scope).length >= 1 || ackStatusFor('startup-fail') === null), 3000);
+      expect(startupTyping).toEqual([]);
       // Either recovery stored (preferred) or rows returned to pending — never
       // settled with a raw provider error.
       const recoveryStored = listRecoveryEntries(scope).length >= 1;

@@ -25,7 +25,11 @@ import { log } from './log.js';
 import { isNonRetryableDeliveryError } from './delivery-errors.js';
 import { normalizeOptions } from './channels/ask-question.js';
 import { clearOutbox, openInboundDb, openOutboundDb, readOutboxFiles } from './session-manager.js';
-import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
+import {
+  applyStoredDiscordTypingActivity,
+  pauseTypingRefreshAfterDelivery,
+  setTypingAdapter,
+} from './modules/typing/index.js';
 import type { OutboundFile } from './channels/adapter.js';
 import type { Session } from './types.js';
 
@@ -53,6 +57,26 @@ const deliveryAttempts = new Map<string, number>();
  * second caller skips will be picked up on the next poll tick (~1s).
  */
 const inflightDeliveries = new Map<string, Promise<number>>();
+const inflightOutboundDbs = new Map<string, Database.Database>();
+const typingReadFailures = new Set<string>();
+
+function readTypingActivity(session: Session, db: Database.Database): void {
+  const timeout = db.pragma('busy_timeout', { simple: true }) as number;
+  try {
+    db.pragma('busy_timeout = 0');
+    const row = db.prepare("SELECT value FROM session_state WHERE key = 'discord_typing_activity'").get() as
+      | { value: string }
+      | undefined;
+    if (row) applyStoredDiscordTypingActivity(session.id, session.agent_group_id, row.value);
+    typingReadFailures.delete(session.id);
+  } catch (err) {
+    if (!typingReadFailures.has(session.id))
+      log.warn('Could not read Discord typing activity', { sessionId: session.id, err });
+    typingReadFailures.add(session.id);
+  } finally {
+    db.pragma(`busy_timeout = ${timeout}`);
+  }
+}
 const deliveryContentionStreaks = new Map<string, number>();
 const DELIVERY_CONTENTION_ERROR_THRESHOLD = 3;
 const suppressedSessionOutbound = new Set<string>();
@@ -184,17 +208,14 @@ export function startSweepDeliveryPoll(): void {
 
 async function pollActive(): Promise<void> {
   if (!activePolling) return;
+  setTimeout(pollActive, ACTIVE_POLL_MS);
 
   try {
     const sessions = getRunningSessions();
-    for (const session of sessions) {
-      await deliverSessionMessages(session);
-    }
+    await Promise.all(sessions.map((session) => deliverSessionMessages(session)));
   } catch (err) {
     log.error('Active delivery poll error', { err });
   }
-
-  setTimeout(pollActive, ACTIVE_POLL_MS);
 }
 
 async function pollSweep(): Promise<void> {
@@ -215,7 +236,11 @@ async function pollSweep(): Promise<void> {
 export async function deliverSessionMessages(session: Session): Promise<void> {
   // Reject re-entry from a concurrent poll on the same session — see the
   // comment on inflightDeliveries above.
-  if (inflightDeliveries.has(session.id)) return;
+  if (inflightDeliveries.has(session.id)) {
+    const db = inflightOutboundDbs.get(session.id);
+    if (db) readTypingActivity(session, db);
+    return;
+  }
 
   const delivery = drainSession(session);
   inflightDeliveries.set(session.id, delivery);
@@ -364,6 +389,8 @@ async function drainSession(session: Session, options: DrainSessionOptions = {})
   if (!outDb || !inDb) return 0;
 
   try {
+    inflightOutboundDbs.set(session.id, outDb);
+    readTypingActivity(session, outDb);
     // Read all due messages from outbound.db (read-only)
     const allDue = getDueOutboundMessages(outDb);
     if (allDue.length === 0) return 0;
@@ -445,6 +472,7 @@ async function drainSession(session: Session, options: DrainSessionOptions = {})
     logStaleOutboundDropped(session, staleDropCount, options.staleReason ?? 'inactive-session-delivery');
     return staleDropCount;
   } finally {
+    if (inflightOutboundDbs.get(session.id) === outDb) inflightOutboundDbs.delete(session.id);
     outDb.close();
     inDb.close();
   }

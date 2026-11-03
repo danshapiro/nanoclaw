@@ -116,4 +116,4 @@ These rules are enforced by convention in `src/session-manager.ts` and `containe
 | `session_routing` | inbound | `writeSessionRouting()` in `src/session-manager.ts` | container `send_message` defaults |
 | `messages_out` | outbound | `container/agent-runner/src/db/messages-out.ts` | `src/delivery.ts` poll loop |
 | `processing_ack` | outbound | `container/agent-runner/src/db/messages-in.ts` | `src/host-sweep.ts` (`syncProcessingAcks`) |
-| `session_state` | outbound | `container/agent-runner/src/db/session-state.ts` | container on startup |
+| `session_state` | outbound | `container/agent-runner/src/db/session-state.ts` | container on startup; host reads ephemeral Discord typing activity during delivery polling |

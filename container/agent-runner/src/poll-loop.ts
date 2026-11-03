@@ -59,6 +59,7 @@ import {
   type ProviderEvent,
 } from './providers/types.js';
 import { bindHostGwsCorrelation, GwsCorrelationLifecycleFault, releaseHostGwsCorrelation } from './gws-correlation.js';
+import { TypingActivity, type TypingDestination } from './typing-activity.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
@@ -347,6 +348,7 @@ export interface PollLoopConfig {
   /** Internal deterministic seams; production uses authenticated host IPC. */
   bindGwsCorrelation?: typeof bindHostGwsCorrelation;
   releaseGwsCorrelation?: typeof releaseHostGwsCorrelation;
+  publishTypingActivity?: (destinations: TypingDestination[]) => void;
   signal?: AbortSignal;
 }
 
@@ -361,6 +363,7 @@ export interface PollLoopConfig {
  * 6. Loop
  */
 export async function runPollLoop(config: PollLoopConfig): Promise<void> {
+  const typingActivity = new TypingActivity(config.publishTypingActivity);
   // Resume the agent's prior session from a previous container run if one
   // was persisted. The continuation is opaque to the poll-loop — the
   // provider decides how to use it (Claude resumes a .jsonl transcript,
@@ -788,6 +791,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     };
     try {
       if (!initialClaim) throw new Error('missing exact initial input claim');
+      typingActivity.select(topLevelInputId, keep);
       const result = await processQuery(
         query,
         routing,
@@ -808,6 +812,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         config,
         parkUnbackedRows,
         parkedUnroutableIds,
+        typingActivity,
       );
       if (result.clearContinuation) {
         // Authoritative clear (explicit provider clear-continuation, positive
@@ -952,6 +957,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           label: 'markProviderRetryUserErrorEmitted',
         });
       }
+    } finally {
+      typingActivity.clear();
     }
     log(`Completed wake for route ${activeRouteKey} (${ids.length} active row(s))`);
   }
@@ -1164,6 +1171,7 @@ async function processQuery(
   // only because it trails existing optional params; the sole production
   // caller passes it.
   parkedIds?: ReadonlySet<string>,
+  typingActivity?: TypingActivity,
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let clearContinuationRequested = false;
@@ -1201,6 +1209,7 @@ async function processQuery(
   // prompt is `accepted` only after the provider emits input-accepted for it,
   // and `resolved` only after a successful result resolves/supersedes it.
   const ledger = new Map<string, InputLedgerEntry>();
+  const followupTypingRows = new Map<string, MessageInRow[]>();
   const boundGwsInputs = ledgerCtx.acceptanceContext.boundGwsInputs;
   ledger.set(ledgerCtx.topLevelInputId, {
     inputId: ledgerCtx.topLevelInputId,
@@ -1234,6 +1243,11 @@ async function processQuery(
     }
     claim.acceptanceObserved = true;
     entry.state = 'accepted';
+    const selectedFollowup = followupTypingRows.get(inputId);
+    if (selectedFollowup) {
+      followupTypingRows.delete(inputId);
+      typingActivity?.select(inputId, selectedFollowup);
+    }
     clearProviderRetrySchedule(providerName, ledgerCtx.activeRouteKey);
     // Resuming a prior interrupted turn: mark its recovery entries in_flight for
     // THIS top-level input. They are NOT consumed yet (mere acceptance never
@@ -1283,6 +1297,9 @@ async function processQuery(
         idsToComplete.push(...claim.messageIds);
       }
       entry.state = entry.claims.every((claim) => claim.state === 'resolved') ? 'resolved' : 'queued';
+      // Later context-only claims can share this input without becoming new
+      // user work. Once its accepted trigger resolves, they must not hold typing.
+      typingActivity?.resolve([inputId]);
     }
     // A successful result that resolves the top-level input also resolves the
     // recovery entries this turn resumed (and completes their owned recovery rows).
@@ -1374,6 +1391,7 @@ async function processQuery(
       if (!userStopRequested) {
         userStopRequested = true;
         await withSqliteRetry(() => writeRoutedMessage(routing, STOP_ACTIVE_ACK), { label: 'writeRoutedMessage' });
+        typingActivity?.clear();
         log(
           JSON.stringify({
             severity: 'info',
@@ -1475,6 +1493,7 @@ async function processQuery(
     try {
       unwrappedOutputNudged = false;
       pendingUnwrappedOutputText = null;
+      if (followupTrigger) followupTypingRows.set(followupInputId, newMessages);
       query.push({
         inputId: followupInputId,
         acceptInput: claim.acceptInput,
@@ -1494,6 +1513,7 @@ async function processQuery(
         }),
       );
       entry.claims = entry.claims.filter((candidate) => candidate !== claim);
+      followupTypingRows.delete(followupInputId);
       entry.messageIds = entry.messageIds.filter((id) => !newIds.includes(id));
       if (entry.claims.length === 0) ledger.delete(followupInputId);
       await withSqliteRetry(() => returnProcessingToPending(newIds, 'followup_enqueue_failed'), {
@@ -1555,6 +1575,7 @@ async function processQuery(
         clearContinuationRequested = true;
         queryContinuation = undefined;
       } else if (event.type === 'interruption') {
+        if (event.terminal) typingActivity?.clear();
         if (userStopRequested) {
           log(
             JSON.stringify({
@@ -1729,6 +1750,7 @@ async function processQuery(
     throw err;
   } finally {
     done = true;
+    typingActivity?.clear();
     clearInterval(pollHandle);
     signal?.removeEventListener('abort', abortQuery);
 

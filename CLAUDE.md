@@ -248,7 +248,7 @@ The container buildkit caches the build context aggressively. `--no-cache` alone
 
 ## Container Runtime (Bun)
 
-The agent container runs on **Bun**; the host runs on **Node** (pnpm). They communicate only via session DBs — no shared modules. Details and rationale: [docs/build-and-runtime.md](docs/build-and-runtime.md).
+The agent container runs on **Bun**; the host runs on **Node** (pnpm). They exchange session messages and typing activity through session DBs and use authenticated host IPC for trusted GWS correlation; they have no shared modules. Details and rationale: [docs/build-and-runtime.md](docs/build-and-runtime.md).
 
 **Gotchas — trigger + action:**
 

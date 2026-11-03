@@ -175,6 +175,11 @@ export function initializeGwsCorrelationLaunchControl(control: GwsCorrelationLau
   };
 }
 
+/** Non-secret identifier of this runner's launch, for ephemeral session activity. */
+export function currentLaunchLeaseId(): string | null {
+  return runtimeLease?.leaseId ?? null;
+}
+
 /** Read the one-shot host launch lease from fd 0, close it, and retain only lexical process memory. */
 export function consumeGwsCorrelationLaunchControlFromStdin(): void {
   const chunks: Buffer[] = [];
