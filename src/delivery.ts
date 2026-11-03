@@ -29,6 +29,7 @@ import {
   applyStoredDiscordTypingActivity,
   pauseTypingRefreshAfterDelivery,
   setTypingAdapter,
+  stopTypingGrace,
 } from './modules/typing/index.js';
 import type { OutboundFile } from './channels/adapter.js';
 import type { Session } from './types.js';
@@ -436,6 +437,23 @@ async function drainSession(session: Session, options: DrainSessionOptions = {})
         // shouldn't get a gap in their typing indicator for them.
         if (msg.kind !== 'system' && msg.channel_type !== 'agent') {
           pauseTypingRefreshAfterDelivery(session.id);
+          try {
+            const content = JSON.parse(msg.content) as {
+              stopTypingFor?: Array<{ platformId?: unknown; threadId?: unknown; inputId?: unknown }>;
+            };
+            for (const target of Array.isArray(content.stopTypingFor) ? content.stopTypingFor : []) {
+              if (
+                target &&
+                typeof target.platformId === 'string' &&
+                typeof target.inputId === 'string' &&
+                (typeof target.threadId === 'string' || target.threadId === null)
+              ) {
+                stopTypingGrace(session.id, 'discord', target.platformId, target.threadId, target.inputId);
+              }
+            }
+          } catch {
+            // Delivery already handles malformed content; this optional marker is best effort.
+          }
         }
       } catch (err) {
         const attempts = (deliveryAttempts.get(msg.id) ?? 0) + 1;

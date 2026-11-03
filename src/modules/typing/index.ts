@@ -60,7 +60,10 @@ interface TypingTarget {
 
 let adapter: TypingAdapter | null = null;
 const typingRefreshers = new Map<string, TypingTarget>();
-const discordRefreshers = new Map<string, Map<string, TypingTarget & { active: boolean; expiresAt: number }>>();
+const discordRefreshers = new Map<
+  string,
+  Map<string, TypingTarget & { active: boolean; expiresAt: number; graces: Map<string, number> }>
+>();
 const containerOwners = new Map<string, string>();
 const typingFailures = new Set<string>();
 const invalidSnapshots = new Set<string>();
@@ -69,12 +72,20 @@ function discordKey(platformId: string, threadId: string | null): string {
   return JSON.stringify([platformId, threadId]);
 }
 
+function hasWakeGrace(graces: Map<string, number>): boolean {
+  for (const [id, startedAt] of graces) {
+    if (Date.now() - startedAt >= TYPING_GRACE_MS) graces.delete(id);
+  }
+  return graces.size > 0;
+}
+
 function startDiscordRefresh(
   sessionId: string,
   agentGroupId: string,
   platformId: string,
   threadId: string | null,
   active: boolean,
+  inputId?: string,
 ): void {
   let targets = discordRefreshers.get(sessionId);
   if (!targets) {
@@ -84,9 +95,10 @@ function startDiscordRefresh(
   const key = discordKey(platformId, threadId);
   const existing = targets.get(key);
   if (existing) {
+    if (active && !existing.active) existing.graces.delete('');
     existing.active ||= active;
     if (!active) {
-      existing.startedAt = Date.now();
+      existing.graces.set(inputId ?? '', Date.now());
       void triggerTyping('discord', platformId, threadId, sessionId);
     }
     return;
@@ -95,10 +107,8 @@ function startDiscordRefresh(
   const interval = setInterval(() => {
     const entry = discordRefreshers.get(sessionId)?.get(key);
     if (!entry) return;
-    if (
-      (entry.active && Date.now() < entry.expiresAt) ||
-      (!entry.active && Date.now() - entry.startedAt < TYPING_GRACE_MS)
-    ) {
+    const withinGrace = hasWakeGrace(entry.graces);
+    if ((entry.active && Date.now() < entry.expiresAt) || withinGrace) {
       void triggerTyping('discord', platformId, threadId, sessionId);
     } else {
       clearInterval(entry.interval);
@@ -114,10 +124,11 @@ function startDiscordRefresh(
     platformId,
     threadId,
     interval,
-    startedAt: Date.now(),
+    startedAt: active ? 0 : Date.now(),
     pausedUntil: 0,
     active,
     expiresAt: Number.POSITIVE_INFINITY,
+    graces: new Map(active ? [] : [[inputId ?? '', Date.now()]]),
   });
 }
 
@@ -138,7 +149,12 @@ export function setTypingContainerOwner(sessionId: string, leaseId: string): voi
 
 export function applyStoredDiscordTypingActivity(sessionId: string, agentGroupId: string, value: string): void {
   try {
-    const snapshot = JSON.parse(value) as { leaseId?: unknown; updatedAt?: unknown; destinations?: unknown };
+    const snapshot = JSON.parse(value) as {
+      leaseId?: unknown;
+      updatedAt?: unknown;
+      destinations?: unknown;
+      acknowledgedMessageIds?: unknown;
+    };
     if (!containerOwners.has(sessionId) || snapshot.leaseId !== containerOwners.get(sessionId)) return;
     if (
       typeof snapshot.updatedAt !== 'number' ||
@@ -160,6 +176,16 @@ export function applyStoredDiscordTypingActivity(sessionId: string, agentGroupId
     )
       return;
     const expiry = snapshot.updatedAt + 15_000;
+    if (
+      expiry > Date.now() &&
+      Array.isArray(snapshot.acknowledgedMessageIds) &&
+      snapshot.acknowledgedMessageIds.every((id: unknown) => typeof id === 'string')
+    ) {
+      const acknowledged = new Set(snapshot.acknowledgedMessageIds);
+      for (const entry of discordRefreshers.get(sessionId)?.values() ?? []) {
+        for (const id of acknowledged) entry.graces.delete(id);
+      }
+    }
     applyDiscordTypingActivity(sessionId, agentGroupId, expiry > Date.now() ? snapshot.destinations : [], expiry);
     invalidSnapshots.delete(sessionId);
   } catch {
@@ -177,8 +203,11 @@ export function applyDiscordTypingActivity(
   const keys = new Set(destinations.map(({ platformId, threadId }) => discordKey(platformId, threadId)));
   for (const [key, entry] of discordRefreshers.get(sessionId) ?? []) {
     if (entry.active && !keys.has(key)) {
-      clearInterval(entry.interval);
-      discordRefreshers.get(sessionId)?.delete(key);
+      entry.active = false;
+      if (!hasWakeGrace(entry.graces)) {
+        clearInterval(entry.interval);
+        discordRefreshers.get(sessionId)?.delete(key);
+      }
       log.info('Discord typing activity ended', {
         sessionId,
         agentGroupId,
@@ -230,9 +259,10 @@ export function startTypingRefresh(
   channelType: string,
   platformId: string,
   threadId: string | null,
+  inputId?: string,
 ): void {
   if (channelType === 'discord') {
-    startDiscordRefresh(sessionId, agentGroupId, platformId, threadId, false);
+    startDiscordRefresh(sessionId, agentGroupId, platformId, threadId, false, inputId);
     return;
   }
   const existing = typingRefreshers.get(sessionId);
@@ -290,13 +320,6 @@ export function startTypingRefresh(
  * pushes it back on. No-op if no refresh is active for this session.
  */
 export function pauseTypingRefreshAfterDelivery(sessionId: string): void {
-  for (const [key, target] of discordRefreshers.get(sessionId) ?? []) {
-    if (!target.active) {
-      clearInterval(target.interval);
-      discordRefreshers.get(sessionId)?.delete(key);
-    }
-  }
-  if (discordRefreshers.get(sessionId)?.size === 0) discordRefreshers.delete(sessionId);
   const entry = typingRefreshers.get(sessionId);
   if (!entry) return;
   entry.pausedUntil = Date.now() + POST_DELIVERY_PAUSE_MS;
@@ -319,6 +342,7 @@ export function stopTypingGrace(
   channelType: string,
   platformId: string,
   threadId: string | null,
+  inputId?: string,
 ): void {
   if (channelType !== 'discord') {
     stopTypingRefresh(sessionId);
@@ -326,9 +350,13 @@ export function stopTypingGrace(
   }
   const key = discordKey(platformId, threadId);
   const entry = discordRefreshers.get(sessionId)?.get(key);
-  if (entry && !entry.active) {
-    clearInterval(entry.interval);
-    discordRefreshers.get(sessionId)?.delete(key);
-    if (discordRefreshers.get(sessionId)?.size === 0) discordRefreshers.delete(sessionId);
+  if (entry) {
+    if (inputId === undefined) entry.graces.clear();
+    else entry.graces.delete(inputId);
+    if (!entry.active && !hasWakeGrace(entry.graces)) {
+      clearInterval(entry.interval);
+      discordRefreshers.get(sessionId)?.delete(key);
+      if (discordRefreshers.get(sessionId)?.size === 0) discordRefreshers.delete(sessionId);
+    }
   }
 }

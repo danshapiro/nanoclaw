@@ -802,13 +802,20 @@ async function deliverToAgent(
       agentEvent.channelType,
       agentEvent.platformId,
       agentEvent.threadId,
+      routedMessageId,
     );
     const freshSession = getSession(session.id);
     if (freshSession) {
       try {
         await wakeContainer(freshSession);
       } catch (err) {
-        stopTypingGrace(session.id, agentEvent.channelType, agentEvent.platformId, agentEvent.threadId);
+        stopTypingGrace(
+          session.id,
+          agentEvent.channelType,
+          agentEvent.platformId,
+          agentEvent.threadId,
+          routedMessageId,
+        );
         throw err;
       }
     }

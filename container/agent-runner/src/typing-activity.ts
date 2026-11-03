@@ -4,33 +4,32 @@ import { currentLaunchLeaseId } from './gws-correlation.js';
 
 export type TypingDestination = { platformId: string; threadId: string | null };
 
-/** Only selected Discord bridge trigger rows represent Discord-origin work. */
-function destinationsFor(rows: MessageInRow[]): TypingDestination[] {
-  return rows
-    .filter((row) => row.kind === 'chat-sdk' && row.trigger === 1 && row.channel_type === 'discord' && row.platform_id)
-    .map((row) => ({ platformId: row.platform_id!, threadId: row.thread_id }));
-}
-
 export class TypingActivity {
-  private readonly inputs = new Map<string, TypingDestination[]>();
+  private readonly inputs = new Map<string, { destinations: TypingDestination[]; messageIds: string[] }>();
+  private readonly completed = new Map<string, number>();
   private timer: ReturnType<typeof setInterval> | undefined;
   private failures = 0;
-  private readonly publish: ((targets: TypingDestination[]) => void) | undefined;
+  private readonly publish: ((targets: TypingDestination[], acknowledgedMessageIds: string[]) => void) | undefined;
 
   constructor(
-    publish?: (targets: TypingDestination[]) => void,
+    publish?: (targets: TypingDestination[], acknowledgedMessageIds: string[]) => void,
     private readonly sessionId: string | null = process.env.NANOCLAW_SESSION_ID ?? null,
   ) {
     const lease = currentLaunchLeaseId();
-    this.publish = publish ?? (lease ? (targets) => writeTypingActivity(lease, targets) : undefined);
+    this.publish = publish ?? (lease ? (targets, ids) => writeTypingActivity(lease, targets, ids) : undefined);
   }
 
   private update(): void {
     const unique = new Map<string, TypingDestination>();
-    for (const targets of this.inputs.values())
-      for (const target of targets) unique.set(JSON.stringify(target), target);
+    const now = Date.now();
+    for (const [id, completedAt] of this.completed) if (now - completedAt >= 15_000) this.completed.delete(id);
+    const acknowledged = new Set(this.completed.keys());
+    for (const input of this.inputs.values()) {
+      for (const target of input.destinations) unique.set(JSON.stringify(target), target);
+      for (const id of input.messageIds) acknowledged.add(id);
+    }
     try {
-      this.publish?.([...unique.values()]);
+      this.publish?.([...unique.values()], [...acknowledged]);
       if (this.failures)
         console.error(
           JSON.stringify({
@@ -62,9 +61,15 @@ export class TypingActivity {
   }
 
   select(inputId: string, rows: MessageInRow[]): void {
-    const destinations = destinationsFor(rows);
-    if (!destinations.length) return;
-    this.inputs.set(inputId, destinations);
+    // Only selected Discord bridge trigger rows represent Discord-origin work.
+    const selected = rows.filter(
+      (row) => row.kind === 'chat-sdk' && row.trigger === 1 && row.channel_type === 'discord' && row.platform_id,
+    );
+    if (!selected.length) return;
+    this.inputs.set(inputId, {
+      destinations: selected.map((row) => ({ platformId: row.platform_id!, threadId: row.thread_id })),
+      messageIds: selected.map((row) => row.id),
+    });
     this.update();
     if (!this.timer) {
       this.timer = setInterval(() => this.update(), 5000);
@@ -74,7 +79,13 @@ export class TypingActivity {
 
   resolve(inputIds: string[]): void {
     let changed = false;
-    for (const id of inputIds) changed = this.inputs.delete(id) || changed;
+    for (const id of inputIds) {
+      const input = this.inputs.get(id);
+      if (!input) continue;
+      for (const messageId of input.messageIds) this.completed.set(messageId, Date.now());
+      this.inputs.delete(id);
+      changed = true;
+    }
     if (changed) this.update();
   }
 

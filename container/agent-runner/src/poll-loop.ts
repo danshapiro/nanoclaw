@@ -187,7 +187,7 @@ async function ownExhaustedPreacceptRetry(
  * outbound writes go through this so the agent's own progress/result/relay rows
  * are harvestable into route-scoped recovery and never leak across conversations.
  */
-function writeRoutedMessage(routing: RoutingContext, text: string): void {
+function writeRoutedMessage(routing: RoutingContext, text: string, stopMessages: MessageInRow[] = []): void {
   // Delivery-side sanitation: fallback paths (e.g. delivering the agent's raw
   // final text after an ignored unwrapped-output nudge) can carry leftover
   // `<answer>`/`<message to=…>` wrapper tags or blocks addressed to
@@ -224,7 +224,16 @@ function writeRoutedMessage(routing: RoutingContext, text: string): void {
     route_key: routing.routeKey ?? null,
     messaging_group_id: routing.messagingGroupId ?? null,
     is_group: routing.isGroup ?? null,
-    content: JSON.stringify({ text: sanitized.text }),
+    content: JSON.stringify({
+      text: sanitized.text,
+      ...(stopMessages.length
+        ? {
+            stopTypingFor: stopMessages
+              .filter((row) => row.kind === 'chat-sdk' && row.channel_type === 'discord' && row.platform_id)
+              .map((row) => ({ platformId: row.platform_id, threadId: row.thread_id, inputId: row.id })),
+          }
+        : {}),
+    }),
   });
 }
 
@@ -507,7 +516,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       const stopRouting = extractRouting(idleStopMessages);
       stampRoutingScope(stopRouting, activeRouteScope);
       await withSqliteRetry(() => markCompleted(idleStopMessages.map((m) => m.id)), { label: 'markCompleted' });
-      await withSqliteRetry(() => writeRoutedMessage(stopRouting, STOP_IDLE_ACK), { label: 'writeRoutedMessage' });
+      await withSqliteRetry(() => writeRoutedMessage(stopRouting, STOP_IDLE_ACK, idleStopMessages), {
+        label: 'writeRoutedMessage',
+      });
       log(
         JSON.stringify({
           severity: 'info',
@@ -1390,7 +1401,9 @@ async function processQuery(
       await withSqliteRetry(() => markCompleted(sameRouteIds), { label: 'markCompleted' });
       if (!userStopRequested) {
         userStopRequested = true;
-        await withSqliteRetry(() => writeRoutedMessage(routing, STOP_ACTIVE_ACK), { label: 'writeRoutedMessage' });
+        await withSqliteRetry(() => writeRoutedMessage(routing, STOP_ACTIVE_ACK, stopMessages), {
+          label: 'writeRoutedMessage',
+        });
         typingActivity?.clear();
         log(
           JSON.stringify({

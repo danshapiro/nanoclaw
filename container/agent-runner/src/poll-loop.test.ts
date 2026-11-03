@@ -2372,6 +2372,10 @@ describe('poll-loop /stop control messages', () => {
 
     expect(provider.calls).toBe(0);
     expect(outboundTexts().filter((t) => t.includes('No active'))).toHaveLength(1);
+    const row = getOutboundDb().query("SELECT content FROM messages_out WHERE kind = 'chat'").get() as { content: string };
+    expect(JSON.parse(row.content).stopTypingFor).toEqual([
+      { platformId: 'chan-1', threadId: null, inputId: 'stop-idle-control' },
+    ]);
   });
 
   it('splits /stop out of a cold-start batch without dropping other work', async () => {

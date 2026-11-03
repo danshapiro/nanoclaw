@@ -658,14 +658,24 @@ export class ClaudeProvider implements AgentProvider {
     async function* translateEvents(): AsyncGenerator<ProviderEvent> {
       let messageCount = 0;
       let sdkStreamCompleted = false;
+      const sdkIterator = sdkResult[Symbol.asyncIterator]();
+      let pendingSdkMessage = sdkIterator.next();
       try {
-        for await (const message of sdkResult) {
+        while (true) {
+          // A consumed prompt is itself an event: the SDK may then spend a
+          // long time thinking without yielding anything on its output stream.
+          const accepted = new Promise<'accepted'>((resolve) => {
+            acceptWaker = () => resolve('accepted');
+            if (acceptedBuffer.length > 0) acceptWaker();
+          });
+          const next = await Promise.race([pendingSdkMessage, accepted]);
+          acceptWaker = null;
           if (aborted) return;
-          messageCount++;
-
-          // Emit any input-accepted events queued since the last SDK event,
-          // before translating this one, so the poll loop sees acceptance first.
           for (const ev of drainAccepted()) yield ev;
+          if (next === 'accepted') continue;
+          if (next.done) break;
+          const message = next.value;
+          messageCount++;
 
           // Yield activity for every SDK event so the poll loop knows the agent is working
           yield { type: 'activity' };
@@ -719,6 +729,7 @@ export class ClaudeProvider implements AgentProvider {
             const tn = message as { summary?: string };
             yield { type: 'progress', message: tn.summary || 'Task notification' };
           }
+          pendingSdkMessage = sdkIterator.next();
         }
         sdkStreamCompleted = true;
         // Flush any trailing acceptance events the SDK never interleaved.
@@ -726,6 +737,16 @@ export class ClaudeProvider implements AgentProvider {
           for (const ev of drainAccepted()) yield ev;
         }
       } finally {
+        acceptWaker = null;
+        if (!sdkStreamCompleted && sdkIterator.return) {
+          // There can be a pending SDK next() while an acceptance is yielded.
+          // Request iterator cleanup without waiting for that next() here:
+          // the caller may need this generator to return before it can abort
+          // the SDK and unblock that pending read.
+          void sdkIterator.return().catch((err) => {
+            log(JSON.stringify({ severity: 'warn', event: 'claude_sdk_iterator_close_failed', error: String(err) }));
+          });
+        }
         // Prompt consumption is the provider-submission boundary. If abort
         // races after the SDK has consumed a prompt but before it emits its
         // next event, preserve that acceptance signal so the poll loop keeps

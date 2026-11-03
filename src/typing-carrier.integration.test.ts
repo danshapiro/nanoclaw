@@ -8,6 +8,7 @@ import {
   applyStoredDiscordTypingActivity,
   setTypingAdapter,
   setTypingContainerOwner,
+  startTypingRefresh,
   stopTypingRefresh,
 } from './modules/typing/index.js';
 
@@ -31,8 +32,8 @@ it('transfers Bun activity to Node, rejects another owner, and recovers from a l
     'PRAGMA journal_mode=DELETE; CREATE TABLE session_state (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)',
   );
   const writer = path.join(process.cwd(), 'container/agent-runner/src/typing-activity.test-writer.ts');
-  const publish = (lease: string, destinations: unknown[]) =>
-    spawnSync(bun, [writer, dbPath, lease, JSON.stringify(destinations), String(Date.now())], {
+  const publish = (lease: string, destinations: unknown[], ids: string[] = []) =>
+    spawnSync(bun, [writer, dbPath, lease, JSON.stringify(destinations), String(Date.now()), JSON.stringify(ids)], {
       encoding: 'utf8',
       timeout: 3000,
     });
@@ -62,7 +63,8 @@ it('transfers Bun activity to Node, rejects another owner, and recovers from a l
     expect(blocked.status).not.toBe(0);
     expect(blocked.error).toBeUndefined();
     db.exec('ROLLBACK');
-    expect(publish('new', []).status).toBe(0);
+    startTypingRefresh('carrier', 'agent', 'discord', 'channel', 'thread', 'message-2');
+    expect(publish('new', [], ['message-2']).status).toBe(0);
     applyStoredDiscordTypingActivity('carrier', 'agent', read());
     const calls = setTyping.mock.calls.length;
     await vi.advanceTimersByTimeAsync(8000);

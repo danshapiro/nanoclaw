@@ -4,7 +4,7 @@ import { writeTypingActivityToDb } from './db/session-state.js';
 const db = new Database(process.argv[2]);
 if (process.argv[5]) Date.now = () => Number(process.argv[5]);
 try {
-  writeTypingActivityToDb(db, process.argv[3], JSON.parse(process.argv[4]));
+  writeTypingActivityToDb(db, process.argv[3], JSON.parse(process.argv[4]), JSON.parse(process.argv[6] ?? '[]'));
 } finally {
   db.close();
 }

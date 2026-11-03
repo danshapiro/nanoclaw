@@ -17,6 +17,43 @@ afterEach(() => {
 });
 
 describe('Discord request typing', () => {
+  it('keeps another wake in the same thread when one wake fails', async () => {
+    vi.useFakeTimers();
+    const setTyping = vi.fn().mockResolvedValue(undefined);
+    setTypingAdapter({ setTyping });
+    startTypingRefresh('typing-test', 'agent', 'discord', 'channel', 'thread', 'first');
+    startTypingRefresh('typing-test', 'agent', 'discord', 'channel', 'thread', 'failed');
+    stopTypingGrace('typing-test', 'discord', 'channel', 'thread', 'failed');
+    setTyping.mockClear();
+    await vi.advanceTimersByTimeAsync(8000);
+    expect(setTyping).toHaveBeenCalledTimes(2);
+  });
+  it('ends same-thread wake grace after its selected request completes even if the active snapshot was missed', async () => {
+    vi.useFakeTimers();
+    const setTyping = vi.fn().mockResolvedValue(undefined);
+    setTypingAdapter({ setTyping });
+    setTypingContainerOwner('typing-test', 'owner');
+    const snapshot = (destinations: unknown[], acknowledgedMessageIds: string[]) =>
+      JSON.stringify({
+        leaseId: 'owner',
+        updatedAt: Date.now(),
+        destinations,
+        acknowledgedMessageIds,
+      });
+    startTypingRefresh('typing-test', 'agent', 'discord', 'channel', 'thread', 'first');
+    applyStoredDiscordTypingActivity(
+      'typing-test',
+      'agent',
+      snapshot([{ platformId: 'channel', threadId: 'thread' }], ['first']),
+    );
+    startTypingRefresh('typing-test', 'agent', 'discord', 'channel', 'thread', 'second');
+    applyStoredDiscordTypingActivity('typing-test', 'agent', snapshot([], ['first']));
+    await vi.advanceTimersByTimeAsync(4000);
+    const before = setTyping.mock.calls.length;
+    applyStoredDiscordTypingActivity('typing-test', 'agent', snapshot([], ['first', 'second']));
+    await vi.advanceTimersByTimeAsync(8000);
+    expect(setTyping).toHaveBeenCalledTimes(before);
+  });
   it('refreshes during quiet active work and intermediate delivery, then stops at completion', async () => {
     vi.useFakeTimers();
     const setTyping = vi.fn().mockResolvedValue(undefined);
@@ -81,7 +118,7 @@ describe('Discord request typing', () => {
     startTypingRefresh('typing-test', 'agent', 'discord', 'channel', 'failed');
     stopTypingGrace('typing-test', 'discord', 'channel', 'failed');
     startTypingRefresh('typing-test', 'agent', 'discord', 'channel', 'idle-stop');
-    pauseTypingRefreshAfterDelivery('typing-test');
+    stopTypingGrace('typing-test', 'discord', 'channel', 'idle-stop');
     const before = setTyping.mock.calls.length;
     await vi.advanceTimersByTimeAsync(8000);
     expect(setTyping.mock.calls.slice(before)).toEqual([

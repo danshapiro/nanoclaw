@@ -46,21 +46,23 @@ function setValue(key: string, value: string): void {
 export function writeTypingActivity(
   leaseId: string,
   destinations: Array<{ platformId: string; threadId: string | null }>,
+  acknowledgedMessageIds: string[] = [],
 ): void {
-  writeTypingActivityToDb(getOutboundDb(), leaseId, destinations);
+  writeTypingActivityToDb(getOutboundDb(), leaseId, destinations, acknowledgedMessageIds);
 }
 
 export function writeTypingActivityToDb(
   db: Database,
   leaseId: string,
   destinations: Array<{ platformId: string; threadId: string | null }>,
+  acknowledgedMessageIds: string[] = [],
 ): void {
   const timeout = (db.query('PRAGMA busy_timeout').get() as { timeout: number }).timeout;
   try {
     db.exec('PRAGMA busy_timeout = 0');
     db.prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)').run(
       'discord_typing_activity',
-      JSON.stringify({ leaseId, updatedAt: Date.now(), destinations }),
+      JSON.stringify({ leaseId, updatedAt: Date.now(), destinations, acknowledgedMessageIds }),
       new Date().toISOString(),
     );
   } finally {

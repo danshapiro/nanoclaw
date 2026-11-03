@@ -43,7 +43,12 @@ import {
   setDeliveryAdapter,
   suppressSessionOutbound,
 } from './delivery.js';
-import { setTypingContainerOwner, stopTypingRefresh } from './modules/typing/index.js';
+import {
+  applyDiscordTypingActivity,
+  setTypingContainerOwner,
+  startTypingRefresh,
+  stopTypingRefresh,
+} from './modules/typing/index.js';
 
 function now(): string {
   return new Date().toISOString();
@@ -175,6 +180,125 @@ afterEach(() => {
 });
 
 describe('deliverSessionMessages — concurrent invocations', () => {
+  it('preserves a newer wake grace across another delivery and previous activity completion', async () => {
+    vi.useFakeTimers();
+    seedAgentAndChannel();
+    createMessagingGroup({
+      id: 'mg-discord',
+      channel_type: 'discord',
+      platform_id: 'channel',
+      name: 'Discord',
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    createMessagingGroupAgent({
+      id: 'mga-discord',
+      messaging_group_id: 'mg-discord',
+      agent_group_id: 'ag-1',
+      engage_mode: 'mention',
+      engage_pattern: null,
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'shared',
+      priority: 0,
+      created_at: now(),
+    });
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'previous-response');
+    const db = new Database(outboundDbPath('ag-1', session.id));
+    db.prepare(
+      "UPDATE messages_out SET channel_type = 'discord', platform_id = 'channel', thread_id = 'one' WHERE id = ?",
+    ).run('previous-response');
+    db.close();
+    const setTyping = vi.fn().mockResolvedValue(undefined);
+    const deliver = vi.fn().mockResolvedValue('sent');
+    setDeliveryAdapter({ deliver, setTyping });
+    try {
+      startTypingRefresh(session.id, 'ag-1', 'discord', 'channel', 'one');
+      applyDiscordTypingActivity(session.id, 'ag-1', [{ platformId: 'channel', threadId: 'one' }]);
+      await vi.advanceTimersByTimeAsync(4000);
+      startTypingRefresh(session.id, 'ag-1', 'discord', 'channel', 'one');
+      startTypingRefresh(session.id, 'ag-1', 'discord', 'channel', 'two');
+      await deliverSessionMessages(session);
+      expect(deliver).toHaveBeenCalledWith('discord', 'channel', 'one', 'chat', expect.any(String), undefined);
+      applyDiscordTypingActivity(session.id, 'ag-1', []);
+      setTyping.mockClear();
+      await vi.advanceTimersByTimeAsync(8000);
+      expect(setTyping.mock.calls).toEqual([
+        ['discord', 'channel', 'one'],
+        ['discord', 'channel', 'two'],
+        ['discord', 'channel', 'one'],
+        ['discord', 'channel', 'two'],
+      ]);
+      await vi.advanceTimersByTimeAsync(8000);
+      expect(setTyping).toHaveBeenCalledTimes(6);
+    } finally {
+      stopTypingRefresh(session.id);
+      vi.useRealTimers();
+    }
+  });
+
+  it('ends only the stop command wake grace when its acknowledgement is delivered', async () => {
+    vi.useFakeTimers();
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'stop-ack');
+    const db = new Database(outboundDbPath('ag-1', session.id));
+    db.prepare('UPDATE messages_out SET content = ? WHERE id = ?').run(
+      JSON.stringify({
+        text: 'No active turn is running.',
+        stopTypingFor: [{ platformId: 'channel', threadId: 'stopped', inputId: 'stop' }],
+      }),
+      'stop-ack',
+    );
+    db.close();
+    const setTyping = vi.fn().mockResolvedValue(undefined);
+    setDeliveryAdapter({ deliver: vi.fn().mockResolvedValue('sent'), setTyping });
+    try {
+      startTypingRefresh(session.id, 'ag-1', 'discord', 'channel', 'stopped', 'stop');
+      startTypingRefresh(session.id, 'ag-1', 'discord', 'channel', 'other');
+      await deliverSessionMessages(session);
+      setTyping.mockClear();
+      await vi.advanceTimersByTimeAsync(8000);
+      expect(setTyping.mock.calls).toEqual([
+        ['discord', 'channel', 'other'],
+        ['discord', 'channel', 'other'],
+      ]);
+    } finally {
+      stopTypingRefresh(session.id);
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not end a later request in the same thread when an older stop acknowledgement arrives', async () => {
+    vi.useFakeTimers();
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'stop-ack');
+    const db = new Database(outboundDbPath('ag-1', session.id));
+    db.prepare('UPDATE messages_out SET content = ? WHERE id = ?').run(
+      JSON.stringify({
+        text: 'Stopped.',
+        stopTypingFor: [{ platformId: 'channel', threadId: 'thread', inputId: 'stop' }],
+      }),
+      'stop-ack',
+    );
+    db.close();
+    const setTyping = vi.fn().mockResolvedValue(undefined);
+    setDeliveryAdapter({ deliver: vi.fn().mockResolvedValue('sent'), setTyping });
+    try {
+      startTypingRefresh(session.id, 'ag-1', 'discord', 'channel', 'thread', 'stop');
+      startTypingRefresh(session.id, 'ag-1', 'discord', 'channel', 'thread', 'newer');
+      await deliverSessionMessages(session);
+      setTyping.mockClear();
+      await vi.advanceTimersByTimeAsync(8000);
+      expect(setTyping).toHaveBeenCalledTimes(2);
+    } finally {
+      stopTypingRefresh(session.id);
+      vi.useRealTimers();
+    }
+  });
   it('reads current runner typing activity even when there are no outgoing messages', async () => {
     seedAgentAndChannel();
     const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
