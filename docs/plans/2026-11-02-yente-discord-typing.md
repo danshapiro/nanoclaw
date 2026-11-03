@@ -11,11 +11,11 @@ Make Yente reliably show the Discord typing indicator while a user request is ac
 
 ### Explicit constraints
 - Keep the solution simple and use the existing periodic Discord typing refresh.
-- Use the-usual workflow, stopping after load-bearing validation.
+- Complete the-usual workflow through implementation and verification.
 - Do not deploy or mutate production without explicit authorization.
 
 ### Accepted tradeoffs and residuals
-- None stated.
+- Existing requests already in progress when the change takes effect do not require retroactive typing support.
 
 **Goal:** Keep Discord typing refreshed during actual selected user-request work, including quiet thinking and tools, and stop refreshing when that work ends.
 
@@ -25,7 +25,7 @@ Make Yente reliably show the Discord typing indicator while a user request is ac
 
 ## Global Constraints
 
-- Work in `/home/dan/code/nanoclaw-yente-typing/.worktrees/yente-discord-typing` and follow its `AGENTS.md` and `docs/build-and-runtime.md`. Do not deploy, mutate production, or call live Discord without explicit authorization. This run stops after Stage 2.
+- Work in `/home/dan/code/nanoclaw-yente-typing/.worktrees/yente-discord-typing` and follow its `AGENTS.md` and `docs/build-and-runtime.md`. Do not deploy, mutate production, or call live Discord without explicit authorization.
 - Queued, delayed, parked, accumulated, or held requests are not active thinking. Keep the existing immediate routing hint as a one-shot call; do not start a periodic timer at routing time. Scheduled tasks and context-only messages must not generate typing.
 - A result or terminal failure ends the matching selected work; user cancellation ends its display on acknowledgement, while existing asynchronous provider cleanup remains unchanged. An intermediate delivery does not end a request. Do not infer activity from pending, processing or recovery acknowledgements, a recovery ownership record, or heartbeat freshness.
 - Retain the host's existing four-second Discord refresh; do not open SQLite synchronously on refresh. Do not add a recovery scheduler, persistent typing ledger, general IPC framework, or alter GWS correlation. Preserve non-Discord behavior and existing recovery safety.
@@ -35,7 +35,7 @@ Make Yente reliably show the Discord typing indicator while a user request is ac
 
 The new runner-to-host signal and its failure behavior have not been implemented or behaviorally proven. Use the existing per-container stdout stream as the first candidate: it is already piped to the host and is separate from GWS. Publish a bounded, distinguishable complete activity set on changes and periodically while the runner is alive, so later received snapshots correct a missed or duplicated update. Parse arbitrary chunks and unrelated output without blocking provider work, associate data with the current container lease, and discard stale process data. Confirm the actual stream closure and backpressure behavior in local tests before treating this approach as reliable. A permanently broken stream is not repaired by repeating snapshots; diagnose it with structured error logs and use the existing verified container-stop cleanup, without pretending a socket close means work ended. If local behavioral tests cannot establish a safe way to maintain accurate activity on this path, stop and revisit the transport decision rather than assert success or introduce untested recovery machinery.
 
-Existing persisted rows can lack the original source. A historical redirected request may have discarded its source thread, and the stored reply address or shared session cannot recover it. For such a resumed request, use an authoritative retained source only if available; otherwise do not guess another destination, log the missing source, and do not send typing to an unrelated conversation. The actual incidence at rollout is unknown. This is a limitation for old in-flight redirected requests, not a claim that all old rows were redirected or that their original source is recoverable. Implementation and deployment planning must surface this limitation; no rollout is authorized here.
+Existing persisted rows can lack the original source. A historical redirected request may have discarded its source thread, and the stored reply address or shared session cannot recover it. Requests already in progress when the change takes effect do not require retroactive typing support. Do not add recovery machinery to reconstruct their missing source or guess a destination. New requests still need source and recovery handling even when they start in an existing Discord thread or are interrupted later. No rollout is authorized here.
 
 ## File responsibilities
 
@@ -47,9 +47,9 @@ Existing persisted rows can lack the original source. A historical redirected re
 
 ## Stage 2: Load-bearing validation
 
-Evidence and decisions are recorded in `../.the-usual-logs/yente-discord-typing/load-bearing-ledger.md` relative to the worktree's parent and its linked reports. Existing acknowledgements do not prove active execution, ordinary due wakes miss direct recovery wakes, original source is not always reconstructible from old rows, and the proposed per-refresh inbound opener may mutate schema. The selected signal and source migration are feasibility decisions, not claims of observed new behavior. Stage 2 ends with this correction, ledger, focused plan commit, and receipt. Do not begin plan review, implementation, or deployment in this run.
+Evidence and decisions are recorded in `../.the-usual-logs/yente-discord-typing/load-bearing-ledger.md` relative to the worktree's parent and its linked reports. Existing acknowledgements do not prove active execution, ordinary due wakes miss direct recovery wakes, original source is not always reconstructible from old rows, and the proposed per-refresh inbound opener may mutate schema. The selected signal and source migration are feasibility decisions, not claims of observed new behavior. Stage 2 is complete. The user has since authorized continuing and clarified that retroactive support for requests already in progress is unnecessary.
 
-## Task 2: Request-scoped Discord typing (for a later continuation)
+## Task 2: Request-scoped Discord typing
 
 **Files:** Modify the files assigned above. Extend `src/router.test.ts`, `src/delivery.test.ts`, `src/container-runner.test.ts`, `src/host-sweep.revival.test.ts`, `src/channels/chat-sdk-bridge.test.ts`, `container/agent-runner/src/poll-loop.test.ts`, and relevant DB migration tests. Add a focused test adjacent to the production stream parser only if the existing container runner fixture cannot exercise its real input. Update `docs/build-and-runtime.md` when the transport is implemented.
 
@@ -65,4 +65,4 @@ Evidence and decisions are recorded in `../.the-usual-logs/yente-discord-typing/
 
 ## Planning self-review
 
-The complete User Request remains unchanged once. Task 2 maps quiet work, intermediate output, completion, overlaps, failure, cancellation, recovery, source fidelity and non-Discord preservation to observable behavior. No mock replaces the production signal: local fixtures must exercise the real runner-to-host path and real stored rows. The proposed transport and source migration are not yet proven; exact stream encoding and behavior under permanent failure remain implementation-stage validation concerns, not verified facts. Historical redirected source loss is explicitly disclosed rather than silently repaired with a wrong destination. This plan gives concrete ownership, commands and behavioral cases without presenting unexecuted implementation code as verified. No production or live-Discord test is authorized in this run.
+The complete current User Request appears once. Task 2 maps quiet work, intermediate output, completion, overlaps, failure, cancellation, recovery, source fidelity and non-Discord preservation to observable behavior. No mock replaces the production signal: local fixtures must exercise the real runner-to-host path and real stored rows. The proposed transport and source migration are not yet proven; exact stream encoding and behavior under permanent failure remain implementation-stage validation concerns, not verified facts. Retroactive support for already-active requests is unnecessary; retaining source and recovery IDs for new requests remains necessary because a request can begin in an existing thread or be interrupted after the change. This plan gives concrete ownership, commands and behavioral cases without presenting unexecuted implementation code as verified. No production or live-Discord test is authorized in this run.
