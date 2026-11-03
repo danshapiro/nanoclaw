@@ -60,6 +60,58 @@ interface TypingTarget {
 
 let adapter: TypingAdapter | null = null;
 const typingRefreshers = new Map<string, TypingTarget>();
+const discordRefreshers = new Map<string, Map<string, TypingTarget & { active: boolean }>>();
+
+function discordKey(platformId: string, threadId: string | null): string {
+  return JSON.stringify([platformId, threadId]);
+}
+
+function startDiscordRefresh(
+  sessionId: string,
+  agentGroupId: string,
+  platformId: string,
+  threadId: string | null,
+  active: boolean,
+): void {
+  let targets = discordRefreshers.get(sessionId);
+  if (!targets) {
+    targets = new Map();
+    discordRefreshers.set(sessionId, targets);
+  }
+  const key = discordKey(platformId, threadId);
+  const existing = targets.get(key);
+  if (existing) {
+    existing.active ||= active;
+    if (!active) {
+      existing.startedAt = Date.now();
+      void triggerTyping('discord', platformId, threadId);
+    }
+    return;
+  }
+  void triggerTyping('discord', platformId, threadId);
+  const interval = setInterval(() => {
+    const entry = discordRefreshers.get(sessionId)?.get(key);
+    if (!entry) return;
+    if (entry.active || Date.now() - entry.startedAt < TYPING_GRACE_MS) {
+      void triggerTyping('discord', platformId, threadId);
+    } else {
+      clearInterval(entry.interval);
+      discordRefreshers.get(sessionId)?.delete(key);
+      if (discordRefreshers.get(sessionId)?.size === 0) discordRefreshers.delete(sessionId);
+    }
+  }, TYPING_REFRESH_MS);
+  interval.unref();
+  targets.set(key, {
+    agentGroupId,
+    channelType: 'discord',
+    platformId,
+    threadId,
+    interval,
+    startedAt: Date.now(),
+    pausedUntil: 0,
+    active,
+  });
+}
 
 /**
  * Bind the typing module to the channel delivery adapter so it can
@@ -70,6 +122,29 @@ const typingRefreshers = new Map<string, TypingTarget>();
  */
 export function setTypingAdapter(a: TypingAdapter): void {
   adapter = a;
+}
+
+export function applyDiscordTypingActivity(
+  sessionId: string,
+  agentGroupId: string,
+  destinations: Array<{ platformId: string; threadId: string | null }>,
+): void {
+  const oldEntry = typingRefreshers.get(sessionId);
+  if (oldEntry?.channelType === 'discord' && destinations.length > 0) {
+    clearInterval(oldEntry.interval);
+    typingRefreshers.delete(sessionId);
+    startDiscordRefresh(sessionId, agentGroupId, oldEntry.platformId, oldEntry.threadId, false);
+  }
+  const keys = new Set(destinations.map(({ platformId, threadId }) => discordKey(platformId, threadId)));
+  for (const [key, entry] of discordRefreshers.get(sessionId) ?? []) {
+    if (entry.active && !keys.has(key)) {
+      clearInterval(entry.interval);
+      discordRefreshers.get(sessionId)?.delete(key);
+    }
+  }
+  for (const { platformId, threadId } of destinations) {
+    startDiscordRefresh(sessionId, agentGroupId, platformId, threadId, true);
+  }
 }
 
 async function triggerTyping(channelType: string, platformId: string, threadId: string | null): Promise<void> {
@@ -97,6 +172,10 @@ export function startTypingRefresh(
   platformId: string,
   threadId: string | null,
 ): void {
+  if (channelType === 'discord' && discordRefreshers.has(sessionId)) {
+    startDiscordRefresh(sessionId, agentGroupId, platformId, threadId, false);
+    return;
+  }
   const existing = typingRefreshers.get(sessionId);
   if (existing) {
     // Already refreshing. Fire an immediate tick for the new inbound
@@ -158,6 +237,8 @@ export function pauseTypingRefreshAfterDelivery(sessionId: string): void {
 }
 
 export function stopTypingRefresh(sessionId: string): void {
+  for (const entry of discordRefreshers.get(sessionId)?.values() ?? []) clearInterval(entry.interval);
+  discordRefreshers.delete(sessionId);
   const entry = typingRefreshers.get(sessionId);
   if (!entry) return;
   clearInterval(entry.interval);
