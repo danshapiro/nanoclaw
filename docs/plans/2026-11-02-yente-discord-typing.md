@@ -17,33 +17,6 @@ Make Yente reliably show the Discord typing indicator while a user request is ac
 ### Accepted tradeoffs and residuals
 - None stated.
 
-# Scope rule
-
-The User Request defines need. Deliver its Requested result and Explicit constraints by the simplest complete means, and build only what they require. Preserve pre-existing code and behavior unless satisfying the User Request requires changing them.
-
-A reviewer's suggested remedy is advisory; the finding itself is what must be resolved.
-
-Every substantiated finding is binding: the run may not report success until it reaches a final disposition. Binding never requires a fix.
-
-- `CLEARED` — fixed, with evidence: corrected, or simplified away by removing machinery this run introduced or materially expanded so the finding no longer applies.
-- `UNSUBSTANTIATED` — the assessment finds the finding wrong, with the reason recorded.
-- `OUT-OF-SCOPE` — available to Major, Minor, and Nit findings. The finding does not block the Requested result or an Explicit constraint. Record a one-line reason; the recap lists it as a suggestion.
-- `OPTIONAL` — available only to Minor and Nit findings. Probably a real improvement, but nothing requires it. Record a two-sentence reason: one sentence says why it would improve the work, one says why it is not required. The recap lists it; it never blocks anything and may be acted on at any time or never.
-
-Apply this scope as given — never rewrite the User Request to fit the work. If no compliant clearing exists, mark the result `FAILED/non-converged` and report the conflict.
-
-# Turn economy
-
-Batching changes scheduling only: preserve every call, instruction, output, acceptance criterion, evidence item, required order, and gate. This policy is a fixed safety boundary; orchestrators that load it apply it as written.
-
-- INDEPENDENCE: Put ready independent calls in the same tool-call response only after confirming all inputs are known, no call needs another's result, and no call can change state another reads or writes. Treat uncertain independence as a dependency.
-- SAFE REPORT FAN-OUT: Calls that only read shared state may batch. Each may also write only to its own predeclared, disjoint report path — one per topic under the run's reports directory — after shared directory setup. A shared ledger, anchor, receipt, index, Git state, or other shared artifact is not a disjoint report.
-- MUTATION BOUNDARY: Run mutations of one worktree one at a time: one mutating delegate per worktree at any moment. Parallel mutators require isolated worktrees with independent Git state and disjoint external targets. Calls are dependent when either can change state the other reads or writes. A mutating delegate without a bounded write scope owns its whole worktree.
-- CALL BOUNDARY: A batch combines scheduling only. Each call keeps its own instruction, scope, output, acceptance criteria, and evidence; do not widen or merge calls merely to reduce turns. Attribute every result to the call that produced it.
-- JOIN: After a batch finishes, account for every result before any downstream action that depends on those results, including synthesis, repair, review, commit, or another gate.
-- DURABILITY: Record each result in the run's durable record — [usual-run-contract](usual-run-contract.md) owns its schema — in the first response after the result lands and before reading any full report; then read only the sections needed. Put ready independent bookkeeping in the same tool-call response; never defer it to a phase-end sweep.
-- REVIEW: Preserve each review's specified exact instruction, context isolation, and provider/model settings; wait for its verdict before dependent repair. When a batching assumption proves wrong or a boundary is violated, tighten: isolate the affected calls and run them one at a time.
-
 **Goal:** Keep Discord typing refreshed during actual selected user-request work, including quiet thinking and tools, and stop refreshing when that work ends.
 
 **Architecture:** The runner reports the current set of selected Discord user requests, identified by message ID and original source destination, to its owning host process. The host uses that set to drive the existing immediate Discord typing call and four-second refresh, grouping by physical destination and retaining a destination while any of its requests is active. New inbound rows preserve the original source separately from the reply destination; the runner publishes activity only when it actually selects work, including a recovery it actually resumes, and removes it when the work ends or is returned, held, or cancelled.
@@ -92,4 +65,4 @@ Evidence and decisions are recorded in `../.the-usual-logs/yente-discord-typing/
 
 ## Planning self-review
 
-The complete User Request and its scope and scheduling rules remain unchanged once. Task 2 maps quiet work, intermediate output, completion, overlaps, failure, cancellation, recovery, source fidelity and non-Discord preservation to observable behavior. No mock replaces the production signal: local fixtures must exercise the real runner-to-host path and real stored rows. The proposed transport and source migration are not yet proven; exact stream encoding and behavior under permanent failure remain implementation-stage validation concerns, not verified facts. Historical redirected source loss is explicitly disclosed rather than silently repaired with a wrong destination. This plan gives concrete ownership, commands and behavioral cases without presenting unexecuted implementation code as verified. No production or live-Discord test is authorized in this run.
+The complete User Request remains unchanged once. Task 2 maps quiet work, intermediate output, completion, overlaps, failure, cancellation, recovery, source fidelity and non-Discord preservation to observable behavior. No mock replaces the production signal: local fixtures must exercise the real runner-to-host path and real stored rows. The proposed transport and source migration are not yet proven; exact stream encoding and behavior under permanent failure remain implementation-stage validation concerns, not verified facts. Historical redirected source loss is explicitly disclosed rather than silently repaired with a wrong destination. This plan gives concrete ownership, commands and behavioral cases without presenting unexecuted implementation code as verified. No production or live-Discord test is authorized in this run.
