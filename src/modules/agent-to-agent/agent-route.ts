@@ -19,13 +19,21 @@
  * core throws with a "module not installed" message so retry → mark failed.
  */
 import fs from 'fs';
+import { createHash } from 'crypto';
 import path from 'path';
 
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { getSession } from '../../db/sessions.js';
 import { wakeContainer } from '../../container-runner.js';
 import { log } from '../../log.js';
-import { resolveSession, sessionDir, writeSessionMessage } from '../../session-manager.js';
+import {
+  openInboundDb,
+  readOutboxFiles,
+  resolveSession,
+  sessionDir,
+  writeSessionMessage,
+} from '../../session-manager.js';
+import { DeliveryUnavailableError } from '../../delivery-errors.js';
 import type { Session } from '../../types.js';
 import { hasDestination } from './db/agent-destinations.js';
 
@@ -63,9 +71,8 @@ export function isSafeAttachmentName(name: string): boolean {
  * as relative to `/workspace/`, matching how channel-inbound attachments
  * are surfaced today.
  *
- * Missing source files and unsafe (path-traversal) filenames are skipped
- * with a warning rather than failing the whole route — a bad filename
- * reference shouldn't kill the accompanying text.
+ * All declared attachments must be safe and readable before any message is
+ * inserted. A partial transfer is an error, never an acknowledged route.
  */
 export function forwardAttachedFiles(
   source: { agentGroupId: string; sessionId: string; messageId: string; filenames: string[] },
@@ -73,45 +80,28 @@ export function forwardAttachedFiles(
 ): ForwardedAttachment[] {
   if (source.filenames.length === 0) return [];
 
-  const sourceDir = path.join(sessionDir(source.agentGroupId, source.sessionId), 'outbox', source.messageId);
-  if (!fs.existsSync(sourceDir)) {
-    log.warn('agent-route: source outbox dir missing, no files forwarded', {
-      sourceMsgId: source.messageId,
-      sourceDir,
-    });
-    return [];
-  }
-
-  const targetInboxDir = path.join(sessionDir(target.agentGroupId, target.sessionId), 'inbox', target.messageId);
-  fs.mkdirSync(targetInboxDir, { recursive: true });
-
-  const attachments: ForwardedAttachment[] = [];
   for (const filename of source.filenames) {
     if (!isSafeAttachmentName(filename)) {
-      log.warn('agent-route: rejecting unsafe attachment filename (path traversal attempt?)', {
-        sourceMsgId: source.messageId,
-        filename,
-      });
-      continue;
+      throw new DeliveryUnavailableError(`Unsafe agent attachment name for message ${source.messageId}`, false);
     }
-    const src = path.join(sourceDir, filename);
-    if (!fs.existsSync(src)) {
-      log.warn('agent-route: referenced file missing in source outbox, skipped', {
-        sourceMsgId: source.messageId,
-        filename,
-      });
-      continue;
-    }
-    const dst = path.join(targetInboxDir, filename);
-    fs.copyFileSync(src, dst);
-    attachments.push({
-      name: filename,
-      filename,
-      type: 'file',
-      localPath: `inbox/${target.messageId}/${filename}`,
-    });
   }
-  return attachments;
+  const files = readOutboxFiles(source.agentGroupId, source.sessionId, source.messageId, source.filenames);
+  const targetInboxDir = path.join(sessionDir(target.agentGroupId, target.sessionId), 'inbox', target.messageId);
+  fs.mkdirSync(targetInboxDir, { recursive: true });
+  return files.map(({ filename, data }) => {
+    const dst = path.join(targetInboxDir, filename);
+    const fd = fs.openSync(
+      dst,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | fs.constants.O_NOFOLLOW,
+      0o600,
+    );
+    try {
+      fs.writeFileSync(fd, data);
+    } finally {
+      fs.closeSync(fd);
+    }
+    return { name: filename, filename, type: 'file' as const, localPath: `inbox/${target.messageId}/${filename}` };
+  });
 }
 
 export interface RoutableAgentMessage {
@@ -136,32 +126,69 @@ export async function routeAgentMessage(msg: RoutableAgentMessage, session: Sess
   if (!getAgentGroup(targetAgentGroupId)) {
     throw new Error(`target agent group ${targetAgentGroupId} not found for message ${msg.id}`);
   }
-  const { session: targetSession } = resolveSession(targetAgentGroupId, null, null, 'agent-shared');
-  const a2aMsgId = `a2a-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  // The source-owned ledger fixes the target session before inserting any
+  // message. Replays after a wake failure reuse that session and message ID.
+  const sourceDb = openInboundDb(session.agent_group_id, session.id);
+  let targetSessionId: string;
+  try {
+    sourceDb.exec(`CREATE TABLE IF NOT EXISTS agent_route_targets (
+      message_out_id TEXT PRIMARY KEY,
+      target_agent_id TEXT NOT NULL,
+      target_session_id TEXT NOT NULL
+    )`);
+    let route = sourceDb
+      .prepare('SELECT target_agent_id, target_session_id FROM agent_route_targets WHERE message_out_id = ?')
+      .get(msg.id) as { target_agent_id: string; target_session_id: string } | undefined;
+    if (!route) {
+      const { session: target } = resolveSession(targetAgentGroupId, null, null, 'agent-shared');
+      sourceDb
+        .prepare('INSERT OR IGNORE INTO agent_route_targets VALUES (?, ?, ?)')
+        .run(msg.id, targetAgentGroupId, target.id);
+      route = sourceDb
+        .prepare('SELECT target_agent_id, target_session_id FROM agent_route_targets WHERE message_out_id = ?')
+        .get(msg.id) as { target_agent_id: string; target_session_id: string };
+    }
+    if (route.target_agent_id !== targetAgentGroupId) throw new Error(`Agent route target changed for ${msg.id}`);
+    targetSessionId = route.target_session_id;
+  } finally {
+    sourceDb.close();
+  }
+  const targetSession = getSession(targetSessionId);
+  if (!targetSession || targetSession.status !== 'active' || targetSession.agent_group_id !== targetAgentGroupId) {
+    throw new DeliveryUnavailableError(`Agent route target session is inactive or missing for ${msg.id}`, false);
+  }
+  const a2aMsgId =
+    'a2a-' +
+    createHash('sha256')
+      .update(JSON.stringify([session.agent_group_id, session.id, msg.id, targetAgentGroupId]))
+      .digest('hex');
+  const targetDb = openInboundDb(targetAgentGroupId, targetSession.id);
+  let alreadyInserted: boolean;
+  try {
+    alreadyInserted = !!targetDb.prepare('SELECT 1 FROM messages_in WHERE id = ?').get(a2aMsgId);
+  } finally {
+    targetDb.close();
+  }
+  if (!alreadyInserted) {
+    const forwardedContent = forwardFileAttachments(msg, a2aMsgId, session, targetAgentGroupId, targetSession.id);
+    writeSessionMessage(targetAgentGroupId, targetSession.id, {
+      id: a2aMsgId,
+      kind: 'chat',
+      timestamp: new Date().toISOString(),
+      platformId: session.agent_group_id,
+      channelType: 'agent',
+      threadId: null,
+      content: forwardedContent,
+    });
+    log.info('Agent message routed', {
+      from: session.agent_group_id,
+      to: targetAgentGroupId,
+      targetSession: targetSession.id,
+      a2aMsgId,
+      forwardedFileCount: countForwardedFiles(forwardedContent),
+    });
+  }
 
-  // If the source message references files (via `send_file`), forward the
-  // bytes from the source's outbox into the target's inbox so the target
-  // agent can actually see and re-send them. Without this, agent-to-agent
-  // file attachments look like they arrive but the target has no way to
-  // read the bytes — they live in a session dir it doesn't mount.
-  const forwardedContent = forwardFileAttachments(msg, a2aMsgId, session, targetAgentGroupId, targetSession.id);
-
-  writeSessionMessage(targetAgentGroupId, targetSession.id, {
-    id: a2aMsgId,
-    kind: 'chat',
-    timestamp: new Date().toISOString(),
-    platformId: session.agent_group_id,
-    channelType: 'agent',
-    threadId: null,
-    content: forwardedContent,
-  });
-  log.info('Agent message routed', {
-    from: session.agent_group_id,
-    to: targetAgentGroupId,
-    targetSession: targetSession.id,
-    a2aMsgId,
-    forwardedFileCount: countForwardedFiles(forwardedContent),
-  });
   const fresh = getSession(targetSession.id);
   if (fresh) await wakeContainer(fresh);
 }
@@ -188,9 +215,12 @@ function forwardFileAttachments(
     return msg.content;
   }
   const files = parsed.files as unknown;
-  if (!Array.isArray(files) || files.length === 0) return msg.content;
-  const filenames = files.filter((f): f is string => typeof f === 'string');
-  if (filenames.length === 0) return msg.content;
+  if (files === undefined) return msg.content;
+  if (!Array.isArray(files) || files.some((f) => typeof f !== 'string')) {
+    throw new DeliveryUnavailableError(`Invalid agent attachment list for message ${msg.id}`, false);
+  }
+  if (files.length === 0) return msg.content;
+  const filenames = files as string[];
 
   const attachments = forwardAttachedFiles(
     {

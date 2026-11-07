@@ -3,11 +3,8 @@ import { describe, expect, it } from 'vitest';
 import { isSafeAttachmentName } from './agent-route.js';
 
 /**
- * `forwardAttachedFiles` has a filesystem side that's awkward to unit-test
- * without mocking DATA_DIR. The guarantee worth pinning is that the
- * filename validator rejects everything that could escape the inbox dir —
- * `forwardAttachedFiles` runs this guard before any I/O, so traversal is
- * impossible as long as this matrix holds.
+ * Cover the filename validator independently of the filesystem-backed
+ * forwarding and wake-retry tests in write-destinations.test.ts.
  */
 describe('isSafeAttachmentName', () => {
   it('accepts plain filenames', () => {

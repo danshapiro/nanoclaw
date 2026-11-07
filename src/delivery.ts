@@ -468,9 +468,17 @@ function markStaleOutboundDropped(inDb: Database.Database, messageId: string): v
     .run(messageId);
 }
 
-function shouldPreserveQuarantined(db: Database.Database, messageId: string): boolean {
-  const state = getDeliveryAttempt(db, messageId)?.state;
-  return state === 'sending' || state === 'unknown' || state === 'failed';
+function shouldPreserveQuarantined(db: Database.Database, messageId: string, sessionId: string): boolean {
+  const attempt = getDeliveryAttempt(db, messageId);
+  if (attempt?.state === 'retry') {
+    // An archived session is no longer polled. Keep a visible terminal
+    // incident and the outbox rather than silently discarding a pending retry.
+    setDeliveryAttempt(db, messageId, 'failed', attempt.attempts, 0, 'Session archived while delivery was pending');
+    markDeliveryFailed(db, messageId);
+    log.error('Pending outbound delivery quarantined after session archived', { messageId, sessionId });
+    return true;
+  }
+  return attempt?.state === 'sending' || attempt?.state === 'unknown' || attempt?.state === 'failed';
 }
 
 function shouldPreserveForSchedulerDrain(msg: { kind: string; content: string }): boolean {
@@ -541,7 +549,7 @@ async function drainSession(session: Session, options: DrainSessionOptions = {})
     if (shouldDropSessionOutbound(session.id)) {
       let staleDropCount = 0;
       for (const msg of undelivered) {
-        if (shouldPreserveForSchedulerDrain(msg) || shouldPreserveQuarantined(inDb, msg.id)) continue;
+        if (shouldPreserveForSchedulerDrain(msg) || shouldPreserveQuarantined(inDb, msg.id, session.id)) continue;
         markStaleOutboundDropped(inDb, msg.id);
         staleDropCount++;
       }
@@ -552,7 +560,7 @@ async function drainSession(session: Session, options: DrainSessionOptions = {})
     let staleDropCount = 0;
     for (const msg of undelivered) {
       if (shouldDropSessionOutbound(session.id)) {
-        if (shouldPreserveForSchedulerDrain(msg) || shouldPreserveQuarantined(inDb, msg.id)) continue;
+        if (shouldPreserveForSchedulerDrain(msg) || shouldPreserveQuarantined(inDb, msg.id, session.id)) continue;
         markStaleOutboundDropped(inDb, msg.id);
         staleDropCount++;
         continue;
@@ -956,14 +964,8 @@ async function deliverMessage(
  * Delivery action registry.
  *
  * Modules register handlers for system-kind outbound message actions via
- * `registerDeliveryAction`. Core checks the registry first in
- * `handleSystemAction` and falls through to the inline switch when no
- * handler is registered. The switch will shrink as modules are extracted
- * (scheduling, approvals, agent-to-agent) and eventually only its default
- * branch remains.
- *
- * Default when no handler registered and the switch doesn't match: log
- * "Unknown system action" and return.
+ * `registerDeliveryAction`. Unknown actions fail visibly and are quarantined
+ * rather than being acknowledged as delivered.
  */
 export type DeliveryActionHandler = (
   content: Record<string, unknown>,
@@ -1001,7 +1003,7 @@ async function handleSystemAction(
     return;
   }
 
-  log.warn('Unknown system action', { action });
+  throw new DeliveryUnavailableError(`Unknown system action: ${action ?? '(missing)'}`, false);
 }
 
 export function stopDeliveryPolls(): void {

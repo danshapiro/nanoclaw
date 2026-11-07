@@ -2,7 +2,7 @@
  * migrate-v2 step: channel-auth
  *
  * Copy channel auth state from v1 to v2 for selected channels.
- * Handles both env keys and on-disk auth files (Baileys, Matrix, etc.)
+ * Handles both env keys and on-disk auth files for supported channels.
  * per the CHANNEL_AUTH_REGISTRY.
  *
  * Usage: pnpm exec tsx setup/migrate-v2/channel-auth.ts <v1-path> <channel1> [channel2...]
@@ -69,6 +69,11 @@ function main(): void {
 
   if (!v1Path || channels.length === 0) {
     console.error('Usage: tsx setup/migrate-v2/channel-auth.ts <v1-path> <channel1> [channel2...]');
+    process.exit(1);
+  }
+
+  if (channels.some((channel) => ['whatsapp', 'wa', 'whatsapp-cloud'].includes(channel.toLowerCase()))) {
+    console.error('WhatsApp messaging is not supported; its credentials will not be copied.');
     process.exit(1);
   }
 

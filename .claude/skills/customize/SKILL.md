@@ -106,7 +106,7 @@ launchctl load ~/Library/LaunchAgents/$(launchd_label).plist
 User: "Add Telegram as an input channel"
 
 1. Ask: "Should Telegram use the same @Andy trigger, or a different one?"
-2. Ask: "Should Telegram messages create separate conversation contexts, or share with WhatsApp groups?"
+2. Ask: "Should Telegram messages create separate conversation contexts, or share with existing groups?"
 3. Create `src/channels/telegram.ts` implementing the `Channel` interface (see `src/channels/discord.ts`)
 4. Add the channel to `main()` in `src/index.ts`
 5. Tell user how to authenticate and test

@@ -52,7 +52,7 @@ Parse the status block. Key fields: STATUS, STATE_DIR, CHANNELS, WORKSPACE_FILES
 - "I found your OpenClaw installation at `<STATE_DIR>`."
 - Identity: name from IDENTITY.md (if found)
 - Workspace files: which of SOUL.md, USER.md, MEMORY.md, IDENTITY.md exist
-- Channels: list each, note which NanoClaw supports (whatsapp, telegram, slack, discord) and which it doesn't
+- Channels: list each, note which NanoClaw supports (telegram, slack, discord) and which it doesn't
 - Daily memory files: count (if any)
 - Skills: count and names (from workspace, shared, personal, project locations)
 - Cron jobs: count and names
@@ -63,7 +63,7 @@ Then explain the key architectural differences. Don't dump a table — paraphras
 
 - **Container isolation:** NanoClaw runs each agent in an isolated Linux container (Docker or Apple Container). OpenClaw runs everything in one process. This means stronger isolation but also means each group is its own sandbox.
 - **Group-based memory:** In OpenClaw, all groups under one agent share the same SOUL.md, MEMORY.md, and IDENTITY.md. In NanoClaw, each group has its own filesystem and CLAUDE.md. Shared state goes in `groups/global/CLAUDE.md` (mounted read-only into all non-main containers).
-- **Channel skills:** In OpenClaw, channels are configured in `openclaw.json`. In NanoClaw, channels are installed as code via skills (`/add-telegram`, `/add-whatsapp`, etc.) and configured through `.env` variables.
+- **Channel skills:** In OpenClaw, channels are configured in `openclaw.json`. In NanoClaw, channels are installed as code via skills (`/add-telegram`, `/add-discord`, etc.) and configured through `.env` variables.
 - **Simpler config:** NanoClaw has no config file — behavior is in the code and `CLAUDE.md` files. Credentials live in `.env` or the OneCLI vault.
 
 AskUserQuestion: "Ready to start migrating? I'll go through each area one at a time."
@@ -111,7 +111,7 @@ pnpm exec tsx setup/index.ts --step register -- --jid "<nanoclaw_jid>" --name "<
 
 Only pass `--assistant-name` on the first registration (it updates all CLAUDE.md templates globally).
 
-Folder naming: `<channel>_<name-slug>` (e.g. `whatsapp_family-chat`, `telegram_dev-team`). Ask the user to confirm each group's name and folder.
+Folder naming: `<channel>_<name-slug>` (e.g. `discord_family-chat`, `telegram_dev-team`). Ask the user to confirm each group's name and folder.
 
 For the first/primary group, add `--is-main --no-trigger-required`. Other groups default to requiring a trigger prefix.
 
@@ -160,7 +160,7 @@ If found, offer to save to `.env`. This pre-fills the NanoClaw setup credential 
 ### Sender Allowlists
 
 Read the channel configs for access control settings. OpenClaw stores these per-channel:
-- `channels.<channel>.allowFrom` — array of allowed sender IDs (E.164 for WhatsApp, numeric IDs for Telegram)
+- `channels.<channel>.allowFrom` — array of allowed sender IDs (numeric IDs for Telegram)
 - `channels.<channel>.dmPolicy` — `"open"`, `"allowlist"`, `"disabled"`
 - `channels.<channel>.groupPolicy` — `"open"`, `"allowlist"`, `"disabled"`
 - `channels.<channel>.groupAllowFrom` — array of allowed group member IDs
@@ -317,7 +317,7 @@ If these exist, briefly mention them and explain:
 
 For each channel found in the discovery results, handle it based on NanoClaw support:
 
-### Supported channels (whatsapp, telegram, slack, discord)
+### Supported channels (telegram, slack, discord)
 
 Run the credential extraction script with `--write-env .env` so it writes credentials directly to NanoClaw's `.env` file. The script never emits raw credential values to stdout — only masked versions.
 
@@ -348,11 +348,10 @@ The script writes the credential directly to `.env` using the correct NanoClaw v
 
 For Slack: there are two credentials (bot token + app token). The script handles both in one run — check `HAS_CREDENTIAL_2` and `NANOCLAW_ENV_VAR_2` in the status block.
 
-**WhatsApp special case:** WhatsApp uses QR/pairing-code authentication, not a token. Do not copy auth state from OpenClaw — encryption sessions become stale after copying and messages fail to decrypt. Authentication will be handled during `/setup` via the `/add-whatsapp` skill (takes about 60 seconds with a pairing code). Just note that WhatsApp was configured and move on.
 
 **Allowlist note:** If the channel had `allowFrom` or group policies, these were already handled in Phase 2 (sender allowlists). Mention that the allowlist file was created earlier.
 
-### Unsupported channels (signal, matrix, irc, msteams, feishu, etc.)
+### Unsupported channels (whatsapp, signal, matrix, irc, msteams, feishu, etc.)
 
 Explain briefly: "NanoClaw doesn't have a `<channel>` integration yet, but channels are added over time via skills. Any groups from this channel were already registered in Phase 1 — they'll activate when the channel is added."
 

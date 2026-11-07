@@ -21,7 +21,10 @@ import {
   initTestDb,
   runMigrations,
 } from '../../db/index.js';
-import { inboundDbPath, resolveSession, sessionDir } from '../../session-manager.js';
+import { inboundDbPath, outboundDbPath, resolveSession, sessionDir } from '../../session-manager.js';
+import { deliverSessionMessages } from '../../delivery.js';
+import { wakeContainer } from '../../container-runner.js';
+import { archiveSession } from '../../db/sessions.js';
 import { createDestination } from './db/agent-destinations.js';
 import { routeAgentMessage } from './agent-route.js';
 import { writeDestinations } from './write-destinations.js';
@@ -62,6 +65,7 @@ beforeEach(() => {
   const db = initTestDb();
   runMigrations(db);
 
+  vi.mocked(wakeContainer).mockReset().mockResolvedValue(undefined);
   seedAgent('ag-primary', 'Primary');
   seedAgent('ag-child', 'Child');
   seedAgent('ag-parent', 'Parent');
@@ -210,6 +214,119 @@ describe('writeDestinations channel projection policy', () => {
 });
 
 describe('agent-to-agent attachment forwarding', () => {
+  it('reuses one durable target message after a wake failure', async () => {
+    createDestination({
+      agent_group_id: 'ag-primary',
+      local_name: 'child',
+      target_type: 'agent',
+      target_id: 'ag-child',
+      created_at: now(),
+    });
+    const { session: source } = resolveSession('ag-primary', 'mg-user', null, 'shared');
+    const { session: target } = resolveSession('ag-child', null, null, 'agent-shared');
+    const msg = { id: 'source-id', platform_id: 'ag-child', content: JSON.stringify({ text: 'hello' }) };
+    vi.mocked(wakeContainer).mockRejectedValueOnce(new Error('wake failed')).mockResolvedValueOnce(undefined);
+    await expect(routeAgentMessage(msg, source)).rejects.toThrow('wake failed');
+    await routeAgentMessage(msg, source);
+    const db = new Database(inboundDbPath('ag-child', target.id));
+    const rows = db.prepare("SELECT id FROM messages_in WHERE channel_type='agent'").all();
+    db.close();
+    expect(rows).toHaveLength(1);
+    expect(wakeContainer).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries a failed wake through the real delivery loop without duplicating the agent message', async () => {
+    createDestination({
+      agent_group_id: 'ag-primary',
+      local_name: 'child',
+      target_type: 'agent',
+      target_id: 'ag-child',
+      created_at: now(),
+    });
+    const { session: source } = resolveSession('ag-primary', 'mg-user', null, 'shared');
+    const { session: target } = resolveSession('ag-child', null, null, 'agent-shared');
+    const out = new Database(outboundDbPath('ag-primary', source.id));
+    out
+      .prepare(
+        "INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, thread_id, content) VALUES (?, datetime('now'), 'chat', ?, 'agent', NULL, ?)",
+      )
+      .run('agent-loop', 'ag-child', JSON.stringify({ text: 'hello' }));
+    out.close();
+    vi.mocked(wakeContainer).mockRejectedValueOnce(new Error('wake failed')).mockResolvedValueOnce(undefined);
+    await deliverSessionMessages(source);
+    const sourceDb = new Database(inboundDbPath('ag-primary', source.id));
+    expect(sourceDb.prepare('SELECT state FROM delivery_attempts WHERE message_out_id=?').get('agent-loop')).toEqual({
+      state: 'retry',
+    });
+    sourceDb.prepare('UPDATE delivery_attempts SET next_attempt_ms=0 WHERE message_out_id=?').run('agent-loop');
+    sourceDb.close();
+    await deliverSessionMessages(source);
+    const targetDb = new Database(inboundDbPath('ag-child', target.id));
+    expect(targetDb.prepare("SELECT count(*) AS n FROM messages_in WHERE channel_type='agent'").get()).toEqual({
+      n: 1,
+    });
+    targetDb.close();
+    const receiptDb = new Database(inboundDbPath('ag-primary', source.id));
+    expect(receiptDb.prepare('SELECT status FROM delivered WHERE message_out_id=?').get('agent-loop')).toEqual({
+      status: 'delivered',
+    });
+    receiptDb.close();
+    expect(wakeContainer).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not move a retry into a newly created target after its recorded target is archived', async () => {
+    createDestination({
+      agent_group_id: 'ag-primary',
+      local_name: 'child',
+      target_type: 'agent',
+      target_id: 'ag-child',
+      created_at: now(),
+    });
+    const { session: source } = resolveSession('ag-primary', 'mg-user', null, 'shared');
+    const { session: target } = resolveSession('ag-child', null, null, 'agent-shared');
+    const msg = { id: 'source-archive', platform_id: 'ag-child', content: JSON.stringify({ text: 'hello' }) };
+    vi.mocked(wakeContainer).mockRejectedValueOnce(new Error('wake failed'));
+    await expect(routeAgentMessage(msg, source)).rejects.toThrow('wake failed');
+    archiveSession(target.id);
+    await expect(routeAgentMessage(msg, source)).rejects.toThrow('target session is inactive');
+    const db = new Database(inboundDbPath('ag-child', target.id));
+    expect(db.prepare("SELECT count(*) AS n FROM messages_in WHERE channel_type='agent'").get()).toEqual({ n: 1 });
+    db.close();
+    expect(wakeContainer).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['missing.txt', '../escape.txt', 'link.txt'])(
+    'fails closed on missing or unsafe attachment %s',
+    async (filename) => {
+      createDestination({
+        agent_group_id: 'ag-primary',
+        local_name: 'child',
+        target_type: 'agent',
+        target_id: 'ag-child',
+        created_at: now(),
+      });
+      const { session: source } = resolveSession('ag-primary', 'mg-user', null, 'shared');
+      const { session: target } = resolveSession('ag-child', null, null, 'agent-shared');
+      const sourceOutbox = `${sessionDir('ag-primary', source.id)}/outbox/agent-missing`;
+      fs.mkdirSync(sourceOutbox, { recursive: true });
+      if (filename === 'link.txt') fs.symlinkSync(inboundDbPath('ag-child', target.id), `${sourceOutbox}/link.txt`);
+      await expect(
+        routeAgentMessage(
+          {
+            id: 'agent-missing',
+            platform_id: 'ag-child',
+            content: JSON.stringify({ text: 'hello', files: [filename] }),
+          },
+          source,
+        ),
+      ).rejects.toThrow();
+      const db = new Database(inboundDbPath('ag-child', target.id));
+      expect(db.prepare("SELECT count(*) AS n FROM messages_in WHERE channel_type='agent'").get()).toEqual({ n: 0 });
+      db.close();
+      expect(wakeContainer).not.toHaveBeenCalled();
+    },
+  );
+
   it('preserves the forwarded localPath when writeSessionMessage stores an agent message', async () => {
     createDestination({
       agent_group_id: 'ag-primary',

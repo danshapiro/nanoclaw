@@ -189,10 +189,6 @@ const CHANNEL_SPECS: Record<string, ChannelCredentialSpec> = {
     fields: ['botToken', 'appToken'],
     envVars: ['SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN'],
   },
-  whatsapp: {
-    fields: [], // Auth-state based, no token field
-    envVars: [],
-  },
 };
 
 // ---------------------------------------------------------------------------
@@ -291,57 +287,12 @@ function main(): void {
     }
   }
 
-  // WhatsApp special case: no token, auth-state based.
-  // OpenClaw stores Baileys auth at <stateDir>/credentials/whatsapp/<accountId>/
-  // using useMultiFileAuthState (same as NanoClaw). The files are directly compatible.
-  if (channel === 'whatsapp') {
-    const authPaths = [
-      path.join(stateDir, 'credentials', 'whatsapp', 'default'),
-      path.join(stateDir, 'credentials', 'whatsapp'),
-      path.join(stateDir, 'wa-auth'),
-    ];
-
-    // Also scan credentials/whatsapp/ for any account subdirectory
-    const waCredsDir = path.join(stateDir, 'credentials', 'whatsapp');
-    if (fs.existsSync(waCredsDir)) {
-      try {
-        for (const entry of fs.readdirSync(waCredsDir)) {
-          const candidate = path.join(waCredsDir, entry);
-          if (fs.statSync(candidate).isDirectory()) {
-            authPaths.push(candidate);
-          }
-        }
-      } catch {
-        // ignore
-      }
-    }
-    let authStatePath = '';
-    for (const p of authPaths) {
-      // Look for creds.json inside the directory — that confirms valid Baileys auth state
-      if (fs.existsSync(path.join(p, 'creds.json'))) {
-        authStatePath = p;
-        break;
-      }
-    }
-
-    emitStatus({
-      CHANNEL: 'whatsapp',
-      HAS_CREDENTIAL: false,
-      CREDENTIAL_SOURCE: 'auth_state',
-      NOTE: authStatePath
-        ? `Baileys auth state found at ${authStatePath}. May not be portable across versions — recommend re-authenticating.`
-        : 'No WhatsApp auth state found. Will need to authenticate during setup.',
-      AUTH_STATE_PATH: authStatePath || 'not_found',
-    });
-    return;
-  }
-
   // Unknown channel
   if (!spec) {
     emitStatus({
       CHANNEL: channel,
       HAS_CREDENTIAL: false,
-      NOTE: `Channel "${channel}" is not supported by NanoClaw. Supported: telegram, discord, slack, whatsapp.`,
+      NOTE: `Channel "${channel}" is not supported by NanoClaw. Supported: telegram, discord, slack.`,
     });
     return;
   }

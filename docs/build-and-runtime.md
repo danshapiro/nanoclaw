@@ -152,7 +152,9 @@ pnpm exec tsx scripts/reconcile-delivery.ts /absolute/path/to/inbound.db MESSAGE
 ```
 
 Messages intentionally discarded when a session is reset are recorded as `dropped`,
-not as successful deliveries. The next poll retries the whole message after an
+not as successful deliveries. The requeue command refuses inactive or missing source sessions and retains
+the incident; a message on an archived session requires operator reconciliation.
+If the session is active, the next poll retries the whole message after an
 explicit requeue. A partly delivered message is neither
 of these cases: reconcile the missing parts manually before recording completion.
 Never requeue a partial or uncertain send: doing so can duplicate messages.

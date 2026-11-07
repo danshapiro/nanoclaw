@@ -856,15 +856,27 @@ export function writeSystemResponse(
  * All declared files must be present as regular files inside the outbox.
  * Sending a partial message and then deleting the surviving files loses data.
  */
+function safeOutboxComponent(value: string): boolean {
+  return (
+    typeof value === 'string' &&
+    value !== '' &&
+    value !== '.' &&
+    value !== '..' &&
+    !/[\\/\0]/.test(value) &&
+    path.basename(value) === value
+  );
+}
+
 export function readOutboxFiles(
   agentGroupId: string,
   sessionId: string,
   messageId: string,
   filenames: string[],
 ): OutboundFile[] {
+  if (!safeOutboxComponent(messageId)) throw new DeliveryUnavailableError('Invalid outbox message ID', false);
   const outboxDir = path.join(sessionDir(agentGroupId, sessionId), 'outbox', messageId);
   return filenames.map((filename) => {
-    if (typeof filename !== 'string' || !filename || path.basename(filename) !== filename) {
+    if (!safeOutboxComponent(filename)) {
       throw new DeliveryUnavailableError(`Invalid outbox filename for message ${messageId}`, false);
     }
     const filePath = path.join(outboxDir, filename);
@@ -893,6 +905,10 @@ export function readOutboxFiles(
  * thrown error would trigger the delivery retry path and deliver twice.
  */
 export function clearOutbox(agentGroupId: string, sessionId: string, messageId: string): void {
+  if (!safeOutboxComponent(messageId)) {
+    log.warn('Invalid outbox message ID; cleanup skipped', { messageId });
+    return;
+  }
   const outboxDir = path.join(sessionDir(agentGroupId, sessionId), 'outbox', messageId);
   if (!fs.existsSync(outboxDir)) return;
   try {

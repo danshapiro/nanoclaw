@@ -126,7 +126,6 @@ interface ChannelInfo {
 }
 
 const SUPPORTED_CHANNELS = new Set([
-  'whatsapp',
   'telegram',
   'slack',
   'discord',

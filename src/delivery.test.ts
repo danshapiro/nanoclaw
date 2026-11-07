@@ -103,6 +103,19 @@ function insertOutbound(agentGroupId: string, sessionId: string, msgId: string, 
   db.close();
 }
 
+function writeCentralSessionStatus(sessionId: string, status: string): void {
+  const db = new Database(path.join(TEST_DIR, 'v2.db'));
+  db.exec(
+    'CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, agent_group_id TEXT NOT NULL, status TEXT NOT NULL)',
+  );
+  db.prepare('INSERT OR REPLACE INTO sessions (id, agent_group_id, status) VALUES (?, ?, ?)').run(
+    sessionId,
+    'ag-1',
+    status,
+  );
+  db.close();
+}
+
 function insertReactionOutbound(agentGroupId: string, sessionId: string, msgId: string): void {
   const db = new Database(outboundDbPath(agentGroupId, sessionId));
   db.prepare(
@@ -1189,6 +1202,81 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     reopened.close();
   });
 
+  it('quarantines an archived retry and refuses to requeue it while inactive', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-archived-retry');
+    const deliver = vi.fn().mockRejectedValue(new DeliveryUnavailableError('starting', true));
+    setDeliveryAdapter({ deliver });
+    await deliverSessionMessages(session);
+    archiveSession(session.id);
+    await dropInactiveSessionOutbound(session.id, 'test-reset');
+    expect(deliveredRows('ag-1', session.id)).toEqual([
+      { message_out_id: 'out-archived-retry', platform_message_id: null, status: 'failed' },
+    ]);
+    const dbPath = inboundDbPath('ag-1', session.id);
+    writeCentralSessionStatus(session.id, 'archived');
+    const result = spawnSync(
+      process.execPath,
+      [
+        'node_modules/tsx/dist/cli.mjs',
+        'scripts/reconcile-delivery.ts',
+        dbPath,
+        'out-archived-retry',
+        '--confirmed-not-delivered',
+      ],
+      { encoding: 'utf8' },
+    );
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain('source session is inactive or missing');
+    const db = new Database(dbPath);
+    expect(
+      db.prepare('SELECT state FROM delivery_attempts WHERE message_out_id = ?').get('out-archived-retry'),
+    ).toEqual({ state: 'failed' });
+    db.close();
+    expect(deliveredRows('ag-1', session.id)[0].status).toBe('failed');
+  });
+
+  it('retains a requeued incident if the source session is archived before the next poll', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-archive-after-requeue');
+    setDeliveryAdapter({ deliver: vi.fn().mockRejectedValue(new Error('ambiguous')) });
+    await deliverSessionMessages(session);
+    writeCentralSessionStatus(session.id, 'active');
+    const dbPath = inboundDbPath('ag-1', session.id);
+    const result = spawnSync(
+      process.execPath,
+      [
+        'node_modules/tsx/dist/cli.mjs',
+        'scripts/reconcile-delivery.ts',
+        dbPath,
+        'out-archive-after-requeue',
+        '--confirmed-not-delivered',
+      ],
+      { encoding: 'utf8' },
+    );
+    expect(result.status, result.stderr).toBe(0);
+    archiveSession(session.id);
+    await dropInactiveSessionOutbound(session.id, 'test-reset');
+    const db = new Database(dbPath);
+    expect(
+      db.prepare('SELECT state FROM delivery_attempts WHERE message_out_id = ?').get('out-archive-after-requeue'),
+    ).toEqual({ state: 'failed' });
+    db.close();
+    expect(deliveredRows('ag-1', session.id)[0].status).toBe('failed');
+  });
+
+  it('marks unknown system actions failed instead of claiming delivery', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertSchedulingOutbound('ag-1', session.id, 'unknown-action', { action: 'not_registered' });
+    await deliverSessionMessages(session);
+    expect(deliveredRows('ag-1', session.id)).toEqual([
+      { message_out_id: 'unknown-action', platform_message_id: null, status: 'failed' },
+    ]);
+  });
+
   it('recovers interrupted sends in inactive sessions at startup without waiting for a poll', async () => {
     seedAgentAndChannel();
     const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
@@ -1354,6 +1442,7 @@ describe('deliverSessionMessages — concurrent invocations', () => {
       setDeliveryAdapter({ deliver });
       await deliverSessionMessages(session);
       const dbPath = inboundDbPath('ag-1', session.id);
+      writeCentralSessionStatus(session.id, 'active');
       const run = (...args: string[]) =>
         spawnSync(
           process.execPath,

@@ -158,18 +158,6 @@ export const CHANNEL_AUTH_REGISTRY: Record<string, ChannelAuthSpec> = {
     ],
     candidatePaths: ['data/sessions/telegram', 'store/telegram-session'],
   },
-  whatsapp: {
-    v1EnvKeys: ['WHATSAPP_PHONE', 'WHATSAPP_OWNER'],
-    requiredV2Keys: [],
-    candidatePaths: [
-      'data/sessions/baileys',
-      'data/baileys_auth',
-      'store/auth_info_baileys',
-      'store/baileys',
-      'auth_info_baileys',
-    ],
-    note: 'Baileys keystore — copying is best-effort. Encryption sessions may still need a fresh pair via /add-whatsapp.',
-  },
   matrix: {
     v1EnvKeys: ['MATRIX_HOMESERVER', 'MATRIX_USER_ID', 'MATRIX_ACCESS_TOKEN'],
     requiredV2Keys: [
