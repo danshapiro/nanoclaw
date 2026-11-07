@@ -39,6 +39,7 @@ import {
 } from './db/index.js';
 import { archiveSession } from './db/sessions.js';
 import { DeliveryUnavailableError } from './delivery-errors.js';
+import { log } from './log.js';
 import { deliverToChannel } from './channel-delivery.js';
 import { resolveSession, openOutboundDbHealing, outboundDbPath, inboundDbPath } from './session-manager.js';
 import {
@@ -1126,6 +1127,27 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     ]);
   });
 
+  it.each([{ operation: 'reaction' }, { operation: 'edit' }, { type: 'ask_question' }])(
+    'rejects attachments on unsupported operation %j before calling the platform',
+    async (operation) => {
+      seedAgentAndChannel();
+      const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+      insertOutbound('ag-1', session.id, 'out-unsupported-file');
+      const out = new Database(outboundDbPath('ag-1', session.id));
+      out
+        .prepare('UPDATE messages_out SET content = ? WHERE id = ?')
+        .run(JSON.stringify({ ...operation, text: 'hello', files: ['proof.txt'] }), 'out-unsupported-file');
+      out.close();
+      const deliver = vi.fn();
+      setDeliveryAdapter({ deliver });
+      await deliverSessionMessages(session);
+      expect(deliver).not.toHaveBeenCalled();
+      expect(deliveredRows('ag-1', session.id)).toEqual([
+        { message_out_id: 'out-unsupported-file', platform_message_id: null, status: 'failed' },
+      ]);
+    },
+  );
+
   it('does not follow a symlink supplied as an outbox attachment', async () => {
     seedAgentAndChannel();
     const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
@@ -1177,7 +1199,7 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     db.prepare("UPDATE delivery_attempts SET state = 'sending' WHERE message_out_id = ?").run('out-inactive-crashed');
     db.close();
     archiveSession(session.id);
-    recoverInterruptedDeliveries();
+    await recoverInterruptedDeliveries();
     await dropInactiveSessionOutbound(session.id, 'test-reset');
     expect(deliveredRows('ag-1', session.id)).toEqual([]);
     const reopened = new Database(inboundDbPath('ag-1', session.id));
@@ -1186,6 +1208,56 @@ describe('deliverSessionMessages — concurrent invocations', () => {
         .prepare('SELECT state, updated_at_ms FROM delivery_attempts WHERE message_out_id = ?')
         .get('out-inactive-crashed'),
     ).toEqual({ state: 'unknown', updated_at_ms: expect.any(Number) });
+    reopened.close();
+  });
+
+  it('yields to the event loop while recovering many session databases', async () => {
+    for (let i = 0; i < 40; i++) {
+      const dir = path.join(TEST_DIR, 'v2-sessions', 'scan-group', `scan-${i}`);
+      fs.mkdirSync(dir, { recursive: true });
+      const db = new Database(path.join(dir, 'inbound.db'));
+      db.exec(
+        "CREATE TABLE delivery_attempts (message_out_id TEXT PRIMARY KEY, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_attempt_ms INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '')",
+      );
+      db.close();
+    }
+    let finished = false;
+    const scan = recoverInterruptedDeliveries().then(() => {
+      finished = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(finished).toBe(false);
+    await scan;
+    expect(finished).toBe(true);
+  });
+
+  it('does not wait on a locked session during startup recovery and reports it', async () => {
+    const dir = path.join(TEST_DIR, 'v2-sessions', 'scan-group', 'locked');
+    fs.mkdirSync(dir, { recursive: true });
+    const db = new Database(path.join(dir, 'inbound.db'));
+    db.pragma('journal_mode = DELETE');
+    db.exec(
+      "CREATE TABLE delivery_attempts (message_out_id TEXT PRIMARY KEY, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_attempt_ms INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '')",
+    );
+    db.prepare("INSERT INTO delivery_attempts (message_out_id, state) VALUES ('pending', 'sending')").run();
+    db.exec('BEGIN EXCLUSIVE');
+    const error = vi.spyOn(log, 'error');
+    try {
+      await recoverInterruptedDeliveries();
+      expect(error).toHaveBeenCalledWith(
+        'Unable to inspect session delivery attempts at startup',
+        expect.objectContaining({ sessionId: 'locked' }),
+      );
+    } finally {
+      error.mockRestore();
+      db.exec('ROLLBACK');
+      db.close();
+    }
+    await recoverInterruptedDeliveries();
+    const reopened = new Database(path.join(dir, 'inbound.db'));
+    expect(reopened.prepare("SELECT state FROM delivery_attempts WHERE message_out_id='pending'").get()).toEqual({
+      state: 'unknown',
+    });
     reopened.close();
   });
 

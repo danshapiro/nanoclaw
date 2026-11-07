@@ -202,6 +202,7 @@ export function clearOutboundThreadResolverForTest(): void {
 let deliveryAdapter: ChannelDeliveryAdapter | null = null;
 let activePolling = false;
 let sweepPolling = false;
+let startupRecovery: Promise<void> | null = null;
 
 /**
  * Callbacks fired when the delivery adapter is first set (and again if it's
@@ -253,9 +254,10 @@ export function clearDeliveryAdapterForTest(): void {
  * inactive ones excluded by the normal active-session sweeper. Unreadable DBs
  * remain visible as stale `sending` rows to the host monitor.
  */
-export function recoverInterruptedDeliveries(): void {
+export async function recoverInterruptedDeliveries(): Promise<void> {
   const root = sessionsBaseDir();
   if (!fs.existsSync(root)) return;
+  let examined = 0;
   for (const group of fs.readdirSync(root, { withFileTypes: true })) {
     if (!group.isDirectory()) continue;
     const groupDir = path.join(root, group.name);
@@ -270,9 +272,14 @@ export function recoverInterruptedDeliveries(): void {
       if (!session.isDirectory()) continue;
       const dbPath = path.join(groupDir, session.name, 'inbound.db');
       if (!fs.existsSync(dbPath)) continue;
+      // Releasing the event loop keeps channel startup and shutdown responsive
+      // even on machines with thousands of retained sessions. The normal poll
+      // loops wait for the entire scan; direct concurrent drains are skipped.
+      if (++examined % 16 === 0) await new Promise<void>((resolve) => setImmediate(resolve));
+      if (inflightDeliveries.has(session.name)) continue;
       let db: Database.Database | undefined;
       try {
-        db = new Database(dbPath, { fileMustExist: true, timeout: 1000 });
+        db = new Database(dbPath, { fileMustExist: true, timeout: 0 });
         const table = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_attempts'").get();
         if (!table) continue;
         ensureDeliveryAttempts(db);
@@ -298,19 +305,30 @@ export function recoverInterruptedDeliveries(): void {
   }
 }
 
+/** Pollers share one recovery and never race it when dispatching platform calls. */
+function afterStartupRecovery(start: () => void): void {
+  startupRecovery ??= recoverInterruptedDeliveries().catch((err) => {
+    log.error('Unable to complete startup delivery recovery', { err });
+  });
+  void startupRecovery.then(start);
+}
+
 /** Start the active container poll loop (~1s). */
 export function startActiveDeliveryPoll(): void {
   if (activePolling) return;
-  recoverInterruptedDeliveries();
   activePolling = true;
-  pollActive();
+  afterStartupRecovery(() => {
+    if (activePolling) void pollActive();
+  });
 }
 
 /** Start the sweep poll loop (~60s). */
 export function startSweepDeliveryPoll(): void {
   if (sweepPolling) return;
   sweepPolling = true;
-  pollSweep();
+  afterStartupRecovery(() => {
+    if (sweepPolling) void pollSweep();
+  });
 }
 
 async function pollActive(): Promise<void> {
@@ -665,7 +683,11 @@ async function drainSession(session: Session, options: DrainSessionOptions = {})
  */
 function isReactionOutbound(msg: { content: string }): boolean {
   try {
-    return (JSON.parse(msg.content) as { operation?: unknown }).operation === 'reaction';
+    const content = JSON.parse(msg.content) as { operation?: unknown; files?: unknown };
+    return (
+      content.operation === 'reaction' &&
+      (content.files === undefined || (Array.isArray(content.files) && content.files.length === 0))
+    );
   } catch {
     return false;
   }
@@ -840,6 +862,17 @@ async function deliverMessage(
   }
   if (!deliveryAdapter) {
     throw new DeliveryUnavailableError('Delivery bridge is not configured yet', true);
+  }
+
+  if (content.files !== undefined && !Array.isArray(content.files)) {
+    throw new DeliveryUnavailableError(`Message ${msg.id} has an invalid file list`, false);
+  }
+  if (
+    Array.isArray(content.files) &&
+    content.files.length > 0 &&
+    (content.operation === 'reaction' || content.operation === 'edit' || content.type === 'ask_question')
+  ) {
+    throw new DeliveryUnavailableError(`Message ${msg.id} has attachments on an unsupported operation`, false);
   }
 
   // Read file attachments from outbox if the content declares files.
