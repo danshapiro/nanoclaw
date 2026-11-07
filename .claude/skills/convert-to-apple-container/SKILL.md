@@ -178,7 +178,7 @@ pnpm run build
 launchctl kickstart -k gui/$(id -u)/com.nanoclaw
 ```
 
-Send a message via WhatsApp and verify the agent responds.
+Send a message through an enabled, approved channel and verify the agent responds.
 
 ## Troubleshooting
 

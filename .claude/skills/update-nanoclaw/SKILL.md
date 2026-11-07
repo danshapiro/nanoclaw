@@ -212,9 +212,9 @@ If no `[BREAKING]` lines are found:
 If one or more `[BREAKING]` lines are found:
 - Display a warning header to the user: "This update includes breaking changes that may require action:"
 - For each breaking change, display the full description.
-- Collect all skill names referenced in the breaking change entries (the `/<skill-name>` part).
+- Collect all skill names referenced in the breaking change entries (the `/<skill-name>` part). Do not offer `/add-whatsapp` or `/add-whatsapp-cloud`: WhatsApp messaging is retired on this overlay, even if an upstream changelog references those skills.
 - Use AskUserQuestion to ask the user which migration skills they want to run now. Options:
-  - One option per referenced skill (e.g., "Run /add-whatsapp to re-add WhatsApp channel")
+  - One option per supported referenced skill (e.g., "Run /add-discord to update Discord")
   - "Skip — I'll handle these manually"
 - Set `multiSelect: true` so the user can pick multiple skills if there are several breaking changes.
 - For each skill the user selects, invoke it using the Skill tool.

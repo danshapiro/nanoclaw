@@ -12,8 +12,8 @@ description: Finish migrating a NanoClaw v1 install into v2. Run after `bash mig
 - Group folders copied (v1 CLAUDE.md → v2 CLAUDE.local.md)
 - Session data copied with conversation continuity (incl. Claude Code memory + JSONL transcripts)
 - Scheduled tasks ported
-- Channel code installed and auth state copied (incl. WhatsApp Baileys keystore)
-- WhatsApp LIDs resolved from `store/auth` and aliased into `messaging_groups`
+- Supported channel code installed and corresponding auth state copied
+- Historical channel identifiers retained where needed for existing records; WhatsApp messaging remains retired and its credentials are not copied
 - Container skills copied
 - Container image built
 
@@ -62,7 +62,6 @@ v2 auto-creates a `users` row for every sender it sees (via `extractAndUpsertUse
 **User ID format**: always `<channel_type>:<platform_handle>`. Each channel populates this differently:
 - **Telegram**: `telegram:<numeric_user_id>` (e.g. `telegram:6037840640`)
 - **Discord**: `discord:<snowflake_user_id>` (e.g. `discord:123456789012345678`)
-- **WhatsApp**: `whatsapp:<phone>@s.whatsapp.net` (e.g. `whatsapp:14155551234@s.whatsapp.net`)
 - **Slack**: `slack:<user_id>` (e.g. `slack:U04ABCDEF`)
 - **Others**: `<channel_type>:<platform_id>`
 

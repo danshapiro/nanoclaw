@@ -17,7 +17,7 @@ Stand up the first NanoClaw agent for a channel and verify end-to-end delivery b
 
 Read `src/channels/index.ts` to find enabled channels (uncommented imports). Cross-check `.env` for the relevant credentials.
 
-AskUserQuestion: "Which channel should host the welcome DM?" with one option per enabled channel (Discord, Slack, Telegram, WhatsApp, Webex, Teams, Google Chat, Matrix, iMessage, Resend, …).
+AskUserQuestion: "Which channel should host the welcome DM?" with one option per enabled channel (Discord, Slack, Telegram, Webex, Teams, Google Chat, Matrix, iMessage, Resend, …).
 
 Record the choice as `CHANNEL` (lowercase, e.g. `discord`).
 
@@ -35,7 +35,7 @@ Then ask in plain text (NOT `AskUserQuestion` — these are free-form):
 
 This depends on whether the channel supports cold DM via `adapter.openDM`.
 
-**Channels without cold DM (direct-addressable): telegram, whatsapp, imessage, matrix, resend.** The user handle doubles as the DM chat id. Set:
+**Channels without cold DM (direct-addressable): telegram, imessage, matrix, resend.** The user handle doubles as the DM chat id. Set:
 
 ```
 PLATFORM_ID=${CHANNEL}:${USER_HANDLE}
