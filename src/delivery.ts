@@ -613,7 +613,8 @@ async function drainSession(session: Session, options: DrainSessionOptions = {})
         // Once an adapter was called, an arbitrary exception may mean the
         // provider accepted all or part of a request. Do not send it twice.
         // Explicit unavailable errors are raised by the bridge before a call.
-        if (current?.state === 'sending' && !unavailable && !isNonRetryableDeliveryError(err)) {
+        const cosmeticRejection = isReactionOutbound(msg) && isNonRetryableDeliveryError(err);
+        if (current?.state === 'sending' && !unavailable && !cosmeticRejection) {
           setDeliveryAttempt(inDb, msg.id, 'unknown', attempts, 0, errorSummary(err));
           log.error('Outbound delivery outcome unknown; reconcile before replay', {
             messageId: msg.id,
@@ -688,6 +689,7 @@ async function resolveOutboundThread(
   inDb: Database.Database,
   outDb: Database.Database,
   content: { operation?: unknown },
+  onPlatformOperation: () => void,
 ): Promise<string | null> {
   if (msg.thread_id) return msg.thread_id;
   if (!outboundThreadResolver || !deliveryAdapter) return null;
@@ -695,6 +697,27 @@ async function resolveOutboundThread(
   // Edits and reactions name a message that already lives somewhere.
   if (content.operation === 'edit' || content.operation === 'reaction') return null;
 
+  let resolverSent = false;
+  const underlying = deliveryAdapter;
+  const resolverAdapter: ChannelDeliveryAdapter = {
+    ...underlying,
+    async deliver(...args) {
+      const result = await underlying.deliver(...args);
+      resolverSent = true;
+      onPlatformOperation();
+      return result;
+    },
+    ...(underlying.openThread
+      ? {
+          async openThread(...args: Parameters<NonNullable<ChannelDeliveryAdapter['openThread']>>) {
+            const result = await underlying.openThread!(...args);
+            resolverSent = true;
+            onPlatformOperation();
+            return result;
+          },
+        }
+      : {}),
+  };
   try {
     return await outboundThreadResolver({
       session,
@@ -707,10 +730,13 @@ async function resolveOutboundThread(
       },
       inDb,
       outDb,
-      adapter: deliveryAdapter,
+      adapter: resolverAdapter,
     });
   } catch (err) {
     log.warn('Outbound thread resolver failed; outcome requires reconciliation', { messageId: msg.id, err });
+    if (resolverSent && err instanceof DeliveryUnavailableError) {
+      throw new Error('Thread resolver failed after a platform operation', { cause: err });
+    }
     throw err;
   }
 }
@@ -831,7 +857,10 @@ async function deliverMessage(
   // for messages that carry no thread of their own and address a real
   // conversation: edits and reactions name a message that already lives
   // somewhere, and retargeting those would break them.
-  const threadId = await resolveOutboundThread(msg, session, inDb, outDb, content);
+  let resolverSent = false;
+  const threadId = await resolveOutboundThread(msg, session, inDb, outDb, content, () => {
+    resolverSent = true;
+  });
 
   // Track pending questions for ask_user_question flow.
   // Guarded: without the interactive module, `pending_questions` doesn't
@@ -862,14 +891,22 @@ async function deliverMessage(
     }
   }
 
-  const platformMsgId = await deliveryAdapter.deliver(
-    msg.channel_type,
-    msg.platform_id,
-    threadId,
-    msg.kind,
-    msg.content,
-    files,
-  );
+  let platformMsgId: string | undefined;
+  try {
+    platformMsgId = await deliveryAdapter.deliver(
+      msg.channel_type,
+      msg.platform_id,
+      threadId,
+      msg.kind,
+      msg.content,
+      files,
+    );
+  } catch (err) {
+    if (resolverSent && err instanceof DeliveryUnavailableError) {
+      throw new Error('Delivery failed after a thread resolver platform operation', { cause: err });
+    }
+    throw err;
+  }
   log.info('Platform accepted message; recording delivery receipt', {
     id: msg.id,
     channelType: msg.channel_type,

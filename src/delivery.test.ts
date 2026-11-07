@@ -935,6 +935,55 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     db.close();
   });
 
+  it('quarantines a 4xx following a partial multi-part adapter send', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-partial');
+    const acceptedParts: string[] = [];
+    const deliver = vi.fn(async () => {
+      acceptedParts.push('first part');
+      throw new Error('Discord API error: 404 after first part');
+    });
+    setDeliveryAdapter({ deliver });
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(session);
+    expect(acceptedParts).toEqual(['first part']);
+    expect(deliveredRows('ag-1', session.id)).toEqual([]);
+    const db = new Database(inboundDbPath('ag-1', session.id));
+    expect(db.prepare('SELECT state FROM delivery_attempts WHERE message_out_id = ?').get('out-partial')).toEqual({
+      state: 'unknown',
+    });
+    db.close();
+  });
+
+  it.each([
+    new Error('Discord API error: 404 after anchor'),
+    new DeliveryUnavailableError('adapter stopped after anchor', true),
+  ])('quarantines a body failure after the thread resolver posted its anchor: %s', async (error) => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-anchor-body');
+    const deliver = vi.fn().mockResolvedValueOnce('anchor-id').mockRejectedValueOnce(error);
+    setDeliveryAdapter({ deliver });
+    registerOutboundThreadResolver(async (ctx) => {
+      await ctx.adapter.deliver('telegram', 'telegram:123', null, 'chat', JSON.stringify({ text: 'anchor' }));
+      return 'thread-id';
+    });
+    try {
+      await deliverSessionMessages(session);
+      await deliverSessionMessages(session);
+      expect(deliver).toHaveBeenCalledTimes(2);
+      expect(deliveredRows('ag-1', session.id)).toEqual([]);
+      const db = new Database(inboundDbPath('ag-1', session.id));
+      expect(db.prepare('SELECT state FROM delivery_attempts WHERE message_out_id = ?').get('out-anchor-body')).toEqual(
+        { state: 'unknown' },
+      );
+      db.close();
+    } finally {
+      clearOutboundThreadResolverForTest();
+    }
+  });
+
   it('does not assume a rate-limit error proves that a multi-part send was not accepted', async () => {
     seedAgentAndChannel();
     const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
