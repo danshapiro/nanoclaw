@@ -1,3 +1,4 @@
+import { DeliveryUnavailableError } from '../delivery-errors.js';
 /**
  * Chat SDK bridge — wraps a Chat SDK adapter + Chat instance
  * to conform to the NanoClaw ChannelAdapter interface.
@@ -17,7 +18,6 @@ import {
   type Message as ChatMessage,
 } from 'chat';
 import { log } from '../log.js';
-import { extractHttpStatusFromError } from '../delivery-errors.js';
 import { SqliteStateAdapter } from '../state-sqlite.js';
 import { registerWebhookAdapter } from '../webhook-server.js';
 import { getAskQuestionRender } from '../db/sessions.js';
@@ -765,22 +765,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       if (content.operation === 'reaction' && content.messageId && content.emoji) {
         const messageId = content.messageId as string;
         const emoji = resolveReactionEmoji(content.emoji as string);
-        try {
-          await adapter.addReaction(retargetThreadStarterTid(tid, messageId), messageId, emoji);
-        } catch (err) {
-          const status = extractHttpStatusFromError(err);
-          // 429 (rate limit) is transient -- rethrow so the delivery retry
-          // loop handles it like 5xx/network errors instead of dropping the
-          // reaction.
-          if (status !== null && status >= 400 && status < 500 && status !== 429) {
-            // Deterministic client error (unknown message/emoji) -- retrying
-            // cannot succeed and a missing reaction is cosmetic. Log and let
-            // the delivery row succeed-as-skipped.
-            log.warn('reaction skipped', { messageId, emoji, status });
-            return;
-          }
-          throw err; // 5xx / network errors are transient -- let delivery retry
-        }
+        await adapter.addReaction(retargetThreadStarterTid(tid, messageId), messageId, emoji);
         return;
       }
 
@@ -790,8 +775,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         const title = content.title as string;
         const question = content.question as string;
         if (!title) {
-          log.error('ask_question missing required title — skipping delivery', { questionId });
-          return;
+          throw new DeliveryUnavailableError(`ask_question ${questionId} is missing a title`, false);
         }
         const options: NormalizedOption[] = normalizeOptions(content.options as never);
         const card = Card({
@@ -860,6 +844,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         const result = await adapter.postMessage(tid, { markdown: '', files: fileUploads });
         return result?.id;
       }
+      throw new DeliveryUnavailableError('Message has no deliverable text or files', false);
     },
 
     async setTyping(platformId: string, threadId: string | null) {

@@ -606,13 +606,13 @@ describe('Chat SDK bridge deliver — reactions', () => {
     content: { operation: 'reaction', messageId, emoji },
   });
 
-  it('swallows 4xx adapter errors so the delivery row succeeds-as-skipped', async () => {
+  it('reports 4xx adapter errors so failed reactions are not marked delivered', async () => {
     const { bridge, addReaction } = makeBridge();
     addReaction.mockRejectedValue(new Error('Discord API error: 404 {"message": "Unknown Message", "code": 10008}'));
 
     await expect(
       bridge.deliver('discord:guild-1:chan-1', 'discord:guild-1:chan-1', reactionMessage('msg-1', '✅')),
-    ).resolves.toBeUndefined();
+    ).rejects.toThrow('404');
     expect(addReaction).toHaveBeenCalledTimes(1);
   });
 
@@ -662,7 +662,7 @@ describe('Chat SDK bridge deliver — reactions', () => {
     expect(addReaction).toHaveBeenCalledWith('discord:guild-1:chan-1', 'msg-1', '🎯');
   });
 
-  it('rethrows 5xx adapter errors so transient failures still retry', async () => {
+  it('rethrows 5xx adapter errors for reconciliation', async () => {
     const { bridge, addReaction } = makeBridge();
     addReaction.mockRejectedValue(new Error('Discord API error: 502 Bad Gateway'));
 
@@ -671,7 +671,7 @@ describe('Chat SDK bridge deliver — reactions', () => {
     ).rejects.toThrow('502');
   });
 
-  it('rethrows 429 rate-limit errors so the delivery retry loop handles them', async () => {
+  it('rethrows 429 rate-limit errors for reconciliation', async () => {
     const { bridge, addReaction } = makeBridge();
     addReaction.mockRejectedValue(
       new Error('Discord API error: 429 {"message": "You are being rate limited.", "retry_after": 0.3}'),
@@ -682,13 +682,13 @@ describe('Chat SDK bridge deliver — reactions', () => {
     ).rejects.toThrow('429');
   });
 
-  it.each([400, 403, 404])('still swallows deterministic %i client errors', async (status) => {
+  it.each([400, 403, 404])('reports deterministic %i client errors', async (status) => {
     const { bridge, addReaction } = makeBridge();
     addReaction.mockRejectedValue(new Error(`Discord API error: ${status} {"message": "client error"}`));
 
     await expect(
       bridge.deliver('discord:guild-1:chan-1', 'discord:guild-1:chan-1', reactionMessage('msg-1', '✅')),
-    ).resolves.toBeUndefined();
+    ).rejects.toThrow(String(status));
     expect(addReaction).toHaveBeenCalledTimes(1);
   });
 

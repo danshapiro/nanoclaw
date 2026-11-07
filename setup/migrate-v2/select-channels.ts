@@ -18,7 +18,6 @@ const CHANNELS = [
   { value: 'telegram',       label: 'Telegram' },
   { value: 'discord',        label: 'Discord' },
   { value: 'slack',          label: 'Slack' },
-  { value: 'whatsapp',       label: 'WhatsApp' },
   { value: 'teams',          label: 'Microsoft Teams' },
   { value: 'matrix',         label: 'Matrix' },
   { value: 'imessage',       label: 'iMessage' },
@@ -27,7 +26,6 @@ const CHANNELS = [
   { value: 'resend',         label: 'Resend (email)' },
   { value: 'github',         label: 'GitHub' },
   { value: 'linear',         label: 'Linear' },
-  { value: 'whatsapp-cloud', label: 'WhatsApp Cloud API' },
 ];
 
 const VALID_NAMES = new Set(CHANNELS.map((c) => c.value));

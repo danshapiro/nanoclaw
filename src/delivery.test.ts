@@ -38,11 +38,16 @@ import {
   createMessagingGroupAgent,
 } from './db/index.js';
 import { archiveSession } from './db/sessions.js';
+import { DeliveryUnavailableError } from './delivery-errors.js';
+import { deliverToChannel } from './channel-delivery.js';
 import { resolveSession, openOutboundDbHealing, outboundDbPath, inboundDbPath } from './session-manager.js';
 import {
   deliverSessionMessages,
   dropInactiveSessionOutbound,
   quiesceSessionDelivery,
+  recoverInterruptedDeliveries,
+  registerOutboundThreadResolver,
+  clearOutboundThreadResolverForTest,
   setDeliveryAdapter,
   suppressSessionOutbound,
 } from './delivery.js';
@@ -719,7 +724,7 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     await deliverSessionMessages(session);
     expect(delivered).toEqual([]);
     expect(deliveredRows('ag-1', session.id)).toEqual([
-      { message_out_id: 'stale-1', platform_message_id: null, status: 'delivered' },
+      { message_out_id: 'stale-1', platform_message_id: null, status: 'dropped' },
     ]);
 
     await deliverSessionMessages(session);
@@ -763,7 +768,7 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     expect(delivered).toEqual(['first']);
     expect(deliveredRows('ag-1', session.id)).toEqual([
       { message_out_id: 'out-1', platform_message_id: 'platform-first', status: 'delivered' },
-      { message_out_id: 'out-2', platform_message_id: null, status: 'delivered' },
+      { message_out_id: 'out-2', platform_message_id: null, status: 'dropped' },
     ]);
   });
 
@@ -785,8 +790,8 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     await expect(dropInactiveSessionOutbound(session.id, 'yente-session-reset')).resolves.toBe(2);
     expect(delivered).toEqual([]);
     expect(deliveredRows('ag-1', session.id)).toEqual([
-      { message_out_id: 'late-1', platform_message_id: null, status: 'delivered' },
-      { message_out_id: 'late-2', platform_message_id: null, status: 'delivered' },
+      { message_out_id: 'late-1', platform_message_id: null, status: 'dropped' },
+      { message_out_id: 'late-2', platform_message_id: null, status: 'dropped' },
     ]);
 
     await expect(dropInactiveSessionOutbound(session.id, 'yente-session-reset')).resolves.toBe(0);
@@ -838,7 +843,7 @@ describe('deliverSessionMessages — concurrent invocations', () => {
 
     expect(deliveredRows('ag-1', session.id)).toEqual([
       { message_out_id: 'out-1', platform_message_id: 'platform-first', status: 'delivered' },
-      { message_out_id: 'out-2', platform_message_id: null, status: 'delivered' },
+      { message_out_id: 'out-2', platform_message_id: null, status: 'dropped' },
     ]);
   });
 
@@ -873,7 +878,7 @@ describe('deliverSessionMessages — concurrent invocations', () => {
 
     expect(deliveredRows('ag-1', session.id)).toEqual([
       { message_out_id: 'out-1', platform_message_id: 'platform-first', status: 'delivered' },
-      { message_out_id: 'out-2', platform_message_id: null, status: 'delivered' },
+      { message_out_id: 'out-2', platform_message_id: null, status: 'dropped' },
     ]);
   });
 
@@ -911,58 +916,348 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     expect(attempts).toHaveLength(1);
   });
 
-  it('keeps the 3-attempt retry behavior for transient (non-4xx) errors', async () => {
+  it('quarantines an ambiguous platform error without automatic replay', async () => {
     seedAgentAndChannel();
     const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
     insertOutbound('ag-1', session.id, 'out-flaky', 'transient');
-
-    let calls = 0;
-    setDeliveryAdapter({
-      async deliver() {
-        calls++;
-        throw new Error('Discord API error: 502 Bad Gateway');
-      },
+    const deliver = vi.fn(async () => {
+      throw new Error('Discord API error: 502 Bad Gateway');
     });
-
+    setDeliveryAdapter({ deliver });
     await deliverSessionMessages(session);
-    expect(calls).toBe(1);
+    await deliverSessionMessages(session);
+    expect(deliver).toHaveBeenCalledTimes(1);
     expect(deliveredRows('ag-1', session.id)).toEqual([]);
-
-    await deliverSessionMessages(session);
-    await deliverSessionMessages(session);
-    expect(calls).toBe(3);
-    expect(deliveredRows('ag-1', session.id)).toEqual([
-      { message_out_id: 'out-flaky', platform_message_id: null, status: 'failed' },
-    ]);
+    const db = new Database(inboundDbPath('ag-1', session.id));
+    expect(db.prepare('SELECT state FROM delivery_attempts WHERE message_out_id = ?').get('out-flaky')).toEqual({
+      state: 'unknown',
+    });
+    db.close();
   });
 
-  it('treats 429 rate-limit errors as transient and retries them', async () => {
+  it('does not assume a rate-limit error proves that a multi-part send was not accepted', async () => {
     seedAgentAndChannel();
     const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
-    insertOutbound('ag-1', session.id, 'out-limited', 'rate limited once');
-
-    let calls = 0;
-    setDeliveryAdapter({
-      async deliver() {
-        calls++;
-        if (calls === 1) {
-          throw new Error('Discord API error: 429 {"message": "You are being rate limited.", "retry_after": 0.3}');
-        }
-        return 'plat-limited';
-      },
+    insertOutbound('ag-1', session.id, 'out-limited');
+    const deliver = vi.fn(async () => {
+      throw new Error('Discord API error: 429 rate limited');
     });
-
+    setDeliveryAdapter({ deliver });
     await deliverSessionMessages(session);
-    // 429 is transient -- not marked failed on attempt 1.
-    expect(calls).toBe(1);
+    await deliverSessionMessages(session);
+    expect(deliver).toHaveBeenCalledTimes(1);
     expect(deliveredRows('ag-1', session.id)).toEqual([]);
+    const db = new Database(inboundDbPath('ag-1', session.id));
+    expect(db.prepare('SELECT state FROM delivery_attempts WHERE message_out_id = ?').get('out-limited')).toEqual({
+      state: 'unknown',
+    });
+    db.close();
+  });
 
+  it('marks a retired channel failed without deleting its attachment', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-retired');
+    const out = new Database(outboundDbPath('ag-1', session.id));
+    out
+      .prepare('UPDATE messages_out SET content = ? WHERE id = ?')
+      .run(JSON.stringify({ text: 'hello', files: ['proof.txt'] }), 'out-retired');
+    out.close();
+    const file = path.join(path.dirname(inboundDbPath('ag-1', session.id)), 'outbox', 'out-retired', 'proof.txt');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, 'attachment');
+    setDeliveryAdapter({ deliver: deliverToChannel });
     await deliverSessionMessages(session);
-    expect(calls).toBe(2);
     expect(deliveredRows('ag-1', session.id)).toEqual([
-      { message_out_id: 'out-limited', platform_message_id: 'plat-limited', status: 'delivered' },
+      { message_out_id: 'out-retired', platform_message_id: null, status: 'failed' },
+    ]);
+    expect(fs.readFileSync(file, 'utf8')).toBe('attachment');
+  });
+
+  it('persists safe startup retries across polls and preserves files until the receipt', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-starting');
+    const out = new Database(outboundDbPath('ag-1', session.id));
+    out
+      .prepare('UPDATE messages_out SET content = ? WHERE id = ?')
+      .run(JSON.stringify({ text: 'hello', files: ['proof.txt'] }), 'out-starting');
+    out.close();
+    const file = path.join(path.dirname(inboundDbPath('ag-1', session.id)), 'outbox', 'out-starting', 'proof.txt');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, 'attachment');
+    const deliver = vi
+      .fn()
+      .mockRejectedValueOnce(new DeliveryUnavailableError('starting', true))
+      .mockRejectedValueOnce(new DeliveryUnavailableError('still starting', true))
+      .mockImplementationOnce(async () => {
+        expect(fs.existsSync(file)).toBe(true);
+        return undefined; // a successful adapter need not return a platform ID
+      });
+    setDeliveryAdapter({ deliver });
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(session);
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(fs.existsSync(file)).toBe(true);
+    const db = new Database(inboundDbPath('ag-1', session.id));
+    expect(
+      db.prepare('SELECT state, attempts FROM delivery_attempts WHERE message_out_id = ?').get('out-starting'),
+    ).toEqual({ state: 'retry', attempts: 1 });
+    const first = (
+      db.prepare('SELECT first_attempt_ms FROM delivery_attempts WHERE message_out_id = ?').get('out-starting') as {
+        first_attempt_ms: number;
+      }
+    ).first_attempt_ms;
+    expect(first).toBeGreaterThan(0);
+    db.prepare('UPDATE delivery_attempts SET next_attempt_ms = 0 WHERE message_out_id = ?').run('out-starting');
+    db.close();
+    await deliverSessionMessages(session);
+    expect(deliver).toHaveBeenCalledTimes(2);
+    const retryDb = new Database(inboundDbPath('ag-1', session.id));
+    expect(
+      retryDb
+        .prepare('SELECT state, attempts, first_attempt_ms FROM delivery_attempts WHERE message_out_id = ?')
+        .get('out-starting'),
+    ).toEqual({ state: 'retry', attempts: 2, first_attempt_ms: first });
+    retryDb.prepare('UPDATE delivery_attempts SET next_attempt_ms = 0 WHERE message_out_id = ?').run('out-starting');
+    retryDb.close();
+    await deliverSessionMessages(session);
+    expect(deliver).toHaveBeenCalledTimes(3);
+    expect(deliveredRows('ag-1', session.id)).toEqual([
+      { message_out_id: 'out-starting', platform_message_id: null, status: 'delivered' },
+    ]);
+    expect(fs.existsSync(file)).toBe(false);
+  });
+
+  it('migrates an older retry ledger and preserves its attempt count', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-old-ledger');
+    const db = new Database(inboundDbPath('ag-1', session.id));
+    db.exec(
+      "CREATE TABLE delivery_attempts (message_out_id TEXT PRIMARY KEY, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, next_attempt_ms INTEGER NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '')",
+    );
+    db.prepare("INSERT INTO delivery_attempts (message_out_id, state, attempts) VALUES (?, 'retry', 2)").run(
+      'out-old-ledger',
+    );
+    db.close();
+    setDeliveryAdapter({ deliver: vi.fn().mockRejectedValue(new DeliveryUnavailableError('starting', true)) });
+    await deliverSessionMessages(session);
+    const reopened = new Database(inboundDbPath('ag-1', session.id));
+    const row = reopened
+      .prepare(
+        'SELECT state, attempts, updated_at_ms, first_attempt_ms FROM delivery_attempts WHERE message_out_id = ?',
+      )
+      .get('out-old-ledger');
+    expect(row).toEqual({
+      state: 'retry',
+      attempts: 3,
+      updated_at_ms: expect.any(Number),
+      first_attempt_ms: expect.any(Number),
+    });
+    expect((row as { first_attempt_ms: number }).first_attempt_ms).toBeGreaterThan(0);
+    reopened.close();
+  });
+
+  it('fails before calling the platform when a declared file is missing', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-missing');
+    const out = new Database(outboundDbPath('ag-1', session.id));
+    out
+      .prepare('UPDATE messages_out SET content = ? WHERE id = ?')
+      .run(JSON.stringify({ text: 'hello', files: ['missing.txt'] }), 'out-missing');
+    out.close();
+    const deliver = vi.fn();
+    setDeliveryAdapter({ deliver });
+    await deliverSessionMessages(session);
+    expect(deliver).not.toHaveBeenCalled();
+    expect(deliveredRows('ag-1', session.id)).toEqual([
+      { message_out_id: 'out-missing', platform_message_id: null, status: 'failed' },
     ]);
   });
+
+  it('does not follow a symlink supplied as an outbox attachment', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-link');
+    const out = new Database(outboundDbPath('ag-1', session.id));
+    out
+      .prepare('UPDATE messages_out SET content = ? WHERE id = ?')
+      .run(JSON.stringify({ text: 'hello', files: ['link.txt'] }), 'out-link');
+    out.close();
+    const dir = path.join(path.dirname(inboundDbPath('ag-1', session.id)), 'outbox', 'out-link');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.symlinkSync(inboundDbPath('ag-1', session.id), path.join(dir, 'link.txt'));
+    const deliver = vi.fn();
+    setDeliveryAdapter({ deliver });
+    await deliverSessionMessages(session);
+    expect(deliver).not.toHaveBeenCalled();
+    expect(deliveredRows('ag-1', session.id)).toEqual([
+      { message_out_id: 'out-link', platform_message_id: null, status: 'failed' },
+    ]);
+  });
+
+  it('quarantines an interrupted send after a restart instead of resending', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-crashed');
+    const deliver = vi.fn().mockRejectedValue(new DeliveryUnavailableError('starting', true));
+    setDeliveryAdapter({ deliver });
+    await deliverSessionMessages(session);
+    const db = new Database(inboundDbPath('ag-1', session.id));
+    db.prepare("UPDATE delivery_attempts SET state = 'sending' WHERE message_out_id = ?").run('out-crashed');
+    db.close();
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(session);
+    expect(deliver).toHaveBeenCalledTimes(1);
+    const reopened = new Database(inboundDbPath('ag-1', session.id));
+    expect(reopened.prepare('SELECT state FROM delivery_attempts WHERE message_out_id = ?').get('out-crashed')).toEqual(
+      { state: 'unknown' },
+    );
+    reopened.close();
+  });
+
+  it('recovers interrupted sends in inactive sessions at startup without waiting for a poll', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-inactive-crashed');
+    setDeliveryAdapter({ deliver: vi.fn().mockRejectedValue(new DeliveryUnavailableError('starting', true)) });
+    await deliverSessionMessages(session);
+    const db = new Database(inboundDbPath('ag-1', session.id));
+    db.prepare("UPDATE delivery_attempts SET state = 'sending' WHERE message_out_id = ?").run('out-inactive-crashed');
+    db.close();
+    archiveSession(session.id);
+    recoverInterruptedDeliveries();
+    await dropInactiveSessionOutbound(session.id, 'test-reset');
+    expect(deliveredRows('ag-1', session.id)).toEqual([]);
+    const reopened = new Database(inboundDbPath('ag-1', session.id));
+    expect(
+      reopened
+        .prepare('SELECT state, updated_at_ms FROM delivery_attempts WHERE message_out_id = ?')
+        .get('out-inactive-crashed'),
+    ).toEqual({ state: 'unknown', updated_at_ms: expect.any(Number) });
+    reopened.close();
+  });
+
+  it('quarantines a failed thread resolver after it has posted an anchor', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-anchor');
+    const deliver = vi.fn().mockResolvedValue('anchor-id');
+    setDeliveryAdapter({ deliver });
+    registerOutboundThreadResolver(async (ctx) => {
+      await ctx.adapter.deliver('telegram', 'telegram:123', null, 'chat', JSON.stringify({ text: 'anchor' }));
+      throw new Error('thread creation timed out after anchor');
+    });
+    try {
+      await deliverSessionMessages(session);
+      await deliverSessionMessages(session);
+      expect(deliver).toHaveBeenCalledTimes(1);
+      expect(deliveredRows('ag-1', session.id)).toEqual([]);
+      const db = new Database(inboundDbPath('ag-1', session.id));
+      expect(db.prepare('SELECT state FROM delivery_attempts WHERE message_out_id = ?').get('out-anchor')).toEqual({
+        state: 'unknown',
+      });
+      db.close();
+    } finally {
+      clearOutboundThreadResolverForTest();
+    }
+  });
+
+  it('keeps files and quarantines when the platform succeeds but receipt persistence fails', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-receipt-error');
+    const out = new Database(outboundDbPath('ag-1', session.id));
+    out
+      .prepare('UPDATE messages_out SET content = ? WHERE id = ?')
+      .run(JSON.stringify({ text: 'hello', files: ['proof.txt'] }), 'out-receipt-error');
+    out.close();
+    const file = path.join(path.dirname(inboundDbPath('ag-1', session.id)), 'outbox', 'out-receipt-error', 'proof.txt');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, 'attachment');
+    const db = new Database(inboundDbPath('ag-1', session.id));
+    db.exec(
+      "CREATE TRIGGER reject_receipt BEFORE INSERT ON delivered BEGIN SELECT RAISE(ABORT, 'receipt failed'); END",
+    );
+    db.close();
+    const deliver = vi.fn().mockResolvedValue('accepted');
+    setDeliveryAdapter({ deliver });
+    await deliverSessionMessages(session);
+    expect(fs.existsSync(file)).toBe(true);
+    const reopened = new Database(inboundDbPath('ag-1', session.id));
+    expect(
+      reopened.prepare('SELECT state FROM delivery_attempts WHERE message_out_id = ?').get('out-receipt-error'),
+    ).toEqual({ state: 'unknown' });
+    reopened.exec('DROP TRIGGER reject_receipt');
+    reopened.close();
+    await deliverSessionMessages(session);
+    expect(deliver).toHaveBeenCalledTimes(1);
+  });
+
+  it('never resends after a cleanup failure following a durable receipt', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-cleanup-error');
+    const file = path.join(path.dirname(inboundDbPath('ag-1', session.id)), 'outbox', 'out-cleanup-error', 'proof.txt');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, 'attachment');
+    const actualRemove = fs.rmSync.bind(fs);
+    const remove = vi.spyOn(fs, 'rmSync').mockImplementation((target, options) => {
+      if (String(target) === path.dirname(file)) throw new Error('cleanup failed');
+      return actualRemove(target, options);
+    });
+    const deliver = vi.fn().mockResolvedValue('accepted');
+    setDeliveryAdapter({ deliver });
+    try {
+      await deliverSessionMessages(session);
+      await deliverSessionMessages(session);
+      expect(deliver).toHaveBeenCalledTimes(1);
+      expect(deliveredRows('ag-1', session.id)).toEqual([
+        { message_out_id: 'out-cleanup-error', platform_message_id: 'accepted', status: 'delivered' },
+      ]);
+      expect(fs.existsSync(file)).toBe(true);
+    } finally {
+      remove.mockRestore();
+    }
+  });
+
+  it.each(['--confirmed-delivered', '--confirmed-not-delivered'])(
+    'reconciles a quarantined send using %s only with explicit confirmation',
+    async (confirmation) => {
+      seedAgentAndChannel();
+      const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+      insertOutbound('ag-1', session.id, 'out-reconcile');
+      const deliver = vi.fn().mockRejectedValueOnce(new Error('connection lost')).mockResolvedValue('accepted');
+      setDeliveryAdapter({ deliver });
+      await deliverSessionMessages(session);
+      const dbPath = inboundDbPath('ag-1', session.id);
+      const run = (...args: string[]) =>
+        spawnSync(
+          process.execPath,
+          ['node_modules/tsx/dist/cli.mjs', 'scripts/reconcile-delivery.ts', dbPath, ...args],
+          { encoding: 'utf8' },
+        );
+      expect(run('out-reconcile').status).not.toBe(0);
+      const inspect = run();
+      expect(inspect.status, inspect.stderr).toBe(0);
+      expect(JSON.parse(inspect.stdout)).toEqual([
+        expect.objectContaining({ message_out_id: 'out-reconcile', state: 'unknown' }),
+      ]);
+      const result = run('out-reconcile', confirmation);
+      expect(result.status, result.stderr).toBe(0);
+      await deliverSessionMessages(session);
+      expect(deliver).toHaveBeenCalledTimes(confirmation === '--confirmed-delivered' ? 1 : 2);
+      expect(deliveredRows('ag-1', session.id)).toEqual([
+        {
+          message_out_id: 'out-reconcile',
+          platform_message_id: confirmation === '--confirmed-delivered' ? null : 'accepted',
+          status: 'delivered',
+        },
+      ]);
+    },
+  );
 
   it('does not stale-drop scheduling system actions during inactive suppression', async () => {
     seedAgentAndChannel();
@@ -979,7 +1274,7 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     await expect(suppressSessionOutbound(session.id, 'yente-session-reset')).resolves.toBe(1);
 
     expect(deliveredRows('ag-1', session.id)).toEqual([
-      { message_out_id: 'stale-chat', platform_message_id: null, status: 'delivered' },
+      { message_out_id: 'stale-chat', platform_message_id: null, status: 'dropped' },
     ]);
   });
 });

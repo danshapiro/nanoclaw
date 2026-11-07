@@ -1,3 +1,5 @@
+> **Yente overlay:** This upstream design is historical; WhatsApp messaging support has been removed from this runtime.
+
 # NanoClaw Specification
 
 A personal Claude assistant with multi-channel support, persistent memory per conversation, scheduled tasks, and container-isolated agent execution.

@@ -18,7 +18,6 @@
 #   - groups/                       (CLAUDE.md files etc.)
 #   - container/skills/             (tracked container skills)
 #   - src/channels/                 (tracked bridge / registry code)
-#   - setup/whatsapp-auth.ts        (channel installs may overwrite)
 #   - setup/pair-telegram.ts        (channel installs may overwrite)
 #   - setup/index.ts                (channel installs append entries)
 #   - package.json + pnpm-lock.yaml (channel installs add deps)
@@ -85,12 +84,12 @@ printf '%s  Restored %s\n' "$(green '✓')" "src/channels/ from git"
 # Restore tracked setup helpers that channel installs overwrite, and
 # remove the untracked ones they create. Don't blanket-clean setup/
 # because user WIP (setup/migrate-v2/*) lives there too.
-git checkout -- setup/whatsapp-auth.ts setup/pair-telegram.ts setup/index.ts 2>/dev/null || true
+git checkout -- setup/pair-telegram.ts setup/index.ts 2>/dev/null || true
 rm -f setup/groups.ts
 printf '%s  Restored %s\n' "$(green '✓')" "setup/ install helpers"
 
 # Restore package.json + lockfile (channel installs add deps like
-# @whiskeysockets/baileys). node_modules/ is intentionally kept.
+# other channel SDKs). node_modules/ is intentionally kept.
 git checkout -- package.json pnpm-lock.yaml 2>/dev/null || true
 printf '%s  Restored %s\n' "$(green '✓')" "package.json + pnpm-lock.yaml"
 

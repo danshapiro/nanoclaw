@@ -1,3 +1,4 @@
+import { DeliveryUnavailableError } from './delivery-errors.js';
 /**
  * Session lifecycle: folders, DBs, messages, container status.
  *
@@ -852,28 +853,37 @@ export function writeSystemResponse(
  * writes files into the session's `outbox/<messageId>/` directory alongside
  * its `messages_out` row, and the host reads them back at delivery time.
  *
- * Returns undefined when the outbox dir is missing or no declared file was
- * actually on disk — delivery continues without attachments rather than
- * failing the whole message.
+ * All declared files must be present as regular files inside the outbox.
+ * Sending a partial message and then deleting the surviving files loses data.
  */
 export function readOutboxFiles(
   agentGroupId: string,
   sessionId: string,
   messageId: string,
   filenames: string[],
-): OutboundFile[] | undefined {
+): OutboundFile[] {
   const outboxDir = path.join(sessionDir(agentGroupId, sessionId), 'outbox', messageId);
-  if (!fs.existsSync(outboxDir)) return undefined;
-  const files: OutboundFile[] = [];
-  for (const filename of filenames) {
-    const filePath = path.join(outboxDir, filename);
-    if (fs.existsSync(filePath)) {
-      files.push({ filename, data: fs.readFileSync(filePath) });
-    } else {
-      log.warn('Outbox file not found', { messageId, filename });
+  return filenames.map((filename) => {
+    if (typeof filename !== 'string' || !filename || path.basename(filename) !== filename) {
+      throw new DeliveryUnavailableError(`Invalid outbox filename for message ${messageId}`, false);
     }
-  }
-  return files.length > 0 ? files : undefined;
+    const filePath = path.join(outboxDir, filename);
+    let fd: number | undefined;
+    try {
+      // Check the opened descriptor, not a prior stat: replacing a filename
+      // with a symlink between stat and read must never expose host files.
+      fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      if (!fs.fstatSync(fd).isFile()) {
+        throw new DeliveryUnavailableError(`Outbox file is not regular for message ${messageId}: ${filename}`, false);
+      }
+      return { filename, data: fs.readFileSync(fd) };
+    } catch (err) {
+      if (err instanceof DeliveryUnavailableError) throw err;
+      throw new DeliveryUnavailableError(`Outbox file unavailable for message ${messageId}: ${filename}`, false);
+    } finally {
+      if (fd !== undefined) fs.closeSync(fd);
+    }
+  });
 }
 
 /**

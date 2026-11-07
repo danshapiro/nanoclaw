@@ -25,6 +25,7 @@ import { cleanupAttachmentStaging } from './yente/attachments.js';
 import { cleanupOrphanedPendingApprovalAttachments } from './modules/permissions/pending-attachments.js';
 import { reconcileLegacyTaskImportsOnStartup } from './modules/scheduling/startup-import.js';
 import { log } from './log.js';
+import { deliverToChannel } from './channel-delivery.js';
 import {
   expireAllStaleGwsCorrelations,
   startGwsCorrelationIpcWatcher,
@@ -188,21 +189,7 @@ async function main(): Promise<void> {
 
   // 4. Delivery adapter bridge — dispatches to channel adapters
   const deliveryAdapter = {
-    async deliver(
-      channelType: string,
-      platformId: string,
-      threadId: string | null,
-      kind: string,
-      content: string,
-      files?: import('./channels/adapter.js').OutboundFile[],
-    ): Promise<string | undefined> {
-      const adapter = getChannelAdapter(channelType);
-      if (!adapter) {
-        log.warn('No adapter for channel type', { channelType });
-        return;
-      }
-      return adapter.deliver(platformId, threadId, { kind, content: JSON.parse(content), files });
-    },
+    deliver: deliverToChannel,
     async setTyping(channelType: string, platformId: string, threadId: string | null): Promise<void> {
       const adapter = getChannelAdapter(channelType);
       await adapter?.setTyping?.(platformId, threadId);

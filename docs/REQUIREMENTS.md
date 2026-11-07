@@ -1,3 +1,5 @@
+> **Yente overlay:** This upstream design is historical; WhatsApp messaging support has been removed from this runtime.
+
 # NanoClaw Requirements
 
 Original requirements and design decisions from the project creator.

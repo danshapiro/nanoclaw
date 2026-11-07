@@ -158,18 +158,11 @@ export async function run(_args: string[]): Promise<void> {
     'WEBEX_BOT_TOKEN',
     'MATRIX_ACCESS_TOKEN',
     'RESEND_API_KEY',
-    'WHATSAPP_ACCESS_TOKEN',
     'IMESSAGE_ENABLED',
   ]);
 
   const has = (key: string) => !!(process.env[key] || envVars[key]);
   const channelAuth: Record<string, string> = {};
-
-  // WhatsApp Baileys: check for auth credentials on disk
-  const authDir = path.join(projectRoot, 'store', 'auth');
-  if (fs.existsSync(authDir) && fs.readdirSync(authDir).length > 0) {
-    channelAuth.whatsapp = 'authenticated';
-  }
 
   // Token-based channels
   if (has('DISCORD_BOT_TOKEN')) channelAuth.discord = 'configured';
@@ -182,7 +175,6 @@ export async function run(_args: string[]): Promise<void> {
   if (has('WEBEX_BOT_TOKEN')) channelAuth.webex = 'configured';
   if (has('MATRIX_ACCESS_TOKEN')) channelAuth.matrix = 'configured';
   if (has('RESEND_API_KEY')) channelAuth.resend = 'configured';
-  if (has('WHATSAPP_ACCESS_TOKEN')) channelAuth['whatsapp-cloud'] = 'configured';
   if (has('IMESSAGE_ENABLED')) channelAuth.imessage = 'configured';
 
   const configuredChannels = Object.keys(channelAuth);

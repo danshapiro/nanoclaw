@@ -4,14 +4,14 @@ NanoClaw runs a split stack: the host is Node + pnpm, the agent container is Bun
 
 ## Why the split
 
-- **Host stays on Node** because Baileys (WhatsApp) depends on `libsignal-node` native bindings and a long-tested WebSocket/HTTP stack. Bun's Node-API compat has improved, but this isn't where we want risk.
+- **Host stays on Node** for the established channel adapters, SQLite native binding, and the tested WebSocket/HTTP stack.
 - **Container runs Bun** because `bun:sqlite` is built-in (no native compile of `better-sqlite3` per image rebuild), source runs directly (no tsc build step at image build or session wake), and `bun install` is ~5-10× faster than `npm install`.
 
 Host and container each have their own package tree:
 
 ```
 /                             pnpm + Node 22
-  pnpm-lock.yaml              host deps (channels, Chat SDK, Baileys, better-sqlite3, etc.)
+  pnpm-lock.yaml              host deps (channels, Chat SDK, better-sqlite3, etc.)
   pnpm-workspace.yaml         minimumReleaseAge + onlyBuiltDependencies policy
 
 /container/agent-runner/      Bun 1.3+
@@ -119,3 +119,40 @@ No workstation-specific worktree or virtual environment path is required. A miss
 ## Migration history
 
 This structure replaced a uniform npm-on-Node stack across both host and container. The pnpm migration landed first (PR #1771) to bring the host under supply-chain policy, then the container moved to Bun to eliminate native-module compilation and the per-wake tsc step. The split was chosen over going full-Bun because Baileys' native deps are the main risk surface on the host — the container has no such deps, so it benefits from Bun without taking the risk.
+
+## Reconciling outbound delivery
+
+An adapter that is still starting leaves its outbound row pending with a
+persisted backoff. Missing or retired routes and deterministic failures are
+quarantined as `failed`. A platform request interrupted by process termination
+or an ambiguous transport failure is quarantined as `unknown`: it may have
+reached the recipient, so no automatic replay is safe. Outbox files remain in
+place until a durable success receipt is recorded. A successful adapter may
+legitimately return no platform message ID.
+
+For a session's host-owned `inbound.db`, inspect quarantined rows:
+
+```bash
+pnpm exec tsx scripts/reconcile-delivery.ts /absolute/path/to/inbound.db
+```
+
+After checking the destination and verifying the entire text and all files,
+record that it arrived, without resending:
+
+```bash
+pnpm exec tsx scripts/reconcile-delivery.ts /absolute/path/to/inbound.db MESSAGE_ID --confirmed-delivered
+```
+
+The receipt is durable; outbox files are retained for operator cleanup. If it
+is certain that **nothing** arrived, fix the channel or files, then explicitly
+requeue it:
+
+```bash
+pnpm exec tsx scripts/reconcile-delivery.ts /absolute/path/to/inbound.db MESSAGE_ID --confirmed-not-delivered
+```
+
+Messages intentionally discarded when a session is reset are recorded as `dropped`,
+not as successful deliveries. The next poll retries the whole message after an
+explicit requeue. A partly delivered message is neither
+of these cases: reconcile the missing parts manually before recording completion.
+Never requeue a partial or uncertain send: doing so can duplicate messages.

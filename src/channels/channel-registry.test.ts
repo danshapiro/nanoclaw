@@ -84,7 +84,8 @@ describe('channel registry', () => {
     await import('./index.js');
     const { getRegisteredChannelNames } = await import('./channel-registry.js');
 
-    expect(getRegisteredChannelNames()).toEqual(expect.arrayContaining(['cli', 'discord', 'whatsapp']));
+    expect(getRegisteredChannelNames()).toEqual(expect.arrayContaining(['cli', 'discord', 'agentmail']));
+    expect(getRegisteredChannelNames()).not.toContain('whatsapp');
   }, 10_000);
 
   it('should register and retrieve channel adapters', async () => {

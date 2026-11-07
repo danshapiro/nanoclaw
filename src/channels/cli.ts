@@ -29,9 +29,7 @@
  * route-opcode connections (`to` set) are one-shot and do NOT evict an
  * active chat client.
  *
- * deliver() silently no-ops when no client is connected. The outbound row
- * is already in outbound.db, so the message isn't lost — it just doesn't
- * reach this run's terminal. Reconnect to see subsequent replies.
+ * When no terminal is connected, delivery remains queued for retry.
  */
 import fs from 'fs';
 import net from 'net';
@@ -39,6 +37,7 @@ import path from 'path';
 
 import { DATA_DIR } from '../config.js';
 import { log } from '../log.js';
+import { DeliveryUnavailableError } from '../delivery-errors.js';
 import type { ChannelAdapter, ChannelSetup, DeliveryAddress, InboundEvent, OutboundMessage } from './adapter.js';
 import { registerChannelAdapter } from './channel-registry.js';
 
@@ -48,7 +47,7 @@ function socketPath(): string {
   return path.join(DATA_DIR, 'cli.sock');
 }
 
-function createAdapter(): ChannelAdapter {
+export function createCliAdapter(): ChannelAdapter {
   let server: net.Server | null = null;
   let client: net.Socket | null = null;
 
@@ -117,20 +116,17 @@ function createAdapter(): ChannelAdapter {
     },
 
     async deliver(platformId, _threadId, message: OutboundMessage): Promise<string | undefined> {
-      if (platformId !== PLATFORM_ID) return undefined;
-      if (!client) {
-        // No live terminal — outbound row is already persisted, so this
-        // isn't a data loss. User will see it on the next connect cycle
-        // (or never, if we don't add scroll-back). Not worth throwing.
-        return undefined;
-      }
+      if (platformId !== PLATFORM_ID) throw new DeliveryUnavailableError('Unknown CLI destination', false);
+      const target = client;
+      if (!target || !target.writable) throw new DeliveryUnavailableError('No CLI client is connected', true);
+      if (message.files?.length) throw new DeliveryUnavailableError('CLI does not support file attachments', false);
       const text = extractText(message);
-      if (text === null) return undefined;
-      try {
-        client.write(JSON.stringify({ text }) + '\n');
-      } catch (err) {
-        log.warn('Failed to write to CLI client', { err });
-      }
+      if (text === null) throw new DeliveryUnavailableError('CLI message has no text', false);
+      // A callback failure can occur after some bytes were accepted; let the
+      // host quarantine its outcome rather than guessing and resending.
+      await new Promise<void>((resolve, reject) => {
+        target.write(JSON.stringify({ text }) + '\n', (err) => (err ? reject(err) : resolve()));
+      });
       return undefined;
     },
   };
@@ -273,4 +269,4 @@ function extractText(message: OutboundMessage): string | null {
   return null;
 }
 
-registerChannelAdapter('cli', { factory: createAdapter });
+registerChannelAdapter('cli', { factory: createCliAdapter });

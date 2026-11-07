@@ -52,3 +52,14 @@ export function isNonRetryableDeliveryError(err: unknown): boolean {
   const status = extractHttpStatusFromError(err);
   return status !== null && status >= 400 && status < 500 && status !== 429;
 }
+
+/** No platform request was made. A temporarily starting channel may be retried. */
+export class DeliveryUnavailableError extends Error {
+  constructor(
+    message: string,
+    readonly retryable: boolean,
+  ) {
+    super(message);
+    this.name = 'DeliveryUnavailableError';
+  }
+}

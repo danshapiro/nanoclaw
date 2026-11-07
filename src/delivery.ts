@@ -7,7 +7,9 @@
  *   - Tracks delivery in inbound.db's `delivered` table (host-owned)
  *   - Never writes to outbound.db — preserves single-writer-per-file invariant
  */
-import type Database from 'better-sqlite3';
+import Database from 'better-sqlite3';
+import fs from 'fs';
+import path from 'path';
 
 import { getRunningSessions, getActiveSessions, createPendingQuestion, getSession } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
@@ -22,9 +24,9 @@ import {
   migrateDeliveredTable,
 } from './db/session-db.js';
 import { log } from './log.js';
-import { isNonRetryableDeliveryError } from './delivery-errors.js';
+import { DeliveryUnavailableError, isNonRetryableDeliveryError } from './delivery-errors.js';
 import { normalizeOptions } from './channels/ask-question.js';
-import { clearOutbox, openInboundDb, openOutboundDb, readOutboxFiles } from './session-manager.js';
+import { clearOutbox, openInboundDb, openOutboundDb, readOutboxFiles, sessionsBaseDir } from './session-manager.js';
 import {
   applyStoredDiscordTypingActivity,
   pauseTypingRefreshAfterDelivery,
@@ -41,8 +43,60 @@ const SCHEDULING_ACTIONS = new Set(['schedule_task', 'cancel_task', 'pause_task'
 const SUBAGENT_CHANNEL_BLOCKED_MESSAGE =
   'Subagents report to the caller/parent, not directly to the user. Only the primary channel-wired agent is authorized to communicate with user channels.';
 
-/** Track delivery attempt counts. Resets on process restart (gives failed messages a fresh chance). */
-const deliveryAttempts = new Map<string, number>();
+/**
+ * The host owns this ledger, not the container. `sending` is written before a
+ * platform request; surviving process death means the outcome is unknown, so
+ * never blindly replay it. `retry` is reserved for failures known to have
+ * made no request. `unknown` requires operator reconciliation.
+ */
+function ensureDeliveryAttempts(db: Database.Database): void {
+  db.exec(`CREATE TABLE IF NOT EXISTS delivery_attempts (
+    message_out_id TEXT PRIMARY KEY,
+    state TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_ms INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '',
+    updated_at_ms INTEGER NOT NULL DEFAULT 0,
+    first_attempt_ms INTEGER NOT NULL DEFAULT 0
+  )`);
+  const columns = db.prepare('PRAGMA table_info(delivery_attempts)').all() as Array<{ name: string }>;
+  if (!columns.some((column) => column.name === 'updated_at_ms')) {
+    db.exec('ALTER TABLE delivery_attempts ADD COLUMN updated_at_ms INTEGER NOT NULL DEFAULT 0');
+  }
+  if (!columns.some((column) => column.name === 'first_attempt_ms')) {
+    db.exec('ALTER TABLE delivery_attempts ADD COLUMN first_attempt_ms INTEGER NOT NULL DEFAULT 0');
+  }
+}
+
+type DeliveryAttempt = { state: string; attempts: number; next_attempt_ms: number };
+function getDeliveryAttempt(db: Database.Database, id: string): DeliveryAttempt | undefined {
+  return db
+    .prepare('SELECT state, attempts, next_attempt_ms FROM delivery_attempts WHERE message_out_id = ?')
+    .get(id) as DeliveryAttempt | undefined;
+}
+function setDeliveryAttempt(
+  db: Database.Database,
+  id: string,
+  state: string,
+  attempts: number,
+  next: number,
+  reason: string,
+): void {
+  db.prepare(
+    `INSERT INTO delivery_attempts (message_out_id, state, attempts, next_attempt_ms, last_error, updated_at_ms, first_attempt_ms)
+    VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(message_out_id) DO UPDATE SET
+    state=excluded.state, attempts=excluded.attempts, next_attempt_ms=excluded.next_attempt_ms,
+    last_error=excluded.last_error, updated_at_ms=excluded.updated_at_ms,
+    first_attempt_ms=CASE WHEN delivery_attempts.first_attempt_ms=0 THEN excluded.first_attempt_ms ELSE delivery_attempts.first_attempt_ms END`,
+  ).run(id, state, attempts, next, reason.slice(0, 500), Date.now(), Date.now());
+}
+function errorSummary(err: unknown): string {
+  // Provider exception text can contain message content or secrets.
+  return err instanceof DeliveryUnavailableError ? err.message : err instanceof Error ? err.name : 'Unknown error';
+}
+function retryDelayMs(attempts: number): number {
+  return Math.min(60_000, Math.round(1000 * 2 ** Math.min(attempts - 1, 6) * (0.8 + Math.random() * 0.4)));
+}
 
 /**
  * Sessions whose outbound queue is currently being drained.
@@ -129,8 +183,8 @@ export interface OutboundThreadContext {
 /**
  * Chooses a thread for an outbound message that carries none, or returns null
  * to leave it in the channel. Registered by modules (scheduling uses it for
- * per-run result threads); core stays generic and delivers unchanged when no
- * resolver is registered or the resolver throws.
+ * per-run result threads); without a resolver the message stays in the channel.
+ * Resolver errors are quarantined because an anchor may already have been sent.
  */
 export type OutboundThreadResolver = (ctx: OutboundThreadContext) => Promise<string | null>;
 
@@ -193,9 +247,61 @@ export function clearDeliveryAdapterForTest(): void {
   setTypingAdapter({});
 }
 
+/**
+ * At daemon start no platform call from a prior process can still be in this
+ * process. Recover interrupted sends in every retained session, including
+ * inactive ones excluded by the normal active-session sweeper. Unreadable DBs
+ * remain visible as stale `sending` rows to the host monitor.
+ */
+export function recoverInterruptedDeliveries(): void {
+  const root = sessionsBaseDir();
+  if (!fs.existsSync(root)) return;
+  for (const group of fs.readdirSync(root, { withFileTypes: true })) {
+    if (!group.isDirectory()) continue;
+    const groupDir = path.join(root, group.name);
+    let sessions: fs.Dirent[];
+    try {
+      sessions = fs.readdirSync(groupDir, { withFileTypes: true });
+    } catch (err) {
+      log.error('Unable to inspect group sessions at startup', { agentGroupId: group.name, err });
+      continue;
+    }
+    for (const session of sessions) {
+      if (!session.isDirectory()) continue;
+      const dbPath = path.join(groupDir, session.name, 'inbound.db');
+      if (!fs.existsSync(dbPath)) continue;
+      let db: Database.Database | undefined;
+      try {
+        db = new Database(dbPath, { fileMustExist: true, timeout: 1000 });
+        const table = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_attempts'").get();
+        if (!table) continue;
+        ensureDeliveryAttempts(db);
+        const result = db
+          .prepare("UPDATE delivery_attempts SET state='unknown', updated_at_ms=?, last_error=? WHERE state='sending'")
+          .run(Date.now(), 'Process stopped during send; reconcile before replay');
+        if (result.changes)
+          log.error('Interrupted outbound delivery requires reconciliation', {
+            agentGroupId: group.name,
+            sessionId: session.name,
+            count: result.changes,
+          });
+      } catch (err) {
+        log.error('Unable to inspect session delivery attempts at startup', {
+          agentGroupId: group.name,
+          sessionId: session.name,
+          err,
+        });
+      } finally {
+        db?.close();
+      }
+    }
+  }
+}
+
 /** Start the active container poll loop (~1s). */
 export function startActiveDeliveryPoll(): void {
   if (activePolling) return;
+  recoverInterruptedDeliveries();
   activePolling = true;
   pollActive();
 }
@@ -337,7 +443,16 @@ function shouldDropSessionOutbound(sessionId: string): boolean {
 }
 
 function markStaleOutboundDropped(inDb: Database.Database, messageId: string): void {
-  markDelivered(inDb, messageId, null);
+  inDb
+    .prepare(
+      "INSERT OR IGNORE INTO delivered (message_out_id, platform_message_id, status, delivered_at) VALUES (?, NULL, 'dropped', datetime('now'))",
+    )
+    .run(messageId);
+}
+
+function shouldPreserveQuarantined(db: Database.Database, messageId: string): boolean {
+  const state = getDeliveryAttempt(db, messageId)?.state;
+  return state === 'sending' || state === 'unknown' || state === 'failed';
 }
 
 function shouldPreserveForSchedulerDrain(msg: { kind: string; content: string }): boolean {
@@ -392,6 +507,7 @@ async function drainSession(session: Session, options: DrainSessionOptions = {})
   try {
     inflightOutboundDbs.set(session.id, outDb);
     readTypingActivity(session, outDb);
+    ensureDeliveryAttempts(inDb);
     // Read all due messages from outbound.db (read-only)
     const allDue = getDueOutboundMessages(outDb);
     if (allDue.length === 0) return 0;
@@ -407,7 +523,7 @@ async function drainSession(session: Session, options: DrainSessionOptions = {})
     if (shouldDropSessionOutbound(session.id)) {
       let staleDropCount = 0;
       for (const msg of undelivered) {
-        if (shouldPreserveForSchedulerDrain(msg)) continue;
+        if (shouldPreserveForSchedulerDrain(msg) || shouldPreserveQuarantined(inDb, msg.id)) continue;
         markStaleOutboundDropped(inDb, msg.id);
         staleDropCount++;
       }
@@ -418,16 +534,48 @@ async function drainSession(session: Session, options: DrainSessionOptions = {})
     let staleDropCount = 0;
     for (const msg of undelivered) {
       if (shouldDropSessionOutbound(session.id)) {
-        if (shouldPreserveForSchedulerDrain(msg)) continue;
+        if (shouldPreserveForSchedulerDrain(msg) || shouldPreserveQuarantined(inDb, msg.id)) continue;
         markStaleOutboundDropped(inDb, msg.id);
         staleDropCount++;
         continue;
       }
 
+      const previous = getDeliveryAttempt(inDb, msg.id);
+      if (previous?.state === 'unknown' || previous?.state === 'failed') continue;
+      if (previous?.state === 'sending') {
+        setDeliveryAttempt(
+          inDb,
+          msg.id,
+          'unknown',
+          previous.attempts,
+          0,
+          'Process stopped during send; reconcile before replay',
+        );
+        log.error('Outbound delivery outcome unknown after interrupted send; reconcile before replay', {
+          messageId: msg.id,
+          sessionId: session.id,
+        });
+        continue;
+      }
+      if (previous?.state === 'retry' && previous.next_attempt_ms > Date.now()) continue;
+
       try {
         const platformMsgId = await deliverMessage(msg, session, inDb, outDb);
-        markDelivered(inDb, msg.id, platformMsgId ?? null);
-        deliveryAttempts.delete(msg.id);
+        // A receipt must be durable before deleting files. If it fails, the
+        // persisted sending state stops automatic replay after restart.
+        inDb.transaction(() => {
+          markDelivered(inDb, msg.id, platformMsgId ?? null);
+          inDb.prepare('DELETE FROM delivery_attempts WHERE message_out_id = ?').run(msg.id);
+        })();
+        if (msg.kind !== 'system' && msg.channel_type !== 'agent') {
+          log.info('Message delivered', {
+            id: msg.id,
+            channelType: msg.channel_type,
+            platformId: msg.platform_id,
+            platformMsgId,
+          });
+          clearOutbox(session.agent_group_id, session.id, msg.id);
+        }
 
         // Pause the typing indicator after a real user-facing message
         // lands on the user's screen, so the client has time to visually
@@ -459,32 +607,43 @@ async function drainSession(session: Session, options: DrainSessionOptions = {})
           }
         }
       } catch (err) {
-        const attempts = (deliveryAttempts.get(msg.id) ?? 0) + 1;
-        deliveryAttempts.set(msg.id, attempts);
-        // Deterministic client errors (HTTP 4xx) fail identically on every
-        // retry -- mark failed immediately instead of burning 3 attempts.
-        const nonRetryable = isNonRetryableDeliveryError(err);
-        if (nonRetryable || attempts >= MAX_DELIVERY_ATTEMPTS) {
-          const details = {
+        const current = getDeliveryAttempt(inDb, msg.id);
+        const attempts = (previous?.attempts ?? 0) + 1;
+        const unavailable = err instanceof DeliveryUnavailableError ? err : null;
+        // Once an adapter was called, an arbitrary exception may mean the
+        // provider accepted all or part of a request. Do not send it twice.
+        // Explicit unavailable errors are raised by the bridge before a call.
+        if (current?.state === 'sending' && !unavailable && !isNonRetryableDeliveryError(err)) {
+          setDeliveryAttempt(inDb, msg.id, 'unknown', attempts, 0, errorSummary(err));
+          log.error('Outbound delivery outcome unknown; reconcile before replay', {
+            messageId: msg.id,
+            sessionId: session.id,
+            err,
+          });
+        } else if (unavailable?.retryable) {
+          const next = Date.now() + retryDelayMs(attempts);
+          setDeliveryAttempt(inDb, msg.id, 'retry', attempts, next, errorSummary(err));
+          log.warn('Channel unavailable; delivery retained for retry', {
             messageId: msg.id,
             sessionId: session.id,
             attempts,
-            nonRetryable,
+            nextAttempt: new Date(next).toISOString(),
             err,
-          };
-          if (isReactionOutbound(msg)) {
-            log.warn('Message delivery failed permanently, giving up', details);
-          } else {
-            log.error('Message delivery failed permanently, giving up', details);
-          }
+          });
+        } else if (unavailable || isNonRetryableDeliveryError(err) || attempts >= MAX_DELIVERY_ATTEMPTS) {
+          const details = { messageId: msg.id, sessionId: session.id, attempts, err };
+          if (isReactionOutbound(msg)) log.warn('Message delivery failed permanently, giving up', details);
+          else log.error('Message delivery failed permanently, giving up', details);
+          setDeliveryAttempt(inDb, msg.id, 'failed', attempts, 0, errorSummary(err));
           markDeliveryFailed(inDb, msg.id);
-          deliveryAttempts.delete(msg.id);
         } else {
-          log.warn('Message delivery failed, will retry', {
+          const next = Date.now() + retryDelayMs(attempts);
+          setDeliveryAttempt(inDb, msg.id, 'retry', attempts, next, errorSummary(err));
+          log.warn('Message delivery failed before sending; retained for retry', {
             messageId: msg.id,
             sessionId: session.id,
-            attempt: attempts,
-            maxAttempts: MAX_DELIVERY_ATTEMPTS,
+            attempts,
+            nextAttempt: new Date(next).toISOString(),
             err,
           });
         }
@@ -513,8 +672,8 @@ function isReactionOutbound(msg: { content: string }): boolean {
 
 /**
  * Thread this message should be delivered into: the one it already carries,
- * or one a registered resolver opens for it. Fail-open — a resolver that
- * throws leaves the message going exactly where it was.
+ * or one a registered resolver opens for it. A resolver can post an anchor;
+ * an exception is therefore ambiguous and must not cause a blind replay.
  */
 async function resolveOutboundThread(
   msg: {
@@ -551,8 +710,8 @@ async function resolveOutboundThread(
       adapter: deliveryAdapter,
     });
   } catch (err) {
-    log.warn('Outbound thread resolver failed; delivering to the channel', { messageId: msg.id, err });
-    return null;
+    log.warn('Outbound thread resolver failed; outcome requires reconciliation', { messageId: msg.id, err });
+    throw err;
   }
 }
 
@@ -570,11 +729,6 @@ async function deliverMessage(
   inDb: Database.Database,
   outDb: Database.Database,
 ): Promise<string | undefined> {
-  if (!deliveryAdapter) {
-    log.warn('No delivery adapter configured, dropping message', { id: msg.id });
-    return;
-  }
-
   const content = JSON.parse(msg.content);
 
   // System actions — handle internally (schedule_task, cancel_task, etc.)
@@ -618,7 +772,10 @@ async function deliverMessage(
   if (msg.channel_type && msg.platform_id) {
     const mg = getMessagingGroupByPlatform(msg.channel_type, msg.platform_id);
     if (!mg) {
-      throw new Error(`unknown messaging group for ${msg.channel_type}/${msg.platform_id} (message ${msg.id})`);
+      throw new DeliveryUnavailableError(
+        `unknown messaging group for ${msg.channel_type}/${msg.platform_id} (message ${msg.id})`,
+        false,
+      );
     }
     if (!isAgentChannelWired(session.agent_group_id)) {
       log.warn('subagent_channel_delivery_blocked', {
@@ -629,7 +786,7 @@ async function deliverMessage(
         platformId: msg.platform_id,
         threadId: msg.thread_id,
       });
-      throw new Error(SUBAGENT_CHANNEL_BLOCKED_MESSAGE);
+      throw new DeliveryUnavailableError(SUBAGENT_CHANNEL_BLOCKED_MESSAGE, false);
     }
     const isOriginChat = session.messaging_group_id === mg.id;
     // Guarded: without the agent-to-agent module, `agent_destinations`
@@ -643,13 +800,32 @@ async function deliverMessage(
         )
         .get(session.agent_group_id, 'channel', mg.id);
       if (!row) {
-        throw new Error(
+        throw new DeliveryUnavailableError(
           `unauthorized channel destination: ${session.agent_group_id} cannot send to ${mg.channel_type}/${mg.platform_id}`,
+          false,
         );
       }
     }
   }
 
+  // Channel delivery
+  if (!msg.channel_type || !msg.platform_id) {
+    throw new DeliveryUnavailableError(`Message ${msg.id} is missing channel routing fields`, false);
+  }
+  if (!deliveryAdapter) {
+    throw new DeliveryUnavailableError('Delivery bridge is not configured yet', true);
+  }
+
+  // Read file attachments from outbox if the content declares files.
+  // File I/O lives in session-manager.ts (symmetric with inbound
+  // extractAttachmentFiles) — delivery just hands buffers to the adapter.
+  const files =
+    Array.isArray(content.files) && content.files.length > 0
+      ? readOutboxFiles(session.agent_group_id, session.id, msg.id, content.files as string[])
+      : undefined;
+
+  const priorAttempt = getDeliveryAttempt(inDb, msg.id);
+  setDeliveryAttempt(inDb, msg.id, 'sending', priorAttempt?.attempts ?? 0, 0, '');
   // A registered resolver may place this message in a thread it opens on the
   // fly (scheduling uses it to collect a whole run under one headline). Only
   // for messages that carry no thread of their own and address a real
@@ -686,20 +862,6 @@ async function deliverMessage(
     }
   }
 
-  // Channel delivery
-  if (!msg.channel_type || !msg.platform_id) {
-    log.warn('Message missing routing fields', { id: msg.id });
-    return;
-  }
-
-  // Read file attachments from outbox if the content declares files.
-  // File I/O lives in session-manager.ts (symmetric with inbound
-  // extractAttachmentFiles) — delivery just hands buffers to the adapter.
-  const files =
-    Array.isArray(content.files) && content.files.length > 0
-      ? readOutboxFiles(session.agent_group_id, session.id, msg.id, content.files as string[])
-      : undefined;
-
   const platformMsgId = await deliveryAdapter.deliver(
     msg.channel_type,
     msg.platform_id,
@@ -708,7 +870,7 @@ async function deliverMessage(
     msg.content,
     files,
   );
-  log.info('Message delivered', {
+  log.info('Platform accepted message; recording delivery receipt', {
     id: msg.id,
     channelType: msg.channel_type,
     platformId: msg.platform_id,
@@ -716,8 +878,6 @@ async function deliverMessage(
     platformMsgId,
     fileCount: files?.length,
   });
-
-  clearOutbox(session.agent_group_id, session.id, msg.id);
 
   return platformMsgId;
 }

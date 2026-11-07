@@ -1052,7 +1052,7 @@ describe('Yente host command routing', () => {
     expect(deliveredRows(original.id)).toContainEqual({
       message_out_id: 'late-old-session-outbound',
       platform_message_id: null,
-      status: 'delivered',
+      status: 'dropped',
     });
   });
 
