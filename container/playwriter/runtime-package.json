@@ -1,0 +1,7 @@
+{
+  "name": "nanoclaw-playwriter-client",
+  "private": true,
+  "dependencies": {
+    "playwriter": "file:/usr/local/share/nanoclaw/playwriter/playwriter-client-0303f56f07c838bb4686870cc03c9374ccff46f8.tgz"
+  }
+}

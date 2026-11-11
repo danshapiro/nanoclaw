@@ -124,52 +124,49 @@ describe('shared Playwriter runtime', () => {
     }
   });
 
-  it('installs only the exact local archive at image build time with optional dependencies omitted', () => {
-    const dockerfile = fs.readFileSync(repoPath('container', 'Dockerfile'), 'utf8');
-    const section = dockerfile.match(/# ---- Playwriter stock client -+\n(?<body>[\s\S]*?)\n# ---- [^-]/)?.groups?.body;
+  it.each(['0.4.0', 'playwriter/0.4.0 linux-x64 node-v22.21.1'])(
+    'executes the client and accepts the stock version output %s',
+    (version) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'playwriter-version-'));
+      const client = path.join(root, 'client.cjs');
+      const marker = path.join(root, 'invoked');
+      fs.writeFileSync(
+        client,
+        `if (process.argv[2] !== '--version') process.exit(9); require('fs').writeFileSync(${JSON.stringify(marker)}, 'yes'); console.log(${JSON.stringify(version)});`,
+      );
+      try {
+        expect(() =>
+          execFileSync(process.execPath, [repoPath('container', 'playwriter', 'verify-client-version.mjs'), client], {
+            stdio: 'pipe',
+          }),
+        ).not.toThrow();
+        expect(fs.readFileSync(marker, 'utf8')).toBe('yes');
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
 
-    expect(section).toBeDefined();
-    expect(section).toContain(
-      `COPY playwriter/${CLIENT_FILENAME} /usr/local/share/nanoclaw/playwriter/${CLIENT_FILENAME}`,
-    );
-    expect(section).toContain('COPY playwriter/client-identity.json /usr/local/share/nanoclaw/playwriter/');
-    expect(section).toContain(`'${CLIENT_SHA256}  /usr/local/share/nanoclaw/playwriter/${CLIENT_FILENAME}'`);
-    expect(section).toContain('sha256sum --check --strict');
-    expect(section).toContain(
-      `test "$(wc -c <"/usr/local/share/nanoclaw/playwriter/${CLIENT_FILENAME}")" = "${CLIENT_BYTES}"`,
-    );
-    expect(section).toContain(`pnpm install -g "/usr/local/share/nanoclaw/playwriter/${CLIENT_FILENAME}"`);
-    expect(section).toContain('playwriter_version="$(playwriter --version 2>&1)"');
-    expect(section).toContain("grep -Eq '^playwriter/0[.]4[.]0([[:space:]]|$)'");
-    expect(section).toContain(
-      'COPY playwriter/verify-no-optional-dependencies.mjs /usr/local/share/nanoclaw/playwriter/',
-    );
-    expect(section).toContain(
-      'node /usr/local/share/nanoclaw/playwriter/verify-no-optional-dependencies.mjs "$playwriter_bin"',
-    );
-    expect(section).not.toContain('@latest');
-    expect(section).not.toMatch(/playwriter@/);
-    expect(section).not.toMatch(/https?:\/\/(?:registry\.)?npmjs/);
-    expect(section).not.toMatch(/\b(?:curl|wget)\b/);
-
-    const entrypoint = fs.readFileSync(repoPath('container', 'entrypoint.sh'), 'utf8');
-    expect(entrypoint).not.toMatch(/\b(?:npm|pnpm|npx|bun)\s+(?:install|add).*\bplaywriter\b/);
-  });
-
-  it('checks shared non-root client availability and identity in a disposable offline container', () => {
-    const buildScript = fs.readFileSync(repoPath('container', 'build.sh'), 'utf8');
-
-    expect(buildScript).toContain('Verifying the exact stock Playwriter client as a non-root uid');
-    expect(buildScript).toContain('--network none');
-    expect(buildScript).toContain('--user 12345:12345');
-    expect(buildScript).toContain('command -v playwriter');
-    expect(buildScript).toContain('playwriter_version="$(playwriter --version 2>&1)"');
-    expect(buildScript).toContain('grep -Eq "^playwriter/0[.]4[.]0([[:space:]]|$)"');
-    expect(buildScript).toContain(CLIENT_FILENAME);
-    expect(buildScript).toContain(CLIENT_SHA256);
-    expect(buildScript).toContain(`test "$(wc -c <"$archive")" = "${CLIENT_BYTES}"`);
-    expect(buildScript).toContain(
-      'node /usr/local/share/nanoclaw/playwriter/verify-no-optional-dependencies.mjs "$playwriter_bin"',
-    );
+  it.each([
+    ['console.log("0.4.1")', 'unexpected-version'],
+    ['process.exit(73)', 'client-failed'],
+  ])('rejects a wrong version or failed executable: %s', (source, reason) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'playwriter-version-'));
+    const client = path.join(root, 'client.cjs');
+    fs.writeFileSync(client, source);
+    try {
+      let failure: { stderr?: Buffer } | undefined;
+      try {
+        execFileSync(process.execPath, [repoPath('container', 'playwriter', 'verify-client-version.mjs'), client], {
+          stdio: 'pipe',
+        });
+      } catch (error) {
+        failure = error as { stderr?: Buffer };
+      }
+      expect(failure).toBeDefined();
+      expect(failure?.stderr?.toString()).toContain(reason);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });

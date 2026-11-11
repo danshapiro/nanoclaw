@@ -42,9 +42,9 @@ the agent container.
 
 ## Lockfiles
 
-| Tree | Lockfile | Manager | Regenerate after dep change |
-|------|----------|---------|----------------------------|
-| Host | `pnpm-lock.yaml` | pnpm 10 | `pnpm install` |
+| Tree         | Lockfile                          | Manager  | Regenerate after dep change                |
+| ------------ | --------------------------------- | -------- | ------------------------------------------ |
+| Host         | `pnpm-lock.yaml`                  | pnpm 10  | `pnpm install`                             |
 | Agent-runner | `container/agent-runner/bun.lock` | Bun 1.3+ | `cd container/agent-runner && bun install` |
 
 Both are committed. CI and the Dockerfile run `--frozen-lockfile` variants — any drift between `package.json` and lockfile fails the build.
@@ -58,12 +58,23 @@ Both are committed. CI and the Dockerfile run `--frozen-lockfile` variants — a
 
 `container/Dockerfile` is a single-stage build on `node:22-slim`:
 
-- **Pinned ARGs** — `BUN_VERSION`, `CLAUDE_CODE_VERSION`, `AGENT_BROWSER_VERSION`, `VERCEL_VERSION`. Bump deliberately in PRs.
+- **Pinned ARGs** — `BUN_VERSION`, `PNPM_VERSION`, `CLAUDE_CODE_VERSION`, `AGENT_BROWSER_VERSION`, `VERCEL_VERSION`. Bump deliberately in PRs. The image activates pnpm 10.33.0 explicitly, matching the host's `packageManager` pin; running Corepack without that pin can select a newer major with incompatible global CLI installation behavior.
 - **CJK fonts** — `ARG INSTALL_CJK_FONTS=false`. `container/build.sh` reads `INSTALL_CJK_FONTS` from `.env` and passes it through. Default build saves ~200MB; opt in when the user works with Chinese/Japanese/Korean content.
 - **BuildKit cache mounts** — `/var/cache/apt`, `/var/lib/apt`, `/root/.bun/install/cache`, `/root/.cache/pnpm`. Rebuilds where `package.json`/`bun.lock` haven't changed are fast. Requires BuildKit (default on Docker 23+, Apple Container-compat).
 - **`tini` as init** — reaps Chromium zombies, forwards signals so in-flight `outbound.db` writes finalize on SIGTERM.
 - **`entrypoint.sh`** (extracted) — honors explicit `docker run IMAGE <command>` arguments for image-surface smokes, otherwise captures stdin and `exec bun run /app/src/index.ts` under tini. Readable and diffable.
 - **No compiled `/app/dist`** — Bun runs TS directly. The host also mounts fresh source over `/app/src` at session start, so host edits take effect without rebuilding the image.
+
+The pinned stock Playwriter archive installs separately under `/opt/playwriter`
+with optional dependencies omitted. `/usr/local/bin/playwriter` links to its
+actual package entry point, so dependency checks resolve from the client rather
+than a pnpm launcher. The build executes the client and accepts both stock
+`0.4.0` and `playwriter/0.4.0 ...` version formats; archive identity checks remain
+authoritative. This isolated install keeps Playwriter's optional-package policy
+from removing binaries needed by other globally installed CLIs.
+Corepack's prepared pnpm lives in the public, read-only
+`/usr/local/share/corepack` cache so arbitrary runtime UIDs can use that exact
+version without downloading another package manager on first use.
 
 ## Session wake (two paths)
 
@@ -114,7 +125,7 @@ No workstation-specific worktree or virtual environment path is required. A miss
 - **Global container CLIs stay on pnpm, not Bun.** `agent-browser`, `@anthropic-ai/claude-code`, `vercel` and any future Node CLIs the agent invokes should be pinned versions under the Dockerfile's pnpm global-install block. `bun install -g` would bypass the pnpm supply-chain policy.
 - **GWS stays mediated.** The agent image must expose `/usr/local/bin/gws` as the policy-proxy shim, must not install the real Google Workspace CLI, and must not create or receive a Google OAuth config path. The trusted `gws-proxy` service owns the real CLI and OAuth state. For `-o/--output`, the shim writes caller-visible Drive export/download files locally from bytes streamed by the proxy, verifies byte count and SHA-256 metadata, and refuses to overwrite existing targets; the proxy uses only private temp output paths and never receives caller paths.
 - **Browser handoff stays mediated.** Agents receive only `YENTE_BROWSER_HANDOFF_URL` and the skill helper. OneCLI owns broker authorization, and the browser handoff service owns the VNC password, profile, and CDP socket.
-- **SDK tmp/CA material must escape systemd `PrivateTmp`.** The generated systemd unit (`setup/service.ts`) routes the OneCLI SDK's temp files to a host-visible runtime directory via `RuntimeDirectory=nanoclaw-sdk-tmp` + `Environment=TMPDIR=%t/nanoclaw-sdk-tmp`. The SDK writes its CA pems via `os.tmpdir()`, and dockerd resolves those paths in the *host* namespace — under `PrivateTmp=yes` a plain `/tmp` path becomes an empty directory to Docker and yields an empty rustls trust store. Any externally-managed unit that enables `PrivateTmp=yes` (e.g. a deploy repo's own unit file) must mirror this `RuntimeDirectory`/`TMPDIR` mechanism; do not disable `PrivateTmp` instead.
+- **SDK tmp/CA material must escape systemd `PrivateTmp`.** The generated systemd unit (`setup/service.ts`) routes the OneCLI SDK's temp files to a host-visible runtime directory via `RuntimeDirectory=nanoclaw-sdk-tmp` + `Environment=TMPDIR=%t/nanoclaw-sdk-tmp`. The SDK writes its CA pems via `os.tmpdir()`, and dockerd resolves those paths in the _host_ namespace — under `PrivateTmp=yes` a plain `/tmp` path becomes an empty directory to Docker and yields an empty rustls trust store. Any externally-managed unit that enables `PrivateTmp=yes` (e.g. a deploy repo's own unit file) must mirror this `RuntimeDirectory`/`TMPDIR` mechanism; do not disable `PrivateTmp` instead.
 
 ## Migration history
 

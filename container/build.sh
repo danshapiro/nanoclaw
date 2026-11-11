@@ -85,12 +85,11 @@ ${CONTAINER_RUNTIME} run --rm \
 archive=/usr/local/share/nanoclaw/playwriter/playwriter-client-0303f56f07c838bb4686870cc03c9374ccff46f8.tgz
 identity=/usr/local/share/nanoclaw/playwriter/client-identity.json
 test -x "$(command -v playwriter)"
-playwriter_version="$(playwriter --version 2>&1)"
-printf "%s\n" "$playwriter_version" | grep -Eq "^playwriter/0[.]4[.]0([[:space:]]|$)"
 test "$(wc -c <"$archive")" = "1066577"
 printf "%s  %s\n" "29af65feb673528c70cf06c284b2bb52d3179da74930b158622fa6693d2296b0" "$archive" | sha256sum --check --strict
 jq -e ".artifact.filename == \"playwriter-client-0303f56f07c838bb4686870cc03c9374ccff46f8.tgz\" and .artifact.sha256 == \"29af65feb673528c70cf06c284b2bb52d3179da74930b158622fa6693d2296b0\" and .preparation_receipt.sha256 == \"f68a7ea5afabab788fe299f033d995f69dfca4f3608f470f836f313b5b65e96c\"" "$identity" >/dev/null
 playwriter_bin="$(readlink -f "$(command -v playwriter)")"
+node /usr/local/share/nanoclaw/playwriter/verify-client-version.mjs "$playwriter_bin"
 node /usr/local/share/nanoclaw/playwriter/verify-no-optional-dependencies.mjs "$playwriter_bin"'
 
 echo ""
