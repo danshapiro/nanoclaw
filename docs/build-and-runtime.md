@@ -75,6 +75,11 @@ from removing binaries needed by other globally installed CLIs.
 Corepack's prepared pnpm lives in the public, read-only
 `/usr/local/share/corepack` cache so arbitrary runtime UIDs can use that exact
 version without downloading another package manager on first use.
+Global CLI executables are explicitly installed in `/pnpm/bin`, preserving the
+absolute path used by the managed Codex wrapper. The image build checks these
+paths as a non-root UID and starts Codex app-server offline with strict config
+and closed stdin; checking only `codex --version` through `PATH` does not cover
+that wrapper contract.
 
 ## Session wake (two paths)
 

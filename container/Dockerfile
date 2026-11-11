@@ -123,6 +123,7 @@ RUN corepack enable && corepack prepare "pnpm@${PNPM_VERSION}" --activate && \
 
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     echo "only-built-dependencies[]=agent-browser" > /root/.npmrc && \
+    echo "global-bin-dir=/pnpm/bin" >> /root/.npmrc && \
     echo "only-built-dependencies[]=esbuild" >> /root/.npmrc && \
     echo "only-built-dependencies[]=@anthropic-ai/claude-code" >> /root/.npmrc && \
     echo "only-built-dependencies[]=opencode-ai" >> /root/.npmrc && \

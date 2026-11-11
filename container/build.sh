@@ -37,6 +37,26 @@ echo "Image: ${IMAGE_NAME}:${TAG}"
 
 ${CONTAINER_RUNTIME} build "${BUILD_ARGS[@]}" -t "${IMAGE_NAME}:${TAG}" .
 
+echo "Verifying stable global CLI paths and Codex app-server as a non-root uid..."
+# Managed skill wrappers invoke /pnpm/bin/codex directly. A PATH-only probe
+# misses a package-manager layout change that breaks every Codex session.
+# shellcheck disable=SC2016 # The quoted script expands inside the container.
+${CONTAINER_RUNTIME} run --rm \
+    --network none \
+    --user 12345:12345 \
+    -e HOME=/home/node \
+    --entrypoint sh \
+    "${IMAGE_NAME}:${TAG}" \
+    -c 'set -eu
+for cli in codex claude opencode agent-browser vercel; do
+    test -x "/pnpm/bin/$cli"
+done
+/pnpm/bin/codex --version
+timeout 20 /pnpm/bin/codex app-server --strict-config --listen stdio:// </dev/null
+/pnpm/bin/claude --version
+/pnpm/bin/opencode --version
+test "$(pnpm --version)" = "10.33.0"'
+
 echo "Verifying yt-dlp and ffmpeg in the built image..."
 # shellcheck disable=SC2016 # The quoted script expands inside the container.
 ${CONTAINER_RUNTIME} run --rm \
