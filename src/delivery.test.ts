@@ -1017,6 +1017,77 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     db.close();
   });
 
+  it('retries a rate-limited reaction and records its eventual success', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertReactionOutbound('ag-1', session.id, 'out-reaction-limited');
+    const deliver = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('Discord API error: 429 {"retry_after": 0.3}'))
+      .mockResolvedValueOnce(undefined);
+    setDeliveryAdapter({ deliver });
+
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(session);
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(deliveredRows('ag-1', session.id)).toEqual([]);
+    const db = new Database(inboundDbPath('ag-1', session.id));
+    expect(
+      db.prepare('SELECT state, attempts FROM delivery_attempts WHERE message_out_id = ?').get('out-reaction-limited'),
+    ).toEqual({ state: 'retry', attempts: 1 });
+    db.prepare('UPDATE delivery_attempts SET next_attempt_ms = 0 WHERE message_out_id = ?').run('out-reaction-limited');
+    db.close();
+
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(session);
+    expect(deliver).toHaveBeenCalledTimes(2);
+    expect(deliveredRows('ag-1', session.id)).toEqual([
+      { message_out_id: 'out-reaction-limited', platform_message_id: null, status: 'delivered' },
+    ]);
+  });
+
+  it('bounds retries when a reaction keeps receiving rate-limit rejections', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertReactionOutbound('ag-1', session.id, 'out-reaction-limited');
+    const deliver = vi.fn().mockRejectedValue(new Error('Discord API error: 429 rate limited'));
+    setDeliveryAdapter({ deliver });
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      await deliverSessionMessages(session);
+      const db = new Database(inboundDbPath('ag-1', session.id));
+      expect(
+        db
+          .prepare('SELECT state, attempts FROM delivery_attempts WHERE message_out_id = ?')
+          .get('out-reaction-limited'),
+      ).toEqual({ state: attempt < 3 ? 'retry' : 'failed', attempts: attempt });
+      db.prepare('UPDATE delivery_attempts SET next_attempt_ms = 0 WHERE message_out_id = ?').run(
+        'out-reaction-limited',
+      );
+      db.close();
+    }
+    await deliverSessionMessages(session);
+    expect(deliver).toHaveBeenCalledTimes(3);
+    expect(deliveredRows('ag-1', session.id)).toEqual([
+      { message_out_id: 'out-reaction-limited', platform_message_id: null, status: 'failed' },
+    ]);
+  });
+
+  it('retains uncertain reaction transport failures for reconciliation', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertReactionOutbound('ag-1', session.id, 'out-reaction-uncertain');
+    const deliver = vi.fn().mockRejectedValue(new Error('connection closed without a response'));
+    setDeliveryAdapter({ deliver });
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(session);
+    expect(deliver).toHaveBeenCalledTimes(1);
+    const db = new Database(inboundDbPath('ag-1', session.id));
+    expect(
+      db.prepare('SELECT state FROM delivery_attempts WHERE message_out_id = ?').get('out-reaction-uncertain'),
+    ).toEqual({ state: 'unknown' });
+    db.close();
+  });
+
   it('marks a retired channel failed without deleting its attachment', async () => {
     seedAgentAndChannel();
     const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');

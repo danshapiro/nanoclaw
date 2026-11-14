@@ -146,6 +146,11 @@ reached the recipient, so no automatic replay is safe. Outbox files remain in
 place until a durable success receipt is recorded. A successful adapter may
 legitimately return no platform message ID.
 
+An explicit HTTP 429 rejection of a reaction without files uses the persisted
+bounded retry path. It is one rejected operation, while a text/file delivery
+may have accepted an earlier part before a later request is rate limited.
+Ambiguous reaction transport failures still require reconciliation.
+
 For a session's host-owned `inbound.db`, inspect quarantined rows:
 
 ```bash

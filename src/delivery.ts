@@ -24,7 +24,11 @@ import {
   migrateDeliveredTable,
 } from './db/session-db.js';
 import { log } from './log.js';
-import { DeliveryUnavailableError, isNonRetryableDeliveryError } from './delivery-errors.js';
+import {
+  DeliveryUnavailableError,
+  extractHttpStatusFromError,
+  isNonRetryableDeliveryError,
+} from './delivery-errors.js';
 import { normalizeOptions } from './channels/ask-question.js';
 import { clearOutbox, openInboundDb, openOutboundDb, readOutboxFiles, sessionsBaseDir } from './session-manager.js';
 import {
@@ -639,7 +643,11 @@ async function drainSession(session: Session, options: DrainSessionOptions = {})
         // Once an adapter was called, an arbitrary exception may mean the
         // provider accepted all or part of a request. Do not send it twice.
         // Explicit unavailable errors are raised by the bridge before a call.
-        const cosmeticRejection = isReactionOutbound(msg) && isNonRetryableDeliveryError(err);
+        // A reaction without files is one operation. An explicit 429 rejects
+        // that operation, so use the bounded retry path. A multi-part send may
+        // already have accepted earlier parts before its rate-limit response.
+        const cosmeticRejection =
+          isReactionOutbound(msg) && (isNonRetryableDeliveryError(err) || extractHttpStatusFromError(err) === 429);
         if (current?.state === 'sending' && !unavailable && !cosmeticRejection) {
           setDeliveryAttempt(inDb, msg.id, 'unknown', attempts, 0, errorSummary(err));
           log.error('Outbound delivery outcome unknown; reconcile before replay', {
