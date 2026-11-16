@@ -188,3 +188,19 @@ Explicit429 retry_after seconds (including JSON whitespace) are a persisted
 minimum above exponential backoff; waiting polls consume no attempts. Invalid,
 nonfinite or out-of-Date-range delays are rejected by parsing. Attempts remain
 bounded; generic transport, server and multipart uncertainty is never replayed.
+
+## Host container-log retention and archive capture
+
+On Linux the host uses `/usr/bin/flock` to coordinate retention with the
+backup hook. One persistent service-owned 0600 empty inode lives at
+`data/../.container-log-retention.lock`; preserve filesystem traversal through
+release/data symlinks, rather than normalizing `..` lexically. The backup
+owns an exclusive lease during membership/stream/ACL cleanup. The runtime
+holds a shared nonblocking lease only while deleting old tails. New tails
+are published closed and uniquely named; clean and crash retention budgets
+remain separate. Busy leases defer pruning until a later finalization;
+unsafe/missing mutex or tool failures keep tails and log a diagnostic.
+Never unlink or replace the mutex. Unsupported hosts conservatively retain
+logs when the Linux lease utility is unavailable. The coordinated backup
+hook is an external consumer; this source change alone does not prove an
+off-machine backup or production rollout.

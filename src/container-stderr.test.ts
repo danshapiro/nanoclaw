@@ -77,6 +77,7 @@ describe('persistStderrTail', () => {
     tail.append(text);
     return persistStderrTail({
       logDir: dir,
+      retentionLockPath: path.join(dir, '.retention.lock'),
       tail,
       exitCode,
       keepClean: 5,
@@ -90,7 +91,10 @@ describe('persistStderrTail', () => {
     writeOne(dir, 1, 'crash output A', 0);
     writeOne(dir, null, 'crash output B (verify path, unknown code)', 1);
     for (let i = 0; i < 9; i++) writeOne(dir, 0, `clean output ${i}`, 2 + i);
-    const files = fs.readdirSync(dir).sort();
+    const files = fs
+      .readdirSync(dir)
+      .filter((name) => name.endsWith('.log'))
+      .sort();
     const clean = files.filter((f) => f.endsWith('-exit-0.log'));
     const crash = files.filter((f) => !f.endsWith('-exit-0.log'));
     expect(clean).toHaveLength(5); // newest 5 clean kept
@@ -103,7 +107,10 @@ describe('persistStderrTail', () => {
   it('rotates crash tails down to keepCrash among themselves', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stderr-tail-'));
     for (let i = 0; i < 7; i++) writeOne(dir, 1, `crash output ${i}`, i);
-    const files = fs.readdirSync(dir).sort();
+    const files = fs
+      .readdirSync(dir)
+      .filter((name) => name.endsWith('.log'))
+      .sort();
     expect(files).toHaveLength(5);
     expect(fs.readFileSync(path.join(dir, files.at(-1)!), 'utf8')).toContain('crash output 6');
     fs.rmSync(dir, { recursive: true, force: true });
@@ -113,19 +120,39 @@ describe('persistStderrTail', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'stderr-tail-'));
     const tail = new StderrTail(4096);
     tail.append('complete line');
-    const file = persistStderrTail({ logDir: dir, tail, carry: 'FATAL: last words with no newline', exitCode: 1 });
+    const file = persistStderrTail({
+      logDir: dir,
+      retentionLockPath: path.join(dir, '.retention.lock'),
+      tail,
+      carry: 'FATAL: last words with no newline',
+      exitCode: 1,
+    });
     expect(fs.readFileSync(file!, 'utf8')).toContain('FATAL: last words with no newline');
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
   it('never throws and returns null for an empty tail+carry or unwritable dir', () => {
     // Empty tail short-circuits before any fs work.
-    expect(persistStderrTail({ logDir: '/nonexistent/no-perms/x', tail: new StderrTail(64), exitCode: 0 })).toBeNull();
+    expect(
+      persistStderrTail({
+        logDir: '/nonexistent/no-perms/x',
+        retentionLockPath: '/nonexistent/no-perms/lock',
+        tail: new StderrTail(64),
+        exitCode: 0,
+      }),
+    ).toBeNull();
     // A NON-EMPTY tail actually reaches the mkdir/write against an unwritable
     // root-owned path — advisory capture must swallow the error (fail-open).
     const tail = new StderrTail(4096);
     tail.append('crash output that cannot be persisted');
-    expect(persistStderrTail({ logDir: '/nonexistent/no-perms/x', tail, exitCode: 1 })).toBeNull();
+    expect(
+      persistStderrTail({
+        logDir: '/nonexistent/no-perms/x',
+        retentionLockPath: '/nonexistent/no-perms/lock',
+        tail,
+        exitCode: 1,
+      }),
+    ).toBeNull();
   });
 });
 

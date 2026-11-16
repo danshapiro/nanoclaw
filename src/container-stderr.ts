@@ -5,6 +5,8 @@
  * Pure helpers — no container-runner imports — so they unit-test without the
  * spawn harness.
  */
+import { randomUUID } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -91,6 +93,52 @@ export function truncateForLog(line: string, max = 2000): string {
 }
 
 /**
+ * Linux flock locks belong to the open file description. The short-lived
+ * utility inherits our fd, so its successful shared lock remains held by
+ * this process until finally closes fd. No shell, background pruner, or
+ * blocking wait on a backup; failure conservatively defers deletion.
+ * The host-only mutex is outside the backed-up roots and is never unlinked.
+ */
+export function withContainerLogRetentionLease(lockPath: string, prune: () => void): 'pruned' | 'busy' | 'unavailable' {
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(
+      lockPath,
+      fs.constants.O_RDONLY | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
+      0o600,
+    );
+    const held = fs.fstatSync(fd);
+    const sameInode = () => {
+      const named = fs.lstatSync(lockPath);
+      return named.isFile() && named.dev === held.dev && named.ino === held.ino;
+    };
+    if (
+      !held.isFile() ||
+      held.size !== 0 ||
+      held.nlink !== 1 ||
+      held.uid !== process.getuid?.() ||
+      (held.mode & 0o7777) !== 0o600 ||
+      !sameInode()
+    )
+      return 'unavailable';
+    const result = spawnSync('/usr/bin/flock', ['--shared', '--nonblock', '3'], {
+      stdio: ['ignore', 'ignore', 'ignore', fd],
+      timeout: 1000,
+      killSignal: 'SIGKILL',
+    });
+    if (result.error || result.signal) return 'unavailable';
+    if (result.status === 1) return 'busy';
+    if (result.status !== 0 || !sameInode()) return 'unavailable';
+    prune();
+    return 'pruned';
+  } catch {
+    return 'unavailable';
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+/**
  * Persist a stderr tail into the HOST-OWNED per-session log dir (a sibling
  * tree outside the agent-writable workspace — see containerLogsDir; the
  * hostCorrelationDir precedent). Never write these files into /workspace:
@@ -108,39 +156,66 @@ export function truncateForLog(line: string, max = 2000): string {
  */
 export function persistStderrTail(opts: {
   logDir: string;
+  retentionLockPath: string;
   tail: StderrTail;
   carry?: string;
   exitCode: number | null;
   keepClean?: number;
   keepCrash?: number;
   nowMs?: number;
+  onRetentionDeferred?: (reason: 'busy' | 'unavailable') => void;
 }): string | null {
+  let temporary: string | undefined;
   try {
     if (opts.carry) opts.tail.append(opts.carry);
     const contents = opts.tail.contents();
     if (!contents) return null;
     fs.mkdirSync(opts.logDir, { recursive: true, mode: 0o700 });
     const stamp = new Date(opts.nowMs ?? Date.now()).toISOString().replace(/[:.]/g, '-');
-    const file = path.join(opts.logDir, `${stamp}-exit-${opts.exitCode ?? 'unknown'}.log`);
-    fs.writeFileSync(file, `${contents}\n`);
-    const isClean = (f: string): boolean => f.endsWith('-exit-0.log');
-    const entries = fs
-      .readdirSync(opts.logDir)
-      .filter((f) => f.endsWith('.log'))
-      .sort();
-    const prune = (names: string[], keep: number): void => {
-      for (const stale of names.slice(0, Math.max(0, names.length - keep))) {
-        fs.rmSync(path.join(opts.logDir, stale), { force: true });
+    const identity = randomUUID();
+    // Publish a CLOSED immutable tail atomically. Concurrent exits at the
+    // same millisecond never overwrite a censused file; the existing .tmp
+    // capture omission keeps an incomplete write outside archive membership.
+    const file = path.join(opts.logDir, `${stamp}-${identity}-exit-${opts.exitCode ?? 'unknown'}.log`);
+    temporary = path.join(opts.logDir, `.stderr-${identity}.tmp`);
+    fs.writeFileSync(temporary, `${contents}\n`, { flag: 'wx', mode: 0o600 });
+    fs.renameSync(temporary, file);
+    temporary = undefined;
+    const retention = withContainerLogRetentionLease(opts.retentionLockPath, () => {
+      const isClean = (f: string) => f.endsWith('-exit-0.log');
+      const entries = fs
+        .readdirSync(opts.logDir)
+        .filter((f) => f.endsWith('.log'))
+        .sort();
+      const prune = (names: string[], keep: number) => {
+        for (const stale of names.slice(0, Math.max(0, names.length - keep))) {
+          fs.rmSync(path.join(opts.logDir, stale), { force: true });
+        }
+      };
+      prune(entries.filter(isClean), opts.keepClean ?? 5);
+      prune(
+        entries.filter((f) => !isClean(f)),
+        opts.keepCrash ?? 5,
+      );
+    });
+    if (retention !== 'pruned') {
+      try {
+        opts.onRetentionDeferred?.(retention);
+      } catch {
+        /* advisory diagnostics */
       }
-    };
-    prune(entries.filter(isClean), opts.keepClean ?? 5);
-    prune(
-      entries.filter((f) => !isClean(f)),
-      opts.keepCrash ?? 5,
-    );
+    }
     return file;
-    // eslint-disable-next-line no-catch-all/no-catch-all -- fail-open: post-mortem capture is best-effort and must never break container teardown.
   } catch {
+    // Advisory: persistence must not prevent container finalization.
     return null;
+  } finally {
+    if (temporary) {
+      try {
+        fs.rmSync(temporary, { force: true });
+      } catch {
+        /* original failure */
+      }
+    }
   }
 }

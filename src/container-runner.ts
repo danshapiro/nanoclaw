@@ -669,6 +669,12 @@ async function finalizeVerifiedContainerStop(
   const exitCode = code ?? current.observedExitCode ?? null; // null persists as '-exit-unknown'
   const persisted = persistStderrTail({
     logDir: containerLogsDir(current.agentGroupId, sessionId),
+    // Preserve OS traversal through release/data -> shared/data: lexical
+    // path.join(DATA_DIR, '..', ...) would choose the read-only release root.
+    retentionLockPath: `${DATA_DIR}/../.container-log-retention.lock`,
+    onRetentionDeferred: (reason) => {
+      if (reason === 'unavailable') log.warn('Container log retention lease unavailable; keeping tails', { sessionId });
+    },
     tail: current.stderrTail,
     carry: current.stderrState.carry, // flush the final unterminated line
     exitCode,
