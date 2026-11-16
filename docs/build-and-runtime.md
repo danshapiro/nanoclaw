@@ -179,3 +179,12 @@ If the session is active, the next poll retries the whole message after an
 explicit requeue. A partly delivered message is neither
 of these cases: reconcile the missing parts manually before recording completion.
 Never requeue a partial or uncertain send: doing so can duplicate messages.
+
+
+The November15 follow-up narrows safe reaction retry eligibility to nonempty
+string message/emoji targets without files, matching the bridge's single
+operation. Malformed reaction-shaped text retains outcome-unknown protection.
+Explicit429 retry_after seconds (including JSON whitespace) are a persisted
+minimum above exponential backoff; waiting polls consume no attempts. Invalid,
+nonfinite or out-of-Date-range delays are rejected by parsing. Attempts remain
+bounded; generic transport, server and multipart uncertainty is never replayed.

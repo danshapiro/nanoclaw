@@ -1072,6 +1072,57 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     ]);
   });
 
+  it.each([
+    { operation: 'reaction', text: 'may have accepted a text chunk' },
+    { operation: 'reaction', messageId: 'plat-1', emoji: '', text: 'fallback text' },
+    { operation: 'reaction', messageId: '', emoji: 'eyes', text: 'fallback text' },
+    { operation: 'reaction', messageId: 12, emoji: 'eyes' },
+  ])('never replays an unverified reaction-shaped send after429: %j', async (content) => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertReactionOutbound('ag-1', session.id, 'out-unverified');
+    const out = new Database(outboundDbPath('ag-1', session.id));
+    out.prepare('UPDATE messages_out SET content=? WHERE id=?').run(JSON.stringify(content), 'out-unverified');
+    out.close();
+    const deliver = vi.fn().mockRejectedValue(new Error('Discord API error: 429 {"retry_after": 10}'));
+    setDeliveryAdapter({ deliver });
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(session);
+    expect(deliver).toHaveBeenCalledTimes(1);
+    const db = new Database(inboundDbPath('ag-1', session.id));
+    expect(db.prepare('SELECT state FROM delivery_attempts WHERE message_out_id=?').get('out-unverified')).toEqual({
+      state: 'unknown',
+    });
+    db.close();
+  });
+
+  it('persists provider retry_after without burning attempts while the window is closed', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertReactionOutbound('ag-1', session.id, 'out-long-rate-limit');
+    const start = Date.now();
+    const deliver = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('Discord API error: 429 {"retry_after": 10}'))
+      .mockResolvedValue(undefined);
+    setDeliveryAdapter({ deliver });
+    await deliverSessionMessages(session);
+    const db = new Database(inboundDbPath('ag-1', session.id));
+    const row = db
+      .prepare('SELECT state,attempts,next_attempt_ms FROM delivery_attempts WHERE message_out_id=?')
+      .get('out-long-rate-limit') as { state: string; attempts: number; next_attempt_ms: number };
+    expect(row.state).toBe('retry');
+    expect(row.attempts).toBe(1);
+    expect(row.next_attempt_ms).toBeGreaterThanOrEqual(start + 10000);
+    await deliverSessionMessages(session);
+    expect(deliver).toHaveBeenCalledTimes(1);
+    db.prepare('UPDATE delivery_attempts SET next_attempt_ms=0 WHERE message_out_id=?').run('out-long-rate-limit');
+    db.close();
+    await deliverSessionMessages(session);
+    expect(deliver).toHaveBeenCalledTimes(2);
+    expect(deliveredRows('ag-1', session.id)[0]?.status).toBe('delivered');
+  });
+
   it('retains uncertain reaction transport failures for reconciliation', async () => {
     seedAgentAndChannel();
     const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');

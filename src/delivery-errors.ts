@@ -40,13 +40,31 @@ export function extractHttpStatusFromError(err: unknown): number | null {
   return null;
 }
 
+/** Provider retry_after is seconds; keep it as a minimum persisted delay. */
+export function extractRateLimitDelayMs(err: unknown): number | null {
+  if (extractHttpStatusFromError(err) !== 429 || !err || typeof err !== 'object') return null;
+  const error = err as { retry_after?: unknown; message?: unknown };
+  let value = error.retry_after;
+  if (value === undefined && typeof error.message === 'string') {
+    const body = error.message.trim().match(/(?:API error:?|Failed to post message:)\s*429\s+(\{.*\})$/is);
+    if (body) {
+      try {
+        value = (JSON.parse(body[1]) as { retry_after?: unknown }).retry_after;
+      } catch {
+        return null;
+      }
+    }
+  }
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return null;
+  const delay = Math.ceil(value * 1000);
+  return Number.isSafeInteger(delay) && delay <= 8.64e15 - Date.now() ? delay : null;
+}
+
 /**
  * True when the error is a deterministic client error (HTTP 4xx).
  *
- * 429 (rate limit) is excluded: it is transient -- Discord's retry_after is
- * typically sub-second, well within the delivery retry backoff (>=250ms), so
- * a retry succeeds where a "permanent" classification would silently drop
- * the message.
+ * 429 (rate limit) is transient. Safe single-reaction retries honor its
+ * retry_after minimum; ambiguous or multipart sends retain reconciliation.
  */
 export function isNonRetryableDeliveryError(err: unknown): boolean {
   const status = extractHttpStatusFromError(err);

@@ -27,6 +27,7 @@ import { log } from './log.js';
 import {
   DeliveryUnavailableError,
   extractHttpStatusFromError,
+  extractRateLimitDelayMs,
   isNonRetryableDeliveryError,
 } from './delivery-errors.js';
 import { normalizeOptions } from './channels/ask-question.js';
@@ -646,8 +647,8 @@ async function drainSession(session: Session, options: DrainSessionOptions = {})
         // A reaction without files is one operation. An explicit 429 rejects
         // that operation, so use the bounded retry path. A multi-part send may
         // already have accepted earlier parts before its rate-limit response.
-        const cosmeticRejection =
-          isReactionOutbound(msg) && (isNonRetryableDeliveryError(err) || extractHttpStatusFromError(err) === 429);
+        const rateLimitedReaction = isReactionOutbound(msg) && extractHttpStatusFromError(err) === 429;
+        const cosmeticRejection = isReactionOutbound(msg) && (isNonRetryableDeliveryError(err) || rateLimitedReaction);
         if (current?.state === 'sending' && !unavailable && !cosmeticRejection) {
           setDeliveryAttempt(inDb, msg.id, 'unknown', attempts, 0, errorSummary(err));
           log.error('Outbound delivery outcome unknown; reconcile before replay', {
@@ -672,7 +673,8 @@ async function drainSession(session: Session, options: DrainSessionOptions = {})
           setDeliveryAttempt(inDb, msg.id, 'failed', attempts, 0, errorSummary(err));
           markDeliveryFailed(inDb, msg.id);
         } else {
-          const next = Date.now() + retryDelayMs(attempts);
+          const providerDelay = rateLimitedReaction ? (extractRateLimitDelayMs(err) ?? 0) : 0;
+          const next = Date.now() + Math.max(retryDelayMs(attempts), providerDelay);
           setDeliveryAttempt(inDb, msg.id, 'retry', attempts, next, errorSummary(err));
           log.warn('Message delivery failed before sending; retained for retry', {
             messageId: msg.id,
@@ -699,9 +701,18 @@ async function drainSession(session: Session, options: DrainSessionOptions = {})
  */
 function isReactionOutbound(msg: { content: string }): boolean {
   try {
-    const content = JSON.parse(msg.content) as { operation?: unknown; files?: unknown };
+    const content = JSON.parse(msg.content) as {
+      operation?: unknown;
+      messageId?: unknown;
+      emoji?: unknown;
+      files?: unknown;
+    };
     return (
       content.operation === 'reaction' &&
+      typeof content.messageId === 'string' &&
+      content.messageId.trim().length > 0 &&
+      typeof content.emoji === 'string' &&
+      content.emoji.trim().length > 0 &&
       (content.files === undefined || (Array.isArray(content.files) && content.files.length === 0))
     );
   } catch {
