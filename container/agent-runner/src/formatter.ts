@@ -381,6 +381,7 @@ export interface RecoveryContextInput {
   agentMessage: string;
   originalTasks: Array<{ text: string }>;
   acceptedUnresolvedInputs: Array<{ prompt: string }>;
+  pendingFollowups?: Array<{ text: string }>;
   priorProgress: Array<{ text: string }>;
   observations: string[];
   sideEffects: Array<{
@@ -415,6 +416,7 @@ export function formatRecoveryContext(entries: RecoveryContextInput[]): string {
     for (const t of e.originalTasks) lines.push(`    <original_task>${escapeXml(t.text)}</original_task>`);
     for (const a of e.acceptedUnresolvedInputs)
       lines.push(`    <unresolved_input>${escapeXml(a.prompt)}</unresolved_input>`);
+    for (const p of e.pendingFollowups ?? []) lines.push(`    <queued_input>${escapeXml(p.text)}</queued_input>`);
     for (const p of e.priorProgress) lines.push(`    <prior_progress>${escapeXml(p.text)}</prior_progress>`);
     for (const o of e.observations) lines.push(`    <observation>${escapeXml(o)}</observation>`);
     for (const s of e.sideEffects) {

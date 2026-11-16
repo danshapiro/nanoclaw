@@ -15,7 +15,7 @@ import path from 'path';
 import { spawn, type ChildProcess } from 'child_process';
 import { createInterface, type Interface as ReadlineInterface } from 'readline';
 
-import { ProviderQuiescenceError } from './types.js';
+import { ProviderContainerStopRequired, ProviderQuiescenceError } from './types.js';
 
 function log(msg: string): void {
   console.error(`[codex-app-server] ${msg}`);
@@ -267,6 +267,8 @@ export interface CodexTerminationOptions {
   gracefulShutdownMs?: number;
   termExitMs?: number;
   killExitMs?: number;
+  /** Caller proved the query ended normally; still requires host-confirmed whole-container stop. */
+  cleanCompletion?: boolean;
 }
 
 interface CodexProcessExit {
@@ -362,6 +364,14 @@ export function terminateCodexAppServer(server: AppServer, options: CodexTermina
 
     const gracefulExit = await waitForCodexProcessExit(server, options.gracefulShutdownMs ?? 3_000);
     if (gracefulExit) {
+      if (options.cleanCompletion && gracefulExit.code === 0 && gracefulExit.signal === null && !transportState.error) {
+        // This is NOT descendant-quiescence proof: the runner still retains
+        // correlation and exits PID 1. Only host-verified container stop may
+        // revoke the lease or admit a successor, even if children escaped.
+        throw new ProviderContainerStopRequired(
+          'Codex query completed; whole process tree quiescence requires host-confirmed container stop',
+        );
+      }
       // A clean stdin-EOF/direct-process exit is still only proof about the
       // app-server PID. MCP servers and tool subprocesses can outlive it, and
       // this runner has no independent cgroup/process-namespace emptiness

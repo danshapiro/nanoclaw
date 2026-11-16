@@ -243,7 +243,7 @@ export interface ProviderRecoveryScope {
 
 export interface ProviderRecoveryEntry {
   id: string;
-  status: 'pending' | 'in_flight' | 'resolved' | 'superseded';
+  status: 'pending' | 'in_flight' | 'reconciliation_required' | 'resolved' | 'superseded';
   inFlightInputId?: string;
   classification: string;
   agentMessage: string;
@@ -294,7 +294,7 @@ export function listRecoveryEntries(scope: ProviderRecoveryScope): ProviderRecov
 }
 
 function isUnresolved(e: ProviderRecoveryEntry): boolean {
-  return e.status === 'pending' || e.status === 'in_flight';
+  return e.status === 'pending' || e.status === 'in_flight' || e.status === 'reconciliation_required';
 }
 
 export interface AppendRecoveryResult {
@@ -408,7 +408,7 @@ export function appendRecoveryEntryAndOwnRows(
 export function markRecoveryInFlight(scope: ProviderRecoveryScope, recoveryId: string, inputId: string): void {
   const entries = listRecoveryEntries(scope);
   const e = entries.find((x) => x.id === recoveryId);
-  if (!e) return;
+  if (!e || e.status === 'reconciliation_required') return;
   e.status = 'in_flight';
   e.inFlightInputId = inputId;
   e.updatedAt = new Date().toISOString();
@@ -428,14 +428,23 @@ export interface ResolveRecoveryResult {
 export function resolveRecoveryEntry(
   scope: ProviderRecoveryScope,
   recoveryId: string,
-  resolution: { resolvedInputIds: string[]; supersededInputIds?: string[] },
+  resolution: { resolvedInputIds: string[]; supersededInputIds?: string[]; resumedInputId?: string },
 ): ResolveRecoveryResult {
   const entries = listRecoveryEntries(scope);
   const e = entries.find((x) => x.id === recoveryId);
-  if (!e) return { resolvedMessageIds: [] };
+  if (!e || e.status === 'reconciliation_required') return { resolvedMessageIds: [] };
 
   const resolvedSet = new Set([...(resolution.resolvedInputIds ?? []), ...(resolution.supersededInputIds ?? [])]);
-  const resolvedMessageIds: string[] = [];
+  // Queued work was not accepted in the original turn. Only the successful
+  // exact resuming input (which actually received its recovery context) may
+  // discharge those rows; an unrelated or partial old-input result cannot.
+  const exactResume =
+    e.status === 'in_flight' &&
+    e.inFlightInputId === resolution.resumedInputId &&
+    resolution.resumedInputId !== undefined &&
+    resolvedSet.has(resolution.resumedInputId);
+  if (e.pendingFollowups.length > 0 && !exactResume) return { resolvedMessageIds: [] };
+  const resolvedMessageIds: string[] = exactResume ? e.pendingFollowups.map((p) => p.messageId) : [];
   for (const acc of e.acceptedUnresolvedInputs) {
     if (resolvedSet.has(acc.inputId)) {
       for (const id of acc.messageIds) resolvedMessageIds.push(id);

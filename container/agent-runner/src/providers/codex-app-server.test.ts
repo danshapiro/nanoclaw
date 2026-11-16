@@ -13,7 +13,7 @@ import {
   type AppServer,
 } from './codex-app-server.js';
 import { isProcessAlive, spawnCodexTestProcessTree, waitForProcessExit } from './codex-process-tree.test-support.js';
-import { ProviderQuiescenceError } from './types.js';
+import { ProviderContainerStopRequired, ProviderQuiescenceError } from './types.js';
 
 describe('Codex app-server termination', () => {
   it('rejects even a clean EOF exit after the app-server reaps its descendant', async () => {
@@ -49,6 +49,36 @@ describe('Codex app-server termination', () => {
         message: expect.stringContaining('whole process tree'),
       });
       expect(isProcessAlive(tree.descendantPid)).toBe(true);
+    } finally {
+      await tree.cleanup();
+    }
+  });
+
+  it.each(['graceful', 'graceful-unreaped'] as const)(
+    'hands a clean caller to whole-container stop without claiming descendants exited: %s',
+    async (mode) => {
+      const tree = await spawnCodexTestProcessTree(mode);
+      try {
+        await expect(
+          terminateCodexAppServer(tree.server, { cleanCompletion: true, gracefulShutdownMs: 750 }),
+        ).rejects.toBeInstanceOf(ProviderContainerStopRequired);
+        if (mode === 'graceful-unreaped') expect(isProcessAlive(tree.descendantPid)).toBe(true);
+      } finally {
+        await tree.cleanup();
+      }
+    },
+  );
+
+  it('never treats required direct signals as a clean lifecycle handoff', async () => {
+    const tree = await spawnCodexTestProcessTree('stubborn');
+    try {
+      const error = await terminateCodexAppServer(tree.server, {
+        cleanCompletion: true,
+        gracefulShutdownMs: 50,
+        termExitMs: 500,
+      }).catch((e) => e);
+      expect(error).toBeInstanceOf(ProviderQuiescenceError);
+      expect(error).not.toBeInstanceOf(ProviderContainerStopRequired);
     } finally {
       await tree.cleanup();
     }

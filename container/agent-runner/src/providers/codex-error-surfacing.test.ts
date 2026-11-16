@@ -315,10 +315,14 @@ describe('runOneTurn provider-error surfacing', () => {
     });
 
     const collected = await withTimeout(events, 'empty turn with failure reason');
-    const result = findResult(collected);
-    expect(result).toBeDefined();
-    expect(result?.text).toBeNull();
-    expect(result?.errorText).toBe('boom quota');
+    expect(findResult(collected)).toBeUndefined();
+    const failure = collected.find((e) => e.type === 'interruption');
+    expect(failure).toMatchObject({
+      type: 'interruption',
+      terminal: true,
+      classification: 'codex_turn_failed',
+      fallbackUserMessage: expect.stringContaining('boom quota'),
+    });
   });
 
   it('leaves errorText undefined for a normal turn with agent text', async () => {

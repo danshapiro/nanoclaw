@@ -793,6 +793,38 @@ describe('side-effects-verify cross-check (container copy)', () => {
 // ── Task 1 Step 3: route-scoped recovery + lifecycle ─────────────────────────
 
 describe('provider recovery entries', () => {
+  test('durable reconciliation hold survives normal acceptance, resolution and pruning', () => {
+    const scope = dmScope();
+    const e = newRecoveryEntry(scope, { status: 'reconciliation_required' });
+    appendRecoveryEntry(scope, e);
+    markRecoveryInFlight(scope, e.id, 'unrelated');
+    expect(resolveRecoveryEntry(scope, e.id, { resolvedInputIds: ['unrelated'], resumedInputId: 'unrelated' })).toEqual(
+      { resolvedMessageIds: [] },
+    );
+    pruneResolvedRecoveryEntries(scope, { keep: 0 });
+    expect(listRecoveryEntries(scope)[0]).toMatchObject({ status: 'reconciliation_required' });
+  });
+
+  test('queued ownership completes only after successful exact resume and stays safe across interruption', () => {
+    const scope = dmScope();
+    const entry = newRecoveryEntry(scope, {
+      acceptedUnresolvedInputs: [],
+      pendingFollowups: [{ messageId: 'queued-owned', text: 'Exact work', timestamp: new Date().toISOString() }],
+    });
+    appendRecoveryEntry(scope, entry);
+    expect(resolveRecoveryEntry(scope, entry.id, { resolvedInputIds: [] })).toEqual({ resolvedMessageIds: [] });
+    expect(listRecoveryEntries(scope)[0].status).toBe('pending');
+    markRecoveryInFlight(scope, entry.id, 'resume-exact');
+    expect(resolveRecoveryEntry(scope, entry.id, { resolvedInputIds: ['wrong'], resumedInputId: 'wrong' })).toEqual({
+      resolvedMessageIds: [],
+    });
+    expect(listRecoveryEntries(scope)[0].status).toBe('in_flight');
+    expect(
+      resolveRecoveryEntry(scope, entry.id, { resolvedInputIds: ['resume-exact'], resumedInputId: 'resume-exact' }),
+    ).toEqual({ resolvedMessageIds: ['queued-owned'] });
+    expect(listRecoveryEntries(scope)[0].status).toBe('resolved');
+  });
+
   test('entries are keyed by provider plus normalized route and read non-destructively', () => {
     const scope = dmScope();
     appendRecoveryEntry(scope, newRecoveryEntry(scope));

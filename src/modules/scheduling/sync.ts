@@ -391,9 +391,14 @@ export function syncSessionSchedulerState(
       }
 
       if (ack?.status === 'recovery') {
-        recordUnresolvedSchedulerAck(session, row, 'recovery', owner);
+        // A fresh recovery ack is an expected bounded lifecycle, not a new
+        // task failure. Updating a stable series must not page on every new
+        // projection. Preserve real stalled/invalid evidence below; recovery
+        // exhaustion and failed-ack terminal notices remain independently loud.
         const ackAgeMs = Date.now() - parseSqliteUtcMs(ack.status_changed);
-        if (Number.isFinite(ackAgeMs) && ackAgeMs >= SCHEDULER_ACK_STALE_ESCALATION_MS) {
+        if (!Number.isFinite(ackAgeMs) || ackAgeMs < 0) {
+          recordUnresolvedSchedulerAck(session, row, 'recovery', owner);
+        } else if (ackAgeMs >= SCHEDULER_ACK_STALE_ESCALATION_MS) {
           recordStaleSchedulerAckEscalation(session, row, 'recovery', ackAgeMs, owner);
         }
       }

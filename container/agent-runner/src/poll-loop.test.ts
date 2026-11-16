@@ -5002,6 +5002,189 @@ describe('poll-loop inactivity status and terminal recovery', () => {
 });
 
 describe('provider finalization barriers', () => {
+  it('redacts provider interruption diagnostics at the outbound boundary', async () => {
+    insertMessage(
+      'private-error-init',
+      'chat',
+      { sender: 'User', text: 'Run work' },
+      { platformId: 'chan-private-error', channelType: 'discord' },
+    );
+    insertChannelDestination('discord-current', 'chan-private-error');
+    const provider: AgentProvider = {
+      supportsNativeSlashCommands: false,
+      isSessionInvalid: () => false,
+      query(input) {
+        return {
+          push() {},
+          end() {},
+          async abort() {},
+          events: (async function* () {
+            yield { type: 'input-accepted', inputId: input.inputId, scope: 'initial' };
+            yield {
+              type: 'interruption',
+              inputId: input.inputId,
+              classification: 'codex_turn_failed',
+              severity: 'error',
+              terminal: true,
+              agentMessage: 'Failed',
+              fallbackUserMessage:
+                'Failed: Bearer audit-sentinel-token123456789 sk-secretsentinel123456 https://example.invalid/?token=private-sentinel',
+              continuationPolicy: 'preserve',
+            };
+          })(),
+        };
+      },
+    };
+    const controller = new AbortController();
+    const loop = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+    void loop.catch(() => {});
+    await waitFor(() => getAckStatus('private-error-init') === 'recovery', 2000);
+    const text = getUndeliveredMessages()
+      .map((r) => JSON.parse(r.content).text)
+      .join(' ');
+    expect(text).toContain('[redacted');
+    expect(text).not.toContain('audit-sentinel');
+    expect(text).not.toContain('secretsentinel');
+    expect(text).not.toContain('private-sentinel');
+    controller.abort();
+    await loop;
+  });
+
+  for (const mode of ['clean', 'failure', 'host-bound'] as const) {
+    it(`preserves queued follow-up work at a ${mode} stop boundary without premature replay`, async () => {
+      const platformId = `chan-queued-stop-${mode}`;
+      insertMessage(
+        'queued-stop-initial',
+        'chat',
+        { sender: 'User', text: 'Initial work' },
+        { platformId, channelType: 'discord' },
+      );
+      insertChannelDestination('discord-current', platformId);
+      let queued: QueryTurnInput | undefined;
+      let releaseCalls = 0;
+      const provider: AgentProvider = {
+        supportsNativeSlashCommands: false,
+        isSessionInvalid: () => false,
+        query(input) {
+          return {
+            push(turn) {
+              if (typeof turn !== 'string') queued = turn;
+            },
+            end() {},
+            async abort() {},
+            events: (async function* () {
+              yield { type: 'input-accepted', inputId: input.inputId, scope: 'initial' };
+              await waitFor(() => queued !== undefined, 2500);
+              if (mode === 'host-bound') await queued!.acceptInput();
+              yield {
+                type: 'result',
+                text: '<message to="discord-current">Done.</message>',
+                resolvedInputIds: [input.inputId],
+              };
+              if (mode === 'failure') throw new ProviderQuiescenceError('actual shutdown failure');
+              throw new ProviderContainerStopRequired('host must prove container stopped');
+            })(),
+          };
+        },
+      };
+      const loop = runPollLoop({
+        provider,
+        providerName: 'test',
+        cwd: '/tmp',
+        releaseGwsCorrelation: async () => {
+          releaseCalls++;
+        },
+      });
+      void loop.catch(() => {});
+      await waitFor(() => getAckStatus('queued-stop-initial') === 'processing', 1500);
+      insertMessage(
+        'queued-stop-followup',
+        'task',
+        { prompt: 'Exact queued future work' },
+        { platformId, channelType: 'discord' },
+      );
+      await expect(loop).rejects.toBeInstanceOf(ProviderQuiescenceError);
+      expect(getAckStatus('queued-stop-initial')).toBe('completed');
+      expect(releaseCalls).toBe(0);
+      const recoveries = listRecoveryEntries({
+        providerName: 'test',
+        routeKey: normalizeRoute('test', {
+          platformId,
+          channelType: 'discord',
+          threadId: null,
+          messagingGroupId: null,
+          isGroup: null,
+        }).routeKey,
+      });
+      if (mode === 'clean') {
+        expect(getAckStatus('queued-stop-followup')).toBeNull();
+        expect(recoveries).toHaveLength(0);
+      } else {
+        expect(getAckStatus('queued-stop-followup')).toBe('recovery');
+        expect(recoveries).toHaveLength(1);
+        expect(recoveries[0].pendingFollowups).toEqual([
+          expect.objectContaining({ messageId: 'queued-stop-followup', text: 'Exact queued future work' }),
+        ]);
+        expect(recoveries[0].originalTasks).toEqual([]); // completed initial work is not reissued
+        insertMessage(
+          'queued-stop-resume',
+          'chat',
+          { sender: 'User', text: 'Resume saved work' },
+          { platformId, channelType: 'discord' },
+        );
+        let resumedPrompt = '';
+        const controller = new AbortController();
+        const resumeProvider: AgentProvider = {
+          supportsNativeSlashCommands: false,
+          isSessionInvalid: () => false,
+          query(input) {
+            resumedPrompt = input.prompt;
+            return {
+              push() {},
+              end() {},
+              async abort() {},
+              events: (async function* () {
+                yield { type: 'input-accepted', inputId: input.inputId, scope: 'initial' };
+                yield {
+                  type: 'result',
+                  text: '<message to="discord-current">Recovered queued work.</message>',
+                  resolvedInputIds: [input.inputId],
+                };
+              })(),
+            };
+          },
+        };
+        const resumed = runPollLoop({
+          provider: resumeProvider,
+          providerName: 'test',
+          cwd: '/tmp',
+          signal: controller.signal,
+        });
+        void resumed.catch(() => {});
+        await waitFor(() => getAckStatus('queued-stop-followup') === 'completed', 2000);
+        expect(resumedPrompt).toContain('<queued_input>Exact queued future work</queued_input>');
+        expect(getAckStatus('queued-stop-resume')).toBe('completed');
+        expect(
+          listRecoveryEntries({
+            providerName: 'test',
+            routeKey: recoveries.length
+              ? normalizeRoute('test', {
+                  platformId,
+                  channelType: 'discord',
+                  threadId: null,
+                  messagingGroupId: null,
+                  isGroup: null,
+                }).routeKey
+              : '',
+          })[0].status,
+        ).toBe('resolved');
+        controller.abort();
+        await resumed;
+      }
+    });
+  }
+
+
   it('keeps a completed Claude reply but retains correlation for clean whole-container recycle', async () => {
     insertMessage(
       'claude-normal-result-before-recycle',

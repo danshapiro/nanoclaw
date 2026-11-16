@@ -27,6 +27,7 @@ import {
   createOrReplaceScheduledTask,
   getScheduledTask,
   pauseScheduledTask,
+  updateScheduledTask,
   type CreateScheduledTaskInput,
 } from './ledger.js';
 import { projectScheduledTask } from './projection.js';
@@ -38,7 +39,7 @@ vi.mock('../../config.js', async () => {
 });
 
 const LOCK_NAME = 'scheduler-mutator';
-const TEST_DIR = '/tmp/nanoclaw-scheduler-sync-test';
+const TEST_DIR = `/tmp/nanoclaw-scheduler-sync-test-${process.pid}`;
 const INBOUND_PATH = path.join(TEST_DIR, 'inbound.db');
 const OUTBOUND_PATH = path.join(TEST_DIR, 'outbound.db');
 
@@ -415,8 +416,7 @@ describe('syncSessionSchedulerState', () => {
       status: 'pending',
       recurrence: '0 9 * * *',
     });
-    expect(incidentRows()).toHaveLength(1);
-    expect(incidentRows()[0].dedupe_key).toContain('unresolved-ack');
+    expect(incidentRows()).toHaveLength(0);
     inDb.close();
     outDb.close();
   });
@@ -436,7 +436,7 @@ describe('syncSessionSchedulerState', () => {
     });
 
     const keys = incidentRows().map((r) => r.dedupe_key);
-    expect(keys.some((k) => k.endsWith(':unresolved-ack:recovery'))).toBe(true);
+    expect(keys.some((k) => k.endsWith(':unresolved-ack:recovery'))).toBe(false);
     expect(keys.some((k) => k.endsWith(':unresolved-ack:recovery:stale-escalated'))).toBe(true);
     const escalated = incidentRows().find((r) => r.dedupe_key.endsWith(':stale-escalated'));
     expect(escalated).toMatchObject({ severity: 'error', status: 'pending' });
@@ -456,11 +456,56 @@ describe('syncSessionSchedulerState', () => {
     });
 
     const keys = incidentRows().map((r) => r.dedupe_key);
-    expect(keys.some((k) => k.endsWith(':unresolved-ack:recovery'))).toBe(true);
+    expect(keys.some((k) => k.endsWith(':unresolved-ack:recovery'))).toBe(false);
     expect(keys.some((k) => k.endsWith(':stale-escalated'))).toBe(false);
     inDb.close();
     outDb.close();
   });
+
+  it('does not produce new warning wallpaper for successive fresh generations of one stable series', async () => {
+    const { inDb, outDb } = freshDbs();
+    const s = session();
+    await withSchedulerLock((owner) => {
+      for (let generation = 1; generation <= 4; generation++) {
+        if (generation > 1)
+          updateScheduledTask(
+            'ag-1',
+            'task-1',
+            { processAfter: `2020-01-0${generation}T00:00:00.000Z` },
+            { sessionId: s.id, messageId: `generation-${generation}` },
+            owner,
+          );
+        const id =
+          generation === 1
+            ? seedProjectedTask(inDb, owner, s)
+            : projectScheduledTask(inDb, getScheduledTask('ag-1', 'task-1')!, s.id, owner);
+        insertAck(outDb, id, 'recovery');
+        syncSessionSchedulerState(inDb, outDb, s, owner);
+      }
+    });
+    expect(getScheduledTask('ag-1', 'task-1')).toMatchObject({ status: 'pending', generation: 4 });
+    expect(incidentRows()).toHaveLength(0);
+    inDb.close();
+    outDb.close();
+  });
+
+  it.each(['not-a-date', '2999-01-01 00:00:00'])(
+    'keeps malformed or future ack evidence visible: %s',
+    async (statusChanged) => {
+      const { inDb, outDb } = freshDbs();
+      const s = session();
+      await withSchedulerLock((owner) => {
+        const id = seedProjectedTask(inDb, owner, s);
+        insertAck(outDb, id, 'recovery');
+        outDb.prepare('UPDATE processing_ack SET status_changed = ? WHERE message_id = ?').run(statusChanged, id);
+        syncSessionSchedulerState(inDb, outDb, s, owner);
+      });
+      expect(incidentRows()).toHaveLength(1);
+      expect(incidentRows()[0].severity).toBe('warn');
+      inDb.close();
+      outDb.close();
+    },
+  );
 
   it('leaves processing acks alone for ordinary stuck-turn recovery', async () => {
     const { inDb, outDb } = freshDbs();

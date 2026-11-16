@@ -1328,7 +1328,10 @@ async function processQuery(
     const entries = listRecoveryEntries(ledgerCtx.activeRouteScope);
     for (const recId of ledgerCtx.resumableRecoveryIds) {
       const ownedInputIds = (entries.find((e) => e.id === recId)?.acceptedUnresolvedInputs ?? []).map((a) => a.inputId);
-      const res = resolveRecoveryEntry(ledgerCtx.activeRouteScope, recId, { resolvedInputIds: ownedInputIds });
+      const res = resolveRecoveryEntry(ledgerCtx.activeRouteScope, recId, {
+        resolvedInputIds: [...ownedInputIds, ledgerCtx.topLevelInputId],
+        resumedInputId: ledgerCtx.topLevelInputId,
+      });
       if (res.resolvedMessageIds.length > 0) markRecoveryCompleted(res.resolvedMessageIds, recId);
     }
   }
@@ -1583,7 +1586,7 @@ async function processQuery(
         }
         const action = decideProviderStatusAction(providerStatusState, event);
         if (action.kind === 'write') {
-          writeRoutedMessage(routing, action.text);
+          writeRoutedMessage(routing, sanitizeProviderErrorText(action.text));
         } else if (action.kind === 'log') {
           log(
             JSON.stringify({
@@ -1659,7 +1662,7 @@ async function processQuery(
         const action = decideProviderStatusAction(providerStatusState, event);
         if (action.kind === 'write') {
           if (turnUserTriggered) {
-            writeRoutedMessage(routing, action.text);
+            writeRoutedMessage(routing, sanitizeProviderErrorText(action.text));
           } else {
             // Same rule as the missing-visible-reply fallback: interruption
             // notices are log-only unless a real user triggered this turn.
@@ -1973,8 +1976,14 @@ async function processQuery(
         // outer catch's instanceof routing works (Tasks 4/5 contract).
         throw providerStreamFailure;
       }
-      const uncertainEntries = [...ledger.values()].filter((entry) =>
-        entry.claims.some((claim) => claim.state === 'returned' || claim.state === 'queued'),
+      const uncertainEntries = [...ledger.values()].filter(
+        (entry) =>
+          // A clean container-stop handoff never submitted these queued rows.
+          // Leave them pending: host wake already waits for verified whole-
+          // container stop, so a synthetic recovery ack would only add a TTL
+          // delay. Any host-bound input keeps the fail-closed recovery path.
+          (!(quiescenceFailure instanceof ProviderContainerStopRequired) || boundGwsInputs.has(entry.inputId)) &&
+          entry.claims.some((claim) => claim.state === 'returned' || claim.state === 'queued'),
       );
       const uncertainMessageIds = uncertainEntries.flatMap((entry) =>
         entry.claims
@@ -1993,16 +2002,30 @@ async function processQuery(
             agentMessage: 'The provider stream failed and shutdown could not be proven; resume only through recovery.',
             fallbackUserMessage:
               'I lost contact with the provider while stopping safely. Your request is saved for recovery.',
-            originalTasks: ledgerCtx.originalTasks,
+            originalTasks: ledgerCtx.originalTasks.filter((task) => uncertainMessageIds.includes(task.messageId)),
             acceptedUnresolvedInputs: [],
-            pendingFollowups: [],
-            priorProgress: [],
+            // Ownership must carry the exact queued work, not merely the
+            // older turn that happened to be active when it arrived.
+            pendingFollowups: [
+              ...new Map(
+                [...followupTypingRows.values()]
+                  .flat()
+                  .filter((row) => uncertainMessageIds.includes(row.id))
+                  .map((row) => [row.id, { messageId: row.id, text: textOfMessage(row), timestamp: row.timestamp }]),
+              ).values(),
+            ],
+            priorProgress: harvestRouteScopedProgress(ledgerCtx.activeRouteScope.routeKey).map((p) => ({
+              messageOutId: p.messageOutId,
+              text: p.text,
+              source: p.source,
+              timestamp: p.timestamp,
+            })),
             observations: [
               `provider_quiescence_unproven: ${
                 quiescenceFailure instanceof Error ? quiescenceFailure.message : String(quiescenceFailure)
               }`,
             ],
-            sideEffects: [],
+            sideEffects: [...interruptionSideEffects],
             continuationPolicy: 'preserve',
             attemptedContinuation: queryContinuation,
             createdAt: now,

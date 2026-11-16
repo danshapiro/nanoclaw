@@ -369,3 +369,22 @@ describe('stripCdataWrapper', () => {
     expect(stripCdataWrapper(text)).toBe(text);
   });
 });
+
+
+it('injects exact queued followups as escaped work while preserving prior context', () => {
+  const xml = formatRecoveryContext([
+    {
+      classification: 'provider_quiescence_unproven',
+      agentMessage: 'Recover',
+      originalTasks: [{ text: 'Older task' }],
+      acceptedUnresolvedInputs: [],
+      pendingFollowups: [{ text: 'Queued <task> & proof' }],
+      priorProgress: [],
+      observations: [],
+      sideEffects: [],
+      continuationPolicy: 'preserve',
+    },
+  ]);
+  expect(xml).toContain('<queued_input>Queued &lt;task&gt; &amp; proof</queued_input>');
+  expect(xml).toContain('<original_task>Older task</original_task>');
+});

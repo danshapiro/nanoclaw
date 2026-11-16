@@ -435,7 +435,7 @@ export class CodexProvider implements AgentProvider {
       }
       return failure;
     };
-    const terminateQueryServer = (): Promise<void> => {
+    const terminateQueryServer = (cleanCompletion = false): Promise<void> => {
       const activeServer = server;
       if (!activeServer) return Promise.resolve();
       if (!terminationPromise) {
@@ -445,7 +445,7 @@ export class CodexProvider implements AgentProvider {
         }
         const terminate = self.queryDependencies.terminateServer ?? terminateCodexAppServer;
         terminationPromise = Promise.resolve()
-          .then(() => terminate(activeServer))
+          .then(() => terminate(activeServer, { cleanCompletion }))
           .then(
             () => {
               settleQuiescence();
@@ -485,6 +485,7 @@ export class CodexProvider implements AgentProvider {
       }
       let bodyError: unknown;
       let bodyErrorCaptured = false;
+      let cleanCompletion = false;
       // One app-server per query invocation. The poll-loop keeps a single
       // query active per batch of pending messages and ends it on idle, so
       // spawn-per-query matches that cadence naturally.
@@ -546,7 +547,13 @@ export class CodexProvider implements AgentProvider {
             waiting = null;
           }
           if (aborted) return;
-          if (pending.length === 0 && ended) return;
+          if (pending.length === 0 && ended) {
+            // Only a fully drained, normally ended query qualifies. Abort,
+            // terminal interruption, setup/acceptance errors and early iterator
+            // cancellation all retain fatal quiescence semantics.
+            cleanCompletion = turnIndex > 0;
+            return;
+          }
 
           const turn = pending.shift()!;
           const text = prepareCodexInputText(turn.prompt);
@@ -647,7 +654,7 @@ export class CodexProvider implements AgentProvider {
         }
         try {
           if (server) {
-            await terminateQueryServer();
+            await terminateQueryServer(cleanCompletion && !aborted && !bodyErrorCaptured);
           } else {
             // All fallible setup before spawn is inside this finally. With no
             // handle created, there is no child process that could still work.
@@ -998,6 +1005,8 @@ export async function* runOneTurn(
         const turn = params.turn as { status?: string; error?: { message?: string } } | undefined;
         const status = turn?.status ?? (params.status as string | undefined);
         if (status === 'interrupted') turnInterrupted = true;
+        if (status === 'failed')
+          turnState.error = new Error(turn?.error?.message || turnErrorText || 'Codex turn failed');
         if (!abortRequested && turn?.error?.message) turnErrorText = turn.error.message;
         turnDone = true;
         break;

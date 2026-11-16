@@ -398,6 +398,42 @@ export interface RecoveryWakeOptions {
  *
  * Rows whose recovery ownership is older than wake.recoveryWakeTtlMs count as due again (R1) — the bounded escape from the deliberate recovery exclusion.
  */
+/** Durable fail-closed recovery holds; unlike TTL recovery these require explicit reconciliation. */
+export function listReconciliationBlockedRecoveryIds(
+  outDb: Database.Database,
+  conservativeOnMalformed = false,
+): Set<string> {
+  try {
+    if (!outDb.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_state'").get())
+      return new Set();
+    const rows = outDb.prepare("SELECT value FROM session_state WHERE key LIKE 'recovery:%'").all() as Array<{
+      value: string;
+    }>;
+    const blocked = new Set<string>();
+    for (const row of rows) {
+      const entries = JSON.parse(row.value) as Array<{
+        status?: string;
+        originalTasks?: Array<{ messageId?: string }>;
+        pendingFollowups?: Array<{ messageId?: string }>;
+        acceptedUnresolvedInputs?: Array<{ messageIds?: string[] }>;
+      }>;
+      if (!Array.isArray(entries)) throw new Error('Malformed recovery evidence while checking reconciliation hold');
+      for (const e of entries)
+        if (e.status === 'reconciliation_required') {
+          for (const item of [...(e.originalTasks ?? []), ...(e.pendingFollowups ?? [])])
+            if (item.messageId) blocked.add(item.messageId);
+          for (const item of e.acceptedUnresolvedInputs ?? []) for (const id of item.messageIds ?? []) blocked.add(id);
+        }
+    }
+    return blocked;
+  } catch (err) {
+    if (!conservativeOnMalformed) throw err;
+    // Hold uncertain owned rows, while an unrelated fresh input can wake the
+    // runner's existing non-destructive metadata recovery path.
+    return new Set(listRecoveryAcks(outDb).map((r) => r.messageId));
+  }
+}
+
 export function countDueMessagesExcludingRecovery(
   inDb: Database.Database,
   outDb: Database.Database,
@@ -406,10 +442,11 @@ export function countDueMessagesExcludingRecovery(
   const recoveryRows = outDb
     .prepare("SELECT message_id, status_changed FROM processing_ack WHERE status = 'recovery'")
     .all() as Array<{ message_id: string; status_changed: string }>;
+  const reconciliationBlocked = listReconciliationBlockedRecoveryIds(outDb, true);
   const recoveryOwned = new Set(
     recoveryRows
       .filter((r) => {
-        if (!wake) return true; // legacy behavior: exclude every recovery row
+        if (!wake || reconciliationBlocked.has(r.message_id)) return true; // held until explicit reconciliation
         const changedMs = parseSqliteUtcMs(r.status_changed);
         // Unparseable timestamps count as expired: fail toward waking, never
         // toward hiding work (R1 must only ADD wakes).

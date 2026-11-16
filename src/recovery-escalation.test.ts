@@ -223,6 +223,33 @@ describe('releaseOrEscalateExpiredRecoveryAcks', () => {
     expect(entries.find((e) => e.id === 'rec-2')?.status).toBe('pending');
   });
 
+  it.each(['pendingFollowups', 'acceptedUnresolvedInputs'])(
+    'supersedes entries owning exhausted queued work in %s',
+    async (field) => {
+      const { inDb, outDb } = makeDbs();
+      inDb.prepare("INSERT INTO messages_in (id,recovery_wake_attempts) VALUES ('followup',3)").run();
+      reOwn(outDb, 'followup');
+      const entry = {
+        id: 'rec-followup',
+        status: 'pending',
+        originalTasks: [{ messageId: 'older-initial' }],
+        [field]:
+          field === 'pendingFollowups'
+            ? [{ messageId: 'followup' }]
+            : [{ inputId: 'accepted', messageIds: ['followup'] }],
+      };
+      outDb
+        .prepare("INSERT INTO session_state (key,value,updated_at) VALUES ('recovery:test:route-1',?,datetime('now'))")
+        .run(JSON.stringify([entry]));
+      await releaseOrEscalateExpiredRecoveryAcks({ session, inDb, outDb, nowMs: NOW, ttlMs: TTL, maxAttempts: 3 });
+      const payload = JSON.parse(
+        (outDb.prepare("SELECT value FROM session_state WHERE key='recovery:test:route-1'").get() as { value: string })
+          .value,
+      );
+      expect(payload[0].status).toBe('superseded');
+    },
+  );
+
   it('uses task-flavored notice text for kind=task rows', async () => {
     const { inDb, outDb } = makeDbs();
     inDb.prepare("INSERT INTO messages_in (id, kind, recovery_wake_attempts) VALUES ('m-t', 'task', 3)").run();
@@ -365,4 +392,104 @@ describe('releaseOrEscalateExpiredRecoveryAcks', () => {
     syncProcessingAcks(inDb, outDb);
     expect(inDb.prepare("SELECT status FROM messages_in WHERE id = 'm-1'").get()).toMatchObject({ status: 'failed' });
   });
+});
+
+it.each(['pendingFollowups', 'sharedAccepted', 'separateAccepted'])(
+  'retains live sibling context when one member exhausts: %s',
+  async (mode) => {
+    const { inDb, outDb } = makeDbs();
+    inDb.prepare("INSERT INTO messages_in (id,recovery_wake_attempts) VALUES ('failed',3),('live',1)").run();
+    reOwn(outDb, 'failed');
+    reOwn(outDb, 'live');
+    const entry = {
+      id: 'mixed',
+      status: 'pending',
+      originalTasks: [],
+      pendingFollowups:
+        mode === 'pendingFollowups'
+          ? [
+              { messageId: 'failed', text: 'Failed work' },
+              { messageId: 'live', text: 'Live work' },
+            ]
+          : [],
+      acceptedUnresolvedInputs:
+        mode === 'sharedAccepted'
+          ? [{ inputId: 'shared', messageIds: ['failed', 'live'], prompt: 'Shared exact work' }]
+          : mode === 'separateAccepted'
+            ? [
+                { inputId: 'failed-in', messageIds: ['failed'], prompt: 'Failed work' },
+                { inputId: 'live-in', messageIds: ['live'], prompt: 'Live work' },
+              ]
+            : [],
+      observations: [],
+      sideEffects: [{ kind: 'effect', label: 'Already done; never repeat' }],
+    };
+    outDb
+      .prepare("INSERT INTO session_state (key,value,updated_at) VALUES ('recovery:test:route-1',?,datetime('now'))")
+      .run(JSON.stringify([entry]));
+    const result = await releaseOrEscalateExpiredRecoveryAcks({
+      session,
+      inDb,
+      outDb,
+      nowMs: NOW,
+      ttlMs: TTL,
+      maxAttempts: 3,
+    });
+    if (mode === 'sharedAccepted') {
+      expect(result).toEqual({ released: [], escalated: [] });
+      expect(written).toHaveLength(0);
+      expect(getRecoveryWakeAttempts(inDb, 'live')).toBe(1);
+      expect(incidents).toEqual([
+        expect.objectContaining({
+          severity: 'error',
+          details: expect.objectContaining({ reason: 'recovery-shared-input-reconciliation' }),
+        }),
+      ]);
+      const held = JSON.parse(
+        (outDb.prepare("SELECT value FROM session_state WHERE key='recovery:test:route-1'").get() as { value: string })
+          .value,
+      )[0];
+      expect(held).toMatchObject({ ...entry, status: 'reconciliation_required' });
+      expect(countDueMessagesExcludingRecovery(inDb, outDb, { nowMs: NOW, recoveryWakeTtlMs: TTL })).toBe(0);
+      expect(
+        await releaseOrEscalateExpiredRecoveryAcks({
+          session,
+          inDb,
+          outDb,
+          nowMs: NOW + TTL * 10,
+          ttlMs: TTL,
+          maxAttempts: 3,
+        }),
+      ).toEqual({ released: [], escalated: [] });
+      return;
+    }
+    expect(result).toEqual({ released: ['live'], escalated: ['failed'] });
+    const saved = JSON.parse(
+      (outDb.prepare("SELECT value FROM session_state WHERE key='recovery:test:route-1'").get() as { value: string })
+        .value,
+    )[0];
+    expect(saved.status).toBe('pending');
+    expect(saved.sideEffects).toEqual(entry.sideEffects);
+    expect(saved.observations[0]).toContain('do NOT retry');
+    if (mode === 'pendingFollowups') expect(saved.pendingFollowups).toEqual([{ messageId: 'live', text: 'Live work' }]);
+    else {
+      expect(saved.acceptedUnresolvedInputs).toHaveLength(1);
+      expect(saved.acceptedUnresolvedInputs[0].messageIds).toEqual(['live']);
+      expect(saved.acceptedUnresolvedInputs[0].prompt).toContain(
+        mode === 'sharedAccepted' ? 'Shared exact work' : 'Live work',
+      );
+    }
+  },
+);
+
+it('malformed recovery metadata blocks release but permits unrelated fresh work to wake for repair', async () => {
+  const { inDb, outDb } = makeDbs();
+  inDb.exec("INSERT INTO messages_in(id) VALUES ('owned'),('fresh')");
+  reOwn(outDb, 'owned');
+  outDb.prepare("INSERT INTO session_state(key,value) VALUES ('recovery:broken','{bad')").run();
+  expect(countDueMessagesExcludingRecovery(inDb, outDb, { nowMs: NOW, recoveryWakeTtlMs: TTL })).toBe(1);
+  await expect(
+    releaseOrEscalateExpiredRecoveryAcks({ session, inDb, outDb, nowMs: NOW, ttlMs: TTL, maxAttempts: 3 }),
+  ).rejects.toThrow();
+  expect(getRecoveryWakeAttempts(inDb, 'owned')).toBe(0);
 });
