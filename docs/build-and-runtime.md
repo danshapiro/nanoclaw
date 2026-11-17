@@ -65,13 +65,12 @@ Both are committed. CI and the Dockerfile run `--frozen-lockfile` variants — a
 - **`entrypoint.sh`** (extracted) — honors explicit `docker run IMAGE <command>` arguments for image-surface smokes, otherwise captures stdin and `exec bun run /app/src/index.ts` under tini. Readable and diffable.
 - **No compiled `/app/dist`** — Bun runs TS directly. The host also mounts fresh source over `/app/src` at session start, so host edits take effect without rebuilding the image.
 
-The pinned stock Playwriter archive installs separately under `/opt/playwriter`
-with optional dependencies omitted. `/usr/local/bin/playwriter` links to its
-actual package entry point, so dependency checks resolve from the client rather
-than a pnpm launcher. The build executes the client and accepts both stock
-`0.4.0` and `playwriter/0.4.0 ...` version formats; archive identity checks remain
-authoritative. This isolated install keeps Playwriter's optional-package policy
-from removing binaries needed by other globally installed CLIs.
+OpenCode Browse runs in the host's separate browser service. Agent containers
+receive only `BROWSE_URL=http://172.17.0.1:19991`; the editable `browse` skill
+provides its Python client at `/workspace/local-skills/skills/browse/scripts/browse`,
+linked from `/usr/local/bin/browse` in the image. The broker
+injects the relay's credential, and the Windows extension pairs directly to
+the host service. The agent image has no Playwriter package or relay token.
 Corepack's prepared pnpm lives in the public, read-only
 `/usr/local/share/corepack` cache so arbitrary runtime UIDs can use that exact
 version without downloading another package manager on first use.
