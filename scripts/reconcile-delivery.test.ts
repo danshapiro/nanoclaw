@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, rmSync, copyFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { createRequire } from 'node:module';
 
 const script = path.resolve('scripts/reconcile-delivery.ts');
 let root: string, session: string, inbound: Database.Database, outbound: Database.Database;
@@ -144,3 +145,18 @@ it.each(['--confirmed-obsolete-progress', '--confirmed-delivered'])(
     expect(JSON.parse(inspect.stdout)).toEqual([]);
   },
 );
+
+it('executes precompiled operator artifact without live esbuild execution', () => {
+  const require = createRequire(import.meta.url);
+  const compiler = createRequire(require.resolve('tsx'))('esbuild');
+  const compiled = path.join(root, 'operator.cjs');
+  compiler.buildSync({ entryPoints: [script], platform: 'node', format: 'cjs', outfile: compiled });
+  const result = spawnSync(
+    process.execPath,
+    [compiled, path.join(session, 'inbound.db'), 'message', '--confirmed-obsolete-progress'],
+    { encoding: 'utf8', env: { ...process.env, NODE_PATH: path.resolve('node_modules') } },
+  );
+  expect(result.status, result.stderr).toBe(0);
+  expect(inbound.prepare('SELECT status FROM delivered').get()).toEqual({ status: 'dropped' });
+  expect(inbound.prepare('SELECT state FROM delivery_attempts').get()).toEqual({ state: 'unknown' });
+});
