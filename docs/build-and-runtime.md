@@ -204,3 +204,29 @@ Never unlink or replace the mutex. Unsupported hosts conservatively retain
 logs when the Linux lease utility is unavailable. The coordinated backup
 hook is an external consumer; this source change alone does not prove an
 off-machine backup or production rollout.
+
+
+## Explicit CLI-origin reply addresses and default tools
+
+The prepared correction makes explicit admin reply addresses consistent for
+the isolated CLI-origin routes used by live probes: message/file tools,
+current-conversation cards/questions and newly requested tasks use the exact
+host-accepted address. An active CLI input identity always requires its exact
+accepted proof, including when all accepted rows have disappeared. Legacy local
+CLI fallback is preserved only when identity is absent and no unresolved
+redirected acceptance exists. Missing/ended/ambiguous/foreign
+acceptance or missing acceptance timestamps are refused; relay calls require
+their nonempty route lock, locked identity and complete accepted proof. Explicit named destinations
+and ordinary non-CLI defaults retain their existing behavior.
+
+This introduces no QA-specific runtime default, routing migration or schema.
+The operator helper checks the CLI-scoped versioned capability before creating
+a redirected live fixture. Arbitrary non-CLI or agent-shared admin redirection
+remains a pre-existing limitation, outside this repair's acceptance. Live probes
+always use the isolated CLI-origin route. Source qualification does not imply
+production activation.
+
+CLI-origin scheduled output also preserves that exact reply address: its
+headline metadata cannot implicitly create or reuse a child result thread.
+Ordinary platform-origin headline threading is unchanged. Explicit outbound
+thread addresses remain honored by the delivery layer.

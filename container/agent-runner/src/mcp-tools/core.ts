@@ -9,10 +9,15 @@
 import fs from 'fs';
 import path from 'path';
 
-import { findByName, getAllDestinations, isBlockedChannelName, SUBAGENT_CHANNEL_BLOCKED_MESSAGE } from '../destinations.js';
+import {
+  findByName,
+  getAllDestinations,
+  isBlockedChannelName,
+  SUBAGENT_CHANNEL_BLOCKED_MESSAGE,
+} from '../destinations.js';
 import { stripCdataWrapper } from '../formatter.js';
 import { getMessageTargetBySeq, getRoutingBySeq, writeMessageOut } from '../db/messages-out.js';
-import { getSessionRouting } from '../db/session-routing.js';
+import { getCurrentReplyRouting, getSessionRouting } from '../db/session-routing.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
@@ -43,6 +48,7 @@ interface ResolvedRouting {
   platform_id: string;
   thread_id: string | null;
   resolvedName: string;
+  defaultRouteStamp?: RouteStamp;
 }
 
 interface RouteStamp {
@@ -62,18 +68,27 @@ interface RouteStamp {
  * preserved so replies land in the correct thread. Otherwise thread_id
  * is null (a cross-destination send starts a new conversation).
  */
-function resolveRouting(
-  to: string | undefined,
-): ResolvedRouting | { error: string } {
+// Capability consumed by the operator live-probe helper before creating a
+// redirected fixture. This does not change the ordinary CLI destination.
+export const CLI_EXPLICIT_REPLY_TO_DEFAULT_TOOLS = 2;
+
+function resolveRouting(to: string | undefined): ResolvedRouting | { error: string } {
   if (!to) {
     // Default: reply to whatever thread/channel this session is bound to.
-    const session = getSessionRouting();
+    const session = getCurrentReplyRouting();
     if (session.channel_type && session.platform_id) {
       return {
         channel_type: session.channel_type,
         platform_id: session.platform_id,
         thread_id: session.thread_id,
         resolvedName: '(current conversation)',
+        defaultRouteStamp: session.activeRouteKey
+          ? {
+              route_key: session.activeRouteKey,
+              messaging_group_id: session.messaging_group_id,
+              is_group: session.is_group,
+            }
+          : undefined,
       };
     }
     // No session routing (e.g., agent-shared or internal-only agent) —
@@ -97,9 +112,7 @@ function resolveRouting(
     // preserve the thread_id so replies land in the correct thread.
     const session = getSessionRouting();
     const threadId =
-      session.channel_type === dest.channelType && session.platform_id === dest.platformId
-        ? session.thread_id
-        : null;
+      session.channel_type === dest.channelType && session.platform_id === dest.platformId ? session.thread_id : null;
     return {
       channel_type: dest.channelType!,
       platform_id: dest.platformId!,
@@ -138,6 +151,7 @@ function isSameSessionRoute(routing: ResolvedRouting, session: ReturnType<typeof
 }
 
 function routeStampForCurrentSession(routing: ResolvedRouting): RouteStamp | null {
+  if (routing.defaultRouteStamp) return routing.defaultRouteStamp;
   const session = getSessionRouting();
   if (!isSameSessionRoute(routing, session)) return null;
 
@@ -154,12 +168,14 @@ function routeStampForCurrentSession(routing: ResolvedRouting): RouteStamp | nul
 export const sendMessage: McpToolDefinition = {
   tool: {
     name: 'send_message',
-    description:
-      'Send a message to a named destination. If you have only one destination, you can omit `to`.',
+    description: 'Send a message to a named destination. If you have only one destination, you can omit `to`.',
     inputSchema: {
       type: 'object' as const,
       properties: {
-        to: { type: 'string', description: 'Destination name (e.g., "family", "worker-1"). Optional if you have only one destination.' },
+        to: {
+          type: 'string',
+          description: 'Destination name (e.g., "family", "worker-1"). Optional if you have only one destination.',
+        },
         text: { type: 'string', description: 'Message content' },
       },
       required: ['text'],
@@ -248,7 +264,9 @@ export const sendFile: McpToolDefinition = {
           err: writeErr instanceof Error ? writeErr.message : String(writeErr),
         }),
       );
-      return err(`Failed to queue file for delivery: ${writeErr instanceof Error ? writeErr.message : String(writeErr)}`);
+      return err(
+        `Failed to queue file for delivery: ${writeErr instanceof Error ? writeErr.message : String(writeErr)}`,
+      );
     }
 
     log(`send_file: ${id} → ${routing.resolvedName} (${filename})`);

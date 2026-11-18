@@ -25,6 +25,7 @@
 import type Database from 'better-sqlite3';
 
 import { getDb } from '../../db/connection.js';
+import { getMessagingGroup } from '../../db/messaging-groups.js';
 import type { ChannelDeliveryAdapter, OutboundThreadContext } from '../../delivery.js';
 import { log } from '../../log.js';
 
@@ -138,6 +139,11 @@ function canOpenThreads(adapter: ChannelDeliveryAdapter, channelType: string): b
  */
 export async function resolveScheduledRunThread(ctx: OutboundThreadContext): Promise<string | null> {
   const { session, message, inDb, adapter } = ctx;
+
+  // CLI-origin replies can carry an explicit external address. Preserve its
+  // exact parent/thread instead of implicitly opening a headline thread (or
+  // reusing an earlier one). Ordinary platform-origin task threading is intact.
+  if (session.messaging_group_id && getMessagingGroup(session.messaging_group_id)?.channel_type === 'cli') return null;
 
   const taskMessageId = activeTaskMessageId(ctx);
   if (!taskMessageId) return null;

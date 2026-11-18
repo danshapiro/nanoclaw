@@ -20,6 +20,7 @@ import {
   createAgentGroup,
   createMessagingGroup,
   createMessagingGroupAgent,
+  getDb,
   initTestDb,
   runMigrations,
 } from '../../db/index.js';
@@ -153,6 +154,34 @@ afterEach(() => {
 });
 
 describe('scheduled run threads', () => {
+  it('keeps explicit CLI-origin replies in the exact parent without opening headline threads', async () => {
+    getDb().prepare("UPDATE messaging_groups SET channel_type='cli' WHERE id='mg-discord'").run();
+    const inDb = openInboundDb(session.agent_group_id, session.id);
+    seedTaskProjection(inDb, 'task-cli-headline', { prompt: 'fixture', headline: 'must not create a child thread' });
+    inDb.close();
+    claimTask(session, 'task-cli-headline');
+    const { ctx, delivered, opened, close } = context(session, { inReplyTo: 'task-cli-headline' });
+    try {
+      ctx.message.platformId = '1500664250832785490';
+      expect(await resolveScheduledRunThread(ctx)).toBeNull();
+      expect(delivered).toEqual([]);
+      expect(opened).toEqual([]);
+      // Even pre-existing resolver state may not silently override an explicit reply address.
+      getDb()
+        .prepare(
+          `INSERT INTO scheduled_run_threads
+        (session_id, task_message_id, channel_type, platform_id, anchor_message_id, thread_id, created_at)
+        VALUES (?, ?, 'discord', ?, 'old-anchor', 'old-child-thread', ?)`,
+        )
+        .run(session.id, 'task-cli-headline', ctx.message.platformId, now());
+      expect(await resolveScheduledRunThread(ctx)).toBeNull();
+      expect(delivered).toEqual([]);
+      expect(opened).toEqual([]);
+    } finally {
+      close();
+    }
+  });
+
   it('leaves delivery alone when the running task declares no headline', async () => {
     const inDb = openInboundDb(session.agent_group_id, session.id);
     seedTaskProjection(inDb, 'task-nightly-g1', { prompt: 'do the thing' });

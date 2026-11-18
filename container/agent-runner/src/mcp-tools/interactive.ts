@@ -6,7 +6,7 @@
  */
 import { findQuestionResponse, markCompleted } from '../db/messages-in.js';
 import { writeMessageOut } from '../db/messages-out.js';
-import { getSessionRouting } from '../db/session-routing.js';
+import { getCurrentReplyRouting } from '../db/session-routing.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
@@ -19,7 +19,7 @@ function generateId(): string {
 }
 
 function routing() {
-  return getSessionRouting();
+  return getCurrentReplyRouting();
 }
 
 function ok(text: string) {
@@ -96,6 +96,9 @@ export const askUserQuestion: McpToolDefinition = {
       platform_id: r.platform_id,
       channel_type: r.channel_type,
       thread_id: r.thread_id,
+      route_key: r.activeRouteKey ?? null,
+      messaging_group_id: r.activeRouteKey ? r.messaging_group_id : null,
+      is_group: r.activeRouteKey ? r.is_group : null,
       content: JSON.stringify({
         type: 'ask_question',
         questionId,
@@ -158,6 +161,9 @@ export const sendCard: McpToolDefinition = {
       platform_id: r.platform_id,
       channel_type: r.channel_type,
       thread_id: r.thread_id,
+      route_key: r.activeRouteKey ?? null,
+      messaging_group_id: r.activeRouteKey ? r.messaging_group_id : null,
+      is_group: r.activeRouteKey ? r.is_group : null,
       content: JSON.stringify({ type: 'card', card, fallbackText: (args.fallbackText as string) || '' }),
     });
 
