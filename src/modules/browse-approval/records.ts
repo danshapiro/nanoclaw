@@ -20,8 +20,8 @@ export class BrowseRecordStore {
     try {
       entries = JSON.parse(fs.readFileSync(this.indexPath, 'utf8'));
     } catch (error) {
-      // eslint-disable-next-line preserve-caught-error -- Parser messages can contain a live permit; keep the failure category and redact its payload.
       throw new Error('Browse session access index is unreadable; cannot safely restore browser access.', {
+        // eslint-disable-next-line preserve-caught-error -- Parser messages may contain a permit; redact payload while retaining the error category.
         cause: error instanceof SyntaxError ? new SyntaxError('Invalid Browse state JSON') : error,
       });
     }
@@ -29,7 +29,6 @@ export class BrowseRecordStore {
       !Array.isArray(entries) ||
       entries.some((x) => !x || typeof x.agentGroupId !== 'string' || typeof x.sessionId !== 'string')
     )
-      // eslint-disable-next-line preserve-caught-error -- Parser messages can contain a live permit; keep the failure category and redact its payload.
       throw new Error('Browse session access index is malformed.');
     return entries;
   }
@@ -64,8 +63,8 @@ export class BrowseRecordStore {
       try {
         record = JSON.parse(fs.readFileSync(file, 'utf8'));
       } catch (error) {
-        // eslint-disable-next-line preserve-caught-error -- Parser messages can contain a live permit; keep the failure category and redact its payload.
         throw new Error('A retained Browse access record is malformed; browser access cannot resume.', {
+          // eslint-disable-next-line preserve-caught-error -- Parser messages may contain a permit; redact payload while retaining the error category.
           cause: error instanceof SyntaxError ? new SyntaxError('Invalid Browse state JSON') : error,
         });
       }
