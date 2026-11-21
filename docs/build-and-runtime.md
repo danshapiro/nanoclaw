@@ -129,6 +129,11 @@ index contains active session identifiers for this cleanup, not credentials
 or an audit history. Deploy the runtime with the gated broker and updated
 editable helper through the host repository's coordinated Browse runbook.
 
+Approval and stop notifications keep the requesting Discord route, including
+its thread and messaging-group metadata, so the already-open provider query
+receives them promptly. They are host task notices, not new human requests.
+Request failures retain that route only after human provenance was resolved.
+
 ## Session wake (two paths)
 
 1. **Base image ENTRYPOINT** — used for stdin-piped test invocations like the sample in `container/build.sh`: `tini --> entrypoint.sh` captures stdin to `/tmp/input.json`, then `exec bun run src/index.ts`. When a command is passed to `docker run`, the entrypoint executes that command directly so image-surface checks can run without the runtime-only `/app/src` bind mount.

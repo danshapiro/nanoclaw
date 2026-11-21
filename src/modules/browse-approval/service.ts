@@ -18,6 +18,8 @@ export interface BrowseRequester {
   channelType: string;
   platformId: string;
   threadId: string | null;
+  messagingGroupId: string | null;
+  isGroup: 0 | 1 | null;
 }
 export interface BrowseGrant {
   token: string;
@@ -58,7 +60,7 @@ export interface BrowseDependencies {
   }>;
   saveRender(id: string, options: NormalizedOption[]): void;
   deleteRender(id: string): void;
-  notify(session: Session, text: string): void;
+  notify(session: Session, text: string, requester: BrowseRequester): void;
   now(): number;
 }
 interface State {
@@ -132,7 +134,7 @@ export function resolveBrowseRequester(
   }
   const rows = db
     .prepare(
-      `SELECT content, channel_type, platform_id, thread_id, host_acceptance_ended_at, host_accepted_at FROM messages_in
+      `SELECT content, channel_type, platform_id, thread_id, messaging_group_id, is_group, host_acceptance_ended_at, host_accepted_at FROM messages_in
     WHERE host_accepted_input_id = ? AND host_accepted_route_key = ?
       AND kind IN ('chat', 'chat-sdk') AND channel_type = 'discord' AND trigger = 1 ORDER BY seq DESC`,
     )
@@ -141,6 +143,8 @@ export function resolveBrowseRequester(
     channel_type: string;
     platform_id: string;
     thread_id: string | null;
+    messaging_group_id: string | null;
+    is_group: 0 | 1 | null;
     host_acceptance_ended_at: string | null;
     host_accepted_at: string | null;
   }>;
@@ -157,6 +161,8 @@ export function resolveBrowseRequester(
       channelType: row.channel_type,
       platformId: row.platform_id,
       threadId: row.thread_id,
+      messagingGroupId: row.messaging_group_id,
+      isGroup: row.is_group,
     };
   }
   throw new Error(
@@ -257,6 +263,7 @@ export class BrowseApprovalService {
       this.deps.notify(
         state.session,
         'Browse stop failed. Browser access may still be active; do not continue. No new browsing task can be approved until stopping succeeds.',
+        state.requester,
       );
       throw error;
     }
@@ -278,7 +285,11 @@ export class BrowseApprovalService {
         error: error instanceof Error ? error.message : String(error),
       });
     }
-    this.deps.notify(state.session, `Browse session ${status}. A new browsing task needs fresh human approval.`);
+    this.deps.notify(
+      state.session,
+      `Browse session ${status}. A new browsing task needs fresh human approval.`,
+      state.requester,
+    );
   }
   async request(session: Session, request: BrowseRequest, requester: BrowseRequester): Promise<void> {
     await this.initialize();
@@ -403,6 +414,7 @@ export class BrowseApprovalService {
       this.deps.notify(
         state.session,
         'Browse session approved by the requesting human. The current task can continue; finish with browse end.',
+        state.requester,
       );
       return true;
     } catch (error) {

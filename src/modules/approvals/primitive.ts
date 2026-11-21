@@ -125,16 +125,27 @@ function channelTypeOf(userId: string): string {
 
 // ── Request API ──
 
-/** Send a system chat to the agent's session. Used by callers and by the response handler. */
-export function notifyAgent(session: Session, text: string): void {
+interface NotificationRoute {
+  channelType: string;
+  platformId: string;
+  threadId: string | null;
+  messagingGroupId: string | null;
+  isGroup: 0 | 1 | null;
+}
+
+/** A routed notification can continue the originating task in its warm provider query. */
+export function notifyAgent(session: Session, text: string, route?: NotificationRoute): void {
   writeSessionMessage(session.agent_group_id, session.id, {
     id: `sys-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    kind: 'chat',
+    // Routed host notices continue existing work; they are not new human inputs.
+    kind: route ? 'task' : 'chat',
     timestamp: new Date().toISOString(),
-    platformId: session.agent_group_id,
-    channelType: 'agent',
-    threadId: null,
-    content: JSON.stringify({ text, sender: 'system', senderId: 'system' }),
+    platformId: route?.platformId ?? session.agent_group_id,
+    channelType: route?.channelType ?? 'agent',
+    threadId: route?.threadId ?? null,
+    messagingGroupId: route?.messagingGroupId ?? null,
+    isGroup: route?.isGroup ?? null,
+    content: JSON.stringify(route ? { prompt: text } : { text, sender: 'system', senderId: 'system' }),
   });
   const fresh = getSession(session.id);
   if (fresh) {

@@ -130,6 +130,8 @@ it('does not report stopped or replace an approval when the real control socket 
       channelType: 'discord',
       platformId: 'channel',
       threadId: null,
+      messagingGroupId: 'mg-origin',
+      isGroup: 1,
     });
     await service.respond(response('allow', 'card-1'));
     expect(permit).toBe(true);
@@ -144,7 +146,14 @@ it('does not report stopped or replace an approval when the real control socket 
       service.request(
         session,
         { ...req, requestId: 'replacement' },
-        { userId: 'dan', channelType: 'discord', platformId: 'channel', threadId: null },
+        {
+          userId: 'dan',
+          channelType: 'discord',
+          platformId: 'channel',
+          threadId: null,
+          messagingGroupId: 'mg-origin',
+          isGroup: 1,
+        },
       ),
     ).rejects.toThrow(/503/);
     expect(permit).toBe(true);
@@ -207,7 +216,14 @@ it('keeps previous access files locked after an actual socket reset failure', as
           hostInputId: 'input',
           routeKey: 'route',
         },
-        { userId: 'dan', channelType: 'discord', platformId: 'channel', threadId: null },
+        {
+          userId: 'dan',
+          channelType: 'discord',
+          platformId: 'channel',
+          threadId: null,
+          messagingGroupId: 'mg-origin',
+          isGroup: 1,
+        },
       ),
     ).rejects.toThrow(/503/);
     const file = JSON.parse(fs.readFileSync(records.file('ag', 's'), 'utf8'));

@@ -62,6 +62,8 @@ function fixture() {
     channelType: 'discord',
     platformId: 'discord:g:parent',
     threadId: session.thread_id,
+    messagingGroupId: 'mg-origin',
+    isGroup: 1 as const,
   };
   const response = (value = 'allow') => ({
     questionId: service.questionId(session.id)!,
@@ -92,6 +94,11 @@ describe('Browse host approval', () => {
       browser: 'chrome-dandesktop',
     });
     expect(f.records.at(-1)).toMatchObject({ status: 'approved', token: 'secret-permit' });
+    expect(f.deps.notify).toHaveBeenCalledExactlyOnceWith(
+      session,
+      expect.stringContaining('approved by the requesting human'),
+      f.requester,
+    );
     await f.service.shutdown();
   });
   it.each(['user', 'channel', 'card'])('rejects a different %s without consuming the pending request', async (kind) => {
@@ -209,9 +216,11 @@ describe('host input provenance', () => {
   it('uses the exact live host-accepted Discord human rather than supplied user fields', () => {
     const db = new Database(':memory:');
     db.exec(
-      `CREATE TABLE messages_in (id TEXT, seq INTEGER, kind TEXT, channel_type TEXT, platform_id TEXT, thread_id TEXT, content TEXT, trigger INTEGER, host_accepted_input_id TEXT, host_accepted_route_key TEXT, host_acceptance_ended_at TEXT, host_accepted_at TEXT)`,
+      `CREATE TABLE messages_in (id TEXT, seq INTEGER, kind TEXT, channel_type TEXT, platform_id TEXT, thread_id TEXT, content TEXT, trigger INTEGER, host_accepted_input_id TEXT, host_accepted_route_key TEXT, host_acceptance_ended_at TEXT, host_accepted_at TEXT, messaging_group_id TEXT DEFAULT 'mg-origin', is_group INTEGER DEFAULT 1)`,
     );
-    const put = db.prepare('INSERT INTO messages_in VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)');
+    const put = db.prepare(
+      'INSERT INTO messages_in (id, seq, kind, channel_type, platform_id, thread_id, content, trigger, host_accepted_input_id, host_accepted_route_key, host_acceptance_ended_at, host_accepted_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)',
+    );
     put.run(
       'm-a',
       2,
@@ -240,7 +249,7 @@ describe('host input provenance', () => {
     );
     expect(
       resolveBrowseRequester(db, session, request, { inputId: 'input-a', routeKey: 'route-a', sessionId: 'sess-a' }),
-    ).toMatchObject({ userId: 'dan' });
+    ).toMatchObject({ userId: 'dan', messagingGroupId: 'mg-origin', isGroup: 1 });
     expect(() =>
       resolveBrowseRequester(db, session, request, {
         inputId: 'other-input',

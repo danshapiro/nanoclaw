@@ -15,7 +15,12 @@ import { notifyAgent } from '../approvals/primitive.js';
 import { BrowseControlClient } from './broker.js';
 import { DATA_DIR } from '../../config.js';
 import { BrowseRecordStore } from './records.js';
-import { BrowseApprovalService, resolveBrowseRequester, validateBrowseRequest } from './service.js';
+import {
+  BrowseApprovalService,
+  resolveBrowseRequester,
+  validateBrowseRequest,
+  type BrowseRequester,
+} from './service.js';
 
 const title = 'Chrome browser session';
 const records = new BrowseRecordStore(DATA_DIR);
@@ -52,6 +57,7 @@ const service = new BrowseApprovalService({
 });
 
 registerDeliveryAction('request_browse_session', async (content, session, inDb) => {
+  let requester: BrowseRequester | undefined;
   try {
     const request = validateBrowseRequest(content);
     const pointerPath = hostCorrelationPath(session.agent_group_id, session.id);
@@ -62,7 +68,7 @@ registerDeliveryAction('request_browse_session', async (content, session, inDb) 
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
 
-    const requester = resolveBrowseRequester(inDb, session, request, pointer);
+    requester = resolveBrowseRequester(inDb, session, request, pointer);
     await service.request(session, request, requester);
   } catch (error) {
     log.warn('Browse session request failed', {
@@ -72,6 +78,7 @@ registerDeliveryAction('request_browse_session', async (content, session, inDb) 
     notifyAgent(
       session,
       `Browse could not request approval: ${error instanceof Error ? error.message : String(error)} Browser access remains blocked.`,
+      requester,
     );
   }
 });
