@@ -44,3 +44,16 @@ export interface AskQuestionPayload {
   question: string;
   options: NormalizedOption[];
 }
+
+const hostQuestionRenders = new Map<string, { title: string; options: NormalizedOption[] }>();
+
+/** Host-only transient cards do not become generic agent questions or approvals. */
+export function setHostQuestionRender(id: string, render: { title: string; options: NormalizedOption[] }): void {
+  hostQuestionRenders.set(id, render);
+}
+export function getHostQuestionRender(id: string): { title: string; options: NormalizedOption[] } | undefined {
+  return hostQuestionRenders.get(id);
+}
+export function deleteHostQuestionRender(id: string): void {
+  hostQuestionRenders.delete(id);
+}

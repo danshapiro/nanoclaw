@@ -23,3 +23,5 @@ import './permissions/index.js';
 import './agent-to-agent/index.js';
 import './self-mod/index.js';
 import './managed-repos/index.js';
+
+import './browse-approval/index.js';

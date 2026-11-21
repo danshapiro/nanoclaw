@@ -19,9 +19,24 @@ export interface ResponsePayload {
   channelType: string;
   platformId: string;
   threadId: string | null;
+  /** Produced only by an authenticated platform component callback, never agent output. */
+  transportReceipt?: { source: 'discord-component'; channelId: string; messageId: string };
 }
 
 export type ResponseHandler = (payload: ResponsePayload) => Promise<boolean>;
+
+/** A claimed platform action that must leave the original approval card usable. */
+export class RejectedPlatformAction extends Error {}
+
+type PlatformActionPreflight = (payload: ResponsePayload) => boolean | undefined;
+const platformActionPreflights: PlatformActionPreflight[] = [];
+export function registerPlatformActionPreflight(check: PlatformActionPreflight): void {
+  platformActionPreflights.push(check);
+}
+/** Fast local authorization runs before acknowledging or consuming a platform card. */
+export function canDispatchPlatformAction(payload: ResponsePayload): boolean {
+  return platformActionPreflights.every((check) => check(payload) !== false);
+}
 
 const responseHandlers: ResponseHandler[] = [];
 
@@ -31,6 +46,14 @@ export function registerResponseHandler(handler: ResponseHandler): void {
 
 export function getResponseHandlers(): readonly ResponseHandler[] {
   return responseHandlers;
+}
+
+const startupCallbacks: Array<() => void | Promise<void>> = [];
+export function onStartup(callback: () => void | Promise<void>): void {
+  startupCallbacks.push(callback);
+}
+export async function runModuleStartup(): Promise<void> {
+  for (const callback of startupCallbacks) await callback();
 }
 
 type ShutdownCallback = () => void | Promise<void>;

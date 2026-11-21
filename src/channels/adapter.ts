@@ -32,7 +32,18 @@ export interface ChannelSetup {
   onMetadata(platformId: string, name?: string, isGroup?: boolean): void;
 
   /** Called when a user clicks a button/action in a card (e.g., ask_user_question response). */
-  onAction(questionId: string, selectedOption: string, userId: string): void;
+  onActionPreflight?(
+    questionId: string,
+    selectedOption: string,
+    userId: string,
+    receipt?: { source: 'discord-component'; channelId: string; messageId: string },
+  ): boolean;
+  onAction(
+    questionId: string,
+    selectedOption: string,
+    userId: string,
+    receipt?: { source: 'discord-component'; channelId: string; messageId: string },
+  ): void | boolean | Promise<void | boolean>;
 }
 
 /** Delivery address used for reply-to overrides and (normally) the inbound's own origin. */

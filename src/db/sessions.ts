@@ -1,4 +1,5 @@
 import type { PendingApproval, PendingQuestion, Session } from '../types.js';
+import { getHostQuestionRender } from '../channels/ask-question.js';
 import { getDb, hasTable } from './connection.js';
 
 // ── Sessions ──
@@ -263,6 +264,8 @@ export function getPendingApprovalsByAction(action: string): PendingApproval[] {
 export function getAskQuestionRender(
   id: string,
 ): { title: string; options: import('../channels/ask-question.js').NormalizedOption[] } | undefined {
+  const hostRender = getHostQuestionRender(id);
+  if (hostRender) return hostRender;
   const q = getPendingQuestion(id);
   if (q) return { title: q.title, options: q.options };
   const a = getDb().prepare('SELECT title, options_json FROM pending_approvals WHERE approval_id = ?').get(id) as

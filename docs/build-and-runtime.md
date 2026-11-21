@@ -40,6 +40,30 @@ OneCLI injects the `Yente Browser Handoff` authorization header. Broker secrets,
 the VNC password, the Chromium profile, and direct CDP/VNC sockets stay outside
 the agent container.
 
+The optional OpenCode Browse service has a separate session approval contract.
+`src/modules/browse-approval/` accepts `request_browse_session` and
+`close_browse_session` outbound system actions. Requests carry the current
+host-stamped input and route; the host resolves the actual human from its
+inbound DB and posts Allow session / Cancel in that Discord conversation.
+Only a matching Discord component receipt for that human, channel and card can
+grant access. Stop and native-session closure revoke it; pending requests expire
+after ten minutes. The broker independently enforces ten-minute idle expiry and
+a one-hour maximum. Container sleep does not close an active conversation.
+
+The host controls Browse through Unix HTTP at
+`/srv/opencode-browse/control/broker.sock` (`NANOCLAW_BROWSE_CONTROL_SOCKET` may
+override it). This socket is never mounted into agent containers. Approved
+short-lived session permits are published through the existing read-only
+host-correlation mount as `browse-session.json`; raw relay credentials remain
+outside agents. A small identifier-only `data/browse-session-access.json` index
+lets startup invalidate all retained access files before channels resume, even
+if broker reset fails. New approvals stay blocked until control reset succeeds.
+Broker revocation failures keep an explicit retryable Stop control and block the
+helper; they never claim access was stopped. No runtime provider change or
+Playwriter retirement is part of this feature. Deploy the matching broker and
+editable Browse helper together; this source implementation alone is not proof
+of production rollout.
+
 ## Lockfiles
 
 | Tree         | Lockfile                          | Manager  | Regenerate after dep change                |

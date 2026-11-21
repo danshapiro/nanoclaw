@@ -671,6 +671,18 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         const matched = render?.options.find((o) => o.value === selectedOption);
         const selectedLabel = matched?.selectedLabel ?? selectedOption ?? '(clicked)';
 
+        // The host validates approval identity before any card is consumed.
+        const receipt =
+          adapter.name === 'discord'
+            ? {
+                source: 'discord-component' as const,
+                channelId: event.threadId.split(':').at(-1) ?? '',
+                messageId: event.messageId.split(':').at(-1) ?? '',
+              }
+            : undefined;
+        const accepted = setupConfig.onActionPreflight?.(questionId, selectedOption, userId, receipt);
+        if (accepted === false) return;
+
         // Update the card to show the selected answer and remove buttons
         try {
           const tid = event.threadId;
@@ -680,8 +692,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         } catch (err) {
           log.warn('Failed to update card after action', { err });
         }
-
-        setupConfig.onAction(questionId, selectedOption, userId);
+        void setupConfig.onAction(questionId, selectedOption, userId, receipt);
       });
 
       await chat.initialize();
@@ -1022,31 +1033,43 @@ export async function handleForwardedEvent(
       const cardTitle = render?.title ?? ((originalEmbeds[0]?.title as string) || '❓ Question');
       const matchedOpt = render?.options.find((o) => o.value === selectedOption);
       const selectedLabel = matchedOpt?.selectedLabel ?? selectedOption ?? customId;
+      const receipt = {
+        source: 'discord-component' as const,
+        channelId: typeof interaction.channel_id === 'string' ? interaction.channel_id : '',
+        messageId:
+          typeof (interaction.message as Record<string, unknown> | undefined)?.id === 'string'
+            ? (interaction.message as Record<string, string>).id
+            : '',
+      };
+      const accepted =
+        questionId && selectedOption
+          ? setupConfig.onActionPreflight?.(questionId, selectedOption, user?.id || '', receipt)
+          : false;
       try {
         await fetchImpl(`https://discord.com/api/v10/interactions/${interactionId}/${interactionToken}/callback`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            type: 7, // UPDATE_MESSAGE — acknowledge + update in one call
-            data: {
-              embeds: [
-                {
-                  title: cardTitle,
-                  description: `${originalDescription}\n\n${selectedLabel}`,
-                },
-              ],
-              components: [], // remove buttons
-            },
+            type: accepted === false ? 4 : 7,
+            data:
+              accepted === false
+                ? { content: 'This approval is unavailable or belongs to a different requester.', flags: 64 }
+                : {
+                    embeds: [
+                      {
+                        title: cardTitle,
+                        description: `${originalDescription}\n\n${selectedLabel}`,
+                      },
+                    ],
+                    components: [], // remove buttons
+                  },
           }),
         });
       } catch (err) {
         log.error('Failed to update interaction', { err });
       }
-
-      // Dispatch to host
-      if (questionId && selectedOption) {
-        setupConfig.onAction(questionId, selectedOption, user?.id || '');
-      }
+      if (accepted !== false && questionId && selectedOption)
+        void setupConfig.onAction(questionId, selectedOption, user?.id || '', receipt);
       return;
     }
   }

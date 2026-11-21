@@ -40,6 +40,9 @@ import {
 import {
   registerResponseHandler,
   getResponseHandlers,
+  RejectedPlatformAction,
+  canDispatchPlatformAction,
+  runModuleStartup,
   onShutdown,
   getShutdownCallbacks,
   type ResponsePayload,
@@ -48,16 +51,18 @@ import {
 export { registerResponseHandler, onShutdown };
 export type { ResponsePayload, ResponseHandler };
 
-async function dispatchResponse(payload: ResponsePayload): Promise<void> {
+async function dispatchResponse(payload: ResponsePayload): Promise<boolean> {
   for (const handler of getResponseHandlers()) {
     try {
       const claimed = await handler(payload);
-      if (claimed) return;
+      if (claimed) return true;
     } catch (err) {
+      if (err instanceof RejectedPlatformAction) return false;
       log.error('Response handler threw', { questionId: payload.questionId, err });
     }
   }
   log.warn('Unclaimed response', { questionId: payload.questionId, value: payload.value });
+  return false;
 }
 
 // Channel barrel — each enabled channel self-registers on import.
@@ -99,6 +104,8 @@ async function main(): Promise<void> {
   ensureContainerRuntimeRunning();
   cleanupOrphansVerified();
   expireAllStaleGwsCorrelations();
+  // After singleton and verified orphan cleanup, revoke previous-process browser access before resuming channels.
+  await runModuleStartup();
   startGwsCorrelationIpcWatcher();
   // Sweep per-container --env-file leftovers from a previous crash — they hold
   // secret-bearing env values and must not accumulate.
@@ -169,19 +176,29 @@ async function main(): Promise<void> {
           isGroup,
         });
       },
-      onAction(questionId, selectedOption, userId) {
-        dispatchResponse({
+      onActionPreflight(questionId, selectedOption, userId, receipt) {
+        return canDispatchPlatformAction({
           questionId,
           value: selectedOption,
           userId,
           channelType: adapter.channelType,
-          // platformId/threadId aren't surfaced by the current onAction
-          // signature — registered handlers look them up from the
-          // pending_question / pending_approval row.
           platformId: '',
           threadId: null,
+          transportReceipt: receipt,
+        });
+      },
+      onAction(questionId, selectedOption, userId, receipt) {
+        return dispatchResponse({
+          questionId,
+          value: selectedOption,
+          userId,
+          channelType: adapter.channelType,
+          platformId: '',
+          threadId: null,
+          transportReceipt: receipt,
         }).catch((err) => {
           log.error('Failed to handle question response', { questionId, err });
+          return false;
         });
       },
     };
