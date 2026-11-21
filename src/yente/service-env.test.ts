@@ -57,8 +57,21 @@ describe('Yente service env contract', () => {
     expect(() => requireYenteHostEnv({ ...COMPLETE_ENV, BROWSE_URL: 'http://127.0.0.1:19990' })).toThrow(
       'BROWSE_URL must be exactly http://172.17.0.1:19991',
     );
-    expect(result.containerEnv).not.toHaveProperty('PLAYWRITER_HOST');
-    expect(result.containerEnv).not.toHaveProperty('PLAYWRITER_AUTO_ENABLE');
+  });
+
+  it('keeps Playwriter available alongside Browse without automatic tab enablement', () => {
+    const result = requireYenteHostEnv({ ...COMPLETE_ENV, BROWSE_URL: undefined });
+    expect(result.containerEnv).toMatchObject({
+      BROWSE_URL: 'http://172.17.0.1:19991',
+      PLAYWRITER_HOST: 'http://172.17.0.1:19988',
+      PLAYWRITER_AUTO_ENABLE: 'false',
+    });
+    expect(() => requireYenteHostEnv({ ...COMPLETE_ENV, PLAYWRITER_HOST: 'http://127.0.0.1:19988' })).toThrow(
+      'PLAYWRITER_HOST must be exactly http://172.17.0.1:19988',
+    );
+    expect(() => requireYenteHostEnv({ ...COMPLETE_ENV, PLAYWRITER_AUTO_ENABLE: 'true' })).toThrow(
+      'PLAYWRITER_AUTO_ENABLE must be exactly false',
+    );
   });
 
   it('passes only non-secret proxy URLs and placeholder compatibility env into containers', () => {
@@ -71,7 +84,7 @@ describe('Yente service env contract', () => {
       MSGVAULT_API_KEY: 'raw-msgvault-api-key',
       YENTE_BROWSER_HANDOFF_BROKER_SECRET: 'raw-broker-secret',
       YENTE_BROWSER_HANDOFF_VNC_PASSWORD: 'raw-vnc-password',
-      PLAYWRITER_TOKEN: 'retired-relay-bearer',
+      PLAYWRITER_TOKEN: 'raw-playwriter-relay-bearer',
       BROWSE_TOKEN: 'raw-relay-bearer',
       AGENTMAIL_API_KEY: 'raw-agentmail-key',
     });
@@ -88,8 +101,12 @@ describe('Yente service env contract', () => {
       NYNE_API_URL: `http://${YENTE_LOCAL_PROXY_HOSTS.nyne}:8082`,
       YENTE_BROWSER_HANDOFF_URL: YENTE_BROWSER_HANDOFF_PRODUCTION_URL,
       BROWSE_URL: YENTE_BROWSE_PRODUCTION_URL,
-      NO_PROXY: 'localhost,127.0.0.1,registry.npmjs.org,host.docker.internal,172.17.0.1,172.17.0.1:19991',
-      no_proxy: 'localhost,127.0.0.1,registry.npmjs.org,host.docker.internal,172.17.0.1,172.17.0.1:19991',
+      PLAYWRITER_HOST: 'http://172.17.0.1:19988',
+      PLAYWRITER_AUTO_ENABLE: 'false',
+      NO_PROXY:
+        'localhost,127.0.0.1,registry.npmjs.org,host.docker.internal,172.17.0.1,172.17.0.1:19988,172.17.0.1:19991',
+      no_proxy:
+        'localhost,127.0.0.1,registry.npmjs.org,host.docker.internal,172.17.0.1,172.17.0.1:19988,172.17.0.1:19991',
     });
     expect(result.containerEnv).not.toHaveProperty('GOOGLE_APPLICATION_CREDENTIALS');
     expect(result.containerEnv).not.toHaveProperty('ANTHROPIC_API_KEY');
@@ -118,6 +135,7 @@ describe('Yente service env contract', () => {
     expect(entries).not.toContain(YENTE_LOCAL_PROXY_HOSTS.nyne);
     expect(entries).not.toContain(`${YENTE_LOCAL_PROXY_HOSTS.browserHandoff}:6081`);
     expect(entries).toContain('172.17.0.1');
+    expect(entries).toContain('172.17.0.1:19988');
     expect(entries).toContain('172.17.0.1:19991');
   });
 

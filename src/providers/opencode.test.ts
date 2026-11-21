@@ -36,6 +36,8 @@ describe('opencode provider container config', () => {
       expect(contribution.env?.GWS_PROXY_URL).toBe('http://yente-gws-proxy.local:8083');
       expect(contribution.env?.YENTE_BROWSER_HANDOFF_URL).toBe('http://yente-browser-handoff.local:6081');
       expect(contribution.env?.BROWSE_URL).toBe('http://172.17.0.1:19991');
+      expect(contribution.env?.PLAYWRITER_HOST).toBe('http://172.17.0.1:19988');
+      expect(contribution.env?.PLAYWRITER_AUTO_ENABLE).toBe('false');
       expect(contribution.extraHosts).toContain('yente-gws-proxy.local');
       expect(contribution.extraHosts).toContain('yente-browser-handoff.local');
       expect(contribution.mounts).toContainEqual({
@@ -86,6 +88,8 @@ describe('opencode provider container config', () => {
       expect(contribution.env?.GWS_PROXY_URL).toBe('http://yente-gws-proxy.local:8083');
       expect(contribution.env?.YENTE_BROWSER_HANDOFF_URL).toBe('http://yente-browser-handoff.local:6081');
       expect(contribution.env?.BROWSE_URL).toBe('http://172.17.0.1:19991');
+      expect(contribution.env?.PLAYWRITER_HOST).toBe('http://172.17.0.1:19988');
+      expect(contribution.env?.PLAYWRITER_AUTO_ENABLE).toBe('false');
       expect(contribution.env?.OPENCODE_PROVIDER).toBe('opencode-go');
       expect(contribution.env?.OPENCODE_MODEL).toBe('opencode-go/test-model');
       expect(contribution.env?.OPENCODE_SMALL_MODEL).toBe('opencode-go/test-small');

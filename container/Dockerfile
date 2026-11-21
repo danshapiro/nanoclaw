@@ -168,6 +168,27 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
     codex app-server --help | grep -F -- '--strict-config' && \
     codex app-server --help | grep -F -- '--listen'
 
+# ---- Playwriter stock client --------------------------------------------------
+# The archive and identity are copied verbatim from the accepted Task 1
+# preparation. Package version 0.4.0 is not unique, so archive SHA/size and the
+# pinned preparation receipt remain the authoritative identity.
+COPY playwriter/playwriter-client-0303f56f07c838bb4686870cc03c9374ccff46f8.tgz /usr/local/share/nanoclaw/playwriter/playwriter-client-0303f56f07c838bb4686870cc03c9374ccff46f8.tgz
+COPY playwriter/client-identity.json /usr/local/share/nanoclaw/playwriter/
+COPY playwriter/verify-no-optional-dependencies.mjs /usr/local/share/nanoclaw/playwriter/
+COPY playwriter/verify-client-version.mjs /usr/local/share/nanoclaw/playwriter/
+COPY playwriter/runtime-package.json /opt/playwriter/package.json
+RUN --mount=type=cache,target=/root/.cache/pnpm \
+    export PATH="/pnpm/bin:/pnpm:$PATH" && \
+    chmod 0644 "/usr/local/share/nanoclaw/playwriter/playwriter-client-0303f56f07c838bb4686870cc03c9374ccff46f8.tgz" /usr/local/share/nanoclaw/playwriter/client-identity.json /usr/local/share/nanoclaw/playwriter/verify-no-optional-dependencies.mjs /usr/local/share/nanoclaw/playwriter/verify-client-version.mjs /opt/playwriter/package.json && \
+    test "$(wc -c <"/usr/local/share/nanoclaw/playwriter/playwriter-client-0303f56f07c838bb4686870cc03c9374ccff46f8.tgz")" = "1066577" && \
+    printf '%s\n' '29af65feb673528c70cf06c284b2bb52d3179da74930b158622fa6693d2296b0  /usr/local/share/nanoclaw/playwriter/playwriter-client-0303f56f07c838bb4686870cc03c9374ccff46f8.tgz' | sha256sum --check --strict && \
+    jq -e '.artifact.sha256 == "29af65feb673528c70cf06c284b2bb52d3179da74930b158622fa6693d2296b0" and .artifact.bytes == 1066577 and .source.commit == "0303f56f07c838bb4686870cc03c9374ccff46f8" and .preparation_receipt.sha256 == "f68a7ea5afabab788fe299f033d995f69dfca4f3608f470f836f313b5b65e96c" and .optional_dependencies_omitted == ["@playwriter/patchright-core", "sharp"]' /usr/local/share/nanoclaw/playwriter/client-identity.json >/dev/null && \
+    pnpm --dir /opt/playwriter install --prod --no-optional --no-frozen-lockfile && \
+    ln -s /opt/playwriter/node_modules/playwriter/bin.js /usr/local/bin/playwriter && \
+    playwriter_bin="$(readlink -f "$(command -v playwriter)")" && \
+    node /usr/local/share/nanoclaw/playwriter/verify-client-version.mjs "$playwriter_bin" && \
+    node /usr/local/share/nanoclaw/playwriter/verify-no-optional-dependencies.mjs "$playwriter_bin"
+
 # ---- YouTube media downloader ------------------------------------------------
 # Pin the official nightly zipimport executable: distro packages and stable
 # builds can lag behind YouTube changes. Node is already present in the image.

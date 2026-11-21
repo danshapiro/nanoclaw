@@ -28,6 +28,8 @@ describe('Yente Claude provider container config', () => {
 
     expect(contribution.env?.YENTE_BROWSER_HANDOFF_URL).toBe('http://yente-browser-handoff.local:6081');
     expect(contribution.env?.BROWSE_URL).toBe('http://172.17.0.1:19991');
+    expect(contribution.env?.PLAYWRITER_HOST).toBe('http://172.17.0.1:19988');
+    expect(contribution.env?.PLAYWRITER_AUTO_ENABLE).toBe('false');
     expect(contribution.env).not.toHaveProperty('YENTE_BROWSER_HANDOFF_BROKER_SECRET');
     expect(contribution.env).not.toHaveProperty('YENTE_BROWSER_HANDOFF_VNC_PASSWORD');
     expect(contribution.extraHosts).toEqual(

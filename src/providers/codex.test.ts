@@ -526,6 +526,7 @@ describe('codex host provider container config', () => {
           'registry.npmjs.org',
           'host.docker.internal',
           '172.17.0.1',
+          '172.17.0.1:19988',
           '172.17.0.1:19991',
           'internal.example',
         ]),
@@ -537,6 +538,7 @@ describe('codex host provider container config', () => {
           'registry.npmjs.org',
           'host.docker.internal',
           '172.17.0.1',
+          '172.17.0.1:19988',
           '172.17.0.1:19991',
         ]),
       );

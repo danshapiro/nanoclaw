@@ -12,6 +12,8 @@ const YENTE_HOST_ENV_KEYS = [
   'NYNE_PROXY_URL',
   'YENTE_BROWSER_HANDOFF_URL',
   'BROWSE_URL',
+  'PLAYWRITER_HOST',
+  'PLAYWRITER_AUTO_ENABLE',
   'NO_PROXY',
   'no_proxy',
 ] as const;

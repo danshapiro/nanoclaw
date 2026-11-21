@@ -260,8 +260,12 @@ async function loadContainerRunnerHarness(
         NYNE_API_URL: 'http://yente-nyne-proxy.local:8082',
         YENTE_BROWSER_HANDOFF_URL: 'http://yente-browser-handoff.local:6081',
         BROWSE_URL: 'http://172.17.0.1:19991',
-        NO_PROXY: 'localhost,127.0.0.1,registry.npmjs.org,host.docker.internal,172.17.0.1,172.17.0.1:19991',
-        no_proxy: 'localhost,127.0.0.1,registry.npmjs.org,host.docker.internal,172.17.0.1,172.17.0.1:19991',
+        PLAYWRITER_HOST: 'http://172.17.0.1:19988',
+        PLAYWRITER_AUTO_ENABLE: 'false',
+        NO_PROXY:
+          'localhost,127.0.0.1,registry.npmjs.org,host.docker.internal,172.17.0.1,172.17.0.1:19988,172.17.0.1:19991',
+        no_proxy:
+          'localhost,127.0.0.1,registry.npmjs.org,host.docker.internal,172.17.0.1,172.17.0.1:19988,172.17.0.1:19991',
       },
     }),
   }));
@@ -1734,6 +1738,8 @@ describe('session wake lifecycle', () => {
       expect(env.get('YENTE_BROWSER_HANDOFF_URL')).toBe('http://yente-browser-handoff.local:6081');
       expect(env.get('GWS_PROXY_URL')).toBe('http://yente-gws-proxy.local:8083');
       expect(env.get('BROWSE_URL')).toBe('http://172.17.0.1:19991');
+      expect(env.get('PLAYWRITER_HOST')).toBe('http://172.17.0.1:19988');
+      expect(env.get('PLAYWRITER_AUTO_ENABLE')).toBe('false');
       expect(args).toContain('--add-host=yente-browser-handoff.local:host-gateway');
       expect(args).toContain('--add-host=yente-gws-proxy.local:host-gateway');
     } finally {
