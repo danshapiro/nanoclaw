@@ -105,6 +105,30 @@ paths as a non-root UID and starts Codex app-server offline with strict config
 and closed stdin; checking only `codex --version` through `PATH` does not cover
 that wrapper contract.
 
+## Browse session approval
+
+The Browse approval module accepts `request_browse_session` actions from the
+existing session outbound DB. It resolves the requesting human from the host's
+accepted Discord input and requires a matching real component click before
+granting browser access. Generic agent responses cannot approve the request.
+
+The gated Browse service exposes a host-only Unix HTTP control socket, default
+`/srv/opencode-browse/control/broker.sock`; `NANOCLAW_BROWSE_CONTROL_SOCKET` can
+override the host path. Never mount that socket into agent containers. The
+runtime writes the approved task's short-lived token to `browse-session.json`
+in the existing read-only `/workspace/.host-correlation` mount. The editable
+Browse helper reads it and sends it to the broker without printing it. No new
+agent environment or image-installed command is required.
+
+Pending approvals expire after ten minutes. Active grants end through Stop,
+task completion, native-session retirement, ten minutes idle or a one-hour
+maximum. Failed revocation removes the helper token, reports uncertainty and
+retains retry controls. Startup invalidates retained access records before
+resetting the broker; failure leaves new requests blocked. A small host-only
+index contains active session identifiers for this cleanup, not credentials
+or an audit history. Deploy the runtime with the gated broker and updated
+editable helper through the host repository's coordinated Browse runbook.
+
 ## Session wake (two paths)
 
 1. **Base image ENTRYPOINT** — used for stdin-piped test invocations like the sample in `container/build.sh`: `tini --> entrypoint.sh` captures stdin to `/tmp/input.json`, then `exec bun run src/index.ts`. When a command is passed to `docker run`, the entrypoint executes that command directly so image-surface checks can run without the runtime-only `/app/src` bind mount.
