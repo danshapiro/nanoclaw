@@ -233,7 +233,6 @@ explicit requeue. A partly delivered message is neither
 of these cases: reconcile the missing parts manually before recording completion.
 Never requeue a partial or uncertain send: doing so can duplicate messages.
 
-
 The November15 follow-up narrows safe reaction retry eligibility to nonempty
 string message/emoji targets without files, matching the bridge's single
 operation. Malformed reaction-shaped text retains outcome-unknown protection.
@@ -241,6 +240,37 @@ Explicit429 retry_after seconds (including JSON whitespace) are a persisted
 minimum above exponential backoff; waiting polls consume no attempts. Invalid,
 nonfinite or out-of-Date-range delays are rejected by parsing. Attempts remain
 bounded; generic transport, server and multipart uncertainty is never replayed.
+
+### Retiring an abandoned CLI smoke response
+
+A smoke caller can read its response and then fail during cleanup, leaving a
+quarantined output on an expired CLI destination. Preserve the caller failure;
+that is not proof of successful delivery. After verifying the capture is obsolete,
+an operator can explicitly retire one exact output without sending anything:
+
+```bash
+pnpm exec tsx scripts/reconcile-delivery.ts /absolute/path/to/inbound.db MESSAGE_ID --confirmed-obsolete-cli-smoke CONTENT_SHA256
+```
+
+`CONTENT_SHA256` is the lowercase SHA256 of the original raw `messages_out.content`
+string. The command requires a text-only chat older than 24 hours on its exact
+isolated CLI smoke route, a stopped worker, no thread or human input, and no
+scheduled-task references to the route or session. Central bindings are checked
+inside the immediate transaction. Changed payloads, real channels, files/edits,
+in-flight sends and existing terminal receipts are refused.
+
+This records `dropped`, retaining the original outbound and failed/unknown guard,
+error and attempts. It makes no delivery-success claim and never requeues a send.
+Read back those exact records and retain the original capture evidence. This is
+an explicit operator decision, not a general-purpose discard or smoke cleanup.
+
+The installed runtime need not be upgraded to use an operator-only option. Follow
+the deployment repository's **Delivery reconciliation** standalone staging lane:
+publish and review the exact source, verify compatibility with the active schema,
+and stage only its hash-verified script (or offline, unbundled CJS artifact) with
+the exact installed release's dependencies. Never edit the live release, broaden
+its permissions or restart it solely for reconciliation. Source publication alone
+does not establish a live disposition or health acceptance.
 
 ## Host container-log retention and archive capture
 

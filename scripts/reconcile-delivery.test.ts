@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { createHash } from 'node:crypto';
 
 const script = path.resolve('scripts/reconcile-delivery.ts');
 let root: string, session: string, inbound: Database.Database, outbound: Database.Database;
@@ -159,4 +160,128 @@ it('executes precompiled operator artifact without live esbuild execution', () =
   expect(result.status, result.stderr).toBe(0);
   expect(inbound.prepare('SELECT status FROM delivered').get()).toEqual({ status: 'dropped' });
   expect(inbound.prepare('SELECT state FROM delivery_attempts').get()).toEqual({ state: 'unknown' });
+});
+
+describe('operator exact obsolete CLI smoke retirement', () => {
+  const platform = 'cli-smoke:group:1234567890123-fixture';
+  const mg = 'mg-cli-smoke-fixture';
+  let central: Database.Database;
+  beforeEach(() => {
+    central = new Database(path.join(root, 'v2.db'));
+    central.exec(`CREATE TABLE sessions(id TEXT,agent_group_id TEXT,messaging_group_id TEXT,thread_id TEXT,container_status TEXT);
+      CREATE TABLE messaging_groups(id TEXT,channel_type TEXT,platform_id TEXT,is_group INTEGER);
+      CREATE TABLE scheduled_tasks(messaging_group_id TEXT,projected_session_id TEXT,created_by_session_id TEXT,updated_by_session_id TEXT);`);
+    central.prepare('INSERT INTO sessions VALUES (?,?,?,?,?)').run('session', 'group', mg, null, 'stopped');
+    central.prepare('INSERT INTO messaging_groups VALUES (?,?,?,?)').run(mg, 'cli', platform, 0);
+    outbound.exec(`ALTER TABLE messages_out ADD COLUMN channel_type TEXT;
+      ALTER TABLE messages_out ADD COLUMN platform_id TEXT;
+      ALTER TABLE messages_out ADD COLUMN messaging_group_id TEXT;
+      ALTER TABLE messages_out ADD COLUMN thread_id TEXT;
+      ALTER TABLE messages_out ADD COLUMN input_id TEXT;
+      ALTER TABLE messages_out ADD COLUMN route_key TEXT;
+      ALTER TABLE messages_out ADD COLUMN is_group INTEGER;`);
+    outbound
+      .prepare(
+        'UPDATE messages_out SET content=?,channel_type=?,platform_id=?,messaging_group_id=?,route_key=?,is_group=0',
+      )
+      .run(
+        JSON.stringify({ text: 'Historical harness result' }),
+        'cli',
+        platform,
+        mg,
+        `codex|cli|${platform}|dm:${mg}`,
+      );
+    inbound.prepare('UPDATE delivery_attempts SET state=?,last_error=?').run('failed', 'Unknown CLI destination');
+    inbound.prepare('INSERT INTO delivered VALUES (?,NULL,?,?)').run('message', 'failed', 'old');
+  });
+  afterEach(() => central.close());
+  function hash() {
+    return createHash('sha256')
+      .update((outbound.prepare('SELECT content FROM messages_out').get() as any).content)
+      .digest('hex');
+  }
+  function smoke(sha = hash()) {
+    return run('--confirmed-obsolete-cli-smoke', script, [sha]);
+  }
+  function refused() {
+    expect(smoke().status).not.toBe(0);
+    expect(inbound.prepare('SELECT state,last_error FROM delivery_attempts').get()).toEqual({
+      state: 'failed',
+      last_error: 'Unknown CLI destination',
+    });
+    expect(inbound.prepare('SELECT status FROM delivered').get()).toEqual({ status: 'failed' });
+  }
+  it('records dropped while retaining exact source/error/guard and never replaying', () => {
+    const original = outbound.prepare('SELECT * FROM messages_out').get();
+    const result = smoke();
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain('no send or delivery claim');
+    expect(inbound.prepare('SELECT status FROM delivered').get()).toEqual({ status: 'dropped' });
+    expect(inbound.prepare('SELECT state,last_error FROM delivery_attempts').get()).toEqual({
+      state: 'failed',
+      last_error: 'Unknown CLI destination',
+    });
+    expect(outbound.prepare('SELECT * FROM messages_out').get()).toEqual(original);
+    expect(smoke().status).not.toBe(0);
+    expect(inbound.prepare('SELECT status FROM delivered').get()).toEqual({ status: 'dropped' });
+  });
+  it('requires an exact operator-selected payload digest', () => {
+    expect(run('--confirmed-obsolete-cli-smoke').status).toBe(2);
+    expect(smoke('not-a-digest').status).toBe(2);
+    expect(smoke('0'.repeat(64)).status).not.toBe(0);
+    expect(inbound.prepare('SELECT status FROM delivered').get()).toEqual({ status: 'failed' });
+  });
+  it.each([
+    ['channel_type', 'discord'],
+    ['platform_id', 'discord:real'],
+    ['messaging_group_id', 'real'],
+    ['thread_id', 'thread'],
+    ['input_id', 'human-input'],
+    ['route_key', 'codex|discord|real|dm:real'],
+    ['is_group', 1],
+    ['kind', 'file'],
+    ['timestamp', '2099-01-01 00:00:00'],
+    ['timestamp', 'invalid'],
+    ['timestamp', new Date().toISOString().slice(0, 19).replace('T', ' ')],
+    ['content', JSON.stringify({ text: 'text', files: ['a'] })],
+    ['content', JSON.stringify({ text: 'text', operation: 'edit' })],
+    ['content', 'null'],
+    ['content', '[]'],
+    ['content', '{'],
+    ['content', JSON.stringify({ text: '' })],
+  ])('refuses unsafe outbound %s=%s atomically', (column, value) => {
+    outbound.prepare(`UPDATE messages_out SET ${column}=?`).run(value);
+    refused();
+  });
+  it.each(['running', 'starting', 'unknown'])('refuses a %s worker', (status) => {
+    central.prepare('UPDATE sessions SET container_status=?').run(status);
+    refused();
+  });
+  it('refuses missing or rebound sessions and real central routes', () => {
+    central.prepare('UPDATE sessions SET messaging_group_id=?').run('real');
+    refused();
+    central.prepare('DELETE FROM sessions').run();
+    refused();
+  });
+  it.each(['channel_type', 'platform_id'])('refuses central %s drift', (column) => {
+    central.prepare(`UPDATE messaging_groups SET ${column}=?`).run('discord');
+    refused();
+  });
+  it.each(['messaging_group_id', 'projected_session_id', 'created_by_session_id', 'updated_by_session_id'])(
+    'protects scheduled work through %s',
+    (column) => {
+      central
+        .prepare(`INSERT INTO scheduled_tasks (${column}) VALUES (?)`)
+        .run(column === 'messaging_group_id' ? mg : 'session');
+      refused();
+    },
+  );
+  it('refuses active attempts and preserves a delivered receipt', () => {
+    inbound.prepare('UPDATE delivery_attempts SET state=?').run('sending');
+    expect(smoke().status).not.toBe(0);
+    inbound.prepare('UPDATE delivery_attempts SET state=?').run('failed');
+    inbound.prepare('UPDATE delivered SET status=?').run('delivered');
+    expect(smoke().status).not.toBe(0);
+    expect(inbound.prepare('SELECT status FROM delivered').get()).toEqual({ status: 'delivered' });
+  });
 });
