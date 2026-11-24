@@ -1421,6 +1421,10 @@ describe('session wake lifecycle', () => {
       const args = harness.spawnMock.mock.calls[0][1];
       expect(args).toContain('sha256:abcd');
       expect(args).toContain(`${home}:/home/node/.codex`);
+      // Docker otherwise creates missing nested-bind parent directories as
+      // root, which makes the rest of this private cache unwritable to agents.
+      expect(fs.statSync(path.join(home, 'cache')).mode & 0o777).toBe(0o700);
+      expect(fs.statSync(path.join(home, 'cache')).uid).toBe(process.getuid?.());
       expect(args).toContain(
         `${harness.dataDir}/.cache/codex-catalog/ag-1/0.170.0:/home/node/.codex/cache/remote_plugin_catalog`,
       );

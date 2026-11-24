@@ -414,6 +414,12 @@ async function spawnContainerWithStoreLease(
     selectedImage = codexImage.imageId;
     const lease = await acquireStoreLease(DATA_DIR, 'catalog', agentGroup.id, codexImage.version);
     releases.push(lease.release);
+    // Prepare the target as the host/agent user. Docker creates missing bind
+    // parents as root, which would make other private cache paths unwritable.
+    fs.mkdirSync(path.join(sessionDir(agentGroup.id, session.id), 'codex/cache/remote_plugin_catalog'), {
+      recursive: true,
+      mode: 0o700,
+    });
     contribution.mounts = [...(contribution.mounts ?? []), catalogMount(DATA_DIR, agentGroup.id, codexImage.version)];
     log.info('Selected shared Codex catalog', {
       agentGroupId: agentGroup.id,
