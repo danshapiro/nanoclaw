@@ -83,6 +83,18 @@ Both are committed. CI and the Dockerfile run `--frozen-lockfile` variants — a
 `container/Dockerfile` is a single-stage build on `node:22-slim`:
 
 - **Pinned ARGs** — `BUN_VERSION`, `PNPM_VERSION`, `CLAUDE_CODE_VERSION`, `AGENT_BROWSER_VERSION`, `VERCEL_VERSION`. Bump deliberately in PRs. The image activates pnpm 10.33.0 explicitly, matching the host's `packageManager` pin; running Corepack without that pin can select a newer major with incompatible global CLI installation behavior.
+- **ARG scope** — each tool's version is declared immediately before its
+  installation. A Codex-only pin change reuses earlier system, Bun, runner
+  dependency and CLI layers. Any changed step still rebuilds subsequent
+  layers; Bun changes legitimately rebuild the dependencies installed by Bun.
+  Versions and tool order are unchanged by this cache fix. It releases no
+  existing cache bytes by itself, and no production build speed is claimed.
+  Run `python3 scripts/test-build-layer-cache.py` on Linux with Docker,
+  passwordless `sudo` and a static C compiler for the small behavioral fixture.
+  It derives ARG/RUN order from this Dockerfile, uses an isolated Docker daemon
+  under `.test-tmp`, and verifies real successive BuildKit cache identities.
+  The short socket directory under `~/.cache` is recorded and removed on exit;
+  shared development builders and images are never pruned.
 - **CJK fonts** — `ARG INSTALL_CJK_FONTS=false`. `container/build.sh` reads `INSTALL_CJK_FONTS` from `.env` and passes it through. Default build saves ~200MB; opt in when the user works with Chinese/Japanese/Korean content.
 - **BuildKit cache mounts** — `/var/cache/apt`, `/var/lib/apt`, `/root/.bun/install/cache`, `/root/.cache/pnpm`. Rebuilds where `package.json`/`bun.lock` haven't changed are fast. Requires BuildKit (default on Docker 23+, Apple Container-compat).
 - **`tini` as init** — reaps Chromium zombies, forwards signals so in-flight `outbound.db` writes finalize on SIGTERM.
