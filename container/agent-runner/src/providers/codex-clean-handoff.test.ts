@@ -41,7 +41,7 @@ function harness(mode: 'normal' | 'abort' | 'terminal' | 'setup' | 'cancel') {
     serverRequestHandlers: [],
   } as unknown as AppServer;
   const provider = new CodexProvider(
-    { env: { CODEX_MODEL: 'gpt-6.1-sol' } },
+    { env: { CODEX_MODEL: 'gpt-6.2-sol' } },
     {
       syncManagedSkillLinks: () => [],
       writeMcpConfig: () => {},

@@ -15,18 +15,18 @@ import {
 
 describe('createProvider (codex)', () => {
   it('returns CodexProvider for codex', () => {
-    expect(createProvider('codex', { env: { CODEX_MODEL: 'gpt-6.1-sol' } })).toBeInstanceOf(CodexProvider);
+    expect(createProvider('codex', { env: { CODEX_MODEL: 'gpt-6.2-sol' } })).toBeInstanceOf(CodexProvider);
   });
 
   it('flags stale thread errors as session-invalid (2-arg signature)', () => {
-    const p = new CodexProvider({ env: { CODEX_MODEL: 'gpt-6.1-sol' } });
+    const p = new CodexProvider({ env: { CODEX_MODEL: 'gpt-6.2-sol' } });
     expect(p.isSessionInvalid(new Error('thread not found'), { attemptedContinuation: 'thread-1' })).toBe(true);
     expect(p.isSessionInvalid(new Error('unknown thread 123'), { attemptedContinuation: 'thread-1' })).toBe(true);
     expect(p.isSessionInvalid(new Error('No such thread: abc'), { attemptedContinuation: 'thread-1' })).toBe(true);
   });
 
   it('does not flag unrelated errors as session-invalid', () => {
-    const p = new CodexProvider({ env: { CODEX_MODEL: 'gpt-6.1-sol' } });
+    const p = new CodexProvider({ env: { CODEX_MODEL: 'gpt-6.2-sol' } });
     expect(p.isSessionInvalid(new Error('rate limit exceeded'), { attemptedContinuation: 'thread-1' })).toBe(false);
     expect(p.isSessionInvalid(new Error('connection reset'), { attemptedContinuation: 'thread-1' })).toBe(false);
     expect(p.isSessionInvalid(new Error('codex app-server exited: code=1'), { attemptedContinuation: 'thread-1' })).toBe(
@@ -35,7 +35,7 @@ describe('createProvider (codex)', () => {
   });
 
   it('declares no native slash command support', () => {
-    const p = new CodexProvider({ env: { CODEX_MODEL: 'gpt-6.1-sol' } });
+    const p = new CodexProvider({ env: { CODEX_MODEL: 'gpt-6.2-sol' } });
     expect(p.supportsNativeSlashCommands).toBe(false);
   });
 
