@@ -117,7 +117,7 @@ async function loadContainerRunnerHarness(
     };
   } = {},
 ) {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-container-runner-'));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ncr-'));
   const dataDir = path.join(root, 'data');
   const groupsDir = options.releaseGroupsAlias
     ? path.join(root, 'releases', 'test-release', 'groups')
@@ -133,6 +133,7 @@ async function loadContainerRunnerHarness(
   }
 
   const oneCliStarted = deferred();
+  const storeLeases: Array<{ release: ReturnType<typeof vi.fn> }> = [];
   const oneCliRelease = deferred();
   const spawnedProcesses: Array<ReturnType<typeof fakeChildProcess>> = [];
   // Snapshot the --env-file at spawn time: it must exist (with content and
@@ -185,6 +186,18 @@ async function loadContainerRunnerHarness(
   });
 
   vi.resetModules();
+  vi.doMock('./codex-catalog.js', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('./codex-catalog.js')>();
+    return {
+      ...actual,
+      acquireStoreLease: vi.fn(async () => {
+        const lease = { release: vi.fn() };
+        storeLeases.push(lease);
+        return lease;
+      }),
+      resolveCodexImage: vi.fn(async () => ({ imageId: 'sha256:abcd', version: '0.170.0' })),
+    };
+  });
   vi.doMock('child_process', async (importOriginal) => {
     const actual = await importOriginal<typeof import('child_process')>();
     return {
@@ -300,10 +313,12 @@ async function loadContainerRunnerHarness(
 
   return {
     applyContainerConfigMock,
+    storeLeases,
     close() {
       db.closeDb();
       fs.rmSync(root, { recursive: true, force: true });
       vi.doUnmock('child_process');
+      vi.doUnmock('./codex-catalog.js');
       vi.doUnmock('@onecli-sh/sdk');
       vi.doUnmock('./config.js');
       vi.doUnmock('./agent-mcp-config.js');
@@ -1384,6 +1399,75 @@ describe('OneCLI container gateway', () => {
 });
 
 describe('session wake lifecycle', () => {
+  it('launches the probed immutable Codex image with only the nested catalog shared', async () => {
+    const harness = await loadContainerRunnerHarness();
+    const processKill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    try {
+      const { registerProviderContainerConfig } = await import('./providers/provider-container-registry.js');
+      const home = path.join(
+        harness.dataDir,
+        'v2-sessions',
+        harness.session.agent_group_id,
+        harness.session.id,
+        'codex',
+      );
+      registerProviderContainerConfig('codex', () => ({
+        mounts: [{ hostPath: home, containerPath: '/home/node/.codex', readonly: false }],
+      }));
+      fs.mkdirSync(path.join(harness.groupsDir, 'agent'), { recursive: true });
+      fs.writeFileSync(path.join(harness.groupsDir, 'agent/container.json'), JSON.stringify({ provider: 'codex' }));
+      harness.oneCliRelease.resolve();
+      await harness.containerRunner.wakeContainer(harness.session);
+      const args = harness.spawnMock.mock.calls[0][1];
+      expect(args).toContain('sha256:abcd');
+      expect(args).toContain(`${home}:/home/node/.codex`);
+      expect(args).toContain(
+        `${harness.dataDir}/.cache/codex-catalog/ag-1/0.170.0:/home/node/.codex/cache/remote_plugin_catalog`,
+      );
+      expect(harness.storeLeases).toHaveLength(2);
+      expect(harness.storeLeases.every((lease) => lease.release.mock.calls.length === 0)).toBe(true);
+      await harness.containerRunner.cleanupContainerForSession(harness.session.id, 'yente-session-reset');
+      expect(harness.storeLeases.every((lease) => lease.release.mock.calls.length === 1)).toBe(true);
+    } finally {
+      processKill.mockRestore();
+      harness.close();
+    }
+  });
+
+  it('retains store ownership until Docker proves stop, then releases the lease', async () => {
+    const harness = await loadContainerRunnerHarness();
+    const processKill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    try {
+      harness.oneCliRelease.resolve();
+      await harness.containerRunner.wakeContainer(harness.session);
+      expect(harness.storeLeases).toHaveLength(1);
+      expect(harness.storeLeases[0].release).not.toHaveBeenCalled();
+      await harness.containerRunner.cleanupContainerForSession(harness.session.id, 'yente-session-reset');
+      expect(harness.storeLeases[0].release).toHaveBeenCalledOnce();
+    } finally {
+      processKill.mockRestore();
+      harness.close();
+    }
+  });
+
+  it('releases the pre-wake store lease after a failed provider setup', async () => {
+    const harness = await loadContainerRunnerHarness();
+    try {
+      const { registerProviderContainerConfig } = await import('./providers/provider-container-registry.js');
+      registerProviderContainerConfig('broken', () => {
+        throw new Error('setup failed');
+      });
+      fs.mkdirSync(path.join(harness.groupsDir, 'agent'), { recursive: true });
+      fs.writeFileSync(path.join(harness.groupsDir, 'agent/container.json'), JSON.stringify({ provider: 'broken' }));
+      harness.oneCliRelease.resolve();
+      await expect(harness.containerRunner.wakeContainer(harness.session)).rejects.toThrow('setup failed');
+      expect(harness.storeLeases[0].release).toHaveBeenCalledOnce();
+      expect(harness.spawnMock).not.toHaveBeenCalled();
+    } finally {
+      harness.close();
+    }
+  });
+
   it('does not wake an archived session', async () => {
     const harness = await loadContainerRunnerHarness();
     try {

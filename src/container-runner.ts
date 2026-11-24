@@ -6,6 +6,7 @@
 import { ChildProcess, execSync, spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import { acquireStoreLease, catalogMount, resolveCodexImage } from './codex-catalog.js';
 
 import { OneCLI } from '@onecli-sh/sdk';
 
@@ -114,6 +115,7 @@ type ActiveContainer = {
   containerName: string;
   leaseId: string;
   revokeGwsAfterConfirmedStop: () => boolean;
+  releaseStoreLeases?: () => void;
   startedAtMs: number;
   managedSkillsRoot: string;
   finalization?: Promise<boolean>;
@@ -353,6 +355,26 @@ export function wakeContainer(session: Session): Promise<void> {
 }
 
 async function spawnContainer(session: Session): Promise<void> {
+  const releases: Array<() => void> = [];
+  const release = () =>
+    releases
+      .splice(0)
+      .reverse()
+      .forEach((close) => close());
+  const lease = await acquireStoreLease(DATA_DIR, 'session', session.agent_group_id, session.id);
+  releases.push(lease.release);
+  try {
+    await spawnContainerWithStoreLease(session, releases, release);
+  } finally {
+    if (activeContainers.get(session.id)?.releaseStoreLeases !== release) release();
+  }
+}
+
+async function spawnContainerWithStoreLease(
+  session: Session,
+  releases: Array<() => void>,
+  releaseStoreLeases: () => void,
+): Promise<void> {
   const agentGroup = getAgentGroup(session.agent_group_id);
   if (!agentGroup) {
     log.error('Agent group not found', { agentGroupId: session.agent_group_id });
@@ -380,6 +402,25 @@ async function spawnContainer(session: Session): Promise<void> {
   // (extra mounts, env passthrough). Computed once and threaded through both
   // buildMounts and buildContainerArgs so side effects (mkdir, etc.) fire once.
   const { provider, contribution } = await resolveProviderContribution(session, agentGroup, containerConfig);
+
+  const image = await resolveAgentImageForRun({
+    agentGroupId: agentGroup.id,
+    groupFolder: agentGroup.folder,
+    containerConfig,
+  });
+  let selectedImage = image.imageTag;
+  if (provider === 'codex') {
+    const codexImage = await resolveCodexImage(selectedImage);
+    selectedImage = codexImage.imageId;
+    const lease = await acquireStoreLease(DATA_DIR, 'catalog', agentGroup.id, codexImage.version);
+    releases.push(lease.release);
+    contribution.mounts = [...(contribution.mounts ?? []), catalogMount(DATA_DIR, agentGroup.id, codexImage.version)];
+    log.info('Selected shared Codex catalog', {
+      agentGroupId: agentGroup.id,
+      version: codexImage.version,
+      imageId: selectedImage,
+    });
+  }
 
   const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
   // OneCLI agent identifier is always the agent group id — stable across
@@ -413,6 +454,7 @@ async function spawnContainer(session: Session): Promise<void> {
       contribution,
       agentIdentifier,
       yenteDevSsh?.sshAuthSock,
+      selectedImage,
     );
     args = built.args;
     envFilePath = built.envFilePath;
@@ -514,6 +556,7 @@ async function spawnContainer(session: Session): Promise<void> {
     containerName,
     leaseId: launchControl.leaseId,
     revokeGwsAfterConfirmedStop: launchControl.revokeAfterConfirmedStop,
+    releaseStoreLeases,
     startedAtMs: Date.now(),
     managedSkillsRoot,
     agentGroupId: agentGroup.id,
@@ -688,6 +731,7 @@ async function finalizeVerifiedContainerStop(
 
   activeMcpBridges.delete(sessionId);
   const wasActive = activeContainers.delete(sessionId);
+  current.releaseStoreLeases?.();
   if (!wasActive) {
     notifyContainerExit(sessionId);
     return false;
@@ -1897,11 +1941,12 @@ async function buildContainerArgs(
   containerName: string,
   sessionId: string,
   agentGroup: AgentGroup,
-  containerConfig: import('./container-config.js').ContainerConfig,
+  _containerConfig: import('./container-config.js').ContainerConfig,
   _provider: string,
   providerContribution: ProviderContainerContribution,
   agentIdentifier?: string,
   sshAuthSock?: string,
+  selectedImage?: string,
 ): Promise<{ args: string[]; envFilePath: string }> {
   const args: string[] = [
     'run',
@@ -2000,12 +2045,8 @@ async function buildContainerArgs(
   // before running the TypeScript source directly via Bun (no tsc).
   args.push('--entrypoint', 'bash');
 
-  const image = await resolveAgentImageForRun({
-    agentGroupId: agentGroup.id,
-    groupFolder: agentGroup.folder,
-    containerConfig,
-  });
-  args.push(image.imageTag);
+  if (!selectedImage) throw new Error('Container image was not resolved before mount preparation');
+  args.push(selectedImage);
 
   args.push('-c', 'exec /app/entrypoint.sh --prepare-onecli-ca bun run /app/src/index.ts');
 

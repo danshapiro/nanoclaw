@@ -242,6 +242,27 @@ minimum above exponential backoff; waiting polls consume no attempts. Invalid,
 nonfinite or out-of-Date-range delays are rejected by parsing. Attempts remain
 bounded; generic transport, server and multipart uncertainty is never replayed.
 
+## Shared Codex catalog storage
+
+Only `CODEX_HOME/cache/remote_plugin_catalog` receives a nested bind from
+`DATA_DIR/.cache/codex-catalog/<group-id>/<Codex-version>`. The selected image
+is resolved to its immutable ID, its actual Codex binary supplies the version,
+and that same ID is launched. Version probes are cached per image ID for the
+host process lifetime. Auth, config, SQLite, conversations, installed plugin
+packages and plugin state remain private. Codex owns keyed atomic publication
+and freshness; concurrent misses can still download twice.
+
+The host holds shared kernel leases at
+`data/.cache/session-store-leases/<group-id>/<session-id>.lock` from pre-wake
+preparation through verified container stop, plus the corresponding
+`catalog-store-leases/<group-id>/<version>.lock` while using a shared catalog.
+The owning deployment repository's maintenance uses exclusive nonblocking
+leases plus stable session labels and actual mount inspection. Lease inodes
+must never be replaced or unlinked. The image probe and Linux `flock` are
+required; unknown image/version or lease failure is a visible wake failure.
+The host repository owns backup omission, operator forks and bounded weekly
+catalog housekeeping. This source change alone does not claim deployment.
+
 ## Host container-log retention and archive capture
 
 On Linux the host uses `/usr/bin/flock` to coordinate retention with the
