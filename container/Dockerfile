@@ -23,16 +23,8 @@ FROM node:22-slim
 # CJK fonts add ~200MB. Opt in only if you render Chinese/Japanese/Korean text.
 ARG INSTALL_CJK_FONTS=false
 
-# Pin CLI versions for reproducibility. Bump deliberately — unpinned installs
-# mean every rebuild silently picks up the latest and can break in lockstep
-# across all users.
-ARG CLAUDE_CODE_VERSION=2.1.116
-ARG OPENCODE_VERSION=1.15.10
-ARG CODEX_VERSION=0.170.0
-ARG AGENT_BROWSER_VERSION=0.27.2
-ARG VERCEL_VERSION=latest
-ARG BUN_VERSION=1.3.12
-
+# Declare tool version ARGs at their installation steps so a pin change
+# preserves earlier OS and unrelated dependency layers.
 # ---- System dependencies -----------------------------------------------------
 # tini: correct PID 1 / signal forwarding so outbound.db writes finalize on
 # SIGTERM instead of being orphaned by the shell entrypoint.
@@ -87,12 +79,13 @@ ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 # ---- Bun runtime -------------------------------------------------------------
 # Install via the official script (handles multi-arch detection), then move
 # the binary to /usr/local/bin so the non-root `node` user can execute it.
+ARG BUN_VERSION=1.3.12
 RUN curl -fsSL https://bun.sh/install | bash -s "bun-v${BUN_VERSION}" && \
     install -m 0755 /root/.bun/bin/bun /usr/local/bin/bun && \
     rm -rf /root/.bun
 
 # ---- agent-runner deps -------------------------------------------------------
-# Deps are cached independently of CLI versions. Source is NOT baked in —
+# Deps are cached independently of later CLI pins. Source is NOT baked in —
 # it's provided by the shared RO mount at runtime.
 WORKDIR /app
 
@@ -102,8 +95,9 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
     bun install --frozen-lockfile
 
 # ---- pnpm + global Node CLIs -------------------------------------------------
-# Most stable first, most frequently bumped last. Bumping claude-code
-# (the most common change) only invalidates one layer.
+# A CLI pin change rebuilds its installation and subsequent layers. Earlier
+# system, Bun and dependency layers remain reusable; Bun changes also rebuild
+# dependencies installed with Bun. Keep existing tool versions and ordering.
 #
 # only-built-dependencies gates pnpm's supply-chain policy:
 #   - agent-browser has a postinstall build step.
@@ -121,6 +115,7 @@ ARG PNPM_VERSION=10.33.0
 RUN corepack enable && corepack prepare "pnpm@${PNPM_VERSION}" --activate && \
     chmod -R a+rX "$COREPACK_HOME"
 
+ARG VERCEL_VERSION=latest
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     echo "only-built-dependencies[]=agent-browser" > /root/.npmrc && \
     echo "global-bin-dir=/pnpm/bin" >> /root/.npmrc && \
@@ -144,14 +139,17 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
     export PATH="/pnpm/bin:/pnpm:$PATH" && \
     pnpm install -g "vercel@${VERCEL_VERSION}"
 
+ARG AGENT_BROWSER_VERSION=0.27.2
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     export PATH="/pnpm/bin:/pnpm:$PATH" && \
     pnpm install -g "agent-browser@${AGENT_BROWSER_VERSION}"
 
+ARG CLAUDE_CODE_VERSION=2.1.116
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     export PATH="/pnpm/bin:/pnpm:$PATH" && \
     pnpm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
 
+ARG OPENCODE_VERSION=1.15.10
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     export PATH="/pnpm/bin:/pnpm:$PATH" && \
     pnpm install -g "opencode-ai@${OPENCODE_VERSION}" && \
@@ -161,6 +159,7 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
     node postinstall.mjs && \
     opencode --version
 
+ARG CODEX_VERSION=0.170.0
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     export PATH="/pnpm/bin:/pnpm:$PATH" && \
     pnpm install -g "@openai/codex@${CODEX_VERSION}" && \
