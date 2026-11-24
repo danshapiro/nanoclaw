@@ -465,7 +465,7 @@ function shouldDropSessionOutbound(sessionId: string): boolean {
   return suppressedSessionOutbound.has(sessionId) || !isSessionActive(sessionId);
 }
 
-function markStaleOutboundDropped(inDb: Database.Database, messageId: string): void {
+function markOutboundDropped(inDb: Database.Database, messageId: string): void {
   inDb
     .prepare(
       "INSERT OR IGNORE INTO delivered (message_out_id, platform_message_id, status, delivered_at) VALUES (?, NULL, 'dropped', datetime('now'))",
@@ -555,7 +555,7 @@ async function drainSession(session: Session, options: DrainSessionOptions = {})
       let staleDropCount = 0;
       for (const msg of undelivered) {
         if (shouldPreserveForSchedulerDrain(msg) || shouldPreserveQuarantined(inDb, msg.id, session.id)) continue;
-        markStaleOutboundDropped(inDb, msg.id);
+        markOutboundDropped(inDb, msg.id);
         staleDropCount++;
       }
       logStaleOutboundDropped(session, staleDropCount, options.staleReason ?? 'inactive-session-delivery');
@@ -566,7 +566,7 @@ async function drainSession(session: Session, options: DrainSessionOptions = {})
     for (const msg of undelivered) {
       if (shouldDropSessionOutbound(session.id)) {
         if (shouldPreserveForSchedulerDrain(msg) || shouldPreserveQuarantined(inDb, msg.id, session.id)) continue;
-        markStaleOutboundDropped(inDb, msg.id);
+        markOutboundDropped(inDb, msg.id);
         staleDropCount++;
         continue;
       }
@@ -589,6 +589,27 @@ async function drainSession(session: Session, options: DrainSessionOptions = {})
         continue;
       }
       if (previous?.state === 'retry' && previous.next_attempt_ms > Date.now()) continue;
+
+      // Agent smoke reads its own reply directly from messages_out. Do not send
+      // that reply through the terminal adapter or create a failed send receipt.
+      if (
+        msg.kind !== 'system' &&
+        msg.channel_type === 'cli' &&
+        msg.thread_id === null &&
+        (msg.platform_id === 'cli-smoke' || msg.platform_id?.startsWith('cli-smoke:')) &&
+        session.messaging_group_id?.startsWith('mg-cli-smoke-') &&
+        getMessagingGroupByPlatform('cli', msg.platform_id)?.id === session.messaging_group_id
+      ) {
+        inDb.transaction(() => {
+          markOutboundDropped(inDb, msg.id);
+          inDb.prepare('DELETE FROM delivery_attempts WHERE message_out_id = ?').run(msg.id);
+        })();
+        log.info('Capture-only CLI smoke reply retained in session outbox', {
+          messageId: msg.id,
+          sessionId: session.id,
+        });
+        continue;
+      }
 
       try {
         const platformMsgId = await deliverMessage(msg, session, inDb, outDb);

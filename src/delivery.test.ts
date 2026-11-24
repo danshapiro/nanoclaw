@@ -41,6 +41,7 @@ import { archiveSession } from './db/sessions.js';
 import { DeliveryUnavailableError } from './delivery-errors.js';
 import { log } from './log.js';
 import { deliverToChannel } from './channel-delivery.js';
+import { createCliAdapter } from './channels/cli.js';
 import { resolveSession, openOutboundDbHealing, outboundDbPath, inboundDbPath } from './session-manager.js';
 import {
   deliverSessionMessages,
@@ -199,6 +200,82 @@ beforeEach(() => {
 afterEach(() => {
   closeDb();
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+});
+
+describe('CLI smoke capture', () => {
+  it('keeps its own smoke reply available to the caller without sending it to a terminal', async () => {
+    seedAgentAndChannel();
+    const smokeGroup = 'mg-cli-smoke-fixture';
+    const smokePlatform = 'cli-smoke:test-agent:fixture';
+    createMessagingGroup({
+      id: smokeGroup,
+      channel_type: 'cli',
+      platform_id: smokePlatform,
+      name: 'cli-smoke-fixture',
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    const otherGroup = 'mg-cli-smoke-other';
+    const otherPlatform = 'cli-smoke:test-agent:other';
+    createMessagingGroup({
+      id: otherGroup,
+      channel_type: 'cli',
+      platform_id: otherPlatform,
+      name: 'cli-smoke-other',
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    createMessagingGroupAgent({
+      id: 'mga-cli-smoke-other',
+      messaging_group_id: otherGroup,
+      agent_group_id: 'ag-1',
+      engage_mode: 'mention',
+      engage_pattern: null,
+      sender_scope: 'all',
+      ignored_message_policy: 'drop',
+      session_mode: 'shared',
+      priority: 0,
+      created_at: now(),
+    });
+    const { session } = resolveSession('ag-1', smokeGroup, null, 'shared');
+    const outbound = new Database(outboundDbPath('ag-1', session.id));
+    try {
+      outbound
+        .prepare(
+          `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, thread_id, content)
+        VALUES ('smoke-reply', datetime('now'), 'chat', ?, 'cli', NULL, ?)`,
+        )
+        .run(smokePlatform, JSON.stringify({ text: 'PONG' }));
+      outbound
+        .prepare(
+          `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, thread_id, content)
+        VALUES ('wrong-destination', datetime('now'), 'chat', ?, 'cli', NULL, ?)`,
+        )
+        .run(otherPlatform, JSON.stringify({ text: 'must use ordinary destination handling' }));
+      const cliAdapter = createCliAdapter();
+      const deliver = vi.fn(
+        async (_channel: string, destination: string, thread: string | null, kind: string, content: string) =>
+          cliAdapter.deliver(destination, thread, { kind, content: JSON.parse(content) }),
+      );
+      setDeliveryAdapter({ deliver });
+
+      await deliverSessionMessages(session);
+      await deliverSessionMessages(session);
+
+      expect(deliver.mock.calls.map((call) => call[1])).toEqual([otherPlatform]);
+      expect(deliveredRows('ag-1', session.id)).toEqual([
+        { message_out_id: 'smoke-reply', platform_message_id: null, status: 'dropped' },
+        { message_out_id: 'wrong-destination', platform_message_id: null, status: 'failed' },
+      ]);
+      expect(outbound.prepare("SELECT content FROM messages_out WHERE id = 'smoke-reply'").get()).toEqual({
+        content: JSON.stringify({ text: 'PONG' }),
+      });
+    } finally {
+      outbound.close();
+    }
+  });
 });
 
 describe('deliverSessionMessages — concurrent invocations', () => {
