@@ -10,7 +10,7 @@ const MAX_FRAME_BYTES = 64 * 1024;
 const MAX_CONTROL_BYTES = 4096;
 
 /**
- * The host durably committed an acceptance mutation, but the authenticated
+ * The host may have committed an acceptance mutation, but the authenticated
  * response was lost before the runner could prove completion. Retrying or
  * returning the claim to pending would risk duplicate provider/tool work, so
  * this is a fatal container-lifecycle fault owned by host recovery.
@@ -23,6 +23,9 @@ export class GwsCorrelationLifecycleFault extends Error {
     this.name = 'GwsCorrelationLifecycleFault';
   }
 }
+
+/** An explicit authenticated host rejection, as distinct from transport loss. */
+class RejectedControlResponse extends Error {}
 
 export interface GwsCorrelationLaunchControl {
   schemaVersion: 1;
@@ -331,6 +334,11 @@ async function sendControlFrame(lease: RuntimeLease, key: string, value: unknown
   });
   socket.write(encodeFrame(value));
   const result = await response;
+  if (result.schemaVersion === 1 && result.ok === false) {
+    throw new RejectedControlResponse(
+      typeof result.error === 'string' ? result.error : 'host rejected GWS correlation request',
+    );
+  }
   if (result.schemaVersion !== 1 || result.ok !== true) {
     throw new Error(typeof result.error === 'string' ? result.error : 'host rejected GWS correlation request');
   }
@@ -426,7 +434,18 @@ export async function bindHostGwsCorrelation(
       // this claim crossed the acceptance boundary, but not that the provider
       // observed the response. Record it locally and force recovery ownership;
       // retrying the bind/input could duplicate tool work.
-      if (!currentMatchesAcceptedBind(readCurrent(), request, combinedIds, undefined)) throw err;
+      if (!currentMatchesAcceptedBind(readCurrent(), request, combinedIds, undefined)) {
+        if (err instanceof RejectedControlResponse) throw err;
+        // No pointer yet does not prove rejection: the host's serialized
+        // mutation can still publish after the transport deadline. The closed
+        // control channel also cannot recover through another provider query.
+        // Exit for verified host stop/reconciliation; never return these rows
+        // to pending while that mutation can still be live.
+        throw new GwsCorrelationLifecycleFault(
+          `trusted host GWS bind outcome for input ${inputId} is unknown after control transport failure`,
+          { cause: err },
+        );
+      }
       lease.acceptedInputs.set(inputId, {
         originalAcceptedAt: request.originalAcceptedAt,
         routeKey,
