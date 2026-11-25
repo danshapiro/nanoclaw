@@ -104,6 +104,55 @@ async function startFakeHost(opts: {
 }
 
 describe('GWS correlation lifecycle faults', () => {
+  it('requires host recovery when the control connection closes before publication is visible', async () => {
+    const { stop, currentFile } = await startFakeHost({
+      tag: 'response-loss-before-publication',
+      onBind: (_request, socket) => socket.destroy(),
+    });
+    try {
+      await connectGwsCorrelationControlSocket();
+      await expect(
+        bindHostGwsCorrelation('input-test', 'route-test', ['m-1'], 'claim-test', 'initial'),
+      ).rejects.toBeInstanceOf(GwsCorrelationLifecycleFault);
+      expect(fs.existsSync(currentFile)).toBe(false);
+    } finally {
+      await stop();
+    }
+  });
+
+  it('keeps an explicit host rejection retryable on the still-authenticated connection', async () => {
+    let attempts = 0;
+    const { stop } = await startFakeHost({
+      tag: 'rejected-then-accepted',
+      onBind: (request, socket, currentFile) => {
+        attempts++;
+        if (attempts === 1) {
+          socket.write(frame({ schemaVersion: 1, ok: false, requestId: request.requestId, error: 'claim rejected' }));
+          return;
+        }
+        writePointer(currentFile, request, request.originalAcceptedAt);
+        socket.write(frame({ schemaVersion: 1, ok: true, requestId: request.requestId }));
+      },
+    });
+    try {
+      await connectGwsCorrelationControlSocket();
+      let rejected: unknown;
+      try {
+        await bindHostGwsCorrelation('input-test', 'route-test', ['m-1'], 'claim-1', 'initial');
+      } catch (error) {
+        rejected = error;
+      }
+      expect(rejected).toBeInstanceOf(Error);
+      expect(rejected).not.toBeInstanceOf(GwsCorrelationLifecycleFault);
+      await expect(
+        bindHostGwsCorrelation('input-test', 'route-test', ['m-1'], 'claim-2', 'initial'),
+      ).resolves.toBeUndefined();
+      expect(attempts).toBe(2);
+    } finally {
+      await stop();
+    }
+  });
+
   it('classifies a lost bind response as fatal when the exact host pointer proves commit', async () => {
     // The host may have derived the durable original acceptance from a prior
     // life, so the pointer's acceptedAt legitimately differs from the fresh

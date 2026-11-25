@@ -203,6 +203,15 @@ This structure replaced a uniform npm-on-Node stack across both host and contain
 
 ## Reconciling outbound delivery
 
+A lost trusted-input control response requires the runner to exit for the
+host's existing verified stop and recovery. A missing correlation pointer
+does not establish rejection: the serialized host mutation may still publish
+after the transport closes. The runner must not return that uncertain claim
+to pending or keep retrying a closed control connection. Explicit authenticated
+host rejections retain the existing retry behavior; exact processing-claim
+and acceptance checks remain enforced. No operator should resend an input
+whose acceptance or delivery is uncertain.
+
 An adapter that is still starting leaves its outbound row pending with a
 persisted backoff. Missing or retired routes and deterministic failures are
 quarantined as `failed`. A platform request interrupted by process termination
