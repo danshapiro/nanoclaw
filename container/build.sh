@@ -21,6 +21,9 @@ IMAGE_NAME="$(container_image_base)"
 TAG="${1:-latest}"
 CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-docker}"
 
+# Fence short-lived build probes at launch, like other host workloads.
+PROBE_LIMITS=(--memory=2g --memory-swap=2g --pids-limit=512)
+
 # Caller's env takes precedence; fall back to .env.
 if [ -z "${INSTALL_CJK_FONTS:-}" ] && [ -f "../.env" ]; then
     INSTALL_CJK_FONTS="$(grep '^INSTALL_CJK_FONTS=' ../.env | tail -n1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '[:space:]')"
@@ -41,7 +44,7 @@ echo "Verifying stable global CLI paths and Codex app-server as a non-root uid..
 # Managed skill wrappers invoke /pnpm/bin/codex directly. A PATH-only probe
 # misses a package-manager layout change that breaks every Codex session.
 # shellcheck disable=SC2016 # The quoted script expands inside the container.
-${CONTAINER_RUNTIME} run --rm \
+${CONTAINER_RUNTIME} run --rm "${PROBE_LIMITS[@]}" \
     --network none \
     --user 12345:12345 \
     -e HOME=/home/node \
@@ -59,7 +62,7 @@ test "$(pnpm --version)" = "10.33.0"'
 
 echo "Verifying yt-dlp and ffmpeg in the built image..."
 # shellcheck disable=SC2016 # The quoted script expands inside the container.
-${CONTAINER_RUNTIME} run --rm \
+${CONTAINER_RUNTIME} run --rm "${PROBE_LIMITS[@]}" \
     --network none \
     --entrypoint sh \
     "${IMAGE_NAME}:${TAG}" \
@@ -79,7 +82,7 @@ echo "Verifying python3.12 (uv-managed) alongside distro python3 as a non-root u
 # Mirror production agent spawns: an arbitrary host uid with no /etc/passwd
 # entry (src/container-runner.ts pushes --user <uid>:<gid> + HOME=/home/node).
 # shellcheck disable=SC2016 # The quoted script expands inside the container.
-${CONTAINER_RUNTIME} run --rm \
+${CONTAINER_RUNTIME} run --rm "${PROBE_LIMITS[@]}" \
     --network none \
     --user 12345:12345 \
     -e HOME=/home/node \
@@ -95,7 +98,7 @@ echo "Verifying the exact stock Playwriter client as a non-root uid..."
 # Identity and help/version checks are intentionally offline: the relay is not
 # contacted until the shared skill performs its explicit browser/status preflight.
 # shellcheck disable=SC2016 # The quoted script expands inside the container.
-${CONTAINER_RUNTIME} run --rm \
+${CONTAINER_RUNTIME} run --rm "${PROBE_LIMITS[@]}" \
     --network none \
     --user 12345:12345 \
     -e HOME=/home/node \
