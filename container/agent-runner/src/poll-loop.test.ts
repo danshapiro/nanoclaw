@@ -1287,6 +1287,128 @@ describe('poll-loop conversational reply accounting', () => {
     await loopPromise.catch(() => {});
   });
 
+  for (const scenario of ['current', 'old', 'other-message', 'other-route', 'provider-error'] as const) {
+    it(`accounts for a reaction on an empty result: ${scenario}`, async () => {
+      insertMessage(
+        'reaction-input',
+        'chat',
+        { sender: 'User', text: 'I sent it.' },
+        { platformId: 'chan-1', channelType: 'discord', threadId: 'thread-1' },
+      );
+      getInboundDb()
+        .prepare('UPDATE messages_in SET platform_message_id = ? WHERE id = ?')
+        .run('platform-current', 'reaction-input');
+      const react = () =>
+        writeMessageOut({
+          id: 'ack-reaction',
+          kind: 'chat',
+          platform_id: scenario === 'other-route' ? 'chan-2' : 'chan-1',
+          channel_type: 'discord',
+          thread_id: 'thread-1',
+          content: JSON.stringify({
+            operation: 'reaction',
+            messageId: scenario === 'other-message' ? 'platform-other' : 'platform-current',
+            emoji: 'white_check_mark',
+          }),
+        });
+      if (scenario === 'old') react();
+      const provider = new ScriptedProvider(async function* () {
+        yield { type: 'init', continuation: 'reaction-session' };
+        if (scenario !== 'old') react();
+        yield {
+          type: 'result',
+          text: null,
+          ...(scenario === 'provider-error' ? { errorText: 'Provider failed' } : {}),
+        };
+      });
+      const controller = new AbortController();
+      const loopPromise = runPollLoopWithTimeout(provider, controller.signal);
+      await waitFor(() => getAckStatus('reaction-input') === 'completed', 1500);
+      controller.abort();
+      const out = getUndeliveredMessages();
+      expect(out).toHaveLength(scenario === 'current' ? 1 : 2);
+      if (scenario !== 'current') {
+        expect(JSON.parse(out[1].content).text).toContain(
+          scenario === 'provider-error' ? 'Provider failed' : 'completed without sending a user-visible response',
+        );
+      }
+      await loopPromise.catch(() => {});
+    });
+  }
+
+  it('matches a reaction to the trigger when a direct message uses different thread aliases', async () => {
+    const route = { platformId: 'chan-dm', channelType: 'discord', messagingGroupId: 'dm-1', isGroup: 0 as const };
+    insertMessage('context-dm', 'chat', { text: 'earlier' }, { ...route, threadId: 'old-thread', trigger: 0 });
+    insertMessage('trigger-dm', 'chat', { text: 'I sent it' }, { ...route, threadId: 'new-thread' });
+    getInboundDb().prepare('UPDATE messages_in SET seq = 2 WHERE id = ?').run('context-dm');
+    getInboundDb().prepare('UPDATE messages_in SET seq = 4, platform_message_id = ? WHERE id = ?')
+      .run('platform-trigger', 'trigger-dm');
+    expect(getPendingMessages().map((message) => message.id)).toEqual(['context-dm', 'trigger-dm']);
+    const provider = new ScriptedProvider(async function* () {
+      yield { type: 'init', continuation: 'dm-reaction-session' };
+      writeMessageOut({ id: 'dm-reaction', kind: 'chat', platform_id: 'chan-dm', channel_type: 'discord',
+        thread_id: 'new-thread', content: JSON.stringify({ operation: 'reaction', messageId: 'platform-trigger', emoji: 'check' }) });
+      yield { type: 'result', text: null };
+    });
+    const controller = new AbortController();
+    const loop = runPollLoopWithTimeout(provider, controller.signal);
+    await waitFor(() => getAckStatus('trigger-dm') === 'completed', 1500);
+    controller.abort();
+    const out = getUndeliveredMessages();
+    await loop.catch(() => {});
+    expect(out).toHaveLength(1);
+    expect(out[0].id).toBe('dm-reaction');
+  });
+
+  for (const target of ['initial', 'followup'] as const) {
+    it(`does not confuse a ${target} reaction when resolving two inputs`, async () => {
+      const route = { channelType: 'discord', platformId: 'chan-1' };
+      insertMessage('reaction-initial', 'chat', { text: 'first' }, route);
+      getInboundDb().prepare('UPDATE messages_in SET platform_message_id = ? WHERE id = ?')
+        .run('platform-initial', 'reaction-initial');
+      const started = deferred();
+      const pushed = deferred();
+      let followup!: QueryTurnInput;
+      const provider: AgentProvider = {
+        supportsNativeSlashCommands: false,
+        isSessionInvalid: () => false,
+        query(input) {
+          return {
+            push(message) { if (typeof message !== 'string') followup = message; pushed.resolve(); },
+            end() {}, abort: async () => { pushed.resolve(); },
+            events: (async function* () {
+              yield { type: 'input-accepted', inputId: input.inputId, scope: 'initial' };
+              started.resolve();
+              await pushed.promise;
+              if (!followup) return;
+              await followup.acceptInput();
+              yield { type: 'input-accepted', inputId: followup.inputId, scope: 'followup' };
+              writeMessageOut({ id: 'combined-reaction', kind: 'chat', channel_type: 'discord', platform_id: 'chan-1',
+                content: JSON.stringify({ operation: 'reaction', messageId: `platform-${target}`, emoji: 'check' }) });
+              yield { type: 'result', text: null, resolvedInputIds: [input.inputId, followup.inputId] };
+            })(),
+          };
+        },
+      };
+      const controller = new AbortController();
+      const loop = runPollLoop({ provider, providerName: 'test', cwd: '/tmp', signal: controller.signal });
+      try {
+        await started.promise;
+        insertMessage('reaction-followup', 'chat', { text: 'second' }, route);
+        getInboundDb().prepare('UPDATE messages_in SET platform_message_id = ? WHERE id = ?')
+          .run('platform-followup', 'reaction-followup');
+        await waitFor(() => getAckStatus('reaction-followup') === 'completed', 2000);
+        const out = getUndeliveredMessages();
+        expect(out).toHaveLength(target === 'initial' ? 1 : 2);
+        if (target === 'followup') expect(JSON.parse(out[1].content).text).toContain('completed without sending a user-visible response');
+      } finally {
+        controller.abort();
+        pushed.resolve();
+        await loop.catch(() => {});
+      }
+    });
+  }
+
   it('suppresses the terminal interruption notice for non-user-triggered turns', async () => {
     const errSpy = spyOn(console, 'error');
     insertMessage(

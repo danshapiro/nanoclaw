@@ -601,6 +601,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     let prompt: string;
     let attachments: Awaited<ReturnType<typeof collectQueryAttachments>>;
     let query: AgentQuery;
+    let outboundSequenceBeforeQuery = 0;
     let processingIds: string[] = [];
     let claimToken = '';
     let topLevelInputId = '';
@@ -714,6 +715,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // Provider startup / session creation. A synchronous throw here (the
       // OpenCode server failing to spawn, session creation rejecting) is a
       // pre-acceptance failure: no input has been accepted, so it is recoverable.
+      outboundSequenceBeforeQuery = maxOutboundSequence();
       query = config.provider.query({
         inputId: topLevelInputId,
         acceptInput: initialClaim.acceptInput,
@@ -795,6 +797,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const replyAccounting = {
       initialRequiresUserVisibleReply: requiresUserVisibleReply(keep),
       initialUserTriggered: isUserTriggered(keep),
+      initialTriggers: keep.filter((m) => m.trigger === 1 && (m.kind === 'chat' || m.kind === 'chat-sdk') &&
+        m.channel_type !== 'agent' && m.platform_message_id),
+      outboundSequenceBeforeQuery,
       outboundVisibleReplyCountBefore: await withSqliteRetry(
         () => countOutboundVisibleReplyMessages({ ...routing, routeKey: activeRouteScope.routeKey }),
         { label: 'countOutboundVisibleReplyMessages' },
@@ -1023,6 +1028,8 @@ interface ReplyAccounting {
   /** True when the initial batch was triggered by a real user message (not system/a2a). */
   initialUserTriggered: boolean;
   outboundVisibleReplyCountBefore: number;
+  initialTriggers: MessageInRow[];
+  outboundSequenceBeforeQuery: number;
 }
 
 interface InputLedgerEntry {
@@ -1346,12 +1353,14 @@ async function processQuery(
     });
   }
 
-  function settleInitialBatch(topLevelResolved: boolean, providerErrorText: string | null = null): void {
+  function settleInitialBatch(topLevelResolved: boolean, providerErrorText: string | null = null, successfulEmptyResult = false): void {
     if (initialBatchSettled) return;
     if (!topLevelResolved) return;
     initialBatchSettled = true;
 
-    if (hasMissingVisibleReply([ledgerCtx.topLevelInputId])) {
+    const reactionAcknowledged = successfulEmptyResult && !providerErrorText && ledgerCtx.initialClaim.acceptanceObserved &&
+      hasNewReactionToTrigger(routing, replyAccounting.initialTriggers, replyAccounting.outboundSequenceBeforeQuery);
+    if (hasMissingVisibleReply([ledgerCtx.topLevelInputId]) && !reactionAcknowledged) {
       writeMissingVisibleReplyError(routing, providerErrorText, replyAccounting.initialUserTriggered);
     }
   }
@@ -1760,7 +1769,7 @@ async function processQuery(
         // A successful result on this continuation resets the zombie backstop —
         // the session proved live.
         if (queryContinuation) resetZombieCounter(providerName, queryContinuation, config?.provider.continuationScope);
-        settleInitialBatch(resolved.includes(ledgerCtx.topLevelInputId), currentResultErrorText);
+        settleInitialBatch(resolved.includes(ledgerCtx.topLevelInputId), currentResultErrorText, !event.text && !event.errorText);
       }
     }
 
@@ -2078,6 +2087,25 @@ function isUserTriggered(messages: MessageInRow[]): boolean {
   return messages.some(
     (m) => (m.kind === 'chat' || m.kind === 'chat-sdk') && m.trigger === 1 && m.channel_type !== 'agent',
   );
+}
+
+function maxOutboundSequence(): number {
+  return (getOutboundDb().prepare('SELECT COALESCE(MAX(seq), 0) AS max FROM messages_out').get() as { max: number }).max;
+}
+
+/** Reactions count only for terminal empty-success accounting, never text recovery. */
+function hasNewReactionToTrigger(routing: RoutingContext, triggers: MessageInRow[], afterSeq: number): boolean {
+  if (triggers.length === 0) return false;
+  const rows = getOutboundDb().prepare(`SELECT content, channel_type, platform_id, thread_id FROM messages_out
+    WHERE seq > $seq AND kind = 'chat' AND (route_key IS NULL OR route_key = $route_key)
+      AND CASE WHEN json_valid(content) THEN json_extract(content, '$.operation') = 'reaction' ELSE 0 END`)
+    .all({ $seq: afterSeq, $route_key: routing.routeKey ?? null }) as Array<{
+      content: string; channel_type: string | null; platform_id: string | null; thread_id: string | null;
+    }>;
+  return rows.some((row) => triggers.some((trigger) =>
+    trigger.platform_message_id === JSON.parse(row.content).messageId &&
+    trigger.channel_type === row.channel_type && trigger.platform_id === row.platform_id && trigger.thread_id === row.thread_id
+  ));
 }
 
 function countOutboundVisibleReplyMessages(routing: RoutingContext): number {
